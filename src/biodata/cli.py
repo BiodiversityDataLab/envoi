@@ -1,4 +1,5 @@
-import argparse, pandas as pd
+import argparse
+import pandas as pd
 from .enrich import enrich
 
 def main():
