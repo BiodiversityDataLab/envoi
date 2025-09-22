@@ -1,6 +1,7 @@
 from typing import List, Optional
 import pandas as pd
 
+
 def enrich(
     df: pd.DataFrame,
     predictors: List[str],

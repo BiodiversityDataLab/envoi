@@ -2,6 +2,7 @@ import argparse
 import pandas as pd
 from .enrich import enrich
 
+
 def main():
     ap = argparse.ArgumentParser("biodata")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -17,8 +18,15 @@ def main():
     args = ap.parse_args()
     df = pd.read_csv(args.inp)
     predictors = [p.strip() for p in args.predictors.split(",") if p.strip()]
-    enrich(df, predictors=predictors, catalog=args.catalog, window_m=args.window_m,
-           temporal=args.temporal, out_path=args.out)
+    enrich(
+        df,
+        predictors=predictors,
+        catalog=args.catalog,
+        window_m=args.window_m,
+        temporal=args.temporal,
+        out_path=args.out,
+    )
+
 
 if __name__ == "__main__":
     main()

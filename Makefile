@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .PHONY: install test sample-run fmt lint
 
 install:
-	python -m venv .venv
+	python3 -m venv .venv
 	. .venv/bin/activate && pip install -U pip && pip install -e ".[dev]"
 
 test:
