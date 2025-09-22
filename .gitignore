@@ -1,0 +1,27 @@
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+dist/
+build/
+*.egg-info/
+
+# Data
+data/*.tif
+data/*.tiff
+data/*.nc
+data/*.zip
+data/*.parquet
+data/*.gpkg
+data/*.geojson
+data/raw/
+out/
+.cache/
+.cache/**
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

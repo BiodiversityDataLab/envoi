@@ -1,0 +1,19 @@
+datasets:
+  dem_elev:
+    source: local_raster
+    path: data/dem.tif   # placeholder path
+    type: numeric
+    crs: EPSG:4326
+    resolution_m: 30
+    default_reducer: mean
+    license: "CC-BY 4.0"
+    version: "v1"
+  cop_lc_2021:
+    source: local_raster
+    path: data/cop_landcover_2021.tif   # placeholder path
+    type: categorical
+    crs: EPSG:4326
+    resolution_m: 100
+    default_reducer: majority
+    license: "Copernicus"
+    version: "2021"
