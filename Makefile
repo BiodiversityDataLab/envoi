@@ -1,6 +1,8 @@
 SHELL := /bin/bash
 
-.PHONY: install test sample-run fmt lint
+.PHONY: install test sample-run sample-groups fmt lint
+
+PREDICTORS ?= dem_elev
 
 install:
 	python3 -m venv .venv
@@ -17,5 +19,10 @@ lint:
 
 sample-run:
 	mkdir -p out
-	. .venv/bin/activate && biodata enrich --in data/points_sample.csv --out out/gold.parquet --catalog configs/catalog.yml --predictors dem_elev,cop_lc_2021 --window_m 500 --temporal nearest_month
-	@echo "Sample run completed. (Stub predictors for now)"
+	. .venv/bin/activate && biodata enrich --in data/points_sample.csv --out out/gold.parquet --catalog configs/catalog.yml --predictors $(PREDICTORS) --window_m 500 --temporal nearest_month
+	@echo "Sample flat run completed."
+
+sample-groups:
+	mkdir -p out
+	. .venv/bin/activate && biodata enrich --in data/points_sample.csv --out out --catalog configs/catalog.yml --groups configs/run.yml --window_m 100 --temporal nearest_month
+	@echo "Sample groups run completed."

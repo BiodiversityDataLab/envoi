@@ -1,0 +1,7 @@
+groups:
+  - name: dem_stats
+    predictors: [dem_elev]
+    output:
+      kind: tabular
+      window_m: 500
+      reducers: [mean, std, min, max, q90]

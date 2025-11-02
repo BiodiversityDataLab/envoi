@@ -1,54 +1,71 @@
-# biodata-enricher
+# biodata-enricher — Python usage
 
-A Python library and CLI to enrich point observations (`lat`, `lon`, optional `date`) with environmental predictors from **local rasters** and **remote sources** (e.g., GEE/STAC), returning a **model-ready** table (Parquet/CSV) with **QC** and **provenance**.
+Enrich a Pandas DataFrame of points (`id`, `lat`, `lon`, optional `date`) with features sampled from local GeoTIFF rasters.  
+Outputs model-ready **Parquet** plus **QA** columns and **provenance** (metadata JSON).
 
-> MVP scope: 2 sources (LocalRaster + one remote), 3–4 predictor families (elevation/slope, land-cover majority, one climate var), basic reducers (mean/std/majority), Parquet output, QC.
+---
 
-## Quick start
+## Install
 
 ```bash
-# 1) Create & activate venv, install
 make install
-
-# 2) Try the sample end-to-end (uses a stub enrich for now)
-make sample-run
-
-# 3) Run tests & linters
 make test
 ```
 
-### CLI example
-```bash
-biodata enrich --in data/points_sample.csv   --out out/gold.parquet   --catalog configs/catalog.yml   --predictors dem_elev,cop_lc_2021,era5_temp_month   --window_m 500   --temporal nearest_month
+## Recommended: groups mode (one call → multiple features + QA + metadata)
+```python
+import pandas as pd
+from biodata.enrich import enrich
+
+df = pd.read_csv("data/points_sample.csv")
+
+cfg = {
+  "groups": [{
+    "name": "dem_100m",
+    "predictors": ["dem_mini"],             # or "features": [...]
+    "output": {
+      "kind": "tabular",
+      "reducers": ["mean", "std", "q10", "q90"],
+      "window_m": 100
+    }
+  }],
+  "min_coverage_pct": 80,                   # QA threshold
+  "project_crs": "EPSG:3006"
+}
+
+outputs = enrich(df, groups=cfg, catalog="configs/catalog.yml", out_dir="out")
+# Parquet path:
+print(outputs["dem_100m"])                  # -> out/dem_100m.parquet
+# Metadata JSON sits next to it:
+# out/dem_100m_metadata.json
+
 ```
 
-## Project layout
-```
-src/biodata/            # library code
-  adapters/             # data source adapters (LocalRaster, GEE/STAC)
-  enrich.py             # main API
-  reducers.py           # numeric/categorical/temporal reducers
-  geometry.py           # CRS normalization, projections
-  grid.py               # country-based grid generation
-  qc.py                 # schema/value checks, coverage
-  writers.py            # Parquet/CSV writers + metadata
-  config.py             # load/validate catalog + config
-  cli.py                # command-line interface
-configs/                # catalog.yml and other configs
-docs/                   # requirements, plan, predictors, QC spec, minutes
-tests/                  # unit tests
-data/                   # sample data (small only; big data is NOT committed)
-.github/workflows/      # CI config
-```
+## What you’ll see in the Parquet
 
-## MVP tasks
-- [ ] Confirm predictor list v1 & output spec
-- [ ] Implement LocalRasterAdapter (DEM + land cover)
-- [ ] CRS normalize + optional grid builder
-- [ ] Reducers (mean/std/majority) + temporal (nearest_month/monthly_mean)
-- [ ] GEEAdapter for one remote dataset
-- [ ] QC + provenance + Parquet writer
-- [ ] Docs + architecture diagram
+Reducer columns: `dem_mini_mean`, `dem_mini_std`, `dem_mini_q10`, `dem_mini_q90`
 
-## License
-MIT for code. Data inherits original sources' licenses; carry per-predictor license/citation.
+QA columns: `dem_mini_in_extent`, `dem_mini_n_pixels`, `dem_mini_had_nodata`, `dem_mini_coverage_pct`
+
+## Catalog (tell the library where rasters live)
+
+`configs/catalog.yml`:
+```yaml
+datasets:
+  dem_mini:
+    type: raster
+    source: local_raster
+    path: tests/data/mini_dem.tif   # any GeoTIFF with a valid CRS
+    crs: EPSG:4326
+    default_reducer: mean
+```
+Add more predictors by adding more entries to `datasets:` and listing them in your `predictors`/`features`.
+
+
+## Notes & limits
+
+- Windows are in meters using EPSG:3006 internally (robust for Sweden; reprojected to the raster CRS when sampling).
+
+- Works with GeoTIFFs readable by rasterio and having a valid CRS; assumes numeric single-band by default.
+
+- Low coverage is flagged, not fatal; filter by *_coverage_pct as needed.
