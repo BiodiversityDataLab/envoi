@@ -1,0 +1,15 @@
+# Git & cache, keeps the image clean and fast
+.git
+__pycache__/
+*.pyc
+
+# Virtual envs, dont copy local enviroment, security hygiene
+.venv/
+.env
+
+# Data & outputs, prevents the container form being polluted by local resutls
+data/
+out/
+
+# Editor stuff, keeps personal enviroments out of versioned builds
+.vscode/

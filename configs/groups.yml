@@ -1,0 +1,21 @@
+groups:
+  - name: site_stats
+    predictors: [dem_elev, slope]
+    output:
+      kind: tabular          # writes Parquet/CSV table
+      window_m: 500          # 500 m buffer around each point
+      reducers: [mean, std]  # make dem_elev_mean, dem_elev_std, slope_mean, slope_std
+
+  - name: landcover_summary
+    predictors: [lc_majority]
+    output:
+      kind: tabular
+      window_m: 1000
+      reducers: [count]      # (demo) number of valid pixels sampled
+
+  # (Optional) a demo “raster” group—one output per predictor (placeholder)
+  - name: viz_tiles
+    predictors: [dem_elev]
+    output:
+      kind: raster           # our current demo writer for quick visuals
+      window_m: 0            # single pixel per point

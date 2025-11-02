@@ -18,6 +18,7 @@ dependencies = [
     "shapely>=2.0",
     "geopandas>=0.14",
     "pyyaml>=6.0.1",
+    "pyarrow>=17.0.0",
     # "earthengine-api>=0.1.398",   # add when implementing GEE adapter
 ]
 

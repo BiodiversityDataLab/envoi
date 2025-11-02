@@ -25,3 +25,7 @@ out/
 .DS_Store
 .vscode/
 .idea/
+data/*.hgt
+.venv/
+*.pyc
+configs/examples/

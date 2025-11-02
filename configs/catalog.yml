@@ -1,19 +1,32 @@
 datasets:
   dem_elev:
     source: local_raster
-    path: data/dem.tif   # placeholder path
-    type: numeric
+    path: data/dem_sweden.tif
+    type: raster
     crs: EPSG:4326
-    resolution_m: 30
+    resolution_m: 90
     default_reducer: mean
-    license: "CC-BY 4.0"
-    version: "v1"
-  cop_lc_2021:
+
+  slope:
     source: local_raster
-    path: data/cop_landcover_2021.tif   # placeholder path
-    type: categorical
+    path: data/slope_sweden.tif     # precomputed slope GeoTIFF
+    type: raster
+    crs: EPSG:4326
+    resolution_m: 90
+    default_reducer: mean
+
+  lc_majority:
+    source: local_raster
+    path: data/landcover_tile.tif   # categorical land-cover raster
+    type: categorical               # (we still use numeric reducers in MVP)
     crs: EPSG:4326
     resolution_m: 100
-    default_reducer: majority
-    license: "Copernicus"
-    version: "2021"
+    default_reducer: mean
+
+# configs/catalog.yml
+  dem_mini:
+    type: raster
+    source: local_raster
+    path: tests/data/mini_dem.tif  # relative to repo root
+    crs: EPSG:4326                     # let the adapter read it from the file
+    default_reducer: mean

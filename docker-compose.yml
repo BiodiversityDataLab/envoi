@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  biodata:
+    build: .
+    volumes:
+      - ./data:/app/data
+      - ./out:/app/out
+    environment:
+      - MODE=prod
+    command: python -m biodata.enrich

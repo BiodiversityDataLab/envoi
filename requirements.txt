@@ -1,0 +1,16 @@
+# Core
+pandas>=2.1
+numpy>=1.26
+pyproj>=3.6
+PyYAML>=6.0
+
+# Geospatial stack
+rasterio>=1.3
+geopandas>=0.14
+shapely>=2.0
+fiona>=1.9
+affine>=2.4
+
+# Dev
+black
+pytest

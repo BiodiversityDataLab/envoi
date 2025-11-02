@@ -1,0 +1,9 @@
+groups:
+  - name: terrain_features
+    features: [dem_elev, slope]             # you can add lc_majority later
+    summary_statistics: [mean, std, q10, q90]
+    buffer_sizes: [100, 300, 1000]
+    output: { kind: tabular }
+
+project_crs: EPSG:3006
+out_dir: out
