@@ -61,6 +61,36 @@ datasets:
 ```
 Add more predictors by adding more entries to `datasets:` and listing them in your `predictors`/`features`.
 
+## Re-run previous runs (History)
+
+Every `enrich` run writes a manifest with all the knobs you used (input CSV, catalog, groups/predictors, reducers, window, etc.):
+
+- Latest run: `out/last_run.json`
+- Archive of all runs: `out/runs/run_<YYYYMMDD_HHMMSS>.json`
+
+### CLI
+
+```bash
+# Run once (writes out/last_run.json and out/runs/run_*.json)
+biodata enrich \
+  --in data/points_sample.csv \
+  --out out \
+  --catalog configs/catalog.yml \
+  --groups configs/run.yml
+
+# Re-run the latest
+biodata rerun --from out/last_run.json
+
+# Re-run a specific past run
+biodata rerun --from out/runs/run_20251113_121530.json
+```
+### Python
+```python
+from biodata.history import replay_last_run
+
+outputs = replay_last_run()  # or replay_last_run("out/runs/run_20251113_121530.json")
+print(outputs)
+```
 
 ## Notes & limits
 
