@@ -14,3 +14,6 @@ affine>=2.4
 # Dev
 black
 pytest
+
+# Orchestration
+prefect>=2.14
