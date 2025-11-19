@@ -1,9 +1,6 @@
 import argparse
 from pathlib import Path
-import sys
 import pandas as pd
-
-# Existing imports
 from .enrich import enrich
 import json
 from datetime import datetime
@@ -15,16 +12,69 @@ def main():
     ap = argparse.ArgumentParser("biodata")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    # --- enrich ---
     e = sub.add_parser("enrich", help="Enrich points with environmental predictors")
     e.add_argument("--in", dest="inp", required=True, help="Input CSV file with id,lat,lon[,date]")
-    e.add_argument("--out", dest="out", required=True, help="Output directory (groups) or file (flat)")
+    e.add_argument(
+        "--out", dest="out", required=True, help="Output directory (groups) or file (flat)"
+    )
     e.add_argument("--catalog", default="configs/catalog.yml")
     e.add_argument("--predictors", help="Comma-separated predictor names (flat mode)")
     e.add_argument("--groups", help="YAML file defining groups (alternative to --predictors)")
     e.add_argument("--window_m", type=int, default=500)
     e.add_argument("--temporal", default="nearest_month")
 
+    # --- rerun ---
+    r = sub.add_parser("rerun", help="Re-run a previous enrichment from a saved manifest")
+    r.add_argument(
+        "--from",
+        dest="manifest",
+        default="out/last_run.json",
+        help="Path to manifest JSON (default: out/last_run.json)",
+    )
+
     args = ap.parse_args()
+
+    # ---------------------------
+    # Command: rerun
+    # ---------------------------
+    if args.cmd == "rerun":
+        mpath = Path(args.manifest)
+        if not mpath.exists():
+            raise FileNotFoundError(f"Manifest not found: {mpath}")
+        with mpath.open() as f:
+            m = json.load(f)
+
+        df = pd.read_csv(m["input_csv_path"])
+        if m.get("mode") == "groups":
+            outputs = enrich(
+                df,
+                groups=m["groups_config"],
+                catalog=m["catalog_path"],
+                out_dir=m["out_dir"],
+                window_m=m.get("window_m", 500),
+                temporal=m.get("temporal", "nearest_month"),
+            )
+            for k, p in outputs.items():
+                print(f"[rerun:groups] wrote {k}: {p}")
+        else:
+            out_dir = Path(m.get("out_dir", "out"))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = m.get("out_path") or str(out_dir / "flat_rerun.parquet")
+            enrich(
+                df,
+                predictors=m["predictors"],
+                catalog=m["catalog_path"],
+                out_path=out_path,
+                window_m=m.get("window_m", 500),
+                temporal=m.get("temporal", "nearest_month"),
+            )
+            print(f"[rerun:flat] wrote: {out_path}")
+        return
+
+    # ---------------------------
+    # Command: enrich
+    # ---------------------------
     df = pd.read_csv(args.inp)
 
     if args.groups:
@@ -41,6 +91,20 @@ def main():
         )
         for k, p in outputs.items():
             print(f"[groups] wrote {k}: {p}")
+
+        # Save manifest for replay
+        manifest = {
+            "timestamp": datetime.utcnow().strftime("%Y%m%d_%H%M%S"),
+            "mode": "groups",
+            "input_csv_path": args.inp,
+            "catalog_path": args.catalog,
+            "out_dir": str(out_dir),
+            "groups_config": yaml.safe_load(open(args.groups)),
+            "window_m": args.window_m,
+            "temporal": args.temporal,
+        }
+        write_run_manifest(manifest, out_dir)
+
     elif args.predictors:
         # Flat mode → out is a single file
         predictors = [p.strip() for p in args.predictors.split(",") if p.strip()]
@@ -55,41 +119,24 @@ def main():
             out_path=out_path,
         )
         print(f"[flat] wrote: {out_path}")
+
+        # Save manifest for replay (store out_dir as the parent folder)
+        manifest = {
+            "timestamp": datetime.utcnow().strftime("%Y%m%d_%H%M%S"),
+            "mode": "flat",
+            "input_csv_path": args.inp,
+            "catalog_path": args.catalog,
+            "out_dir": str(out_path.parent),
+            "predictors": predictors,
+            "window_m": args.window_m,
+            "temporal": args.temporal,
+            "out_path": str(out_path),
+        }
+        write_run_manifest(manifest, out_path.parent)
+
     else:
         raise ValueError("You must provide either --predictors or --groups")
 
-    elif args.cmd == "prefect":
-        # Ensure repo root and src/ are importable so we can import the flow
-        ROOT = Path(__file__).resolve().parents[1]
-        sys.path.insert(0, str(ROOT))          # allow `from flow...` import
-        sys.path.insert(0, str(ROOT / "src"))  # allow `from biodata...` import
-
-        # Import the Prefect wrapper (filename: prefect_biodiversity_pipeline.py)
-        try:
-            from flow.prefect_biodiversity_pipeline import run_from_cli, biodata_enrichment_flow
-        except Exception as e:
-            raise ImportError(
-                "Could not import flow.prefect_biodiversity_pipeline. Make sure the file exists at "
-                "flow/prefect_biodiversity_pipeline.py and that you run this command from the repo root."
-            ) from e
-
-        if args.serve:
-            # Optional: serve the flow on a schedule (requires running agent or Prefect server)
-            biodata_enrichment_flow.serve(
-                name="biodata_enrichment_groups",
-                cron=args.cron or "0 0 * * 0",  # weekly Sunday midnight
-            )
-        else:
-            run_from_cli({
-                "input": args.input,
-                "groups": args.groups,
-                "catalog": args.catalog,
-                "window": args.window,
-                "out": args.out,
-            })
-
-    else:
-        ap.print_help()
 
 if __name__ == "__main__":
     main()

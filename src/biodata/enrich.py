@@ -1,3 +1,4 @@
+# src/biodata/enrich.py
 from __future__ import annotations
 from typing import List, Dict, Any
 from pathlib import Path
@@ -33,11 +34,11 @@ def enrich(
     cache_dir: str = "~/.biodata_cache",
     out_path: str | Path | None = None,  # reserved for future sources
 ) -> Dict[str, Path]:
-    print("enrich catalog type:", type(catalog), catalog)  # Debug print
     """
     Enrich points either:
       A) with a flat predictor list (legacy), writing a single tabular 'flat' output, or
       B) using 'groups' that specify outputs per group (tabular or demo raster).
+
     Returns: mapping of output-key -> Path written (groups) or a DataFrame (legacy flat mode with out_path=None).
     """
     required = {"id", "lat", "lon"}
@@ -61,12 +62,17 @@ def enrich(
 
         for idx, g in enumerate(groups_list):
             gname = g.get("name", f"group{idx+1}")
+
+            # Accept new names first, fallback to old keys
             feats: List[str] = g.get("features") or g.get("predictors", [])
             out_cfg = g.get("output", {}) or {}
             kind = out_cfg.get("kind", "tabular")
+
+            # Summary stats and buffer sizes
             stats = g.get("summary_statistics") or out_cfg.get("reducers")  # list[str] | None
             buffers = g.get("buffer_sizes")
             if not buffers:
+                # fallback to prior single-window behavior
                 buffers = [out_cfg.get("window_m", window_m)]
 
             work = df.copy()
@@ -77,19 +83,23 @@ def enrich(
                 if p not in cat:
                     raise KeyError(f"Feature '{p}' not found in catalog {catalog}")
                 spec = cat[p]
+
                 if spec.get("source") == "local_raster":
                     adapter = LocalRasterAdapter(spec)
                     coverage_backlog[p] = {}
+
                     # Loop over all requested buffer sizes
                     for buf in buffers:
                         vals_list: List[np.ndarray] = []
                         meta_list: List[Dict[str, Any]] = []
+
                         # One pass: fetch values + meta for each row (use buf!)
                         for lat, lon in zip(work.lat, work.lon):
                             arr, meta = adapter.fetch_values(lat, lon, buf, return_meta=True)
                             arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
                             vals_list.append(arr)
                             meta_list.append(meta)
+
                         # --- reducers → columns (buffer-suffixed) ---
                         created_value_cols: list[str] = []
                         if stats:
@@ -104,12 +114,14 @@ def enrich(
                             col = f"{p}_{default_r}_b{buf}"
                             work[col] = [(reducer(v) if v.size else None) for v in vals_list]
                             created_value_cols.append(col)
+
                         # --- QA columns (prefixed + buffer-suffixed) ---
                         qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
                         qc_df = qc_df.add_prefix(f"{p}_").add_suffix(f"_b{buf}")
                         work = pd.concat(
                             [work.reset_index(drop=True), qc_df.reset_index(drop=True)], axis=1
                         )
+
                         # ---- Back-compat aliases when only one buffer is used ----
                         if len(buffers) == 1:
                             # alias value columns (drop _b{buf})
@@ -125,12 +137,14 @@ def enrich(
                                 dst = f"{p}_{default_r}"
                                 if src in work.columns and dst not in work.columns:
                                     work[dst] = work[src]
+
                             # alias QA columns (drop _b{buf})
                             for qc_col in ["in_extent", "n_pixels", "had_nodata", "coverage_pct"]:
                                 src = f"{p}_{qc_col}_b{buf}"
                                 dst = f"{p}_{qc_col}"
                                 if src in work.columns and dst not in work.columns:
                                     work[dst] = work[src]
+
                         # Coverage summary for this feature + buffer
                         cov = qc_df[f"{p}_coverage_pct_b{buf}"].fillna(0)
                         coverage_backlog[p][str(buf)] = {
@@ -139,6 +153,8 @@ def enrich(
                             "n_full": int((cov == 100).sum()),
                             "total": int(cov.shape[0]),
                         }
+
+                    # Minimal provenance (record buffers & stats used)
                     provenance[p] = build_provenance(
                         spec,
                         stats or [spec.get("default_reducer", "mean")],
@@ -150,7 +166,9 @@ def enrich(
                     # Placeholder for non-local adapters in MVP
                     for buf in buffers:
                         work[f"{p}_value_b{buf}"] = None
+
             if kind == "tabular":
+                # Write parquet + metadata.json (include coverage summary)
                 outputs[gname] = write_group_parquet(
                     work,
                     gname,
@@ -165,7 +183,9 @@ def enrich(
                     },
                 )
             elif kind == "raster":
+                # Demo raster outputs (unchanged)
                 for p in feats:
+                    # choose first available value column per feature just for the demo tiles
                     val_cols = [c for c in work.columns if c.startswith(f"{p}_") and "_b" in c]
                     vcol = val_cols[0] if val_cols else None
                     vals = work[vcol].tolist() if vcol else [None] * len(work)
@@ -174,6 +194,7 @@ def enrich(
                     )
             else:
                 raise ValueError(f"Unknown output kind: {kind}")
+
         return outputs
 
     # -------- Mode A: flat predictor list (back-compat) --------
@@ -186,6 +207,7 @@ def enrich(
             if p not in cat:
                 raise KeyError(f"Predictor '{p}' not found in catalog {catalog}")
             spec = cat[p]
+
             if spec.get("source") == "local_raster":
                 adapter = LocalRasterAdapter(spec)
                 reducer = get_reducer(spec.get("default_reducer", "mean"))
@@ -195,6 +217,8 @@ def enrich(
                 ]
             else:
                 out[p] = None
+
+        # write tabular: honor out_path if provided, else return the DataFrame (legacy)
         if out_path:
             out_path = Path(out_path)
             out_path.parent.mkdir(parents=True, exist_ok=True)
