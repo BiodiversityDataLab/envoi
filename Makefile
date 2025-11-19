@@ -26,7 +26,3 @@ sample-groups:
 	mkdir -p out
 	. .venv/bin/activate && biodata enrich --in data/points_sample.csv --out out --catalog configs/catalog.yml --groups configs/run.yml --window_m 100 --temporal nearest_month
 	@echo "Sample groups run completed."
-
-rerun:
-	. .venv/bin/activate && biodata rerun --from out/last_run.json
-
