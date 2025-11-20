@@ -8,6 +8,7 @@ import numpy as np
 import rasterio
 from rasterio.features import geometry_window
 from rasterio.warp import transform_geom
+from rasterio.windows import transform as win_transform
 from shapely.geometry import box, mapping
 from pyproj import Transformer
 from rasterio.errors import WindowError
@@ -63,16 +64,33 @@ class LocalRasterAdapter:
                 "coverage_pct": 0.0,
                 "window_m": int(window_m),
                 "raster_crs": str(self.raster_crs),
+                # JSON-safe placeholders for dump feature:
+                "transform": None,
+                "dtype": None,
+                "nodata": None,
+                "src_path": str(self.path),
+                "window_arr": None,
             }
             return (vals, meta) if return_meta else vals
 
         arr = self.src.read(1, window=win, masked=True)
+
+        if np.ma.isMaskedArray(arr):
+            window_arr = arr.filled(self.src.nodata)
+        else:
+            window_arr = arr
+
         total = arr.size
         valid = np.count_nonzero(~arr.mask) if np.ma.isMaskedArray(arr) else np.isfinite(arr).sum()
         had_nodata = bool(valid < total)
         vals = arr.compressed() if np.ma.isMaskedArray(arr) else arr.ravel()
         vals = vals[np.isfinite(vals)]
         coverage_pct = 100.0 * (valid / total) if total else 0.0
+
+        # JSON-safe transform (list of 6 floats) to avoid breaking metadata JSON
+        affine = win_transform(win, self.src.transform)
+        transform_list = [affine.a, affine.b, affine.c, affine.d, affine.e, affine.f]
+
         meta = {
             "in_extent": True,
             "n_pixels": int(total),
@@ -80,6 +98,12 @@ class LocalRasterAdapter:
             "coverage_pct": float(coverage_pct),
             "window_m": int(window_m),
             "raster_crs": str(self.raster_crs),
+            # NEW: fields needed to write window tiles
+            "transform": transform_list,  # JSON-safe
+            "dtype": str(self.src.dtypes[0]),
+            "nodata": self.src.nodata,
+            "src_path": str(self.path),
+            "window_arr": window_arr,  # for dump feature
         }
         return (np.asarray(vals), meta) if return_meta else np.asarray(vals)
 

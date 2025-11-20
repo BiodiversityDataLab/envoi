@@ -29,3 +29,6 @@ data/*.hgt
 .venv/
 *.pyc
 configs/examples/
+
+# local scratch
+testing_deleteme.py
