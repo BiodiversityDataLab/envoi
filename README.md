@@ -12,6 +12,10 @@ make install
 make test
 ```
 
+## Sampling policy
+
+Current behavior includes all pixels in the pixel-aligned window. We plan to expose a sampling_policy (e.g., `centroid`, `all_touched`, `fractional`) to control edge inclusion.
+
 ## Recommended: groups mode (one call → multiple features + QA + metadata)
 ```python
 import pandas as pd
