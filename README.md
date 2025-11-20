@@ -92,6 +92,12 @@ outputs = replay_last_run()  # or replay_last_run("out/runs/run_20251113_121530.
 print(outputs)
 ```
 
+### Where do the TIFF files go?
+```
+out/tiles/<group>/<feature>/b<buffer>/id<point_id>.tif
+# e.g. out/tiles/terrain_features/dem_elev/b100/id42.tif
+```
+
 ## Notes & limits
 
 - Windows are in meters using EPSG:3006 internally (robust for Sweden; reprojected to the raster CRS when sampling).
