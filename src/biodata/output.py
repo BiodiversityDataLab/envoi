@@ -16,6 +16,69 @@ class OutputManager:
         df.to_parquet(path, index=False)
         return path
 
+    # NEW: very simple “demo” raster writer used by groups kind="raster"
+    def write_raster_demo(
+        self,
+        values,
+        lats,
+        lons,
+        group_name: str,
+        feature_name: str,
+    ) -> Path:
+        """
+        Write a tiny 1-row GeoTIFF that encodes the per-point values.
+
+        This is mainly for visualization / debugging (viz_tiles groups), not
+        a production interpolation method.
+        """
+        import numpy as np
+        import rasterio
+        from rasterio.transform import from_origin
+
+        vals = np.array(list(values), dtype="float32")
+        if vals.ndim == 1:
+            vals = vals.reshape(1, -1)  # (rows=1, cols=N)
+
+        nrows, ncols = vals.shape
+
+        # crude georeferencing: span the observed lon/lat range
+        lons = list(lons)
+        lats = list(lats)
+        if not lons or not lats:
+            raise ValueError("write_raster_demo: empty lat/lon sequence")
+
+        west = float(min(lons))
+        east = float(max(lons))
+        north = float(max(lats))
+        south = float(min(lats))
+
+        # avoid zero pixel size
+        pixel_width = max((east - west) / max(ncols, 1), 1e-6)
+        pixel_height = max((north - south) / max(nrows, 1), 1e-6)
+
+        transform = from_origin(west, north, pixel_width, pixel_height)
+
+        out_path = self.out_dir / f"{group_name}_{feature_name}.tif"
+
+        profile = {
+            "driver": "GTiff",
+            "height": int(nrows),
+            "width": int(ncols),
+            "count": 1,
+            "dtype": "float32",
+            "crs": "EPSG:4326",  # lat/lon
+            "transform": transform,
+            "nodata": np.nan,
+            "tiled": True,
+            "compress": "LZW",
+        }
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(out_path, "w", **profile) as dst:
+            dst.write(vals, 1)
+
+        return out_path
+
 
 def write_group_parquet(df: pd.DataFrame, group_name: str, provenance: dict, config: dict) -> Path:
     om = OutputManager(config.get("out_dir", "out"))

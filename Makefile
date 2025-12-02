@@ -1,32 +1,53 @@
 SHELL := /bin/bash
 
-.PHONY: install test sample-run sample-groups fmt lint
+VENV := .venv
+PY   := $(VENV)/bin/python
+PIP  := $(VENV)/bin/pip
 
-PREDICTORS ?= dem_elev
+.PHONY: install ensure-venv test fmt lint sample-run sample-groups rerun clean
 
 install:
-	python3 -m venv .venv
-	. .venv/bin/activate && pip install -U pip && pip install -e ".[dev]"
+	python3 -m venv $(VENV)
+	$(PY) -m pip install -U pip
+	$(PIP) install -e ".[dev]"
 
-test:
-	. .venv/bin/activate && pytest -q
+ensure-venv:
+	@test -x $(PY) || (echo "Creating venv..."; python3 -m venv $(VENV); $(PY) -m pip install -U pip; $(PIP) install -e ".[dev]")
 
-fmt:
-	. .venv/bin/activate && black src tests
+test: ensure-venv
+	$(PY) -m pytest -q
 
-lint:
-	. .venv/bin/activate && ruff check src tests
+fmt: ensure-venv
+	$(PY) -m black src tests
 
-sample-run:
+lint: ensure-venv
+	$(PY) -m ruff check src tests
+
+# Flat (legacy)
+PREDICTORS ?= dem_elev
+sample-run: ensure-venv
 	mkdir -p out
-	. .venv/bin/activate && biodata enrich --in data/points_sample.csv --out out/gold.parquet --catalog configs/catalog.yml --predictors $(PREDICTORS) --window_m 500 --temporal nearest_month
+	$(PY) -m biodata.cli enrich \
+	  --in data/points_sample.csv \
+	  --out out/gold.parquet \
+	  --catalog configs/catalog.yml \
+	  --predictors $(PREDICTORS) \
+	  --window_m 500 --temporal nearest_month
 	@echo "Sample flat run completed."
 
-sample-groups:
+# Groups (recommended)
+sample-groups: ensure-venv
 	mkdir -p out
-	. .venv/bin/activate && biodata enrich --in data/points_sample.csv --out out --catalog configs/catalog.yml --groups configs/run.yml --window_m 100 --temporal nearest_month
+	$(PY) -m biodata.cli enrich \
+	  --in data/points_sample.csv \
+	  --out out \
+	  --catalog configs/catalog.yml \
+	  --groups configs/run.yml \
+	  --window_m 100 --temporal nearest_month
 	@echo "Sample groups run completed."
 
-rerun:
-	. .venv/bin/activate && biodata rerun --from out/last_run.json
+rerun: ensure-venv
+	$(PY) -m biodata.cli rerun --from out/last_run.json
 
+clean:
+	rm -rf out

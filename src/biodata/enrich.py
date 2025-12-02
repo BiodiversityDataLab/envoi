@@ -7,14 +7,13 @@ import pandas as pd
 import yaml
 import numpy as np
 
-from .adapters.local_raster import LocalRasterAdapter
+from .adapters import get_adapter
 from .reducers import get_reducer
 from .output import OutputManager
 from .config import load_catalog
 from .qc import compute_qc_flags
 from .provenance import build_provenance
-from .output import write_group_parquet
-from .output import write_window_tiff
+from .output import write_group_parquet, write_window_tiff
 
 
 def _load_yaml(path_or_dict) -> Dict[str, Any]:
@@ -66,128 +65,127 @@ def enrich(
             out_cfg = g.get("output", {}) or {}
             kind = out_cfg.get("kind", "tabular")
 
-            stats = g.get("summary_statistics") or out_cfg.get("reducers")
-            buffers = g.get("buffer_sizes") or [out_cfg.get("window_m", window_m)]
-
-            # NEW: opt-in tile dumping
+            # Optional: dump per-point raster windows as GeoTIFF tiles
             dump_windows = bool(out_cfg.get("dump_windows", False))
             tiles_root = Path(out_dir) / "tiles" / gname  # out/tiles/<group>/
+
+            stats = g.get("summary_statistics") or out_cfg.get("reducers")
+            buffers = g.get("buffer_sizes") or [out_cfg.get("window_m", window_m)]
 
             work = df.copy()
             provenance: Dict[str, Any] = {}
             coverage_backlog: Dict[str, Dict[str, Dict[str, int]]] = {}
 
-            for p in feats:
-                if p not in cat:
-                    raise KeyError(f"Feature '{p}' not found in catalog {catalog}")
-                spec = cat[p]
+        for p in feats:
+            if p not in cat:
+                raise KeyError(f"Feature '{p}' not found in catalog {catalog}")
+            spec = cat[p]
+            source = spec.get("source")
 
-                if spec.get("source") == "local_raster":
-                    adapter = LocalRasterAdapter(spec)
-                    coverage_backlog[p] = {}
+            AdapterCls = get_adapter(source)
+            adapter = AdapterCls(spec)
+            coverage_backlog[p] = {}
 
-                    for buf in buffers:
-                        vals_list: List[np.ndarray] = []
-                        meta_list: List[Dict[str, Any]] = []
+            feature_meta_first: Dict[str, Any] | None = None
 
-                        # fetch values + meta once per point
-                        for lat, lon in zip(work.lat, work.lon):
-                            arr, meta = adapter.fetch_values(lat, lon, buf, return_meta=True)
-                            arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
-                            vals_list.append(arr)
-                            meta_list.append(meta)
+            for buf in buffers:
+                vals_list: List[np.ndarray] = []
+                meta_list: List[Dict[str, Any]] = []
 
-                        # --- reducers → columns (buffer-suffixed) ---
-                        if stats:
-                            for rname in stats:
-                                reducer = get_reducer(rname)
-                                col = f"{p}_{rname}_b{buf}"
-                                work[col] = [(reducer(v) if v.size else None) for v in vals_list]
-                        else:
-                            default_r = spec.get("default_reducer", "mean")
-                            reducer = get_reducer(default_r)
-                            col = f"{p}_{default_r}_b{buf}"
-                            work[col] = [(reducer(v) if v.size else None) for v in vals_list]
+                # --- fetch values + meta for each point (for this buffer) ---
+                for lat, lon in zip(work.lat, work.lon):
+                    arr, meta = adapter.fetch_values(lat, lon, buf, return_meta=True)
+                    arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
+                    vals_list.append(arr)
+                    meta_list.append(meta)
+                    if feature_meta_first is None and meta:
+                        feature_meta_first = meta
 
-                        # --- QA columns (prefixed + buffer-suffixed) ---
-                        qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
-                        qc_df = qc_df.add_prefix(f"{p}_").add_suffix(f"_b{buf}")
-                        work = pd.concat(
-                            [work.reset_index(drop=True), qc_df.reset_index(drop=True)], axis=1
+                # --- reducers → columns (ALWAYS buffer-suffixed) ---
+                if stats:
+                    for rname in stats:
+                        reducer = get_reducer(rname)
+                        col = f"{p}_{rname}_b{buf}"
+                        work[col] = [(reducer(v) if v.size else None) for v in vals_list]
+                else:
+                    default_r = spec.get("default_reducer", "mean")
+                    reducer = get_reducer(default_r)
+                    col = f"{p}_{default_r}_b{buf}"
+                    work[col] = [(reducer(v) if v.size else None) for v in vals_list]
+
+                # --- QA columns (also buffer-suffixed) ---
+                qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
+                qc_df = qc_df.add_prefix(f"{p}_").add_suffix(f"_b{buf}")
+                work = pd.concat(
+                    [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
+                    axis=1,
+                )
+
+                # --- coverage summary for metadata ---
+                cov = qc_df[f"{p}_coverage_pct_b{buf}"].fillna(0)
+                coverage_backlog[p][str(buf)] = {
+                    "n_zero": int((cov == 0).sum()),
+                    "n_partial": int(((cov > 0) & (cov < 100)).sum()),
+                    "n_full": int((cov == 100).sum()),
+                    "total": int(cov.shape[0]),
+                }
+
+                # --- optional: dump tiles for debugging/inspection ---
+                if dump_windows:
+                    tiles_dir = tiles_root / p / f"b{buf}"
+                    tiles_dir.mkdir(parents=True, exist_ok=True)
+
+                    for ridx, vmeta in enumerate(meta_list):
+                        # use id col if present, else row index
+                        pid = work.iloc[ridx]["id"] if "id" in work.columns else ridx
+                        tile_path = tiles_dir / f"id{pid}.tif"
+
+                        arr2d = vmeta.get("window_arr")
+                        if arr2d is None or getattr(arr2d, "ndim", 1) != 2 or arr2d.size == 0:
+                            continue
+
+                        write_window_tiff(
+                            arr=arr2d,
+                            transform=vmeta.get("transform"),
+                            crs=vmeta.get("raster_crs"),
+                            dtype=vmeta.get("dtype", "float32"),
+                            nodata=vmeta.get("nodata"),
+                            path=tile_path,
                         )
 
-                        # ---- Back-compat aliases when only one buffer ----
-                        if len(buffers) == 1:
-                            if stats:
-                                for rname in stats:
-                                    src, dst = f"{p}_{rname}_b{buf}", f"{p}_{rname}"
-                                    if src in work.columns and dst not in work.columns:
-                                        work[dst] = work[src]
-                            else:
-                                default_r = spec.get("default_reducer", "mean")
-                                src, dst = f"{p}_{default_r}_b{buf}", f"{p}_{default_r}"
-                                if src in work.columns and dst not in work.columns:
-                                    work[dst] = work[src]
-                            for qc_col in ["in_extent", "n_pixels", "had_nodata", "coverage_pct"]:
-                                src, dst = f"{p}_{qc_col}_b{buf}", f"{p}_{qc_col}"
-                                if src in work.columns and dst not in work.columns:
-                                    work[dst] = work[src]
+            # --- back-compat aliases when there is only ONE buffer ---
+            if len(buffers) == 1:
+                buf = buffers[0]
 
-                        # --- Coverage summary (for metadata) ---
-                        cov = qc_df[f"{p}_coverage_pct_b{buf}"].fillna(0)
-                        coverage_backlog[p][str(buf)] = {
-                            "n_zero": int((cov == 0).sum()),
-                            "n_partial": int(((cov > 0) & (cov < 100)).sum()),
-                            "n_full": int((cov == 100).sum()),
-                            "total": int(cov.shape[0]),
-                        }
-
-                        if dump_windows:
-                            tiles_dir = tiles_root / p / f"b{buf}"
-                            tiles_dir.mkdir(parents=True, exist_ok=True)
-                            for ridx, vmeta in enumerate(meta_list):
-                                pid = work.iloc[ridx]["id"] if "id" in work.columns else ridx
-                                tile_path = tiles_dir / f"id{pid}.tif"
-
-                                # transform may be Affine or JSON-safe [a,b,c,d,e,f]
-                                transform = vmeta.get("transform")
-                                if isinstance(transform, (list, tuple)) and len(transform) == 6:
-                                    try:
-                                        from affine import Affine
-
-                                        transform = Affine.from_gdal(*transform)
-                                    except Exception:
-                                        transform = tuple(transform)
-
-                                # use the actual 2-D window array from meta
-                                arr2d = vmeta.get("window_arr")
-                                if (
-                                    arr2d is None
-                                    or getattr(arr2d, "ndim", 1) != 2
-                                    or arr2d.size == 0
-                                ):
-                                    continue  # skip out-of-extent/empty
-
-                                write_window_tiff(
-                                    arr=arr2d,
-                                    transform=transform,
-                                    crs=vmeta.get("crs") or vmeta.get("raster_crs"),
-                                    dtype=vmeta.get("dtype", "float32"),
-                                    nodata=vmeta.get("nodata"),
-                                    path=tile_path,
-                                )
-
-                    # provenance (record buffers & stats used)
-                    provenance[p] = build_provenance(
-                        spec,
-                        stats or [spec.get("default_reducer", "mean")],
-                        buffers,
-                        temporal,
-                        meta_list[0] if meta_list else {},
-                    )
+                # reducers
+                if stats:
+                    for rname in stats:
+                        src = f"{p}_{rname}_b{buf}"
+                        dst = f"{p}_{rname}"
+                        if src in work.columns and dst not in work.columns:
+                            work[dst] = work[src]
                 else:
-                    for buf in buffers:
-                        work[f"{p}_value_b{buf}"] = None
+                    default_r = spec.get("default_reducer", "mean")
+                    src = f"{p}_{default_r}_b{buf}"
+                    dst = f"{p}_{default_r}"
+                    if src in work.columns and dst not in work.columns:
+                        work[dst] = work[src]
+
+                # QA columns
+                for qc_base in ["in_extent", "n_pixels", "had_nodata", "coverage_pct"]:
+                    src = f"{p}_{qc_base}_b{buf}"
+                    dst = f"{p}_{qc_base}"
+                    if src in work.columns and dst not in work.columns:
+                        work[dst] = work[src]
+
+            # --- provenance for this feature ---
+            provenance[p] = build_provenance(
+                spec,
+                stats or [spec.get("default_reducer", "mean")],
+                buffers,
+                temporal,
+                feature_meta_first or {},
+            )
 
             if kind == "tabular":
                 outputs[gname] = write_group_parquet(
@@ -227,15 +225,15 @@ def enrich(
                 raise KeyError(f"Predictor '{p}' not found in catalog {catalog}")
             spec = cat[p]
 
-            if spec.get("source") == "local_raster":
-                adapter = LocalRasterAdapter(spec)
-                reducer = get_reducer(spec.get("default_reducer", "mean"))
-                out[p] = [
-                    reducer(adapter.fetch_values(lat, lon, window_m))
-                    for lat, lon in zip(out.lat, out.lon)
-                ]
-            else:
-                out[p] = None
+            source = spec.get("source")
+            AdapterCls = get_adapter(source)
+            adapter = AdapterCls(spec)
+
+            reducer = get_reducer(spec.get("default_reducer", "mean"))
+            out[p] = [
+                reducer(adapter.fetch_values(lat, lon, window_m))
+                for lat, lon in zip(out.lat, out.lon)
+            ]
 
         # write tabular: honor out_path if provided, else return the DataFrame (legacy)
         if out_path:
