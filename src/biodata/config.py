@@ -1,7 +1,7 @@
 # src/biodata/config.py
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Mapping
 import yaml
 
 REQUIRED_DATASET_KEYS = {"source", "path", "type", "crs"}
@@ -62,3 +62,40 @@ def load_catalog(path: str | Path) -> Dict[str, Any]:
             raise CatalogError(f"datasets.{name}.crs must look like 'EPSG:XXXX'")
 
     return data
+
+
+def _load_catalog_any(src: Any) -> Dict[str, Any]:
+    """
+    Internal helper: accept a path or a dict-like catalog and return
+    a normalized {'datasets': {...}} structure.
+    """
+    if src is None:
+        return {"datasets": {}}
+
+    # If it's already a mapping, assume it's a parsed catalog dict.
+    if isinstance(src, Mapping):
+        d = dict(src)
+        if "datasets" not in d:
+            d["datasets"] = {}
+        return d
+
+    # Otherwise, treat it as a path and reuse the validated loader.
+    return load_catalog(src)
+
+
+def load_catalogs(*sources: Any) -> Dict[str, Any]:
+    """
+    Merge one or more catalogs (paths or dicts) into a single catalog.
+
+    Later sources override earlier ones on a per-predictor basis.
+    Always returns: {'datasets': {...}}.
+    """
+    merged: Dict[str, Any] = {"datasets": {}}
+
+    for src in sources:
+        cat = _load_catalog_any(src)
+        for name, spec in cat.get("datasets", {}).items():
+            # override or add
+            merged["datasets"][name] = spec
+
+    return merged
