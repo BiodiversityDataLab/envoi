@@ -154,31 +154,6 @@ def enrich(
                             path=tile_path,
                         )
 
-            # --- back-compat aliases when there is only ONE buffer ---
-            if len(buffers) == 1:
-                buf = buffers[0]
-
-                # reducers
-                if stats:
-                    for rname in stats:
-                        src = f"{p}_{rname}_b{buf}"
-                        dst = f"{p}_{rname}"
-                        if src in work.columns and dst not in work.columns:
-                            work[dst] = work[src]
-                else:
-                    default_r = spec.get("default_reducer", "mean")
-                    src = f"{p}_{default_r}_b{buf}"
-                    dst = f"{p}_{default_r}"
-                    if src in work.columns and dst not in work.columns:
-                        work[dst] = work[src]
-
-                # QA columns
-                for qc_base in ["in_extent", "n_pixels", "had_nodata", "coverage_pct"]:
-                    src = f"{p}_{qc_base}_b{buf}"
-                    dst = f"{p}_{qc_base}"
-                    if src in work.columns and dst not in work.columns:
-                        work[dst] = work[src]
-
             # --- provenance for this feature ---
             provenance[p] = build_provenance(
                 spec,
