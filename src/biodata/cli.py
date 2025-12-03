@@ -1,3 +1,5 @@
+# src/biodata/cli.py
+
 import argparse
 from pathlib import Path
 import pandas as pd
@@ -6,6 +8,7 @@ import json
 from datetime import datetime
 import yaml
 from .output import write_run_manifest
+from .gee_download import run_gee_download  # NEW: GEE raster downloader
 
 
 def main():
@@ -14,18 +17,35 @@ def main():
 
     # --- enrich ---
     e = sub.add_parser("enrich", help="Enrich points with environmental predictors")
-    e.add_argument("--in", dest="inp", required=True, help="Input CSV file with id,lat,lon[,date]")
     e.add_argument(
-        "--out", dest="out", required=True, help="Output directory (groups) or file (flat)"
+        "--in",
+        dest="inp",
+        required=True,
+        help="Input CSV file with id,lat,lon[,date]",
+    )
+    e.add_argument(
+        "--out",
+        dest="out",
+        required=True,
+        help="Output directory (groups) or file (flat)",
     )
     e.add_argument("--catalog", default="configs/catalog.yml")
-    e.add_argument("--predictors", help="Comma-separated predictor names (flat mode)")
-    e.add_argument("--groups", help="YAML file defining groups (alternative to --predictors)")
+    e.add_argument(
+        "--predictors",
+        help="Comma-separated predictor names (flat mode)",
+    )
+    e.add_argument(
+        "--groups",
+        help="YAML file defining groups (alternative to --predictors)",
+    )
     e.add_argument("--window_m", type=int, default=500)
     e.add_argument("--temporal", default="nearest_month")
 
     # --- rerun ---
-    r = sub.add_parser("rerun", help="Re-run a previous enrichment from a saved manifest")
+    r = sub.add_parser(
+        "rerun",
+        help="Re-run a previous enrichment from a saved manifest",
+    )
     r.add_argument(
         "--from",
         dest="manifest",
@@ -33,7 +53,25 @@ def main():
         help="Path to manifest JSON (default: out/last_run.json)",
     )
 
+    # --- gee-download (NEW) ---
+    g = sub.add_parser(
+        "gee-download",
+        help="Download GEE rasters into local GeoTIFFs based on catalog.yml",
+    )
+    g.add_argument(
+        "--catalog",
+        default="configs/catalog.yml",
+        help="Catalog file with gee_raster datasets",
+    )
+
     args = ap.parse_args()
+
+    # ---------------------------
+    # Command: gee-download (NEW)
+    # ---------------------------
+    if args.cmd == "gee-download":
+        run_gee_download(args.catalog)
+        return
 
     # ---------------------------
     # Command: rerun
