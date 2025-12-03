@@ -10,7 +10,7 @@ import numpy as np
 from .adapters import get_adapter
 from .reducers import get_reducer
 from .output import OutputManager
-from .config import load_catalog
+from .config import load_catalogs
 from .qc import compute_qc_flags
 from .provenance import build_provenance
 from .output import write_group_parquet, write_window_tiff
@@ -26,7 +26,8 @@ def _load_yaml(path_or_dict) -> Dict[str, Any]:
 def enrich(
     df: pd.DataFrame,
     predictors: List[str] | None = None,  # legacy flat mode
-    catalog: str | Path = "configs/catalog.yml",
+    catalog: str | Path | dict = "configs/catalog.yml",
+    extra_catalog: str | Path | dict | None = None,  # user-level additions/overrides
     groups: str | dict | None = None,  # group mode
     out_dir: str | Path = "out",
     window_m: int = 500,
@@ -46,7 +47,7 @@ def enrich(
         missing = required - set(df.columns)
         raise ValueError(f"Missing required columns: {missing}")
 
-    catalog_dict = load_catalog(catalog)
+    catalog_dict = load_catalogs(catalog, extra_catalog)
     cat = catalog_dict["datasets"]
 
     om = OutputManager(out_dir)
