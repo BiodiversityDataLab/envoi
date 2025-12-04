@@ -16,6 +16,7 @@ from .auth import init_gee  # you implement this to use your service account JSO
 # Catalog helpers
 # ----------------------------------------------------------------------
 
+
 def _load_catalog(path: str | Path) -> Dict[str, Any]:
     """Load catalog.yml as a dict."""
     path = Path(path)
@@ -45,6 +46,7 @@ def _iter_gee_datasets(cat: Dict[str, Any]) -> Iterable[Tuple[str, Dict[str, Any
 # ----------------------------------------------------------------------
 # Geometry / image builders
 # ----------------------------------------------------------------------
+
 
 def _build_region_from_bbox(bbox: list[float]) -> ee.Geometry:
     """
@@ -132,6 +134,7 @@ def _export_image(
 # Public entry point
 # ----------------------------------------------------------------------
 
+
 def run_gee_download(catalog_path: str | Path) -> None:
     """
     Programmatic entry point used by cli.py.
@@ -144,7 +147,7 @@ def run_gee_download(catalog_path: str | Path) -> None:
     """
     # 1) Initialize Earth Engine
     print("[gee-download] Initializing Earth Engine...")
-    init_gee()                  # your auth.py sets service account + key JSON [web:73]
+    init_gee()  # your auth.py sets service account + key JSON [web:73]
     print("[gee-download] Earth Engine initialized.")
 
     # 2) Load catalog and defaults
@@ -158,9 +161,7 @@ def run_gee_download(catalog_path: str | Path) -> None:
         default_region = _build_region_from_bbox(gee_defaults["bbox"])
     else:
         # backup extent; adjust to your study area if you like
-        default_region = ee.Geometry.Rectangle(
-            [-180.0, -60.0, 180.0, 80.0], proj="EPSG:4326"
-        )
+        default_region = ee.Geometry.Rectangle([-180.0, -60.0, 180.0, 80.0], proj="EPSG:4326")
 
     # 3) Process all gee_raster datasets
     any_found = False
