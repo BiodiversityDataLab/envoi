@@ -80,17 +80,38 @@ class OutputManager:
         return out_path
 
 
-def write_group_parquet(df: pd.DataFrame, group_name: str, provenance: dict, config: dict) -> Path:
+def write_group_parquet(
+    df: pd.DataFrame,
+    group_name: str,
+    meta_info: dict,
+    config: dict,
+) -> Path:
+    """
+    Write a Parquet file for a group and a sidecar JSON with metadata.
+
+    `meta_info` is a free-form dict, typically containing:
+      - "provenance": {feature -> ...}
+      - "coverage_backlog": {feature -> {buffer -> counts}}
+
+    `config` provides run-level context (CRS, thresholds, etc.).
+    """
     om = OutputManager(config.get("out_dir", "out"))
     path = om.write_tabular(df, group_name)
+
     meta_path = path.with_name(f"{group_name}_metadata.json")
+
     meta = {
         "group": group_name,
-        "provenance": provenance,
         "project_crs": config.get("project_crs", "EPSG:3006"),
         "min_coverage_pct": config.get("min_coverage_pct", 80),
-        "reducers": config.get("reducers"),
+        "summary_statistics": config.get("summary_statistics"),
+        "buffer_sizes": config.get("buffer_sizes"),
     }
+
+    if isinstance(meta_info, dict):
+        # merge provenance, coverage_backlog, etc.
+        meta.update(meta_info)
+
     meta_path.write_text(json.dumps(meta, indent=2))
     return path
 

@@ -77,116 +77,148 @@ def enrich(
             provenance: Dict[str, Any] = {}
             coverage_backlog: Dict[str, Dict[str, Dict[str, int]]] = {}
 
-        for p in feats:
-            if p not in cat:
-                raise KeyError(f"Feature '{p}' not found in catalog {catalog}")
-            spec = cat[p]
-            source = spec.get("source")
+            for p in feats:
+                if p not in cat:
+                    raise KeyError(f"Feature '{p}' not found in catalog {catalog}")
+                spec = cat[p]
+                source = spec.get("source")
 
-            AdapterCls = get_adapter(source)
-            adapter = AdapterCls(spec)
-            coverage_backlog[p] = {}
+                AdapterCls = get_adapter(source)
+                adapter = AdapterCls(spec)
+                coverage_backlog[p] = {}
 
-            feature_meta_first: Dict[str, Any] | None = None
+                feature_meta_first: Dict[str, Any] | None = None
 
-            for buf in buffers:
-                vals_list: List[np.ndarray] = []
-                meta_list: List[Dict[str, Any]] = []
+                for buf in buffers:
+                    vals_list: List[np.ndarray] = []
+                    meta_list: List[Dict[str, Any]] = []
 
-                # --- fetch values + meta for each point (for this buffer) ---
-                for lat, lon in zip(work.lat, work.lon):
-                    arr, meta = adapter.fetch_values(lat, lon, buf, return_meta=True)
-                    arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
-                    vals_list.append(arr)
-                    meta_list.append(meta)
-                    if feature_meta_first is None and meta:
-                        feature_meta_first = meta
+                    # --- fetch values + meta for each point (for this buffer) ---
+                    for lat, lon in zip(work.lat, work.lon):
+                        arr, meta = adapter.fetch_values(lat, lon, buf, return_meta=True)
+                        arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
+                        vals_list.append(arr)
+                        meta_list.append(meta)
+                        if feature_meta_first is None and meta:
+                            feature_meta_first = meta
 
-                # --- reducers → columns (ALWAYS buffer-suffixed) ---
-                if stats:
-                    for rname in stats:
-                        reducer = get_reducer(rname)
-                        col = f"{p}_{rname}_b{buf}"
+                    # --- reducers → columns (ALWAYS buffer-suffixed) ---
+                    if stats:
+                        for rname in stats:
+                            reducer = get_reducer(rname)
+                            col = f"{p}_{rname}_b{buf}"
+                            work[col] = [(reducer(v) if v.size else None) for v in vals_list]
+                    else:
+                        default_r = spec.get("default_reducer", "mean")
+                        reducer = get_reducer(default_r)
+                        col = f"{p}_{default_r}_b{buf}"
                         work[col] = [(reducer(v) if v.size else None) for v in vals_list]
-                else:
-                    default_r = spec.get("default_reducer", "mean")
-                    reducer = get_reducer(default_r)
-                    col = f"{p}_{default_r}_b{buf}"
-                    work[col] = [(reducer(v) if v.size else None) for v in vals_list]
 
-                # --- QA columns (also buffer-suffixed) ---
-                qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
-                qc_df = qc_df.add_prefix(f"{p}_").add_suffix(f"_b{buf}")
-                work = pd.concat(
-                    [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
-                    axis=1,
+                    # --- QA columns (also buffer-suffixed) ---
+                    qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
+                    qc_df = qc_df.add_prefix(f"{p}_").add_suffix(f"_b{buf}")
+                    work = pd.concat(
+                        [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
+                        axis=1,
+                    )
+
+                    # --- coverage summary for metadata ---
+                    cov = qc_df[f"{p}_coverage_pct_b{buf}"].fillna(0)
+                    coverage_backlog[p][str(buf)] = {
+                        "n_zero": int((cov == 0).sum()),
+                        "n_partial": int(((cov > 0) & (cov < 100)).sum()),
+                        "n_full": int((cov == 100).sum()),
+                        "total": int(cov.shape[0]),
+                    }
+
+                    # --- optional: dump tiles for debugging/inspection ---
+                    if dump_windows:
+                        tiles_dir = tiles_root / p / f"b{buf}"
+                        tiles_dir.mkdir(parents=True, exist_ok=True)
+
+                        for ridx, vmeta in enumerate(meta_list):
+                            # use id col if present, else row index
+                            pid = work.iloc[ridx]["id"] if "id" in work.columns else ridx
+                            tile_path = tiles_dir / f"id{pid}.tif"
+
+                            arr2d = vmeta.get("window_arr")
+                            if arr2d is None or getattr(arr2d, "ndim", 1) != 2 or arr2d.size == 0:
+                                continue
+
+                            write_window_tiff(
+                                arr=arr2d,
+                                transform=vmeta.get("transform"),
+                                crs=vmeta.get("raster_crs"),
+                                dtype=vmeta.get("dtype", "float32"),
+                                nodata=vmeta.get("nodata"),
+                                path=tile_path,
+                            )
+
+                # --- provenance for this feature ---
+                provenance[p] = build_provenance(
+                    spec,
+                    stats or [spec.get("default_reducer", "mean")],
+                    buffers,
+                    temporal,
+                    feature_meta_first or {},
                 )
 
-                # --- coverage summary for metadata ---
-                cov = qc_df[f"{p}_coverage_pct_b{buf}"].fillna(0)
-                coverage_backlog[p][str(buf)] = {
-                    "n_zero": int((cov == 0).sum()),
-                    "n_partial": int(((cov > 0) & (cov < 100)).sum()),
-                    "n_full": int((cov == 100).sum()),
-                    "total": int(cov.shape[0]),
-                }
+        # --- after all features for this group are processed ---
+        if kind == "tabular":
+            # Core ID columns we always keep
+            core_cols = [c for c in ("id", "lat", "lon", "date") if c in work.columns]
 
-                # --- optional: dump tiles for debugging/inspection ---
-                if dump_windows:
-                    tiles_dir = tiles_root / p / f"b{buf}"
-                    tiles_dir.mkdir(parents=True, exist_ok=True)
+            # QC columns: the *_in_extent_b*, *_n_pixels_b*, *_had_nodata_b*, *_coverage_pct_b* ones
+            qc_suffixes = (
+                "_in_extent_b",
+                "_n_pixels_b",
+                "_had_nodata_b",
+                "_coverage_pct_b",
+            )
+            qc_cols = [c for c in work.columns if any(suf in c for suf in qc_suffixes)]
 
-                    for ridx, vmeta in enumerate(meta_list):
-                        # use id col if present, else row index
-                        pid = work.iloc[ridx]["id"] if "id" in work.columns else ridx
-                        tile_path = tiles_dir / f"id{pid}.tif"
+            # Stats columns = everything that's not QC
+            stats_cols = [c for c in work.columns if c not in qc_cols]
 
-                        arr2d = vmeta.get("window_arr")
-                        if arr2d is None or getattr(arr2d, "ndim", 1) != 2 or arr2d.size == 0:
-                            continue
+            stats_df = work[core_cols + [c for c in stats_cols if c not in core_cols]].copy()
+            qc_df = work[core_cols + [c for c in qc_cols if c not in core_cols]].copy()
 
-                        write_window_tiff(
-                            arr=arr2d,
-                            transform=vmeta.get("transform"),
-                            crs=vmeta.get("raster_crs"),
-                            dtype=vmeta.get("dtype", "float32"),
-                            nodata=vmeta.get("nodata"),
-                            path=tile_path,
-                        )
+            # Metadata: include provenance + coverage_backlog
+            meta_info = {
+                "provenance": provenance,
+                "coverage_backlog": coverage_backlog,
+            }
+            cfg_for_meta = {
+                **gcfg,
+                "project_crs": proj_crs,
+                "min_coverage_pct": min_cov,
+                "summary_statistics": stats,
+                "buffer_sizes": buffers,
+                "out_dir": out_dir,
+            }
 
-            # --- provenance for this feature ---
-            provenance[p] = build_provenance(
-                spec,
-                stats or [spec.get("default_reducer", "mean")],
-                buffers,
-                temporal,
-                feature_meta_first or {},
+            # Write stats parquet + metadata JSON
+            stats_path = write_group_parquet(
+                stats_df,
+                gname,
+                meta_info,
+                cfg_for_meta,
             )
 
-            if kind == "tabular":
-                outputs[gname] = write_group_parquet(
-                    work,
-                    gname,
-                    {"provenance": provenance, "coverage_backlog": coverage_backlog},
-                    {
-                        **gcfg,
-                        "project_crs": proj_crs,
-                        "min_coverage_pct": min_cov,
-                        "summary_statistics": stats,
-                        "buffer_sizes": buffers,
-                        "out_dir": out_dir,
-                    },
-                )
-            elif kind == "raster":
-                for p in feats:
-                    val_cols = [c for c in work.columns if c.startswith(f"{p}_") and "_b" in c]
-                    vcol = val_cols[0] if val_cols else None
-                    vals = work[vcol].tolist() if vcol else [None] * len(work)
-                    outputs[f"{gname}:{p}"] = om.write_raster_demo(
-                        vals, work.lat, work.lon, gname, p
-                    )
-            else:
-                raise ValueError(f"Unknown output kind: {kind}")
+            # Write QC parquet (no separate metadata file for now)
+            qc_path = om.write_tabular(qc_df, f"{gname}_qc")
+
+            outputs[gname] = stats_path
+            outputs[f"{gname}_qc"] = qc_path
+
+        elif kind == "raster":
+            for p in feats:
+                val_cols = [c for c in work.columns if c.startswith(f"{p}_") and "_b" in c]
+                vcol = val_cols[0] if val_cols else None
+                vals = work[vcol].tolist() if vcol else [None] * len(work)
+                outputs[f"{gname}:{p}"] = om.write_raster_demo(vals, work.lat, work.lon, gname, p)
+        else:
+            raise ValueError(f"Unknown output kind: {kind}")
 
         return outputs
 
