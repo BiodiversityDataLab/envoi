@@ -6,10 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "biodata-enricher"
 version = "0.1.0"
 description = "Enrich points with environmental predictors from local/remote sources (MVP)."
-authors = [{name="Team Biodata", email="team@example.com"}]
+authors = [{ name = "Team Biodata", email = "team@example.com" }]
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = { text = "MIT" }
 dependencies = [
     "pandas>=2.1",
     "numpy>=1.26",
@@ -22,19 +22,37 @@ dependencies = [
     # "earthengine-api>=0.1.398",   # add when implementing GEE adapter
 ]
 
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+
+keywords = ["gis", "raster", "geospatial", "environment", "gee"]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5.0",
     "black>=24.3.0",
 ]
+gee = [
+    "earthengine-api>=0.1.398",
+]
 
 [project.scripts]
 biodata = "biodata.cli:main"
 
-[tool.black]
-line-length = 100
-target-version = ["py310"]
+[project.urls]
+Homepage = "https://github.com/AppleShay/biodata-enricher"
 
 [tool.ruff]
 line-length = 100
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]

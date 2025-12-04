@@ -1,14 +1,13 @@
-# src/biodata/cli.py
-
 import argparse
 from pathlib import Path
-import pandas as pd
-from .enrich import enrich
 import json
 from datetime import datetime
+
+import pandas as pd
 import yaml
+
+from .enrich import enrich
 from .output import write_run_manifest
-from .gee_download import run_gee_download  # NEW: GEE raster downloader
 
 
 def main():
@@ -53,7 +52,7 @@ def main():
         help="Path to manifest JSON (default: out/last_run.json)",
     )
 
-    # --- gee-download (NEW) ---
+    # --- gee-download (optional, requires earthengine-api) ---
     g = sub.add_parser(
         "gee-download",
         help="Download GEE rasters into local GeoTIFFs based on catalog.yml",
@@ -67,9 +66,19 @@ def main():
     args = ap.parse_args()
 
     # ---------------------------
-    # Command: gee-download (NEW)
+    # Command: gee-download
     # ---------------------------
     if args.cmd == "gee-download":
+        try:
+            from .gee_download import run_gee_download  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise SystemExit(
+                "GEE support is not installed.\n\n"
+                "Install the extra dependency with:\n"
+                "  pip install 'biodata-enricher[gee]'\n"
+                "or add 'earthengine-api' to your environment."
+            ) from exc
+
         run_gee_download(args.catalog)
         return
 
@@ -137,7 +146,7 @@ def main():
             "input_csv_path": args.inp,
             "catalog_path": args.catalog,
             "out_dir": str(out_dir),
-            "groups_config": yaml.safe_load(open(args.groups)),
+            "groups_config": yaml.safe_load(open(args.groups, encoding="utf-8")),
             "window_m": args.window_m,
             "temporal": args.temporal,
         }
