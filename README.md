@@ -17,32 +17,55 @@ make test
 Current behavior includes all pixels in the pixel-aligned window. We plan to expose a sampling_policy (e.g., `centroid`, `all_touched`, `fractional`) to control edge inclusion.
 
 ## Recommended: groups mode (one call → multiple features + QA + metadata)
+
 ```python
 import pandas as pd
 from biodata.enrich import enrich
 
 df = pd.read_csv("data/points_sample.csv")
 
+# One run, two groups, multiple reducers
 cfg = {
-  "groups": [{
-    "name": "dem_100m",
-    "predictors": ["dem_mini"],             # or "features": [...]
-    "output": {
-      "kind": "tabular",
-      "reducers": ["mean", "std", "q10", "q90"],
-      "window_m": 100
-    }
-  }],
-  "min_coverage_pct": 80,                   # QA threshold
-  "project_crs": "EPSG:3006"
+    "groups": [
+        {
+            "name": "dem_100m",
+            # catalog keys (can be local rasters or GEE-backed)
+            "predictors": ["dem_mini"],
+            "output": {
+                "kind": "tabular",
+                # any subset of the registered reducers:
+                # mean, median, std, var, min, max, q10, q90, count, sum
+                "reducers": ["mean", "std", "q10", "q90"],
+                "window_m": 100,
+            },
+        },
+        {
+            "name": "site_stats",
+            "predictors": ["dem_mini"],
+            "output": {
+                "kind": "tabular",
+                "reducers": ["mean", "min", "max", "count"],
+                "window_m": 500,
+            },
+        },
+    ],
+    "min_coverage_pct": 80,          # QA threshold
+    "project_crs": "EPSG:3006",      # working CRS for meter-based windows
 }
 
-outputs = enrich(df, groups=cfg, catalog="configs/catalog.yml", out_dir="out")
-# Parquet path:
-print(outputs["dem_100m"])                  # -> out/dem_100m.parquet
-# Metadata JSON sits next to it:
-# out/dem_100m_metadata.json
+outputs = enrich(
+    df,
+    groups=cfg,
+    catalog="configs/catalog.yml",          # base catalog shipped with the library
+    extra_catalog="configs/local_catalog.yml",  # optional: user’s own extra sources
+    out_dir="out",
+)
 
+# Parquet paths (per group)
+print(outputs["dem_100m"])   # -> out/dem_100m.parquet
+print(outputs["site_stats"]) # -> out/site_stats.parquet
+# Each has a matching metadata JSON:
+# out/dem_100m_metadata.json, out/site_stats_metadata.json
 ```
 
 ## What you’ll see in the Parquet
