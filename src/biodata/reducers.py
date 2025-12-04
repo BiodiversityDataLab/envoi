@@ -139,3 +139,8 @@ def get_reducer(name: str) -> Callable:
 
 
 __all__ = ["get_reducer", "_REGISTRY"]
+
+
+def list_reducers() -> list[str]:
+    """Return sorted names of registered reducers."""
+    return sorted(_REGISTRY.keys())
