@@ -1,72 +1,24 @@
 datasets:
-  dem_elev:
+# LOCAL
+  dem_local:
     source: local_raster
-    path: data/dem_sweden.tif
-    type: raster
-    crs: EPSG:4326
-    resolution_m: 90
-    default_reducer: mean
+    path: data/for_testing/dem/TG4NHB-dem.tif
+    band: 1
 
-  slope:
+  slope_local:
     source: local_raster
-    path: data/slope_sweden.tif     # precomputed slope GeoTIFF
-    type: raster
-    crs: EPSG:4326
-    resolution_m: 90
-    default_reducer: mean
+    path: data/for_testing/dem/TG4NHB-dem.tif
+    band: 2
 
-  lc_majority:
+  aspect_local:
     source: local_raster
-    path: data/landcover_tile.tif   # categorical land-cover raster
-    type: categorical               # (we still use numeric reducers in MVP)
-    crs: EPSG:4326
-    resolution_m: 100
-    default_reducer: mean
+    path: data/for_testing/dem/TG4NHB-dem.tif
+    band: 3
 
-  dem_mini:
-    type: raster
-    source: local_raster
-    path: tests/data/mini_dem.tif   # relative to repo root
-    crs: EPSG:4326                  # let the adapter read it from the file
-    default_reducer: mean
-
-  # === GEE-derived rasters written to data/gee/ ===
-
-  dem_elev_gee:
+# GOOGLE EARTH ENGINE
+  dem_aster:
     source: gee_raster
-    path: data/gee/dem_elev_gee.tif
-    type: raster
-    crs: EPSG:4326
-    resolution_m: 250          # smaller to avoid huge request size
-    default_reducer: mean
-    gee:
-      image: "NASA/NASADEM_HGT/001"
-      band: "elevation"
-      reducer: "none"
-      bbox: [15.0, 58.0, 16.0, 59.0]
+    path: projects/sat-io/open-datasets/ASTER/GDEM
+    asset_type: image
 
-  slope_gee:
-    source: gee_raster
-    path: data/gee/slope_gee.tif
-    type: raster
-    crs: EPSG:4326
-    resolution_m: 250
-    default_reducer: mean
-    gee:
-      image: "NASA/NASADEM_HGT/001"
-      band: "elevation"
-      reducer: "slope"         # handled in _build_image
-      bbox: [15.0, 58.0, 16.0, 59.0]
-
-  lc_majority_gee:
-    source: gee_raster
-    path: data/gee/lc_majority_gee.tif
-    type: categorical
-    crs: EPSG:4326
-    resolution_m: 1000
-    default_reducer: mean
-    gee:
-      collection: "COPERNICUS/CORINE/V20/100m"
-      band: "landcover"
-      reducer: "mode"
-      bbox: [15.0, 58.0, 16.0, 59.0]
+  
