@@ -13,6 +13,8 @@ from shapely.geometry import box, mapping
 from pyproj import Transformer
 from rasterio.errors import WindowError
 
+from .base import BaseAdapter
+
 try:
     from . import register as _register
 except Exception:
@@ -20,7 +22,7 @@ except Exception:
 
 
 @dataclass
-class LocalRasterAdapter:
+class LocalRasterAdapter(BaseAdapter):
     spec: Dict[str, Any]
 
     def __post_init__(self):
@@ -31,21 +33,28 @@ class LocalRasterAdapter:
         self.src = rasterio.open(self.path)
         self.raster_crs = self.src.crs
 
-        # project CRS policy (EPSG:3006 inside the app)
-        self.to_proj = Transformer.from_crs("EPSG:4326", "EPSG:3006", always_xy=True)
-        self.from_proj_to_raster = Transformer.from_crs(
-            "EPSG:3006", self.raster_crs, always_xy=True
-        )
+        # Band selection: 1-indexed, defaults to 1
+        self.band = self.spec.get("band", 1)
+
+    @staticmethod
+    def _get_utm_crs(lon: float, lat: float) -> str:
+        """Return the EPSG code for the UTM zone covering (lon, lat)."""
+        zone_number = int((lon + 180) / 6) + 1
+        base_epsg = 32600 if lat >= 0 else 32700
+        return f"EPSG:{base_epsg + zone_number}"
 
     def _project_meter_square_to_raster_geom(self, lat: float, lon: float, window_m: int):
-        # center in project CRS
-        cx, cy = self.to_proj.transform(lon, lat)
-        # build a square in meters in project CRS (EPSG:3006)
+        # Determine a metric CRS for building the square:
+        # use the point's UTM zone for global flexibility
+        metric_crs = self._get_utm_crs(lon, lat)
+        to_metric = Transformer.from_crs("EPSG:4326", metric_crs, always_xy=True)
+        cx, cy = to_metric.transform(lon, lat)
+        # build a square in meters
         half = window_m / 2.0
         square_proj = box(cx - half, cy - half, cx + half, cy + half)
-        # transform polygon to raster CRS (handles EPSG:4326 or projected rasters)
+        # transform polygon to raster CRS
         square_raster_geojson = transform_geom(
-            "EPSG:3006", self.raster_crs, mapping(square_proj), precision=6
+            metric_crs, self.raster_crs, mapping(square_proj), precision=6
         )
         return square_raster_geojson
 
@@ -73,7 +82,7 @@ class LocalRasterAdapter:
             }
             return (vals, meta) if return_meta else vals
 
-        arr = self.src.read(1, window=win, masked=True)
+        arr = self.src.read(self.band, window=win, masked=True)
 
         if np.ma.isMaskedArray(arr):
             window_arr = arr.filled(self.src.nodata)

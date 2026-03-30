@@ -5,6 +5,15 @@ import pandas as pd
 
 from biodata.enrich import enrich
 
+CATALOG = {
+    "datasets": {
+        "dem_local": {
+            "source": "local_raster",
+            "path": "data/for_testing/dem/TG4NHB-dem.tif",
+        }
+    }
+}
+
 
 def test_groups_e2e(tmp_path: Path) -> None:
     """End-to-end smoke test for groups mode with a single DEM feature.
@@ -17,13 +26,13 @@ def test_groups_e2e(tmp_path: Path) -> None:
     - Row count is preserved.
     - Metadata JSON exists and contains provenance.
     """
-    df = pd.read_csv(Path("data/points_sample.csv"))
+    df = pd.read_csv(Path("data/for_testing/adrian_example.csv"))
 
     cfg = {
         "groups": [
             {
                 "name": "dem_100m",
-                "predictors": ["dem_mini"],
+                "predictors": ["dem_local"],
                 "output": {
                     "kind": "tabular",
                     "reducers": ["mean", "std"],
@@ -34,7 +43,7 @@ def test_groups_e2e(tmp_path: Path) -> None:
         "min_coverage_pct": 0,
     }
 
-    outputs = enrich(df, groups=cfg, out_dir=tmp_path)
+    outputs = enrich(df, groups=cfg, catalog=CATALOG, out_dir=tmp_path)
 
     stats_path = outputs["dem_100m"]
     qc_path = outputs["dem_100m_qc"]
@@ -53,12 +62,12 @@ def test_groups_e2e(tmp_path: Path) -> None:
     assert list(stats_df["id"]) == list(qc_df["id"]) == list(df["id"])
 
     # Expected reducer & QA columns (with buffer-suffix)
-    reducer_cols = {"dem_mini_mean_b100", "dem_mini_std_b100"}
+    reducer_cols = {"dem_local_mean_b100", "dem_local_std_b100"}
     qa_cols = {
-        "dem_mini_in_extent_b100",
-        "dem_mini_n_pixels_b100",
-        "dem_mini_had_nodata_b100",
-        "dem_mini_coverage_pct_b100",
+        "dem_local_in_extent_b100",
+        "dem_local_n_pixels_b100",
+        "dem_local_had_nodata_b100",
+        "dem_local_coverage_pct_b100",
     }
 
     stats_cols = set(stats_df.columns)
@@ -74,10 +83,10 @@ def test_groups_e2e(tmp_path: Path) -> None:
 
     # No legacy unsuffixed names anywhere
     legacy_cols = {
-        "dem_mini_mean",
-        "dem_mini_std",
-        "dem_mini_in_extent",
-        "dem_mini_coverage_pct",
+        "dem_local_mean",
+        "dem_local_std",
+        "dem_local_in_extent",
+        "dem_local_coverage_pct",
     }
     assert legacy_cols.isdisjoint(stats_cols)
     assert legacy_cols.isdisjoint(qc_cols)

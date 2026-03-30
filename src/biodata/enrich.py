@@ -88,31 +88,66 @@ def enrich(
                 coverage_backlog[p] = {}
 
                 feature_meta_first: Dict[str, Any] | None = None
+                dates = work.date.tolist() if "date" in work.columns else None
 
                 for buf in buffers:
-                    vals_list: List[np.ndarray] = []
-                    meta_list: List[Dict[str, Any]] = []
+                    # ----- Server-side stats (GEE fast path) -----
+                    use_server_stats = (
+                        hasattr(adapter, "fetch_stats_batch")
+                        and stats
+                        and not dump_windows  # need raw pixels for tile dumps
+                    )
 
-                    # --- fetch values + meta for each point (for this buffer) ---
-                    for lat, lon in zip(work.lat, work.lon):
-                        arr, meta = adapter.fetch_values(lat, lon, buf, return_meta=True)
-                        arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
-                        vals_list.append(arr)
-                        meta_list.append(meta)
-                        if feature_meta_first is None and meta:
-                            feature_meta_first = meta
-
-                    # --- reducers → columns (ALWAYS buffer-suffixed) ---
-                    if stats:
-                        for rname in stats:
-                            reducer = get_reducer(rname)
+                    if use_server_stats:
+                        reducer_names = list(stats)
+                        ss_results = adapter.fetch_stats_batch(
+                            work.lat, work.lon, buf, reducer_names, dates=dates,
+                        )
+                        # ss_results: list of (stats_dict, meta_dict)
+                        for rname in reducer_names:
                             col = f"{p}_{rname}_b{buf}"
-                            work[col] = [(reducer(v) if v.size else None) for v in vals_list]
+                            work[col] = [r[0].get(rname) for r in ss_results]
+
+                        meta_list = [r[1] for r in ss_results]
+                        if feature_meta_first is None:
+                            for m in meta_list:
+                                if m and m.get("in_extent"):
+                                    feature_meta_first = m
+                                    break
+
                     else:
-                        default_r = spec.get("default_reducer", "mean")
-                        reducer = get_reducer(default_r)
-                        col = f"{p}_{default_r}_b{buf}"
-                        work[col] = [(reducer(v) if v.size else None) for v in vals_list]
+                        # ----- Python-side stats (local raster path / tile dumps) -----
+                        if hasattr(adapter, "fetch_batch"):
+                            results = adapter.fetch_batch(
+                                work.lat, work.lon, buf,
+                                dates=dates, return_meta=True,
+                            )
+                        else:
+                            results = [
+                                adapter.fetch_values(lat, lon, buf, return_meta=True)
+                                for lat, lon in zip(work.lat, work.lon)
+                            ]
+
+                        vals_list: List[np.ndarray] = []
+                        meta_list: List[Dict[str, Any]] = []
+                        for arr, meta in results:
+                            arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
+                            vals_list.append(arr)
+                            meta_list.append(meta)
+                            if feature_meta_first is None and meta:
+                                feature_meta_first = meta
+
+                        # Apply Python reducers
+                        if stats:
+                            for rname in stats:
+                                reducer = get_reducer(rname)
+                                col = f"{p}_{rname}_b{buf}"
+                                work[col] = [(reducer(v) if v.size else None) for v in vals_list]
+                        else:
+                            default_r = spec.get("default_reducer", "mean")
+                            reducer = get_reducer(default_r)
+                            col = f"{p}_{default_r}_b{buf}"
+                            work[col] = [(reducer(v) if v.size else None) for v in vals_list]
 
                     # --- QA columns (also buffer-suffixed) ---
                     qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
@@ -237,11 +272,27 @@ def enrich(
             AdapterCls = get_adapter(source)
             adapter = AdapterCls(spec)
 
-            reducer = get_reducer(spec.get("default_reducer", "mean"))
-            out[p] = [
-                reducer(adapter.fetch_values(lat, lon, window_m))
-                for lat, lon in zip(out.lat, out.lon)
-            ]
+            default_r = spec.get("default_reducer", "mean")
+            dates = out.date.tolist() if "date" in out.columns else None
+
+            if hasattr(adapter, "fetch_stats_batch"):
+                # Server-side single-stat (GEE fast path)
+                ss_results = adapter.fetch_stats_batch(
+                    out.lat, out.lon, window_m, [default_r], dates=dates,
+                )
+                out[p] = [r[0].get(default_r) for r in ss_results]
+            elif hasattr(adapter, "fetch_batch"):
+                reducer = get_reducer(default_r)
+                batch_vals = adapter.fetch_batch(
+                    out.lat, out.lon, window_m, dates=dates, return_meta=False,
+                )
+                out[p] = [reducer(np.asarray(v)) for v in batch_vals]
+            else:
+                reducer = get_reducer(default_r)
+                out[p] = [
+                    reducer(adapter.fetch_values(lat, lon, window_m))
+                    for lat, lon in zip(out.lat, out.lon)
+                ]
 
         # write tabular: honor out_path if provided, else return the DataFrame (legacy)
         if out_path:
