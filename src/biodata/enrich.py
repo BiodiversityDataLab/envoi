@@ -13,7 +13,7 @@ from .output import OutputManager
 from .config import load_catalogs
 from .qc import compute_qc_flags
 from .provenance import build_provenance
-from .output import write_group_parquet, write_window_tiff
+from .output import write_group_parquet
 
 
 def _load_yaml(path_or_dict) -> Dict[str, Any]:
@@ -45,7 +45,11 @@ def enrich(
     required = {"id", "lat", "lon"}
     if not required.issubset(df.columns):
         missing = required - set(df.columns)
-        raise ValueError(f"Missing required columns: {missing}")
+        raise ValueError(
+            f"Input DataFrame is missing required column(s): {sorted(missing)}.\n"
+            f"Expected columns: id, lat, lon (and optionally: date).\n"
+            f"Found columns: {sorted(df.columns.tolist())}"
+        )
 
     catalog_dict = load_catalogs(catalog, extra_catalog)
     cat = catalog_dict["datasets"]
@@ -58,7 +62,6 @@ def enrich(
         gcfg = _load_yaml(groups)
         groups_list = gcfg.get("groups", [])
         min_cov = gcfg.get("min_coverage_pct", 80)
-        proj_crs = gcfg.get("project_crs", "EPSG:3006")
 
         for idx, g in enumerate(groups_list):
             gname = g.get("name", f"group{idx+1}")
@@ -66,9 +69,7 @@ def enrich(
             out_cfg = g.get("output", {}) or {}
             kind = out_cfg.get("kind", "tabular")
 
-            # Optional: dump per-point raster windows as GeoTIFF tiles
-            dump_windows = bool(out_cfg.get("dump_windows", False))
-            tiles_root = Path(out_dir) / "tiles" / gname  # out/tiles/<group>/
+            resample_m = out_cfg.get("resample_m")  # target resolution for CNN-ready tiles
 
             stats = g.get("summary_statistics") or out_cfg.get("reducers")
             buffers = g.get("buffer_sizes") or [out_cfg.get("window_m", window_m)]
@@ -90,12 +91,73 @@ def enrich(
                 feature_meta_first: Dict[str, Any] | None = None
                 dates = work.date.tolist() if "date" in work.columns else None
 
+                # ----- kind: "raster" — export GeoTIFF tiles, skip stats -----
+                if kind == "raster":
+                    buf = buffers[0]
+                    ids = work["id"].tolist() if "id" in work.columns else None
+                    dates_list = work.date.tolist() if "date" in work.columns else None
+                    tiles_root = Path(out_dir) / "tiles" / gname
+
+                    if hasattr(adapter, "export_images"):
+                        adapter.export_images(
+                            work.lat, work.lon, buf, tiles_root,
+                            ids=ids, dates=dates_list, feature_name=p,
+                            resample_m=resample_m,
+                        )
+                    elif hasattr(adapter, "export_windows"):
+                        adapter.export_windows(
+                            work.lat, work.lon, buf, tiles_root,
+                            ids=ids, feature_name=p,
+                            resample_m=resample_m,
+                        )
+                    else:
+                        raise ValueError(
+                            f"Source '{source}' does not support raster export."
+                        )
+                    outputs[f"{gname}:{p}"] = tiles_root / p
+                    continue  # skip stats for this feature
+
+                # ----- "point" reducer: exact pixel at coordinate, no window -----
+                if stats and "point" in list(stats):
+                    if not hasattr(adapter, "fetch_points_batch"):
+                        raise ValueError(
+                            f"Source '{source}' does not support the 'point' reducer."
+                        )
+                    pt_results = adapter.fetch_points_batch(
+                        work.lat, work.lon, dates=dates,
+                    )
+                    all_keys = {k for vals, _ in pt_results for k in vals}
+                    for bk in sorted(all_keys):
+                        col = f"{p}_{bk}_point" if len(all_keys) > 1 else f"{p}_point"
+                        work[col] = [r[0].get(bk) for r in pt_results]
+
+                    meta_list = [r[1] for r in pt_results]
+                    if feature_meta_first is None:
+                        for m in meta_list:
+                            if m and m.get("in_extent"):
+                                feature_meta_first = m
+                                break
+
+                    qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
+                    qc_df = qc_df.add_prefix(f"{p}_").add_suffix("_point")
+                    work = pd.concat(
+                        [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
+                        axis=1,
+                    )
+                    coverage_backlog[p]["point"] = {
+                        "n_zero": int((qc_df[f"{p}_coverage_pct_point"] == 0).sum()),
+                        "n_full": int((qc_df[f"{p}_coverage_pct_point"] == 100).sum()),
+                        "total": int(len(pt_results)),
+                    }
+
                 for buf in buffers:
+                    if stats and "point" in list(stats):
+                        break  # already handled above
+
                     # ----- Server-side stats (GEE fast path) -----
                     use_server_stats = (
                         hasattr(adapter, "fetch_stats_batch")
                         and stats
-                        and not dump_windows  # need raw pixels for tile dumps
                     )
 
                     if use_server_stats:
@@ -166,30 +228,7 @@ def enrich(
                         "total": int(cov.shape[0]),
                     }
 
-                    # --- optional: dump tiles for debugging/inspection ---
-                    if dump_windows:
-                        tiles_dir = tiles_root / p / f"b{buf}"
-                        tiles_dir.mkdir(parents=True, exist_ok=True)
-
-                        for ridx, vmeta in enumerate(meta_list):
-                            # use id col if present, else row index
-                            pid = work.iloc[ridx]["id"] if "id" in work.columns else ridx
-                            tile_path = tiles_dir / f"id{pid}.tif"
-
-                            arr2d = vmeta.get("window_arr")
-                            if arr2d is None or getattr(arr2d, "ndim", 1) != 2 or arr2d.size == 0:
-                                continue
-
-                            write_window_tiff(
-                                arr=arr2d,
-                                transform=vmeta.get("transform"),
-                                crs=vmeta.get("raster_crs"),
-                                dtype=vmeta.get("dtype", "float32"),
-                                nodata=vmeta.get("nodata"),
-                                path=tile_path,
-                            )
-
-                # --- provenance for this feature ---
+# --- provenance for this feature ---
                 provenance[p] = build_provenance(
                     spec,
                     stats or [spec.get("default_reducer", "mean")],
@@ -225,7 +264,6 @@ def enrich(
             }
             cfg_for_meta = {
                 **gcfg,
-                "project_crs": proj_crs,
                 "min_coverage_pct": min_cov,
                 "summary_statistics": stats,
                 "buffer_sizes": buffers,
@@ -247,11 +285,7 @@ def enrich(
             outputs[f"{gname}_qc"] = qc_path
 
         elif kind == "raster":
-            for p in feats:
-                val_cols = [c for c in work.columns if c.startswith(f"{p}_") and "_b" in c]
-                vcol = val_cols[0] if val_cols else None
-                vals = work[vcol].tolist() if vcol else [None] * len(work)
-                outputs[f"{gname}:{p}"] = om.write_raster_demo(vals, work.lat, work.lon, gname, p)
+            pass  # outputs already populated inside the per-feature loop above
         else:
             raise ValueError(f"Unknown output kind: {kind}")
 

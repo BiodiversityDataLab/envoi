@@ -19,6 +19,11 @@ datasets:
   dem_aster:
     source: gee_raster
     path: projects/sat-io/open-datasets/ASTER/GDEM
-    asset_type: image
 
-  
+  bioclim:
+    source: gee_raster
+    path: WORLDCLIM/V1/BIO
+
+  era5_monthly:
+    source: gee_raster
+    path: ECMWF/ERA5/MONTHLY

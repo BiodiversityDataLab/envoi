@@ -23,4 +23,11 @@ def init_gee(credentials_path: str | Path | None = None):
     key_file = creds_data["private_key"]
 
     credentials = ee.ServiceAccountCredentials(service_account, key_file)
-    ee.Initialize(credentials)
+    try:
+        ee.Initialize(credentials)
+    except Exception as e:
+        raise RuntimeError(
+            f"Google Earth Engine authentication failed.\n"
+            f"Check that the service account in '{path}' is valid and has access to GEE.\n"
+            f"Original error: {e}"
+        ) from e

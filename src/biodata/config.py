@@ -115,6 +115,20 @@ def _load_catalog_any(src: Any) -> Dict[str, Any]:
         d = dict(src)
         if "datasets" not in d:
             d["datasets"] = {}
+        for name, spec in d["datasets"].items():
+            if not isinstance(spec, dict):
+                raise CatalogError(f"datasets.{name}: must be a mapping")
+            if "source" not in spec or not spec.get("source"):
+                raise CatalogError(
+                    f"datasets.{name}: missing required key 'source'.\n"
+                    f"Valid sources are: gee_raster, local_raster."
+                )
+            if "path" not in spec or not spec.get("path"):
+                raise CatalogError(
+                    f"datasets.{name}: missing required key 'path'.\n"
+                    f"For GEE assets, this is the asset ID (e.g. 'COPERNICUS/S2_SR_HARMONIZED').\n"
+                    f"For local rasters, this is the file path (e.g. 'data/dem.tif')."
+                )
         return d
 
     # Otherwise, treat it as a path and reuse the validated loader.
