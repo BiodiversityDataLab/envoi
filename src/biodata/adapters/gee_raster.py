@@ -25,8 +25,6 @@ try:
 except Exception:
     _register = None
 
-from ..gee_features import build_image as _build_image
-
 logger = logging.getLogger(__name__)
 
 _gee_initialized = False
@@ -65,6 +63,149 @@ def _get_utm_crs(lon: float, lat: float) -> str:
     base_epsg = 32600 if lat >= 0 else 32700
     return f"EPSG:{base_epsg + zone_number}"
 
+
+def _snap_to_grid(coord: float, scale: float) -> float:
+    """Snap a UTM coordinate (metres) to the nearest pixel grid multiple of scale.
+
+    Ensures GEE export windows align with the pixel grid, preventing
+    inconsistent image sizes across points.
+    """
+    remainder = coord % scale
+    if remainder < scale / 2:
+        return int(coord / scale) * scale
+    return int((coord + scale) / scale) * scale
+
+
+# ---------------------------------------------------------------------------
+# Image building (collection reduction, date filtering, cloud masking, derived bands)
+# ---------------------------------------------------------------------------
+
+_COLLECTION_REDUCERS = {
+    "mean":   lambda col: col.mean(),
+    "median": lambda col: col.median(),
+    "mode":   lambda col: col.mode(),
+    "mosaic": lambda col: col.mosaic(),
+    "min":    lambda col: col.min(),
+    "max":    lambda col: col.max(),
+    "sum":    lambda col: col.sum(),
+    "first":  lambda col: col.first(),
+}
+
+
+def _reduce_collection(col, reducer: str):
+    """Reduce an ImageCollection to a single Image using *reducer* name."""
+    fn = _COLLECTION_REDUCERS.get(reducer)
+    if fn is None:
+        logger.warning("Unknown collection reducer '%s', falling back to mean", reducer)
+        return col.mean()
+    return fn(col)
+
+
+def _filter_collection_by_date(col, date, feature_spec: dict):
+    """Filter a collection around a sample date using feature_spec config."""
+    start_date = feature_spec.get("start_date")
+    end_date = feature_spec.get("end_date")
+
+    if start_date and end_date:
+        return col.filterDate(start_date, end_date)
+
+    days = feature_spec.get("temporal_window_days")
+    if days and date is not None:
+        half = (days - 1) / 2
+        start = (date - pd.DateOffset(days=half)).strftime("%Y-%m-%d")
+        end = (date + pd.DateOffset(days=half)).strftime("%Y-%m-%d")
+        return col.filterDate(start, end)
+
+    return col
+
+
+def _mask_clouds_s2(image):
+    """Mask clouds and cirrus for Sentinel-2 using QA60 band."""
+    qa = image.select("QA60")
+    cloud_mask = qa.bitwiseAnd(1 << 10).eq(0)
+    cirrus_mask = qa.bitwiseAnd(1 << 11).eq(0)
+    mask = cloud_mask.And(cirrus_mask)
+    return (
+        image.updateMask(mask)
+        .divide(10000)
+        .select("B.*")
+        .copyProperties(image, ["system:time_start"])
+    )
+
+
+_CLOUD_MASK_FNS = {
+    "s2": _mask_clouds_s2,
+}
+
+
+def _apply_cloud_mask(col, mask_type: str):
+    """Apply a cloud mask function to a collection, if mask_type is known."""
+    fn = _CLOUD_MASK_FNS.get(mask_type)
+    if fn is None:
+        logger.warning("Unknown cloud_mask type '%s', skipping", mask_type)
+        return col
+    return col.map(fn)
+
+
+def _apply_derived_band(img, derived: str):
+    """Compute a derived band from an image (NDVI, EVI, slope, aspect)."""
+    if derived == "NDVI":
+        return img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+    if derived == "EVI":
+        return img.expression(
+            "2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))",
+            {"NIR": img.select("B8"), "RED": img.select("B4"), "BLUE": img.select("B2")},
+        ).rename("EVI")
+    if derived == "slope":
+        return ee.Terrain.slope(img)
+    if derived == "aspect":
+        return ee.Terrain.aspect(img)
+    logger.warning("Unknown derived_band '%s', returning image unchanged", derived)
+    return img
+
+
+def _build_image(feature_spec: dict, date=None):
+    """Build an ee.Image from a feature_spec config dict.
+
+    Pipeline: load image/collection → date filter → cloud_pct filter →
+              cloud mask → reduce → band select → derived band.
+    """
+    img = None
+
+    if "image" in feature_spec:
+        img = ee.Image(feature_spec["image"])
+
+    elif "collection" in feature_spec:
+        col = ee.ImageCollection(feature_spec["collection"])
+
+        if date is not None:
+            col = _filter_collection_by_date(col, date, feature_spec)
+        elif feature_spec.get("start_date") and feature_spec.get("end_date"):
+            col = col.filterDate(feature_spec["start_date"], feature_spec["end_date"])
+
+        cloud_pct = feature_spec.get("cloud_pct_max")
+        if cloud_pct is not None:
+            col = col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_pct))
+
+        cloud_mask = feature_spec.get("cloud_mask")
+        if cloud_mask:
+            col = _apply_cloud_mask(col, cloud_mask)
+
+        reducer = feature_spec.get("collection_reducer", "mean")
+        img = _reduce_collection(col, reducer)
+
+    else:
+        raise ValueError("feature_spec must contain 'image' or 'collection'")
+
+    band = feature_spec.get("band")
+    if band is not None:
+        img = img.select(band)
+
+    derived = feature_spec.get("derived_band")
+    if derived:
+        img = _apply_derived_band(img, derived)
+
+    return img
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +319,7 @@ class GeeRasterAdapter:
     Additional capabilities:
     - Dynamic UTM zone per point for accurate meter-based windows.
     - Per-point temporal filtering for ImageCollections.
-    - Feature-specific image builders via ``gee_features`` module.
+    - Generic image building pipeline via module-level ``_build_image``.
     """
 
     spec: Dict[str, Any]
@@ -199,7 +340,14 @@ class GeeRasterAdapter:
         feature_spec = self.spec.get("feature_spec") or {}
         if not feature_spec and self.spec.get("path"):
             asset_id = self.spec["path"]
-            asset_info = ee.data.getAsset(asset_id)
+            try:
+                asset_info = ee.data.getAsset(asset_id)
+            except Exception as e:
+                raise ValueError(
+                    f"GEE asset not found: '{asset_id}'.\n"
+                    f"Check the path in your catalog and that your service account has access to it.\n"
+                    f"Original error: {e}"
+                ) from e
             asset_type = asset_info.get("type")
             if asset_type == "IMAGE_COLLECTION":
                 feature_spec = {"collection": asset_id}
@@ -209,7 +357,7 @@ class GeeRasterAdapter:
                 feature_spec["band"] = self.spec["band"]
             logger.debug("Auto-detected %s as %s", asset_id, asset_type)
 
-        self.scale = self.spec.get("resolution_m", 250)
+        self.scale = self.spec.get("resolution_m")  # None → use native scale
         self.crs = self.spec.get("crs", "EPSG:4326")
         self.max_workers = self.spec.get("max_workers", 8)
         self._feature_spec = feature_spec
@@ -261,13 +409,27 @@ class GeeRasterAdapter:
                 self._cached_band_name = "value"
         return self._cached_band_name
 
+    def _get_scale(self, img):
+        """Return user-specified scale or fall back to the image's native scale."""
+        if self.scale is not None:
+            return self.scale
+        return img.projection().nominalScale()
+
+    def _get_scale_value(self, img) -> float:
+        """Return scale as a plain Python float (metres). Fetches from GEE once and caches."""
+        if self.scale is not None:
+            return float(self.scale)
+        if not hasattr(self, "_cached_native_scale"):
+            self._cached_native_scale = float(img.projection().nominalScale().getInfo())
+        return self._cached_native_scale
+
     def _make_region(self, lat: float, lon: float, window_m: int) -> ee.Geometry:
         """Build a meter-accurate square region using the point's UTM zone."""
         point = ee.Geometry.Point([lon, lat])
         if window_m <= 0:
             return point
         utm = _get_utm_crs(lon, lat)
-        return point.buffer(window_m / 2, proj=ee.Projection(utm)).bounds()
+        return point.buffer(window_m / 2, proj=ee.Projection(utm)).bounds(maxError=1)
 
     def _empty_result(self, window_m: int):
         vals = np.array([])
@@ -305,10 +467,12 @@ class GeeRasterAdapter:
         return self._sample_window(img, region, window_m)
 
     def _sample_pixel(self, img, region, window_m):
+        proj = img.projection()
         result = img.reduceRegion(
             reducer=ee.Reducer.first(),
             geometry=region,
-            scale=self.scale,
+            scale=self._get_scale(img),
+            crs=proj,
         ).getInfo()
 
         if not result:
@@ -390,13 +554,13 @@ class GeeRasterAdapter:
         img = self._get_image(date)
         band_name = self._get_band_name(img)
         region = self._make_region(lat, lon, window_m)
-        utm = _get_utm_crs(lon, lat)
 
+        proj = img.projection()
         result = img.reduceRegion(
             reducer=combined_reducer,
             geometry=region,
-            scale=self.scale,
-            crs=utm,
+            scale=proj.nominalScale(),
+            crs=proj,
             bestEffort=True,
         ).getInfo()
 
@@ -435,7 +599,7 @@ class GeeRasterAdapter:
         try:
             sample = img.sample(
                 region=point,
-                scale=self.scale,
+                scale=self._get_scale(img),
                 numPixels=1,
                 dropNulls=False,
             ).first()
@@ -445,9 +609,17 @@ class GeeRasterAdapter:
             props = None
 
         if not props:
-            return {}, {"in_extent": False, "src_path": self._src_label()}
+            return {}, {
+                "in_extent": False, "n_pixels": 0,
+                "had_nodata": False, "coverage_pct": 0.0,
+                "src_path": self._src_label(),
+            }
 
-        return props, {"in_extent": True, "src_path": self._src_label()}
+        return props, {
+            "in_extent": True, "n_pixels": 1,
+            "had_nodata": False, "coverage_pct": 100.0,
+            "src_path": self._src_label(),
+        }
 
     # ------------------------------------------------------------------
     # Mode 4: Image export  (geemap → GeoTIFF)
@@ -460,14 +632,41 @@ class GeeRasterAdapter:
         window_m: int,
         out_path: Path,
         date=None,
+        resample_m: float | None = None,
     ):
-        """Export a GeoTIFF tile for one point."""
+        """Export a GeoTIFF tile for one point with pixel-grid-snapped window.
+
+        Snapping the centre coordinate to the nearest pixel grid multiple
+        ensures all exported tiles have identical dimensions.
+
+        If resample_m is set, the tile is exported at that resolution instead
+        of the native image resolution — all tiles will be exactly
+        round(window_m / resample_m) × round(window_m / resample_m) pixels.
+        """
         if geemap is None:
             raise ImportError("geemap is required for image export: pip install geemap")
 
         img = self._get_image(date)
-        region = self._make_region(lat, lon, window_m)
+        # Use resample_m as the export scale when provided; fall back to native.
+        scale_m = float(resample_m) if resample_m is not None else self._get_scale_value(img)
         utm = _get_utm_crs(lon, lat)
+
+        # Project to UTM, snap to pixel grid, compute window corners
+        from pyproj import Transformer
+        transformer = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
+        cx, cy = transformer.transform(lon, lat)
+        cx = _snap_to_grid(cx, scale_m)
+        cy = _snap_to_grid(cy, scale_m)
+
+        # Snap half-window to nearest whole pixel count so output dimensions
+        # are consistent across points (window_m is approximate, not exact).
+        half_pixels = max(1, round(window_m / 2 / scale_m))
+        half_m = half_pixels * scale_m
+        region = ee.Geometry.Rectangle(
+            [cx - half_m, cy - half_m, cx + half_m, cy + half_m],
+            proj=ee.Projection(utm),
+            geodesic=False,
+        )
 
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -475,7 +674,7 @@ class GeeRasterAdapter:
         geemap.ee_export_image(
             img,
             filename=str(out_path),
-            scale=self.scale,
+            scale=scale_m,
             region=region,
             crs=utm,
         )
@@ -616,8 +815,12 @@ class GeeRasterAdapter:
         ids: Sequence[str] | None = None,
         dates: Sequence | None = None,
         feature_name: str = "feature",
+        resample_m: float | None = None,
     ) -> List[Path]:
         """Export GeoTIFF tiles for many points in parallel (Mode 4).
+
+        If resample_m is set, all tiles are exported at that resolution so they
+        are exactly round(window_m / resample_m) × round(window_m / resample_m) pixels.
 
         Returns list of output file paths.
         """
@@ -636,7 +839,7 @@ class GeeRasterAdapter:
             ):
                 out_path = out_dir / f"{sample_id}-{feature_name}.tif"
                 future = executor.submit(
-                    self._export_single, lat, lon, window_m, out_path, date
+                    self._export_single, lat, lon, window_m, out_path, date, resample_m
                 )
                 future_to_idx[future] = i
 
