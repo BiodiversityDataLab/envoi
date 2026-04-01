@@ -1,4 +1,4 @@
-# src/biodata/adapters/local_raster.py
+# src/biodata/adapters/local_adapter.py
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path

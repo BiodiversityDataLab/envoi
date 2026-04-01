@@ -1,4 +1,4 @@
-# src/biodata/adapters/gee_raster.py
+# src/biodata/adapters/gee_adapter.py
 from __future__ import annotations
 
 import logging
