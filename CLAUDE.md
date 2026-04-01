@@ -96,8 +96,8 @@ src/biodata/
     reducers.py         ← Python-side reducer registry (mean, std, quantiles, ...)
     adapters/
         base.py         ← BaseAdapter
-        gee_raster.py   ← GeeRasterAdapter + all image-building utilities
-        local_raster.py ← LocalRasterAdapter
+        gee_adapter.py   ← GeeRasterAdapter + all image-building utilities
+        local_adapter.py ← LocalRasterAdapter
     output.py           ← parquet writing, manifest, window TIF export
     qc.py               ← coverage QC flags
     provenance.py       ← provenance metadata per feature
