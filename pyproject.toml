@@ -44,9 +44,6 @@ gee = [
     "earthengine-api>=0.1.398",
 ]
 
-[project.scripts]
-biodata = "biodata.cli:main"
-
 [project.urls]
 Homepage = "https://github.com/AppleShay/biodata-enricher"
 

@@ -29,21 +29,17 @@ def test_groups_e2e(tmp_path: Path) -> None:
     df = pd.read_csv(Path("data/for_testing/adrian_example.csv"))
 
     cfg = {
-        "groups": [
-            {
-                "name": "dem_100m",
-                "predictors": ["dem_local"],
-                "output": {
-                    "kind": "tabular",
-                    "reducers": ["mean", "std"],
-                    "window_m": 100,
-                },
-            }
-        ],
-        "min_coverage_pct": 0,
+        "name": "dem_100m",
+        "predictors": ["dem_local"],
+        "output": {
+            "kind": "tabular",
+            "reducers": ["mean", "std"],
+            "window_m": 100,
+            "min_coverage_pct": 0,
+        },
     }
 
-    outputs = enrich(df, groups=cfg, catalog=CATALOG, out_dir=tmp_path)
+    outputs = enrich(df, cfg, catalog=CATALOG, out_dir=tmp_path)
 
     stats_path = outputs["dem_100m"]
     qc_path = outputs["dem_100m_qc"]
@@ -96,4 +92,9 @@ def test_groups_e2e(tmp_path: Path) -> None:
     assert meta_path.exists()
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
 
-    assert "provenance" in meta
+    assert "run" in meta
+    assert "config" in meta
+    assert "features" in meta
+    assert "quality" in meta
+    assert meta["run"]["n_points"] == len(df)
+    assert "dem_local" in meta["features"]
