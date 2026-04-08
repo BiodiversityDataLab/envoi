@@ -222,4 +222,4 @@ class LocalRasterAdapter(BaseAdapter):
 
 
 if _register is not None:
-    _register("local_raster", LocalRasterAdapter)
+    _register("local", LocalRasterAdapter)

@@ -72,7 +72,7 @@ def enrich(
         kind = out_cfg.get("kind", "tabular")
 
         resample_m = out_cfg.get("resample_m")
-        fmt = out_cfg.get("format", "parquet")
+        fmt = out_cfg.get("format", "csv")
         min_cov = out_cfg.get("min_coverage_pct", 80)
 
         stats = out_cfg.get("reducers")
@@ -103,7 +103,7 @@ def enrich(
                 buf = buffers[0]
                 ids = work["id"].tolist() if "id" in work.columns else None
                 dates_list = work.date.tolist() if "date" in work.columns else None
-                tiles_root = Path(out_dir) / "tiles" / gname
+                tiles_root = Path(out_dir) / gname
 
                 if hasattr(adapter, "export_images"):
                     adapter.export_images(
@@ -172,9 +172,13 @@ def enrich(
                     ss_results = adapter.fetch_stats_batch(
                         work.lat, work.lon, buf, reducer_names, dates=dates,
                     )
-                    for rname in reducer_names:
-                        col = f"{p}_{rname}_b{buf}"
-                        work[col] = [r[0].get(rname) for r in ss_results]
+                    # Use actual result keys — for multi-band datasets these are
+                    # "{band}_{reducer}" (e.g. "bio01_mean"); for single-band just
+                    # "{reducer}" (e.g. "mean"). dict.fromkeys preserves insertion order.
+                    all_stat_keys = dict.fromkeys(k for r, _ in ss_results for k in r)
+                    for key in all_stat_keys:
+                        col = f"{p}_{key}_{buf}m"
+                        work[col] = [r[0].get(key) for r in ss_results]
 
                     meta_list = [r[1] for r in ss_results]
                     if feature_meta_first is None:
@@ -209,24 +213,24 @@ def enrich(
                     if stats:
                         for rname in stats:
                             reducer = get_reducer(rname)
-                            col = f"{p}_{rname}_b{buf}"
+                            col = f"{p}_{rname}_{buf}m"
                             work[col] = [(reducer(v) if v.size else None) for v in vals_list]
                     else:
                         default_r = spec.get("default_reducer", "mean")
                         reducer = get_reducer(default_r)
-                        col = f"{p}_{default_r}_b{buf}"
+                        col = f"{p}_{default_r}_{buf}m"
                         work[col] = [(reducer(v) if v.size else None) for v in vals_list]
 
                 # --- QA columns (also buffer-suffixed) ---
                 qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
-                qc_df = qc_df.add_prefix(f"{p}_").add_suffix(f"_b{buf}")
+                qc_df = qc_df.add_prefix(f"{p}_").add_suffix(f"_{buf}m")
                 work = pd.concat(
                     [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
                     axis=1,
                 )
 
                 # --- coverage summary for metadata ---
-                cov = qc_df[f"{p}_coverage_pct_b{buf}"].fillna(0)
+                cov = qc_df[f"{p}_coverage_pct_{buf}m"].fillna(0)
                 coverage_backlog[p][str(buf)] = {
                     "n_zero": int((cov == 0).sum()),
                     "n_partial": int(((cov > 0) & (cov < 100)).sum()),
@@ -238,11 +242,8 @@ def enrich(
         if kind == "tabular":
             core_cols = [c for c in ("id", "lat", "lon", "date") if c in work.columns]
 
-            qc_suffixes = (
-                "_in_extent_b", "_n_pixels_b",
-                "_had_nodata_b", "_coverage_pct_b",
-            )
-            qc_cols = [c for c in work.columns if any(suf in c for suf in qc_suffixes)]
+            qc_keywords = ("_in_extent_", "_n_pixels_", "_had_nodata_", "_coverage_pct_")
+            qc_cols = [c for c in work.columns if any(kw in c for kw in qc_keywords)]
             stats_cols = [c for c in work.columns if c not in qc_cols]
 
             stats_df = work[core_cols + [c for c in stats_cols if c not in core_cols]].copy()
@@ -270,7 +271,7 @@ def enrich(
 
         elif kind == "raster":
             write_metadata(
-                Path(out_dir) / "tiles" / gname, gname,
+                Path(out_dir) / gname, gname,
                 kind=kind,
                 n_points=len(work),
                 features=feature_metas,
