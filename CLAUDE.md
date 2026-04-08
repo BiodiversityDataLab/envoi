@@ -37,27 +37,47 @@ experiance, the user interface should be as intuitive as possible.
 ## Architecture
 
 ```
-enrich()                  ← main entry point (gateway to all adapters)
+enrich(df, cfg)               ← main entry point
     ↓
-catalog.yml               ← defines available datasets (source + path required)
+catalog.yml                   ← defines available datasets (source + path required)
     ↓
 Adapter (per dataset)
-    ├── GeeRasterAdapter  ← queries GEE directly, parallel via ThreadPoolExecutor
-    └── LocalRasterAdapter ← reads GeoTIFF via rasterio, dynamic UTM per point
+    ├── GeeRasterAdapter      ← queries GEE directly, parallel via ThreadPoolExecutor
+    └── LocalRasterAdapter    ← reads GeoTIFF via rasterio, dynamic UTM per point
+```
+
+## API
+
+The primary interface is `enrich(df, cfg)` where `cfg` is a dict (single output)
+or list of dicts (multiple outputs):
+
+```python
+enrich(df, {
+    "name": "terrain",
+    "predictors": ["dem_local"],
+    "output": {
+        "kind": "tabular",          # "tabular" or "raster"
+        "reducers": ["mean", "std"],
+        "window_m": 200,
+        "format": "parquet",        # "parquet" or "csv"
+        "resample_m": 10,           # optional, for CNN-ready tiles
+        "min_coverage_pct": 80,     # QC threshold
+    },
+})
 ```
 
 ## Catalog design
 
-The catalog (`configs/catalog.yml`) is the  source of available datasets.
+The catalog (`configs/catalog.yml`) is the source of available datasets.
 Only `source` and `path` are required — everything else is auto-detected or optional.
 
 ```yaml
 dem_aster:
-  source: gee_raster
+  source: earth_engine
   path: projects/sat-io/open-datasets/ASTER/GDEM   # asset type auto-detected via ee.data.getAsset()
 
 dem_local:
-  source: local_raster
+  source: local
   path: data/for_testing/dem/TG4NHB-dem.tif
   band: 1                                           # optional, defaults to band 1
 ```
@@ -73,7 +93,7 @@ cloud masking, collection reducer, and derived bands:
 
 ```yaml
 sen2_ndvi:
-  source: gee_raster
+  source: earth_engine
   path: COPERNICUS/S2_SR_HARMONIZED
   feature_spec:
     collection: COPERNICUS/S2_SR_HARMONIZED
@@ -85,28 +105,26 @@ sen2_ndvi:
 
 ---
 
-
 ## Files overview
 
 ```
 src/biodata/
     enrich.py           ← main entry point
     config.py           ← catalog loading + local raster auto-detection
+    metadata.py         ← per-feature metadata + sidecar JSON writer
     auth.py             ← GEE authentication from credentials/ee_credentials.json
     reducers.py         ← Python-side reducer registry (mean, std, quantiles, ...)
+    output.py           ← parquet/csv writing
+    qc.py               ← coverage QC flags
     adapters/
         base.py         ← BaseAdapter
-        gee_adapter.py   ← GeeRasterAdapter + all image-building utilities
-        local_adapter.py ← LocalRasterAdapter
-    output.py           ← parquet writing, manifest, window TIF export
-    qc.py               ← coverage QC flags
-    provenance.py       ← provenance metadata per feature
-    history.py          ← replay last run from manifest
+        gee_adapter.py  ← GeeRasterAdapter + all image-building utilities
+        local_adapter.py← LocalRasterAdapter
 
 configs/
     catalog.yml         ← dataset registry
-    groups.yml          ← example groups config
-    run.yml             ← example run config
+    run.yml             ← example single-output config
+    groups.yml          ← example multi-output config
 
 credentials/
     ee_credentials.json ← GEE service account key (gitignored)

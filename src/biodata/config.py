@@ -23,7 +23,7 @@ def _require_keys(d: Dict[str, Any], required: set, ctx: str) -> None:
 def _inspect_raster(name: str, spec: Dict[str, Any]) -> None:
     """Read CRS, resolution, type, and nodata from a local raster file
     and fill in any missing spec fields automatically."""
-    if spec.get("source") != "local_raster":
+    if spec.get("source") != "local":
         return
 
     p = Path(spec["path"])
@@ -68,7 +68,7 @@ def load_catalog(path: str | Path) -> Dict[str, Any]:
           source: <str>
           path: <str>
           # optional: type, crs, resolution_m, default_reducer, band, ...
-          # For local_raster sources, crs and resolution_m are auto-detected from the file.
+          # For local sources, crs and resolution_m are auto-detected from the file.
     """
     p = Path(path)
     if not p.exists():
@@ -121,7 +121,7 @@ def _load_catalog_any(src: Any) -> Dict[str, Any]:
             if "source" not in spec or not spec.get("source"):
                 raise CatalogError(
                     f"datasets.{name}: missing required key 'source'.\n"
-                    f"Valid sources are: gee_raster, local_raster."
+                    f"Valid sources are: earth_engine, local."
                 )
             if "path" not in spec or not spec.get("path"):
                 raise CatalogError(

@@ -1,29 +1,54 @@
 datasets:
 # LOCAL
   dem_local:
-    source: local_raster
+    source: local
     path: data/for_testing/dem/TG4NHB-dem.tif
     band: 1
 
   slope_local:
-    source: local_raster
+    source: local
     path: data/for_testing/dem/TG4NHB-dem.tif
     band: 2
 
   aspect_local:
-    source: local_raster
+    source: local
     path: data/for_testing/dem/TG4NHB-dem.tif
     band: 3
 
 # GOOGLE EARTH ENGINE
   dem_aster:
-    source: gee_raster
+    source: earth_engine
     path: projects/sat-io/open-datasets/ASTER/GDEM
 
   bioclim:
-    source: gee_raster
+    source: earth_engine
     path: WORLDCLIM/V1/BIO
 
   era5_monthly:
-    source: gee_raster
+    source: earth_engine
     path: ECMWF/ERA5/MONTHLY
+
+  dem_glo30:
+    source: earth_engine
+    path: COPERNICUS/DEM/GLO30
+
+  satellite_embeddings:
+    source: earth_engine
+    path: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
+
+  human_impact_index:
+    source: earth_engine
+    path: projects/HII/v1/hii
+
+  human_impact_index_drivers:
+    source: earth_engine
+    path: projects/HII/v1/driver/infrastructure # infrastructure used to pinpoint the path for all hii drivers
+
+  lulc_esa_worldcover_2021:
+    source: earth_engine
+    path: ESA/WorldCover/v200
+
+  lulc_cgls_lc100:
+    source: earth_engine
+    path: COPERNICUS/Landcover/100m/Proba-V-C3/Global
+
