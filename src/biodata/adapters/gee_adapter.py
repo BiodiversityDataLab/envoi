@@ -102,7 +102,13 @@ def _reduce_collection(col, reducer: str):
 
 
 def _filter_collection_by_date(col, date, feature_spec: dict):
-    """Filter a collection around a sample date using feature_spec config."""
+    """Filter a collection around a sample date using feature_spec config.
+
+    Priority:
+    1. Explicit start_date / end_date in feature_spec.
+    2. temporal_window_days — symmetric window around *date*.
+    3. Fallback — select the single closest image to *date* (±1 year).
+    """
     start_date = feature_spec.get("start_date")
     end_date = feature_spec.get("end_date")
 
@@ -164,11 +170,19 @@ def _apply_derived_band(img, derived: str):
     return img
 
 
-def _build_image(feature_spec: dict, date=None):
+def _build_image(feature_spec: dict, date=None, geometry=None):
     """Build an ee.Image from a feature_spec config dict.
 
-    Pipeline: load image/collection → date filter → cloud_pct filter →
-              cloud mask → reduce → band select → derived band.
+    Pipeline: load image/collection → bounds filter → date filter →
+              cloud_pct filter → cloud mask → reduce → band select →
+              derived band.
+
+    Parameters
+    ----------
+    geometry : ee.Geometry, optional
+        Point or region to spatially constrain the collection via
+        ``filterBounds``.  Essential for large tiled collections
+        (e.g. satellite embeddings with 97k global tiles).
     """
     img = None
 
@@ -177,6 +191,9 @@ def _build_image(feature_spec: dict, date=None):
 
     elif "collection" in feature_spec:
         col = ee.ImageCollection(feature_spec["collection"])
+
+        if geometry is not None:
+            col = col.filterBounds(geometry)
 
         if date is not None:
             col = _filter_collection_by_date(col, date, feature_spec)
@@ -191,7 +208,18 @@ def _build_image(feature_spec: dict, date=None):
         if cloud_mask:
             col = _apply_cloud_mask(col, cloud_mask)
 
-        reducer = feature_spec.get("collection_reducer", "mean")
+        reducer = feature_spec.get("collection_reducer")
+        if reducer is None:
+            if date is None and not feature_spec.get("start_date"):
+                # No date context — mosaic the full collection (static datasets)
+                reducer = "mosaic"
+            else:
+                # Date-filtered: mean for temporal windows, first for closest-image
+                has_window = (
+                    feature_spec.get("temporal_window_days")
+                    or (feature_spec.get("start_date") and feature_spec.get("end_date"))
+                )
+                reducer = "mean" if has_window else "first"
         img = _reduce_collection(col, reducer)
 
     else:
@@ -268,7 +296,7 @@ def _build_combined_reducer(reducer_names: Sequence[str]) -> tuple[ee.Reducer, l
         combined = combined.combine(reducer2=next_reducer, sharedInputs=True)
         suffixes.append(suffix)
 
-    return combined.unweighted(), suffixes
+    return combined, suffixes
 
 
 def _parse_reduce_result(
@@ -294,6 +322,41 @@ def _parse_reduce_result(
         if val is None and len(reducer_names) == 1:
             val = result.get(band_name)
         out[rname] = val
+
+    return out
+
+
+def _parse_multiband_result(
+    result: dict | None,
+    reducer_names: Sequence[str],
+    suffixes: list[str],
+) -> dict[str, float | None]:
+    """Parse reduceRegion output for multi-band images.
+
+    Returns a flat dict keyed as ``{band}_{reducer_name}`` for every band
+    present in *result*, e.g. ``{"bio01_mean": 27.0, "bio02_mean": 180.5}``.
+
+    GEE behaviour:
+    - Single reducer  → keys are bare band names (``{"bio01": 27.0}``)
+    - Combined reducer → keys are ``{band}{gee_suffix}`` (``{"bio01_mean": 27.0}``)
+    """
+    if not result:
+        return {}
+
+    out: dict[str, float | None] = {}
+    is_combined = len(reducer_names) > 1
+
+    for rname, gee_suffix in zip(reducer_names, suffixes):
+        if is_combined:
+            # Find all keys that end with the GEE suffix (e.g. "_mean")
+            for key, val in result.items():
+                if key.endswith(gee_suffix):
+                    band = key[: -len(gee_suffix)]
+                    out[f"{band}_{rname}"] = val
+        else:
+            # Single reducer: GEE uses bare band names as keys
+            for key, val in result.items():
+                out[f"{key}_{rname}"] = val
 
     return out
 
@@ -325,6 +388,7 @@ class GeeRasterAdapter:
     spec: Dict[str, Any]
     _static_image: Any = field(default=None, init=False, repr=False)
     _needs_per_point_date: bool = field(default=False, init=False, repr=False)
+    _native_proj: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if ee is None:
@@ -336,9 +400,9 @@ class GeeRasterAdapter:
         _ensure_gee_init()
 
         # feature_spec holds extra config (bands, date windows, derivatives, etc.)
-        # If absent, auto-detect asset type from GEE using ee.data.getAsset().
-        feature_spec = self.spec.get("feature_spec") or {}
-        if not feature_spec and self.spec.get("path"):
+        # Always auto-detect asset type from GEE, then merge with user config.
+        feature_spec = dict(self.spec.get("feature_spec") or {})
+        if self.spec.get("path") and "image" not in feature_spec and "collection" not in feature_spec:
             asset_id = self.spec["path"]
             try:
                 asset_info = ee.data.getAsset(asset_id)
@@ -350,12 +414,12 @@ class GeeRasterAdapter:
                 ) from e
             asset_type = asset_info.get("type")
             if asset_type == "IMAGE_COLLECTION":
-                feature_spec = {"collection": asset_id}
+                feature_spec["collection"] = asset_id
             else:
-                feature_spec = {"image": asset_id}
-            if self.spec.get("band"):
-                feature_spec["band"] = self.spec["band"]
+                feature_spec["image"] = asset_id
             logger.debug("Auto-detected %s as %s", asset_id, asset_type)
+        if self.spec.get("band") and "band" not in feature_spec:
+            feature_spec["band"] = self.spec["band"]
 
         self.scale = self.spec.get("resolution_m")  # None → use native scale
         self.crs = self.spec.get("crs", "EPSG:4326")
@@ -366,7 +430,30 @@ class GeeRasterAdapter:
         is_collection = "collection" in feature_spec
         has_global_dates = bool(feature_spec.get("start_date") and feature_spec.get("end_date"))
 
-        if not is_collection or has_global_dates:
+        # Cache the native projection from the source — composite images
+        # (mosaic, mean, etc.) lose per-band projection info, so we grab it
+        # from the first image of a collection or the image's first band.
+        if is_collection:
+            self._native_proj = (
+                ee.ImageCollection(feature_spec["collection"])
+                .first().select(0).projection()
+            )
+        elif "image" in feature_spec:
+            self._native_proj = ee.Image(feature_spec["image"]).select(0).projection()
+
+        # Pre-build a static image when the result doesn't depend on per-point dates:
+        # - Single IMAGE assets
+        # - Collections with fixed global date range
+        # - Undated collections without temporal config (mosaic is deterministic)
+        # Only defer to per-point building when temporal_window_days is set,
+        # meaning each point's date should select different imagery.
+        needs_per_point_date = (
+            is_collection
+            and not has_global_dates
+            and feature_spec.get("temporal_window_days") is not None
+        )
+
+        if not needs_per_point_date:
             self._static_image = _build_image(feature_spec)
             self._needs_per_point_date = False
         else:
@@ -381,12 +468,19 @@ class GeeRasterAdapter:
         cfg = self._feature_spec
         return f"gee://{cfg.get('image', cfg.get('collection', 'unknown'))}"
 
-    def _get_image(self, date=None) -> ee.Image:
-        """Return the ee.Image to sample, building per-point if needed."""
+    def _get_image(self, date=None, lat=None, lon=None) -> ee.Image:
+        """Return the ee.Image to sample, building per-point if needed.
+
+        Only rebuilds per-point when ``_needs_per_point_date`` is True
+        (i.e. the user set ``temporal_window_days`` in feature_spec).
+        For collections without temporal config the pre-built static mosaic
+        is always used, regardless of whether the input data has dates.
+        """
         if self._static_image is not None:
             return self._static_image
         dt = pd.to_datetime(date) if date is not None else None
-        return _build_image(self._feature_spec, dt)
+        geom = ee.Geometry.Point([lon, lat]) if lat is not None else None
+        return _build_image(self._feature_spec, dt, geometry=geom)
 
     def _get_band_name(self, img: ee.Image) -> str:
         """Get the first band name from the image (needed for result parsing)."""
@@ -405,22 +499,28 @@ class GeeRasterAdapter:
             try:
                 names = img.bandNames().getInfo()
                 self._cached_band_name = names[0] if names else "value"
+                # Cache band count for multi-band detection in _fetch_stats_single
+                self._cached_band_count = len(names)
             except Exception:
                 self._cached_band_name = "value"
+                self._cached_band_count = 1
         return self._cached_band_name
 
     def _get_scale(self, img):
         """Return user-specified scale or fall back to the image's native scale."""
         if self.scale is not None:
             return self.scale
-        return img.projection().nominalScale()
+        if self._native_proj is not None:
+            return self._native_proj.nominalScale()
+        return img.select(0).projection().nominalScale()
 
     def _get_scale_value(self, img) -> float:
         """Return scale as a plain Python float (metres). Fetches from GEE once and caches."""
         if self.scale is not None:
             return float(self.scale)
         if not hasattr(self, "_cached_native_scale"):
-            self._cached_native_scale = float(img.projection().nominalScale().getInfo())
+            proj = self._native_proj or img.select(0).projection()
+            self._cached_native_scale = float(proj.nominalScale().getInfo())
         return self._cached_native_scale
 
     def _make_region(self, lat: float, lon: float, window_m: int) -> ee.Geometry:
@@ -459,7 +559,7 @@ class GeeRasterAdapter:
 
     def _fetch_single(self, lat: float, lon: float, window_m: int, date=None):
         """Core pixel-array fetch for one point."""
-        img = self._get_image(date)
+        img = self._get_image(date, lat=lat, lon=lon)
         region = self._make_region(lat, lon, window_m)
 
         if window_m <= 0:
@@ -467,12 +567,10 @@ class GeeRasterAdapter:
         return self._sample_window(img, region, window_m)
 
     def _sample_pixel(self, img, region, window_m):
-        proj = img.projection()
         result = img.reduceRegion(
             reducer=ee.Reducer.first(),
             geometry=region,
             scale=self._get_scale(img),
-            crs=proj,
         ).getInfo()
 
         if not result:
@@ -550,21 +648,49 @@ class GeeRasterAdapter:
         suffixes: list[str],
         date=None,
     ):
-        """Compute server-side stats for a single point via reduceRegion."""
-        img = self._get_image(date)
-        band_name = self._get_band_name(img)
+        """Compute server-side stats for a single point via reduceRegion.
+
+        If no specific band is set in the feature_spec, all bands are reduced
+        and returned as ``{band}_{reducer}`` keys (e.g. ``bio01_mean``).
+        If a band is explicitly specified, returns ``{reducer}`` keys as usual.
+        """
+        img = self._get_image(date, lat=lat, lon=lon)
         region = self._make_region(lat, lon, window_m)
 
-        proj = img.projection()
-        result = img.reduceRegion(
+        utm_crs = _get_utm_crs(lon, lat)
+        native_m = self._get_scale_value(img)
+
+        # If the window is smaller than the native pixel size, expand the
+        # region so at least one pixel center falls inside it.
+        if window_m < native_m:
+            region = self._make_region(lat, lon, int(native_m * 2))
+
+        # Resolve band name (also populates _cached_band_count on first call)
+        band_name = self._get_band_name(img)
+        band_count = getattr(self, "_cached_band_count", 1)
+
+        # Use multi-band mode only when no specific band is requested AND the
+        # image actually has more than one band. Single-band images keep the
+        # simpler {reducer} key naming.
+        multiband = not self._feature_spec.get("band") and band_count > 1
+
+        if multiband:
+            img_to_reduce = img
+        else:
+            img_to_reduce = img.select(band_name)
+
+        result = img_to_reduce.reduceRegion(
             reducer=combined_reducer,
             geometry=region,
-            scale=proj.nominalScale(),
-            crs=proj,
+            scale=native_m,
+            crs=utm_crs,
             bestEffort=True,
         ).getInfo()
 
-        stats = _parse_reduce_result(result, band_name, reducer_names, suffixes)
+        if multiband:
+            stats = _parse_multiband_result(result, reducer_names, suffixes)
+        else:
+            stats = _parse_reduce_result(result, band_name, reducer_names, suffixes)
 
         # Build QC meta from a count reducer if available, else approximate
         n_pixels = None
@@ -593,7 +719,7 @@ class GeeRasterAdapter:
 
     def _fetch_point_single(self, lat: float, lon: float, date=None):
         """Sample a single pixel value at exact (lat, lon)."""
-        img = self._get_image(date)
+        img = self._get_image(date, lat=lat, lon=lon)
         point = ee.Geometry.Point([lon, lat])
 
         try:
@@ -646,7 +772,7 @@ class GeeRasterAdapter:
         if geemap is None:
             raise ImportError("geemap is required for image export: pip install geemap")
 
-        img = self._get_image(date)
+        img = self._get_image(date, lat=lat, lon=lon)
         # Use resample_m as the export scale when provided; fall back to native.
         scale_m = float(resample_m) if resample_m is not None else self._get_scale_value(img)
         utm = _get_utm_crs(lon, lat)
@@ -855,4 +981,4 @@ class GeeRasterAdapter:
 
 
 if _register is not None:
-    _register("gee_raster", GeeRasterAdapter)
+    _register("earth_engine", GeeRasterAdapter)
