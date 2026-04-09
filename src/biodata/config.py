@@ -137,17 +137,22 @@ def _load_catalog_any(src: Any) -> Dict[str, Any]:
 
 def load_catalogs(*sources: Any) -> Dict[str, Any]:
     """
-    Merge one or more catalogs (paths or dicts) into a single catalog.
-
-    Later sources override earlier ones on a per-predictor basis.
+    Merge one or more catalogs (paths, dicts, or lists of paths/dicts) into a
+    single catalog. Later sources override earlier ones on a per-predictor basis.
     Always returns: {'datasets': {...}}.
     """
     merged: Dict[str, Any] = {"datasets": {}}
 
+    flat = []
     for src in sources:
+        if isinstance(src, (list, tuple)):
+            flat.extend(src)
+        else:
+            flat.append(src)
+
+    for src in flat:
         cat = _load_catalog_any(src)
         for name, spec in cat.get("datasets", {}).items():
-            # override or add
             merged["datasets"][name] = spec
 
     return merged

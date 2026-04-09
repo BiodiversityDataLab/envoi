@@ -213,7 +213,7 @@ class TestMetadata:
         feat = meta["features"]["dem_local"]
         assert feat["source"] == "local"
         assert "native_crs" in feat
-        assert "native_scale_m" in feat
+        assert "native_spatial_resolution_m" in feat
 
         assert "quality" in meta
         assert "dem_local" in meta["quality"]

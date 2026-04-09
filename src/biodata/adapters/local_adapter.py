@@ -83,18 +83,30 @@ class LocalRasterAdapter(BaseAdapter):
             return (vals, meta) if return_meta else vals
 
         arr = self.src.read(self.band, window=win, masked=True)
+        # arr is 2D (H, W) for a single band int, 3D (n_bands, H, W) for a list
 
         if np.ma.isMaskedArray(arr):
             window_arr = arr.filled(self.src.nodata)
         else:
             window_arr = arr
 
-        total = arr.size
-        valid = np.count_nonzero(~arr.mask) if np.ma.isMaskedArray(arr) else np.isfinite(arr).sum()
+        # Coverage stats use the first (or only) band as representative
+        arr0 = arr[0] if arr.ndim == 3 else arr
+        total = arr0.size
+        valid = int(np.count_nonzero(~arr0.mask)) if np.ma.isMaskedArray(arr0) else int(np.isfinite(arr0).sum())
         had_nodata = bool(valid < total)
-        vals = arr.compressed() if np.ma.isMaskedArray(arr) else arr.ravel()
-        vals = vals[np.isfinite(vals)]
         coverage_pct = 100.0 * (valid / total) if total else 0.0
+
+        if arr.ndim == 3:
+            # Multi-band: return shape (n_bands, n_valid_pixels) so enrich.py can
+            # reduce per band and produce one column per band per reducer.
+            def _band_vals(b):
+                v = b.compressed() if np.ma.isMaskedArray(b) else b.ravel()
+                return v[np.isfinite(v)]
+            vals = np.stack([_band_vals(b) for b in arr], axis=0)
+        else:
+            vals = arr.compressed() if np.ma.isMaskedArray(arr) else arr.ravel()
+            vals = vals[np.isfinite(vals)]
 
         # JSON-safe transform (list of 6 floats) to avoid breaking metadata JSON
         affine = win_transform(win, self.src.transform)
@@ -139,6 +151,8 @@ class LocalRasterAdapter(BaseAdapter):
             _, meta = self.fetch_values(lat, lon, window_m, return_meta=True)
 
             arr2d = meta.get("window_arr")
+            if arr2d is not None and arr2d.ndim == 3:
+                arr2d = arr2d[0]  # raster export uses first band when multi-band
             transform_list = meta.get("transform")
             if arr2d is None or arr2d.size == 0 or transform_list is None:
                 paths.append(None)
@@ -193,25 +207,32 @@ class LocalRasterAdapter(BaseAdapter):
         """Sample the exact pixel value at each (lat, lon) coordinate."""
         transformer = Transformer.from_crs("EPSG:4326", self.raster_crs, always_xy=True)
         results = []
+        multiband = isinstance(self.band, list)
         for lat, lon in zip(lats, lons):
             try:
                 x, y = transformer.transform(lon, lat)
-                val = next(self.src.sample([(x, y)], indexes=self.band))[0]
+                raw = next(self.src.sample([(x, y)], indexes=self.band))
                 nodata = self.src.nodata
-                if nodata is not None and val == nodata:
-                    val = None
+                if multiband:
+                    values = {}
+                    for band_num, v in zip(self.band, raw):
+                        fv = None if (nodata is not None and v == nodata) else float(v)
+                        values[f"b{band_num}"] = fv
+                    any_valid = any(v is not None for v in values.values())
                 else:
-                    val = float(val)
-                values = {"point": val}
+                    v = raw[0]
+                    fv = None if (nodata is not None and v == nodata) else float(v)
+                    values = {"point": fv}
+                    any_valid = fv is not None
                 meta = {
-                    "in_extent": val is not None,
-                    "n_pixels": 1 if val is not None else 0,
-                    "had_nodata": val is None,
-                    "coverage_pct": 100.0 if val is not None else 0.0,
+                    "in_extent": any_valid,
+                    "n_pixels": 1 if any_valid else 0,
+                    "had_nodata": not any_valid,
+                    "coverage_pct": 100.0 if any_valid else 0.0,
                     "src_path": str(self.path),
                 }
             except Exception:
-                values = {"point": None}
+                values = {f"b{b}": None for b in self.band} if multiband else {"point": None}
                 meta = {
                     "in_extent": False, "n_pixels": 0,
                     "had_nodata": False, "coverage_pct": 0.0,

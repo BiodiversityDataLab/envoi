@@ -227,7 +227,7 @@ def _build_image(feature_spec: dict, date=None, geometry=None):
 
     band = feature_spec.get("band")
     if band is not None:
-        img = img.select(band)
+        img = img.select(band if isinstance(band, list) else [band])
 
     derived = feature_spec.get("derived_band")
     if derived:
@@ -485,8 +485,15 @@ class GeeRasterAdapter:
     def _get_band_name(self, img: ee.Image) -> str:
         """Get the first band name from the image (needed for result parsing)."""
         band = self._feature_spec.get("band")
-        if band:
+        if band and isinstance(band, str):
             return band
+        if band and isinstance(band, list):
+            # Populate band cache from the explicit list — no GEE API call needed
+            if not hasattr(self, "_cached_band_name"):
+                self._cached_band_name = band[0]
+                self._cached_band_names = band
+                self._cached_band_count = len(band)
+            return self._cached_band_name
         derived = self._feature_spec.get("derived_band")
         if derived:
             return derived
@@ -499,10 +506,11 @@ class GeeRasterAdapter:
             try:
                 names = img.bandNames().getInfo()
                 self._cached_band_name = names[0] if names else "value"
-                # Cache band count for multi-band detection in _fetch_stats_single
+                self._cached_band_names = names        # full list for metadata
                 self._cached_band_count = len(names)
             except Exception:
                 self._cached_band_name = "value"
+                self._cached_band_names = []
                 self._cached_band_count = 1
         return self._cached_band_name
 
@@ -669,10 +677,10 @@ class GeeRasterAdapter:
         band_name = self._get_band_name(img)
         band_count = getattr(self, "_cached_band_count", 1)
 
-        # Use multi-band mode only when no specific band is requested AND the
-        # image actually has more than one band. Single-band images keep the
-        # simpler {reducer} key naming.
-        multiband = not self._feature_spec.get("band") and band_count > 1
+        # Use multi-band mode when: no band specified (auto-detect all bands), OR
+        # a list of bands was specified. A single named band keeps simple {reducer} naming.
+        spec_band = self._feature_spec.get("band")
+        multiband = not isinstance(spec_band, str) and band_count > 1
 
         if multiband:
             img_to_reduce = img
