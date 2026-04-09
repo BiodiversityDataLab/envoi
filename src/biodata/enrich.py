@@ -12,7 +12,7 @@ from .reducers import get_reducer
 from .output import OutputManager
 from .config import load_catalogs
 from .qc import compute_qc_flags
-from .metadata import build_feature_meta, write_metadata
+from .metadata import build_feature_meta, build_tile_crs_zones, write_metadata
 
 
 def _load_yaml(path_or_dict):
@@ -25,7 +25,10 @@ def _load_yaml(path_or_dict):
 def enrich(
     df: pd.DataFrame,
     cfg: str | Path | dict | list,
-    catalog: str | Path | dict = "configs/catalog.yml",
+    catalog: str | Path | dict | list | tuple = (
+        "configs/ee_catalog.yml",
+        "configs/local_catalog.yml",
+    ),
     extra_catalog: str | Path | dict | None = None,
     out_dir: str | Path = "out",
 ) -> Dict[str, Path]:
@@ -95,9 +98,6 @@ def enrich(
             feature_meta_first: Dict[str, Any] | None = None
             dates = work.date.tolist() if "date" in work.columns else None
 
-            # Collect feature metadata (for all kinds)
-            feature_metas[p] = build_feature_meta(spec, adapter)
-
             # ----- kind: "raster" — export GeoTIFF tiles, skip stats -----
             if kind == "raster":
                 buf = buffers[0]
@@ -121,6 +121,11 @@ def enrich(
                     raise ValueError(
                         f"Source '{source}' does not support raster export."
                     )
+                tile_crs_zones = build_tile_crs_zones(work.lat, work.lon)
+                feature_metas[p] = build_feature_meta(
+                    spec, adapter,
+                    tile_crs_zones=tile_crs_zones,
+                )
                 outputs[f"{gname}:{p}"] = tiles_root / p
                 continue  # skip stats for this feature
 
@@ -210,16 +215,22 @@ def enrich(
                             feature_meta_first = meta
 
                     # Apply Python reducers
-                    if stats:
-                        for rname in stats:
-                            reducer = get_reducer(rname)
+                    # Multi-band local: vals are shape (n_bands, n_pixels); reduce per band.
+                    is_multiband_local = vals_list and vals_list[0].ndim == 2
+                    band_nums = adapter.band if is_multiband_local else None
+
+                    reducer_names_iter = list(stats) if stats else [spec.get("default_reducer", "mean")]
+                    for rname in reducer_names_iter:
+                        reducer = get_reducer(rname)
+                        if is_multiband_local:
+                            for b_idx, band_num in enumerate(band_nums):
+                                col = f"{p}_b{band_num}_{rname}_{buf}m"
+                                work[col] = [
+                                    (reducer(v[b_idx]) if v.size else None) for v in vals_list
+                                ]
+                        else:
                             col = f"{p}_{rname}_{buf}m"
                             work[col] = [(reducer(v) if v.size else None) for v in vals_list]
-                    else:
-                        default_r = spec.get("default_reducer", "mean")
-                        reducer = get_reducer(default_r)
-                        col = f"{p}_{default_r}_{buf}m"
-                        work[col] = [(reducer(v) if v.size else None) for v in vals_list]
 
                 # --- QA columns (also buffer-suffixed) ---
                 qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
@@ -237,6 +248,9 @@ def enrich(
                     "n_full": int((cov == 100).sum()),
                     "total": int(cov.shape[0]),
                 }
+
+            # Build feature metadata after fetching so band_names are cached
+            feature_metas[p] = build_feature_meta(spec, adapter)
 
         # --- after all features processed ---
         if kind == "tabular":
@@ -260,7 +274,7 @@ def enrich(
                 features=feature_metas,
                 config={
                     "reducers": stats,
-                    "buffer_sizes": buffers,
+                    "window_m": buffers[0],
                     "min_coverage_pct": min_cov,
                 },
                 quality=coverage_backlog,

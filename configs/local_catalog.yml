@@ -1,0 +1,16 @@
+datasets:
+
+  dem_local:
+    source: local
+    path: data/for_testing/dem/TG4NHB-dem.tif
+    band: 1
+
+  slope_local:
+    source: local
+    path: data/for_testing/dem/TG4NHB-dem.tif
+    band: 2
+
+  aspect_local:
+    source: local
+    path: data/for_testing/dem/TG4NHB-dem.tif
+    band: 3
