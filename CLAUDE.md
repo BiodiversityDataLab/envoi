@@ -88,7 +88,7 @@ dem_local:
 **Local auto-detection:** CRS, resolution, nodata, and band count are read from the
 file via rasterio (`_inspect_raster()`).
 
-**`feature_spec` block** (optional, GEE only): for advanced config like date filtering,
+**`feature_spec` block** (optional, GEE only): for advanced config like
 cloud masking, collection reducer, and derived bands:
 
 ```yaml
@@ -96,12 +96,16 @@ sen2_ndvi:
   source: earth_engine
   path: COPERNICUS/S2_SR_HARMONIZED
   feature_spec:
-    collection: COPERNICUS/S2_SR_HARMONIZED
-    temporal_window_days: 30
     cloud_pct_max: 20
     cloud_mask: s2
     derived_band: NDVI
 ```
+
+**Automatic date handling for ImageCollections:** when the input DataFrame
+has a `date` column, the adapter fetches the collection's available timestamps
+and selects the single nearest image to each point's date. Out-of-range dates
+are clamped to the closest boundary. When no `date` column is provided, the
+most recent image is used. Date decisions are recorded in the output metadata.
 
 ---
 
@@ -122,9 +126,9 @@ src/biodata/
         local_adapter.py← LocalRasterAdapter
 
 configs/
-    catalog.yml         ← dataset registry
+    ee_catalog.yml      ← GEE dataset registry
+    local_catalog.yml   ← local raster dataset registry
     run.yml             ← example single-output config
-    groups.yml          ← example multi-output config
 
 credentials/
     ee_credentials.json ← GEE service account key (gitignored)
