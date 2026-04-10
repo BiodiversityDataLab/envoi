@@ -11,8 +11,8 @@ from .adapters import get_adapter
 from .reducers import get_reducer
 from .output import OutputManager
 from .config import load_catalogs
-from .qc import compute_qc_flags
-from .metadata import build_feature_meta, build_tile_crs_zones, write_metadata
+from .qc import compute_qc_flags, extract_date_columns, extract_crs_column
+from .metadata import build_feature_meta, build_tile_crs_zones, write_metadata, summarize_date_info
 
 
 def _load_yaml(path_or_dict):
@@ -68,10 +68,10 @@ def enrich(
     else:
         raise ValueError("cfg must be a dict, list, or path to a YAML file.")
 
-    for idx, g in enumerate(output_list):
-        gname = g.get("name", f"output{idx+1}")
-        feats: List[str] = g.get("features") or g.get("predictors", [])
-        out_cfg = g.get("output", {}) or {}
+    for idx, group in enumerate(output_list):
+        gname = group.get("name", f"output{idx+1}")
+        feats: List[str] = group.get("features") or group.get("predictors", [])
+        out_cfg = group.get("output", {}) or {}
         kind = out_cfg.get("kind", "tabular")
 
         resample_m = out_cfg.get("resample_m")
@@ -79,11 +79,12 @@ def enrich(
         min_cov = out_cfg.get("min_coverage_pct", 80)
 
         stats = out_cfg.get("reducers")
-        buffers = [out_cfg.get("window_m", 500)]
+        buf = out_cfg.get("window_m", 500)
 
         work = df.copy()
         feature_metas: Dict[str, Any] = {}
         coverage_backlog: Dict[str, Dict[str, Dict[str, int]]] = {}
+        date_backlog: Dict[str, Any] = {}
 
         for p in feats:
             if p not in cat:
@@ -95,33 +96,50 @@ def enrich(
             adapter = AdapterCls(spec)
             coverage_backlog[p] = {}
 
-            feature_meta_first: Dict[str, Any] | None = None
             dates = work.date.tolist() if "date" in work.columns else None
 
             # ----- kind: "raster" — export GeoTIFF tiles, skip stats -----
             if kind == "raster":
-                buf = buffers[0]
-                ids = work["id"].tolist() if "id" in work.columns else None
-                dates_list = work.date.tolist() if "date" in work.columns else None
                 tiles_root = Path(out_dir) / gname
 
                 if hasattr(adapter, "export_images"):
-                    adapter.export_images(
+                    exported_paths = adapter.export_images(
                         work.lat, work.lon, buf, tiles_root,
-                        ids=ids, dates=dates_list, feature_name=p,
+                        ids=work["id"].tolist(), dates=dates, feature_name=p,
                         resample_m=resample_m,
                     )
                 elif hasattr(adapter, "export_windows"):
-                    adapter.export_windows(
+                    exported_paths = adapter.export_windows(
                         work.lat, work.lon, buf, tiles_root,
-                        ids=ids, feature_name=p,
+                        ids=work["id"].tolist(), feature_name=p,
                         resample_m=resample_m,
                     )
                 else:
                     raise ValueError(
                         f"Source '{source}' does not support raster export."
                     )
+                n_exported = sum(1 for ep in (exported_paths or []) if ep is not None)
+                coverage_backlog[p]["tiles"] = {
+                    "n_exported": n_exported,
+                    "n_failed": len(work) - n_exported,
+                    "total": len(work),
+                }
                 tile_crs_zones = build_tile_crs_zones(work.lat, work.lon)
+                # Band names are cached after stats fetching; for raster-only
+                # exports trigger the lookup via _get_image (works for both
+                # IMAGE assets and per-point-date collections).
+                if hasattr(adapter, "_get_band_name") and hasattr(adapter, "_get_image"):
+                    try:
+                        adapter._get_band_name(adapter._get_image())
+                    except Exception:
+                        pass
+                # Date info: build from _resolve_date_info (pure Python, no GEE calls)
+                if hasattr(adapter, "_resolve_date_info"):
+                    date_list_raster = dates if dates is not None else [None] * len(work)
+                    raster_meta_list = [adapter._resolve_date_info(d) for d in date_list_raster]
+                    date_summary = summarize_date_info(raster_meta_list)
+                    if date_summary is not None:
+                        date_backlog[p] = date_summary
                 feature_metas[p] = build_feature_meta(
                     spec, adapter,
                     tile_crs_zones=tile_crs_zones,
@@ -130,7 +148,7 @@ def enrich(
                 continue  # skip stats for this feature
 
             # ----- "point" reducer: exact pixel at coordinate, no window -----
-            if stats and "point" in list(stats):
+            if stats and "point" in stats:
                 if not hasattr(adapter, "fetch_points_batch"):
                     raise ValueError(
                         f"Source '{source}' does not support the 'point' reducer."
@@ -144,14 +162,21 @@ def enrich(
                     work[col] = [r[0].get(bk) for r in pt_results]
 
                 meta_list = [r[1] for r in pt_results]
-                if feature_meta_first is None:
-                    for m in meta_list:
-                        if m and m.get("in_extent"):
-                            feature_meta_first = m
-                            break
-
                 qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
                 qc_df = qc_df.add_prefix(f"{p}_").add_suffix("_point")
+                extra_dfs = []
+                date_df = extract_date_columns(meta_list)
+                if not date_df.empty:
+                    extra_dfs.append(date_df.add_prefix(f"{p}_").add_suffix("_point"))
+                    date_backlog[p] = summarize_date_info(meta_list)
+                crs_df = extract_crs_column(meta_list)
+                if not crs_df.empty:
+                    extra_dfs.append(crs_df.add_prefix(f"{p}_").add_suffix("_point"))
+                if extra_dfs:
+                    qc_df = pd.concat(
+                        [qc_df.reset_index(drop=True)] + [d.reset_index(drop=True) for d in extra_dfs],
+                        axis=1,
+                    )
                 work = pd.concat(
                     [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
                     axis=1,
@@ -162,10 +187,7 @@ def enrich(
                     "total": int(len(pt_results)),
                 }
 
-            for buf in buffers:
-                if stats and "point" in list(stats):
-                    break  # already handled above
-
+            else:
                 # ----- Server-side stats (GEE fast path) -----
                 use_server_stats = (
                     hasattr(adapter, "fetch_stats_batch")
@@ -186,11 +208,6 @@ def enrich(
                         work[col] = [r[0].get(key) for r in ss_results]
 
                     meta_list = [r[1] for r in ss_results]
-                    if feature_meta_first is None:
-                        for m in meta_list:
-                            if m and m.get("in_extent"):
-                                feature_meta_first = m
-                                break
 
                 else:
                     # ----- Python-side stats (local raster path) -----
@@ -211,8 +228,6 @@ def enrich(
                         arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
                         vals_list.append(arr)
                         meta_list.append(meta)
-                        if feature_meta_first is None and meta:
-                            feature_meta_first = meta
 
                     # Apply Python reducers
                     # Multi-band local: vals are shape (n_bands, n_pixels); reduce per band.
@@ -235,6 +250,19 @@ def enrich(
                 # --- QA columns (also buffer-suffixed) ---
                 qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
                 qc_df = qc_df.add_prefix(f"{p}_").add_suffix(f"_{buf}m")
+                extra_dfs = []
+                date_df = extract_date_columns(meta_list)
+                if not date_df.empty:
+                    extra_dfs.append(date_df.add_prefix(f"{p}_").add_suffix(f"_{buf}m"))
+                    date_backlog[p] = summarize_date_info(meta_list)
+                crs_df = extract_crs_column(meta_list)
+                if not crs_df.empty:
+                    extra_dfs.append(crs_df.add_prefix(f"{p}_").add_suffix(f"_{buf}m"))
+                if extra_dfs:
+                    qc_df = pd.concat(
+                        [qc_df.reset_index(drop=True)] + [d.reset_index(drop=True) for d in extra_dfs],
+                        axis=1,
+                    )
                 work = pd.concat(
                     [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
                     axis=1,
@@ -256,7 +284,9 @@ def enrich(
         if kind == "tabular":
             core_cols = [c for c in ("id", "lat", "lon", "date") if c in work.columns]
 
-            qc_keywords = ("_in_extent_", "_n_pixels_", "_had_nodata_", "_coverage_pct_")
+            qc_keywords = ("_in_extent_", "_n_pixels_", "_had_nodata_", "_coverage_pct_",
+                           "_image_date_used_", "_date_clamped_", "_date_source_",
+                           "_region_crs_")
             qc_cols = [c for c in work.columns if any(kw in c for kw in qc_keywords)]
             stats_cols = [c for c in work.columns if c not in qc_cols]
 
@@ -274,10 +304,11 @@ def enrich(
                 features=feature_metas,
                 config={
                     "reducers": stats,
-                    "window_m": buffers[0],
+                    "window_m": buf,
                     "min_coverage_pct": min_cov,
                 },
                 quality=coverage_backlog,
+                date_info=date_backlog if date_backlog else None,
             )
 
             outputs[gname] = stats_path
@@ -290,9 +321,11 @@ def enrich(
                 n_points=len(work),
                 features=feature_metas,
                 config={
-                    "window_m": buffers[0],
+                    "window_m": buf,
                     **({"resample_m": resample_m} if resample_m else {}),
                 },
+                quality=coverage_backlog if coverage_backlog else None,
+                date_info=date_backlog if date_backlog else None,
             )
         else:
             raise ValueError(f"Unknown output kind: {kind}")

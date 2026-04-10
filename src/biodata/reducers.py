@@ -79,6 +79,22 @@ def r_count(vals: Iterable) -> int:
     return int(np.isfinite(_to_array(vals)).sum())
 
 
+def r_mode(vals: Iterable) -> float:
+    """Most frequent value in the window.
+
+    For continuous data with no repeats, returns the smallest value
+    (equivalent to min). Ties between equally frequent values are broken
+    by returning the smallest. This matches the expected behaviour for
+    integer-coded rasters (e.g. land cover classes).
+    """
+    arr = _finite(vals)
+    maybe = _nan_if_empty(arr)
+    if maybe is not None:
+        return maybe
+    values, counts = np.unique(arr, return_counts=True)
+    return float(values[np.argmax(counts)])
+
+
 # ---------- quantiles ----------
 
 

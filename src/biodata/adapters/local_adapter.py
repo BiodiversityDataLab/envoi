@@ -73,6 +73,7 @@ class LocalRasterAdapter(BaseAdapter):
                 "coverage_pct": 0.0,
                 "window_m": int(window_m),
                 "raster_crs": str(self.raster_crs),
+                "region_crs": str(self.raster_crs),
                 # JSON-safe placeholders for dump feature:
                 "transform": None,
                 "dtype": None,
@@ -119,6 +120,7 @@ class LocalRasterAdapter(BaseAdapter):
             "coverage_pct": float(coverage_pct),
             "window_m": int(window_m),
             "raster_crs": str(self.raster_crs),
+            "region_crs": str(self.raster_crs),
             # NEW: fields needed to write window tiles
             "transform": transform_list,  # JSON-safe
             "dtype": str(self.src.dtypes[0]),

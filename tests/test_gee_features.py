@@ -90,7 +90,6 @@ class TestStaticDatasets:
         cat = {"datasets": {"era5": {
             "source": "earth_engine",
             "path": "ECMWF/ERA5/MONTHLY",
-            "feature_spec": {"temporal_window_days": 60},
         }}}
         df = _run_stats(SAMPLE_DF, "era5", cat, tmp_path)
         # ERA5 has 9 bands — check first one
@@ -102,7 +101,6 @@ class TestStaticDatasets:
         cat = {"datasets": {"sat_emb": {
             "source": "earth_engine",
             "path": "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL",
-            "feature_spec": {"temporal_window_days": 365},
         }}}
         df = _run_stats(SAMPLE_DF, "sat_emb", cat, tmp_path)
         # 64-band embeddings — check at least one
@@ -187,3 +185,36 @@ class TestRasterExport:
             with rasterio.open(tif) as src:
                 assert src.width == expected
                 assert src.height == expected
+
+
+# ------------------------------------------------------------------
+# Automatic date selection for ImageCollections
+# ------------------------------------------------------------------
+
+class TestAutoDateSelection:
+    """Verify automatic nearest-image date selection for collections."""
+
+    def test_collection_no_date_column(self, tmp_path):
+        """DataFrame without a date column should use most recent image."""
+        df_no_date = pd.DataFrame({
+            "id": ["A", "B"],
+            "lat": [62.9768783, 62.9812956],
+            "lon": [18.026823, 18.0309905],
+        })
+        cat = _make_catalog(("bioclim", "WORLDCLIM/V1/BIO"))
+        df = _run_stats(df_no_date, "bioclim", cat, tmp_path)
+        assert df["bioclim_bio01_mean_200m"].notna().all()
+
+    def test_date_clamping_to_range(self, tmp_path):
+        """Dates outside collection range should clamp to nearest boundary."""
+        df_old_date = pd.DataFrame({
+            "id": ["A", "B"],
+            "lat": [62.9768783, 62.9812956],
+            "lon": [18.026823, 18.0309905],
+            "date": ["1920-01-01", "2099-01-01"],
+        })
+        cat = _make_catalog(("era5", "ECMWF/ERA5/MONTHLY"))
+        df = _run_stats(df_old_date, "era5", cat, tmp_path)
+        era5_cols = [c for c in df.columns if c.startswith("era5_") and "_mean_" in c]
+        assert len(era5_cols) > 0
+        assert df[era5_cols[0]].notna().all()

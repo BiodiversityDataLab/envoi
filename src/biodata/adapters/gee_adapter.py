@@ -101,28 +101,37 @@ def _reduce_collection(col, reducer: str):
     return fn(col)
 
 
-def _filter_collection_by_date(col, date, feature_spec: dict):
-    """Filter a collection around a sample date using feature_spec config.
+def _get_collection_timestamps(collection_id: str) -> pd.DatetimeIndex | None:
+    """Fetch all image timestamps from a GEE ImageCollection.
 
-    Priority:
-    1. Explicit start_date / end_date in feature_spec.
-    2. temporal_window_days — symmetric window around *date*.
-    3. Fallback — select the single closest image to *date* (±1 year).
+    Returns a sorted DatetimeIndex or None if unavailable / fetch fails.
+    One getInfo() call, done once per dataset during __post_init__.
     """
-    start_date = feature_spec.get("start_date")
-    end_date = feature_spec.get("end_date")
+    try:
+        col = ee.ImageCollection(collection_id)
+        timestamps = col.aggregate_array("system:time_start").getInfo()
+        clean_ts = [int(t) for t in timestamps if t is not None]
+        if not clean_ts:
+            return None
+        return pd.to_datetime(clean_ts, unit="ms", origin="unix").sort_values()
+    except Exception as e:
+        logger.warning("Failed to fetch timestamps for %s: %s", collection_id, e)
+        return None
 
-    if start_date and end_date:
-        return col.filterDate(start_date, end_date)
 
-    days = feature_spec.get("temporal_window_days")
-    if days and date is not None:
-        half = (days - 1) / 2
-        start = (date - pd.DateOffset(days=half)).strftime("%Y-%m-%d")
-        end = (date + pd.DateOffset(days=half)).strftime("%Y-%m-%d")
-        return col.filterDate(start, end)
+def _find_nearest_timestamp(
+    timestamps: pd.DatetimeIndex, target: pd.Timestamp,
+) -> tuple[pd.Timestamp, bool]:
+    """Return the timestamp closest to *target*, clamping to range.
 
-    return col
+    Returns (nearest_timestamp, was_clamped).
+    """
+    if target <= timestamps.min():
+        return timestamps.min(), target < timestamps.min()
+    if target >= timestamps.max():
+        return timestamps.max(), target > timestamps.max()
+    idx = timestamps.get_indexer([target], method="nearest")[0]
+    return timestamps[idx], False
 
 
 def _mask_clouds_s2(image):
@@ -170,12 +179,22 @@ def _apply_derived_band(img, derived: str):
     return img
 
 
-def _build_image(feature_spec: dict, date=None, geometry=None):
+def _build_image(
+    feature_spec: dict,
+    date=None,
+    geometry=None,
+    collection_timestamps: pd.DatetimeIndex | None = None,
+):
     """Build an ee.Image from a feature_spec config dict.
 
-    Pipeline: load image/collection → bounds filter → date filter →
+    Pipeline: load image/collection → bounds filter → date selection →
               cloud_pct filter → cloud mask → reduce → band select →
               derived band.
+
+    For collections, the date handling strategy is:
+    - date provided + timestamps cached: find nearest timestamp, filterDate, .first()
+    - date provided + no timestamps (fallback): filterDate ±1 day, .first()
+    - no date: use collection_reducer (default "first" on most recent)
 
     Parameters
     ----------
@@ -183,6 +202,9 @@ def _build_image(feature_spec: dict, date=None, geometry=None):
         Point or region to spatially constrain the collection via
         ``filterBounds``.  Essential for large tiled collections
         (e.g. satellite embeddings with 97k global tiles).
+    collection_timestamps : pd.DatetimeIndex, optional
+        Cached timestamps for the collection. Used to find the nearest
+        image to the sample date.
     """
     img = None
 
@@ -195,11 +217,6 @@ def _build_image(feature_spec: dict, date=None, geometry=None):
         if geometry is not None:
             col = col.filterBounds(geometry)
 
-        if date is not None:
-            col = _filter_collection_by_date(col, date, feature_spec)
-        elif feature_spec.get("start_date") and feature_spec.get("end_date"):
-            col = col.filterDate(feature_spec["start_date"], feature_spec["end_date"])
-
         cloud_pct = feature_spec.get("cloud_pct_max")
         if cloud_pct is not None:
             col = col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_pct))
@@ -208,19 +225,23 @@ def _build_image(feature_spec: dict, date=None, geometry=None):
         if cloud_mask:
             col = _apply_cloud_mask(col, cloud_mask)
 
-        reducer = feature_spec.get("collection_reducer")
-        if reducer is None:
-            if date is None and not feature_spec.get("start_date"):
-                # No date context — mosaic the full collection (static datasets)
-                reducer = "mosaic"
-            else:
-                # Date-filtered: mean for temporal windows, first for closest-image
-                has_window = (
-                    feature_spec.get("temporal_window_days")
-                    or (feature_spec.get("start_date") and feature_spec.get("end_date"))
-                )
-                reducer = "mean" if has_window else "first"
-        img = _reduce_collection(col, reducer)
+        # --- Date-based image selection ---
+        if date is not None and collection_timestamps is not None:
+            nearest, _ = _find_nearest_timestamp(collection_timestamps, date)
+            start = nearest.strftime("%Y-%m-%d")
+            end = (nearest + pd.DateOffset(days=1)).strftime("%Y-%m-%d")
+            col = col.filterDate(start, end)
+            img = col.first()
+        elif date is not None:
+            # Fallback: no cached timestamps, use server-side filtering
+            start = (date - pd.DateOffset(days=1)).strftime("%Y-%m-%d")
+            end = (date + pd.DateOffset(days=1)).strftime("%Y-%m-%d")
+            col = col.filterDate(start, end)
+            img = col.first()
+        else:
+            # No date: use collection_reducer (default mosaic for backward compat)
+            reducer = feature_spec.get("collection_reducer", "mosaic")
+            img = _reduce_collection(col, reducer)
 
     else:
         raise ValueError("feature_spec must contain 'image' or 'collection'")
@@ -370,7 +391,7 @@ def _parse_multiband_result(
 class GeeRasterAdapter:
     """Adapter that samples data directly from Google Earth Engine.
 
-    Three extraction modes:
+    Four extraction modes:
 
     1. **fetch_batch / fetch_values** — raw pixel arrays via ``sampleRectangle``
        (feeds into Python-side reducers, same as LocalRasterAdapter).
@@ -379,10 +400,9 @@ class GeeRasterAdapter:
     3. **fetch_points_batch** — single pixel values via ``image.sample()``.
     4. **export_images** — download full GeoTIFF tiles via ``geemap``.
 
-    Additional capabilities:
-    - Dynamic UTM zone per point for accurate meter-based windows.
-    - Per-point temporal filtering for ImageCollections.
-    - Generic image building pipeline via module-level ``_build_image``.
+    For ImageCollections, the adapter automatically selects the nearest
+    image to each point's date. When no date is provided, the most
+    recent image is used.
     """
 
     spec: Dict[str, Any]
@@ -426,9 +446,18 @@ class GeeRasterAdapter:
         self.max_workers = self.spec.get("max_workers", 8)
         self._feature_spec = feature_spec
 
-        # Determine if we can pre-build a static image
+        # Warn about removed feature_spec keys
+        _deprecated = {"temporal_window_days", "start_date", "end_date"}
+        found = _deprecated & set(feature_spec)
+        if found:
+            logger.warning(
+                "feature_spec keys %s are deprecated and ignored. "
+                "Date selection is now automatic for ImageCollections.",
+                sorted(found),
+            )
+
         is_collection = "collection" in feature_spec
-        has_global_dates = bool(feature_spec.get("start_date") and feature_spec.get("end_date"))
+        self._collection_timestamps = None
 
         # Cache the native projection from the source — composite images
         # (mosaic, mean, etc.) lose per-band projection info, so we grab it
@@ -438,27 +467,21 @@ class GeeRasterAdapter:
                 ee.ImageCollection(feature_spec["collection"])
                 .first().select(0).projection()
             )
+            # Fetch available timestamps for automatic date selection
+            self._collection_timestamps = _get_collection_timestamps(
+                feature_spec["collection"]
+            )
+            # Collections with timestamps use per-point date selection;
+            # the static image is built lazily in _get_image when no date
+            # is provided (most-recent fallback).
+            self._needs_per_point_date = self._collection_timestamps is not None
+            if not self._needs_per_point_date:
+                # Timestamp fetch failed — fall back to static mosaic
+                self._static_image = _build_image(feature_spec)
         elif "image" in feature_spec:
             self._native_proj = ee.Image(feature_spec["image"]).select(0).projection()
-
-        # Pre-build a static image when the result doesn't depend on per-point dates:
-        # - Single IMAGE assets
-        # - Collections with fixed global date range
-        # - Undated collections without temporal config (mosaic is deterministic)
-        # Only defer to per-point building when temporal_window_days is set,
-        # meaning each point's date should select different imagery.
-        needs_per_point_date = (
-            is_collection
-            and not has_global_dates
-            and feature_spec.get("temporal_window_days") is not None
-        )
-
-        if not needs_per_point_date:
             self._static_image = _build_image(feature_spec)
             self._needs_per_point_date = False
-        else:
-            self._static_image = None
-            self._needs_per_point_date = True
 
     # ------------------------------------------------------------------
     # Internals
@@ -468,19 +491,69 @@ class GeeRasterAdapter:
         cfg = self._feature_spec
         return f"gee://{cfg.get('image', cfg.get('collection', 'unknown'))}"
 
+    def _resolve_date_info(self, date=None) -> dict:
+        """Compute date metadata for a single point fetch.
+
+        Returns a dict with image_date_used, date_clamped, date_source
+        to be merged into the per-point meta dict.
+        """
+        if self._collection_timestamps is None:
+            return {}
+
+        if date is None:
+            # No-date fallback: most recent image
+            most_recent = self._collection_timestamps.max()
+            return {
+                "image_date_used": most_recent.strftime("%Y-%m-%d"),
+                "date_clamped": False,
+                "date_source": "most_recent_no_date",
+            }
+
+        dt = pd.to_datetime(date)
+        nearest, was_clamped = _find_nearest_timestamp(self._collection_timestamps, dt)
+        return {
+            "image_date_used": nearest.strftime("%Y-%m-%d"),
+            "date_clamped": was_clamped,
+            "date_source": "clamped_to_nearest" if was_clamped else "nearest_to_sample",
+        }
+
     def _get_image(self, date=None, lat=None, lon=None) -> ee.Image:
         """Return the ee.Image to sample, building per-point if needed.
 
-        Only rebuilds per-point when ``_needs_per_point_date`` is True
-        (i.e. the user set ``temporal_window_days`` in feature_spec).
-        For collections without temporal config the pre-built static mosaic
-        is always used, regardless of whether the input data has dates.
+        For IMAGE assets the pre-built static image is always returned.
+        For ImageCollections:
+        - date provided → select nearest image to that date
+        - no date → use most recent image (cached after first call)
         """
-        if self._static_image is not None:
+        # IMAGE assets or already-cached fallback
+        if date is None and self._static_image is not None:
             return self._static_image
-        dt = pd.to_datetime(date) if date is not None else None
+
+        # Collection with no date: select most recent image, cache it
+        if date is None and self._needs_per_point_date:
+            if self._static_image is None:
+                most_recent = self._collection_timestamps.max()
+                logger.info(
+                    "No date provided for collection %s; using most recent image (%s).",
+                    self._feature_spec.get("collection"),
+                    most_recent.strftime("%Y-%m-%d"),
+                )
+                self._static_image = _build_image(
+                    self._feature_spec,
+                    date=most_recent,
+                    collection_timestamps=self._collection_timestamps,
+                )
+                self._date_source = "most_recent_no_date"
+                self._image_date_used = most_recent
+            return self._static_image
+
+        # Per-point date selection
+        dt = pd.to_datetime(date)
         geom = ee.Geometry.Point([lon, lat]) if lat is not None else None
-        return _build_image(self._feature_spec, dt, geometry=geom)
+        return _build_image(
+            self._feature_spec, dt, geometry=geom,
+            collection_timestamps=self._collection_timestamps,
+        )
 
     def _get_band_name(self, img: ee.Image) -> str:
         """Get the first band name from the image (needed for result parsing)."""
@@ -497,10 +570,6 @@ class GeeRasterAdapter:
         derived = self._feature_spec.get("derived_band")
         if derived:
             return derived
-        if self._feature_spec.get("derivative") == "slope":
-            return "slope"
-        if self._feature_spec.get("derivative") == "aspect":
-            return "aspect"
         # Fallback: ask GEE (costs one getInfo call, cached after first use)
         if not hasattr(self, "_cached_band_name"):
             try:
@@ -569,12 +638,13 @@ class GeeRasterAdapter:
         """Core pixel-array fetch for one point."""
         img = self._get_image(date, lat=lat, lon=lon)
         region = self._make_region(lat, lon, window_m)
+        utm = _get_utm_crs(lon, lat)
 
         if window_m <= 0:
-            return self._sample_pixel(img, region, window_m)
-        return self._sample_window(img, region, window_m)
+            return self._sample_pixel(img, region, window_m, utm)
+        return self._sample_window(img, region, window_m, utm)
 
-    def _sample_pixel(self, img, region, window_m):
+    def _sample_pixel(self, img, region, window_m, utm: str = ""):
         result = img.reduceRegion(
             reducer=ee.Reducer.first(),
             geometry=region,
@@ -596,6 +666,7 @@ class GeeRasterAdapter:
             "coverage_pct": 100.0,
             "window_m": int(window_m),
             "raster_crs": self.crs,
+            "region_crs": utm,
             "transform": None,
             "dtype": "float64",
             "nodata": None,
@@ -604,7 +675,7 @@ class GeeRasterAdapter:
         }
         return vals, meta
 
-    def _sample_window(self, img, region, window_m):
+    def _sample_window(self, img, region, window_m, utm: str = ""):
         result = img.sampleRectangle(
             region=region,
             defaultValue=-9999,
@@ -634,6 +705,7 @@ class GeeRasterAdapter:
             "coverage_pct": 100.0 * (valid_count / total) if total else 0.0,
             "window_m": int(window_m),
             "raster_crs": self.crs,
+            "region_crs": utm,
             "transform": None,
             "dtype": "float64",
             "nodata": None,
@@ -713,11 +785,13 @@ class GeeRasterAdapter:
             "coverage_pct": 100.0 if has_values else 0.0,
             "window_m": int(window_m),
             "raster_crs": self.crs,
+            "region_crs": utm_crs,
             "transform": None,
             "dtype": "float64",
             "nodata": None,
             "src_path": self._src_label(),
             "window_arr": None,
+            **self._resolve_date_info(date),
         }
         return stats, meta
 
@@ -742,17 +816,21 @@ class GeeRasterAdapter:
         except Exception:
             props = None
 
+        date_info = self._resolve_date_info(date)
+
         if not props:
             return {}, {
                 "in_extent": False, "n_pixels": 0,
                 "had_nodata": False, "coverage_pct": 0.0,
                 "src_path": self._src_label(),
+                **date_info,
             }
 
         return props, {
             "in_extent": True, "n_pixels": 1,
             "had_nodata": False, "coverage_pct": 100.0,
             "src_path": self._src_label(),
+            **date_info,
         }
 
     # ------------------------------------------------------------------

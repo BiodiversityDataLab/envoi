@@ -66,15 +66,18 @@ datasets:
 
     # --- Optional: GEE feature_spec ---
     feature_spec:
-      temporal_window_days: 30          # Filter collection to +/- N days around each point's date
-      start_date: "2020-01-01"          # Fixed date range (overrides temporal_window_days)
-      end_date: "2020-12-31"
       cloud_pct_max: 20                 # Filter scenes by CLOUDY_PIXEL_PERCENTAGE
       cloud_mask: s2                    # Apply cloud mask function ("s2" for Sentinel-2)
-      collection_reducer: mosaic        # How to reduce collection to single image
+      collection_reducer: mosaic        # How to reduce collection when no date column provided
                                         # Options: mosaic, mean, median, mode, min, max, sum, first
-                                        # Default: mosaic (undated) or mean (date-filtered)
+                                        # Default: mosaic. Ignored when date column is present.
       derived_band: NDVI                # Compute derived band: NDVI, EVI, slope, aspect
+
+    # Date handling for ImageCollections is automatic:
+    # - If the input DataFrame has a 'date' column, the nearest image to
+    #   each point's date is selected. Out-of-range dates are clamped to
+    #   the closest available image.
+    # - If no 'date' column is provided, the most recent image is used.
 
   dem_local:
     source: local
