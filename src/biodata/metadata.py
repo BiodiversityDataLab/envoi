@@ -6,6 +6,24 @@ from datetime import datetime, timezone
 from typing import Sequence
 
 
+def summarize_date_info(meta_list: list[dict]) -> dict | None:
+    """Summarise per-point date decisions for inclusion in group metadata.
+
+    Returns None when the meta dicts contain no date info (e.g. local rasters
+    or IMAGE assets where date selection does not apply).
+    """
+    if not meta_list or "image_date_used" not in meta_list[0]:
+        return None
+    sources = [m.get("date_source", "") for m in meta_list]
+    dates_used = sorted({m["image_date_used"] for m in meta_list if m.get("image_date_used")})
+    return {
+        "n_nearest_to_sample": sum(1 for s in sources if s == "nearest_to_sample"),
+        "n_clamped_to_nearest": sum(1 for s in sources if s == "clamped_to_nearest"),
+        "n_most_recent_no_date": sum(1 for s in sources if s == "most_recent_no_date"),
+        "image_dates_used": dates_used,
+    }
+
+
 def build_tile_crs_zones(lats: Sequence[float], lons: Sequence[float]) -> list[str]:
     """Return the sorted unique UTM EPSG codes for a set of sample points.
 
@@ -74,6 +92,20 @@ def build_feature_meta(
     elif hasattr(adapter, "raster_crs"):
         meta["tile_crs"] = str(adapter.raster_crs)
 
+    # Collection date range and date selection info
+    timestamps = getattr(adapter, "_collection_timestamps", None)
+    if timestamps is not None and len(timestamps) > 0:
+        meta["collection_date_range"] = [
+            timestamps.min().strftime("%Y-%m-%d"),
+            timestamps.max().strftime("%Y-%m-%d"),
+        ]
+    date_source = getattr(adapter, "_date_source", None)
+    if date_source:
+        meta["date_source"] = date_source
+    image_date_used = getattr(adapter, "_image_date_used", None)
+    if image_date_used is not None:
+        meta["image_date_used"] = image_date_used.strftime("%Y-%m-%d")
+
     if spec.get("license"):
         meta["license"] = spec["license"]
 
@@ -89,14 +121,16 @@ def write_metadata(
     features: dict,
     config: dict,
     quality: dict | None = None,
+    date_info: dict | None = None,
 ) -> Path:
     """Write a sidecar metadata JSON for a group output.
 
     Structure:
-      run      — when and how (auto-generated)
-      config   — what the user requested
-      features — per-feature source details
-      quality  — per-feature coverage summary (tabular only)
+      run       — when and how (auto-generated)
+      config    — what the user requested
+      features  — per-feature source details
+      quality   — per-feature coverage summary (tabular only)
+      date_info — per-feature date selection summary (GEE collections only)
     """
     from . import __version__
 
@@ -107,7 +141,7 @@ def write_metadata(
             "n_points": n_points,
         },
         "config": {
-            "group": group_name,
+            "name": group_name,
             **config,
         },
         "features": features,
@@ -115,6 +149,9 @@ def write_metadata(
 
     if quality:
         meta["quality"] = quality
+
+    if date_info:
+        meta["date_info"] = date_info
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
