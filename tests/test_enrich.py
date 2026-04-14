@@ -22,7 +22,7 @@ CATALOG = {
         "slope_local": {
             "source": "local",
             "path": str(DEM_TIF),
-            "band": 2,
+            "bands": 2,
         },
     }
 }
