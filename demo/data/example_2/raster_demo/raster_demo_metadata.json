@@ -1,0 +1,52 @@
+{
+  "run": {
+    "timestamp": "2026-04-14T08:20:17Z",
+    "package_version": "0.1.2",
+    "n_points": 6
+  },
+  "config": {
+    "name": "raster_demo",
+    "window_m": 200,
+    "resample_m": 25
+  },
+  "features": {
+    "dem_glo30": {
+      "source": "earth_engine",
+      "path": "COPERNICUS/DEM/GLO30",
+      "asset_type": "IMAGE_COLLECTION",
+      "native_crs": "EPSG:4326",
+      "native_spatial_resolution_m": 30.92,
+      "band_names": [
+        "DEM"
+      ],
+      "tile_crs": [
+        "EPSG:32634"
+      ],
+      "collection_date_range": [
+        "2006-01-01",
+        "2006-01-01"
+      ],
+      "date_source": "most_recent_no_date",
+      "image_date_used": "2006-01-01"
+    }
+  },
+  "quality": {
+    "dem_glo30": {
+      "tiles": {
+        "n_exported": 6,
+        "n_failed": 0,
+        "total": 6
+      }
+    }
+  },
+  "date_info": {
+    "dem_glo30": {
+      "n_nearest_to_sample": 0,
+      "n_clamped_to_nearest": 6,
+      "n_most_recent_no_date": 0,
+      "image_dates_used": [
+        "2006-01-01"
+      ]
+    }
+  }
+}
