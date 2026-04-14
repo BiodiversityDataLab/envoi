@@ -65,13 +65,13 @@ datasets:
     data_type: continuous               # "continuous" or "categorical"
                                         # Affects default reducer (mean vs point) and
                                         # warns if inappropriate reducers are requested.
-    band: 1                             # Optional: select specific band (name or index)
+    bands: 1                            # Optional: select specific band (name or index)
 
-    # --- Optional: GEE feature_spec ---
-    feature_spec:
+    # --- Optional: GEE dataset_spec ---
+    dataset_spec:
       cloud_pct_max: 20                 # Filter scenes by CLOUDY_PIXEL_PERCENTAGE
       cloud_mask: s2                    # Apply cloud mask function ("s2" for Sentinel-2)
-      derived_band: NDVI                # Compute derived band: NDVI, EVI, slope, aspect
+      derived_bands: NDVI                # Compute derived band: NDVI, EVI, slope, aspect
 
     # Date handling for ImageCollections is automatic:
     # - If the input DataFrame has a 'date' column, the nearest image to
@@ -82,7 +82,7 @@ datasets:
   dem_local:
     source: local
     path: data/dem/my_dem.tif
-    band: 1                             # Optional, defaults to band 1
+    bands: 1                            # Optional, defaults to band 1
     # CRS, resolution, nodata are auto-detected from the file
 
 

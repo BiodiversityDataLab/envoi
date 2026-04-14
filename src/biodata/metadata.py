@@ -53,8 +53,8 @@ def build_feature_meta(
 
     # Asset type
     if spec.get("source") == "earth_engine":
-        feature_spec = getattr(adapter, "_feature_spec", {})
-        if "collection" in feature_spec:
+        dataset_spec = getattr(adapter, "_dataset_spec", {})
+        if "collection" in dataset_spec:
             meta["asset_type"] = "IMAGE_COLLECTION"
         else:
             meta["asset_type"] = "IMAGE"
