@@ -80,26 +80,6 @@ def _snap_to_grid(coord: float, scale: float) -> float:
 # Image building (collection reduction, date filtering, cloud masking, derived bands)
 # ---------------------------------------------------------------------------
 
-_COLLECTION_REDUCERS = {
-    "mean":   lambda col: col.mean(),
-    "median": lambda col: col.median(),
-    "mode":   lambda col: col.mode(),
-    "mosaic": lambda col: col.mosaic(),
-    "min":    lambda col: col.min(),
-    "max":    lambda col: col.max(),
-    "sum":    lambda col: col.sum(),
-    "first":  lambda col: col.first(),
-}
-
-
-def _reduce_collection(col, reducer: str):
-    """Reduce an ImageCollection to a single Image using *reducer* name."""
-    fn = _COLLECTION_REDUCERS.get(reducer)
-    if fn is None:
-        logger.warning("Unknown collection reducer '%s', falling back to mean", reducer)
-        return col.mean()
-    return fn(col)
-
 
 def _get_collection_timestamps(collection_id: str) -> pd.DatetimeIndex | None:
     """Fetch all image timestamps from a GEE ImageCollection.
@@ -194,7 +174,7 @@ def _build_image(
     For collections, the date handling strategy is:
     - date provided + timestamps cached: find nearest timestamp, filterDate, .first()
     - date provided + no timestamps (fallback): filterDate ±1 day, .first()
-    - no date: use collection_reducer (default "first" on most recent)
+    - no date: mosaic (most recent non-masked pixel per position)
 
     Parameters
     ----------
@@ -239,9 +219,8 @@ def _build_image(
             col = col.filterDate(start, end)
             img = col.first()
         else:
-            # No date: use collection_reducer (default mosaic for backward compat)
-            reducer = feature_spec.get("collection_reducer", "mosaic")
-            img = _reduce_collection(col, reducer)
+            # No date: mosaic (most recent non-masked pixel per position)
+            img = col.mosaic()
 
     else:
         raise ValueError("feature_spec must contain 'image' or 'collection'")
@@ -441,7 +420,7 @@ class GeeRasterAdapter:
         if self.spec.get("band") and "band" not in feature_spec:
             feature_spec["band"] = self.spec["band"]
 
-        self.scale = self.spec.get("resolution_m")  # None → use native scale
+        self.scale = None  # always use the dataset's native resolution
         self.crs = self.spec.get("crs", "EPSG:4326")
         self.max_workers = self.spec.get("max_workers", 8)
         self._feature_spec = feature_spec

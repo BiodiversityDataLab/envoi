@@ -3,12 +3,15 @@ from __future__ import annotations
 from typing import List, Dict, Any
 from pathlib import Path
 
+import logging
+
 import pandas as pd
 import yaml
 import numpy as np
+from pyproj import Transformer
 
 from .adapters import get_adapter
-from .reducers import get_reducer
+from .reducers import get_reducer, validate_reducers
 from .output import OutputManager
 from .config import load_catalogs
 from .qc import compute_qc_flags, extract_date_columns, extract_crs_column
@@ -22,6 +25,9 @@ def _load_yaml(path_or_dict):
         return yaml.safe_load(f)
 
 
+logger = logging.getLogger(__name__)
+
+
 def enrich(
     df: pd.DataFrame,
     cfg: str | Path | dict | list,
@@ -31,6 +37,7 @@ def enrich(
     ),
     extra_catalog: str | Path | dict | None = None,
     out_dir: str | Path = "out",
+    input_crs: str | None = None,
 ) -> Dict[str, Path]:
     """Enrich sample points with environmental data.
 
@@ -43,6 +50,13 @@ def enrich(
             "output": {"kind": "tabular", "reducers": ["mean"], "window_m": 200},
         })
 
+    Parameters
+    ----------
+    input_crs : str, optional
+        EPSG code or proj string for the input coordinates (e.g. "EPSG:32634").
+        If provided, lat/lon columns are reprojected to WGS84 (EPSG:4326)
+        before extraction. If omitted, coordinates are assumed to be WGS84.
+
     Returns a mapping of output-key -> Path written.
     """
     required = {"id", "lat", "lon"}
@@ -52,6 +66,40 @@ def enrich(
             f"Input DataFrame is missing required column(s): {sorted(missing)}.\n"
             f"Expected columns: id, lat, lon (and optionally: date).\n"
             f"Found columns: {sorted(df.columns.tolist())}"
+        )
+
+    df = df.copy()
+
+    if input_crs is not None:
+        input_crs_upper = input_crs.upper()
+        if input_crs_upper != "EPSG:4326" and input_crs_upper != "WGS84":
+            logger.info("Reprojecting coordinates from %s to WGS84.", input_crs)
+            transformer = Transformer.from_crs(input_crs, "EPSG:4326", always_xy=True)
+            lons, lats = transformer.transform(
+                df["lon"].values, df["lat"].values,
+            )
+            df["lon"] = lons
+            df["lat"] = lats
+
+    # Validate WGS84 coordinate ranges
+    bad_lat_mask = df["lat"].abs() > 90
+    bad_lon_mask = df["lon"].abs() > 180
+    bad_mask = bad_lat_mask | bad_lon_mask
+    if bad_mask.any():
+        bad_rows = df.loc[bad_mask, ["id", "lat", "lon"]]
+        problems = []
+        if bad_lat_mask.any():
+            problems.append(
+                f"lat values outside ±90°"
+            )
+        if bad_lon_mask.any():
+            problems.append(
+                f"lon values outside ±180°"
+            )
+        raise ValueError(
+            f"Coordinates appear to not be in WGS84 (EPSG:4326): {'; '.join(problems)}.\n"
+            f"Rows with invalid coordinates:\n{bad_rows.to_string(index=False)}\n"
+            f"If your coordinates are in a different CRS, pass input_crs='EPSG:XXXX'"
         )
 
     catalog_dict = load_catalogs(catalog, extra_catalog)
@@ -85,18 +133,25 @@ def enrich(
         feature_metas: Dict[str, Any] = {}
         coverage_backlog: Dict[str, Dict[str, Dict[str, int]]] = {}
         date_backlog: Dict[str, Any] = {}
+        warnings_backlog: Dict[str, str] = {}
 
         for p in feats:
             if p not in cat:
                 raise KeyError(f"Feature '{p}' not found in catalog {catalog}")
             spec = cat[p]
             source = spec.get("source")
+            data_type = spec.get("data_type")
 
             AdapterCls = get_adapter(source)
             adapter = AdapterCls(spec)
             coverage_backlog[p] = {}
 
             dates = work.date.tolist() if "date" in work.columns else None
+
+            if stats:
+                w = validate_reducers(list(stats), data_type, p)
+                if w:
+                    warnings_backlog[p] = w
 
             # ----- kind: "raster" — export GeoTIFF tiles, skip stats -----
             if kind == "raster":
@@ -234,7 +289,8 @@ def enrich(
                     is_multiband_local = vals_list and vals_list[0].ndim == 2
                     band_nums = adapter.band if is_multiband_local else None
 
-                    reducer_names_iter = list(stats) if stats else [spec.get("default_reducer", "mean")]
+                    default = "point" if data_type == "categorical" else "mean"
+                    reducer_names_iter = list(stats) if stats else [spec.get("default_reducer", default)]
                     for rname in reducer_names_iter:
                         reducer = get_reducer(rname)
                         if is_multiband_local:
@@ -309,6 +365,7 @@ def enrich(
                 },
                 quality=coverage_backlog,
                 date_info=date_backlog if date_backlog else None,
+                warnings=warnings_backlog if warnings_backlog else None,
             )
 
             outputs[gname] = stats_path
@@ -326,6 +383,7 @@ def enrich(
                 },
                 quality=coverage_backlog if coverage_backlog else None,
                 date_info=date_backlog if date_backlog else None,
+                warnings=warnings_backlog if warnings_backlog else None,
             )
         else:
             raise ValueError(f"Unknown output kind: {kind}")
