@@ -48,11 +48,13 @@ def build_feature_meta(
         "source": spec.get("source"),
         "path": spec.get("path"),
     }
+    if spec.get("data_type"):
+        meta["data_type"] = spec["data_type"]
 
     # Asset type
     if spec.get("source") == "earth_engine":
-        feature_spec = getattr(adapter, "_feature_spec", {})
-        if "collection" in feature_spec:
+        dataset_spec = getattr(adapter, "_dataset_spec", {})
+        if "collection" in dataset_spec:
             meta["asset_type"] = "IMAGE_COLLECTION"
         else:
             meta["asset_type"] = "IMAGE"
@@ -122,6 +124,7 @@ def write_metadata(
     config: dict,
     quality: dict | None = None,
     date_info: dict | None = None,
+    warnings: dict | None = None,
 ) -> Path:
     """Write a sidecar metadata JSON for a group output.
 
@@ -131,6 +134,7 @@ def write_metadata(
       features  — per-feature source details
       quality   — per-feature coverage summary (tabular only)
       date_info — per-feature date selection summary (GEE collections only)
+      warnings  — per-feature warnings raised during the run (e.g. wrong reducer for data type)
     """
     from . import __version__
 
@@ -152,6 +156,9 @@ def write_metadata(
 
     if date_info:
         meta["date_info"] = date_info
+
+    if warnings:
+        meta["warnings"] = warnings
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
