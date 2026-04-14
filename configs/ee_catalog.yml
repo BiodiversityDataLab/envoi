@@ -1,38 +1,80 @@
 datasets:
 
+  # ── Example / reference entry ────────────────────────────────────────────
+  # Remove or replace this block when adding a real dataset.
+  # All fields except source, path and data_type are optional.
+  dataset_name:
+    source: earth_engine
+    path: path/to/dataset_on_earth_engine   # GEE asset ID; type (IMAGE / IMAGE_COLLECTION) is auto-detected
+    data_type: type                 # "continuous" or "categorical"
+
+    # Band selection — if omitted, all bands are loaded
+    band: [list, of, bands]                 # single string ("DEM") or list (["B4", "B8"])
+
+    feature_spec:
+      # ── Cloud masking (Sentinel-2 only for now) ─────────────────────────
+      cloud_pct_max: 20                     # pre-filter: keep images with < 20 % cloud cover
+      cloud_mask: s2                        # pixel-level mask using QA60 band
+
+      # ── Derived spectral indices ─────────────────────────────────────────
+      # Computes the index and discards the raw bands.
+      # Options: NDVI, EVI, slope, aspect
+      derived_band: NDVI
+
+    dataset_information:
+      # Optional free-form metadata fields, written to metadata JSON.
+      # These are not used by EDDP itself, but can be useful for users.
+      description: "A brief description of the dataset."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/path_to_dataset"
+      source_url: "https://example.com/dataset-info"
+      citation: "Author et al. (Year). Title. Journal. DOI."
+      license: "CC-BY-4.0"
+  # ─────────────────────────────────────────────────────────────────────────
+
   dem_aster:
     source: earth_engine
     path: projects/sat-io/open-datasets/ASTER/GDEM
+    data_type: continuous
 
   dem_glo30:
     source: earth_engine
     path: COPERNICUS/DEM/GLO30
+    data_type: continuous
     band: [DEM]
 
   bioclim:
     source: earth_engine
     path: WORLDCLIM/V1/BIO
+    data_type: continuous
 
   era5_monthly:
     source: earth_engine
     path: ECMWF/ERA5/MONTHLY
+    data_type: continuous
 
   satellite_embeddings:
     source: earth_engine
     path: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
+    data_type: continuous
 
   human_impact_index:
     source: earth_engine
     path: projects/HII/v1/hii
+    data_type: continuous
 
   human_impact_index_drivers: # not working atm
     source: earth_engine
     path: projects/HII/v1/driver/infrastructure
+    data_type: continuous
 
   lulc_esa_worldcover_2021:
     source: earth_engine
     path: ESA/WorldCover/v200
+    data_type: categorical
+
 
   lulc_cgls_lc100: # not working atm
     source: earth_engine
     path: COPERNICUS/Landcover/100m/Proba-V-C3/Global
+    data_type: categorical
+
