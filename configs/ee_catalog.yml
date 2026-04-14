@@ -1,25 +1,21 @@
 datasets:
 
   # ── Example / reference entry ────────────────────────────────────────────
-  # Remove or replace this block when adding a real dataset.
+  # Copy this block when adding a real dataset.
   # All fields except source, path and data_type are optional.
-  dataset_name:
+  dataset_name:  # provide a unique name for this dataset e.g. "sentinel_2_l2a"
     source: earth_engine
     path: path/to/dataset_on_earth_engine   # GEE asset ID; type (IMAGE / IMAGE_COLLECTION) is auto-detected
     data_type: type                 # "continuous" or "categorical"
 
     # Band selection — if omitted, all bands are loaded
-    band: [list, of, bands]                 # single string ("DEM") or list (["B4", "B8"])
+    bands: [list, of, bands]                 # single string ("DEM") or list (["B4", "B8"])
 
-    feature_spec:
-      # ── Cloud masking (Sentinel-2 only for now) ─────────────────────────
+    dataset_spec: # dataset-specific pre-processing and feature engineering options
+      # This example is for Sentinel-2 Level-2A, but other datasets may have different options.
       cloud_pct_max: 20                     # pre-filter: keep images with < 20 % cloud cover
       cloud_mask: s2                        # pixel-level mask using QA60 band
-
-      # ── Derived spectral indices ─────────────────────────────────────────
-      # Computes the index and discards the raw bands.
-      # Options: NDVI, EVI, slope, aspect
-      derived_band: NDVI
+      derived_bands: NDVI                    # add a derived band (e.g. NDVI) to the dataset
 
     dataset_information:
       # Optional free-form metadata fields, written to metadata JSON.
@@ -40,7 +36,7 @@ datasets:
     source: earth_engine
     path: COPERNICUS/DEM/GLO30
     data_type: continuous
-    band: [DEM]
+    bands: [DEM]
 
   bioclim:
     source: earth_engine

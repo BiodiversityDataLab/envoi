@@ -142,7 +142,7 @@ def _apply_cloud_mask(col, mask_type: str):
     return col.map(fn)
 
 
-def _apply_derived_band(img, derived: str):
+def _apply_derived_bandss(img, derived: str):
     """Compute a derived band from an image (NDVI, EVI, slope, aspect)."""
     if derived == "NDVI":
         return img.normalizedDifference(["B8", "B4"]).rename("NDVI")
@@ -155,17 +155,17 @@ def _apply_derived_band(img, derived: str):
         return ee.Terrain.slope(img)
     if derived == "aspect":
         return ee.Terrain.aspect(img)
-    logger.warning("Unknown derived_band '%s', returning image unchanged", derived)
+    logger.warning("Unknown derived_bands '%s', returning image unchanged", derived)
     return img
 
 
 def _build_image(
-    feature_spec: dict,
+    dataset_spec: dict,
     date=None,
     geometry=None,
     collection_timestamps: pd.DatetimeIndex | None = None,
 ):
-    """Build an ee.Image from a feature_spec config dict.
+    """Build an ee.Image from a dataset_spec config dict.
 
     Pipeline: load image/collection → bounds filter → date selection →
               cloud_pct filter → cloud mask → reduce → band select →
@@ -188,20 +188,20 @@ def _build_image(
     """
     img = None
 
-    if "image" in feature_spec:
-        img = ee.Image(feature_spec["image"])
+    if "image" in dataset_spec:
+        img = ee.Image(dataset_spec["image"])
 
-    elif "collection" in feature_spec:
-        col = ee.ImageCollection(feature_spec["collection"])
+    elif "collection" in dataset_spec:
+        col = ee.ImageCollection(dataset_spec["collection"])
 
         if geometry is not None:
             col = col.filterBounds(geometry)
 
-        cloud_pct = feature_spec.get("cloud_pct_max")
+        cloud_pct = dataset_spec.get("cloud_pct_max")
         if cloud_pct is not None:
             col = col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_pct))
 
-        cloud_mask = feature_spec.get("cloud_mask")
+        cloud_mask = dataset_spec.get("cloud_mask")
         if cloud_mask:
             col = _apply_cloud_mask(col, cloud_mask)
 
@@ -223,15 +223,15 @@ def _build_image(
             img = col.mosaic()
 
     else:
-        raise ValueError("feature_spec must contain 'image' or 'collection'")
+        raise ValueError("dataset_spec must contain 'image' or 'collection'")
 
-    band = feature_spec.get("band")
+    band = dataset_spec.get("bands")
     if band is not None:
         img = img.select(band if isinstance(band, list) else [band])
 
-    derived = feature_spec.get("derived_band")
+    derived = dataset_spec.get("derived_bands")
     if derived:
-        img = _apply_derived_band(img, derived)
+        img = _apply_derived_bandss(img, derived)
 
     return img
 
@@ -398,10 +398,10 @@ class GeeRasterAdapter:
 
         _ensure_gee_init()
 
-        # feature_spec holds extra config (bands, date windows, derivatives, etc.)
+        # dataset_spec holds extra config (bands, date windows, derivatives, etc.)
         # Always auto-detect asset type from GEE, then merge with user config.
-        feature_spec = dict(self.spec.get("feature_spec") or {})
-        if self.spec.get("path") and "image" not in feature_spec and "collection" not in feature_spec:
+        dataset_spec = dict(self.spec.get("dataset_spec") or {})
+        if self.spec.get("path") and "image" not in dataset_spec and "collection" not in dataset_spec:
             asset_id = self.spec["path"]
             try:
                 asset_info = ee.data.getAsset(asset_id)
@@ -413,29 +413,29 @@ class GeeRasterAdapter:
                 ) from e
             asset_type = asset_info.get("type")
             if asset_type == "IMAGE_COLLECTION":
-                feature_spec["collection"] = asset_id
+                dataset_spec["collection"] = asset_id
             else:
-                feature_spec["image"] = asset_id
+                dataset_spec["image"] = asset_id
             logger.debug("Auto-detected %s as %s", asset_id, asset_type)
-        if self.spec.get("band") and "band" not in feature_spec:
-            feature_spec["band"] = self.spec["band"]
+        if self.spec.get("bands") and "bands" not in dataset_spec:
+            dataset_spec["bands"] = self.spec["bands"]
 
         self.scale = None  # always use the dataset's native resolution
         self.crs = self.spec.get("crs", "EPSG:4326")
         self.max_workers = self.spec.get("max_workers", 8)
-        self._feature_spec = feature_spec
+        self._dataset_spec = dataset_spec
 
-        # Warn about removed feature_spec keys
+        # Warn about removed dataset_spec keys
         _deprecated = {"temporal_window_days", "start_date", "end_date"}
-        found = _deprecated & set(feature_spec)
+        found = _deprecated & set(dataset_spec)
         if found:
             logger.warning(
-                "feature_spec keys %s are deprecated and ignored. "
+                "dataset_spec keys %s are deprecated and ignored. "
                 "Date selection is now automatic for ImageCollections.",
                 sorted(found),
             )
 
-        is_collection = "collection" in feature_spec
+        is_collection = "collection" in dataset_spec
         self._collection_timestamps = None
 
         # Cache the native projection from the source — composite images
@@ -443,12 +443,12 @@ class GeeRasterAdapter:
         # from the first image of a collection or the image's first band.
         if is_collection:
             self._native_proj = (
-                ee.ImageCollection(feature_spec["collection"])
+                ee.ImageCollection(dataset_spec["collection"])
                 .first().select(0).projection()
             )
             # Fetch available timestamps for automatic date selection
             self._collection_timestamps = _get_collection_timestamps(
-                feature_spec["collection"]
+                dataset_spec["collection"]
             )
             # Collections with timestamps use per-point date selection;
             # the static image is built lazily in _get_image when no date
@@ -456,10 +456,10 @@ class GeeRasterAdapter:
             self._needs_per_point_date = self._collection_timestamps is not None
             if not self._needs_per_point_date:
                 # Timestamp fetch failed — fall back to static mosaic
-                self._static_image = _build_image(feature_spec)
-        elif "image" in feature_spec:
-            self._native_proj = ee.Image(feature_spec["image"]).select(0).projection()
-            self._static_image = _build_image(feature_spec)
+                self._static_image = _build_image(dataset_spec)
+        elif "image" in dataset_spec:
+            self._native_proj = ee.Image(dataset_spec["image"]).select(0).projection()
+            self._static_image = _build_image(dataset_spec)
             self._needs_per_point_date = False
 
     # ------------------------------------------------------------------
@@ -467,7 +467,7 @@ class GeeRasterAdapter:
     # ------------------------------------------------------------------
 
     def _src_label(self) -> str:
-        cfg = self._feature_spec
+        cfg = self._dataset_spec
         return f"gee://{cfg.get('image', cfg.get('collection', 'unknown'))}"
 
     def _resolve_date_info(self, date=None) -> dict:
@@ -514,11 +514,11 @@ class GeeRasterAdapter:
                 most_recent = self._collection_timestamps.max()
                 logger.info(
                     "No date provided for collection %s; using most recent image (%s).",
-                    self._feature_spec.get("collection"),
+                    self._dataset_spec.get("collection"),
                     most_recent.strftime("%Y-%m-%d"),
                 )
                 self._static_image = _build_image(
-                    self._feature_spec,
+                    self._dataset_spec,
                     date=most_recent,
                     collection_timestamps=self._collection_timestamps,
                 )
@@ -530,13 +530,13 @@ class GeeRasterAdapter:
         dt = pd.to_datetime(date)
         geom = ee.Geometry.Point([lon, lat]) if lat is not None else None
         return _build_image(
-            self._feature_spec, dt, geometry=geom,
+            self._dataset_spec, dt, geometry=geom,
             collection_timestamps=self._collection_timestamps,
         )
 
     def _get_band_name(self, img: ee.Image) -> str:
         """Get the first band name from the image (needed for result parsing)."""
-        band = self._feature_spec.get("band")
+        band = self._dataset_spec.get("bands")
         if band and isinstance(band, str):
             return band
         if band and isinstance(band, list):
@@ -546,7 +546,7 @@ class GeeRasterAdapter:
                 self._cached_band_names = band
                 self._cached_band_count = len(band)
             return self._cached_band_name
-        derived = self._feature_spec.get("derived_band")
+        derived = self._dataset_spec.get("derived_bands")
         if derived:
             return derived
         # Fallback: ask GEE (costs one getInfo call, cached after first use)
@@ -709,7 +709,7 @@ class GeeRasterAdapter:
     ):
         """Compute server-side stats for a single point via reduceRegion.
 
-        If no specific band is set in the feature_spec, all bands are reduced
+        If no specific band is set in the dataset_spec, all bands are reduced
         and returned as ``{band}_{reducer}`` keys (e.g. ``bio01_mean``).
         If a band is explicitly specified, returns ``{reducer}`` keys as usual.
         """
@@ -730,7 +730,7 @@ class GeeRasterAdapter:
 
         # Use multi-band mode when: no band specified (auto-detect all bands), OR
         # a list of bands was specified. A single named band keeps simple {reducer} naming.
-        spec_band = self._feature_spec.get("band")
+        spec_band = self._dataset_spec.get("bands")
         multiband = not isinstance(spec_band, str) and band_count > 1
 
         if multiband:

@@ -34,7 +34,7 @@ class LocalRasterAdapter(BaseAdapter):
         self.raster_crs = self.src.crs
 
         # Band selection: 1-indexed, defaults to 1
-        self.band = self.spec.get("band", 1)
+        self.band = self.spec.get("bands", 1)
 
     @staticmethod
     def _get_utm_crs(lon: float, lat: float) -> str:
