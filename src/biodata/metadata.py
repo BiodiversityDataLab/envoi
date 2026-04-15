@@ -108,8 +108,9 @@ def build_feature_meta(
     if image_date_used is not None:
         meta["image_date_used"] = image_date_used.strftime("%Y-%m-%d")
 
-    if spec.get("license"):
-        meta["license"] = spec["license"]
+    dataset_info = spec.get("dataset_information")
+    if dataset_info:
+        meta["dataset_information"] = dataset_info
 
     return meta
 
