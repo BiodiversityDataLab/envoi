@@ -21,3 +21,6 @@ geemap>=0.36
 # Dev / testing
 black>=24.0
 pytest>=8.0
+
+# Notebook / Jupyter kernel support
+ipykernel>=6.0

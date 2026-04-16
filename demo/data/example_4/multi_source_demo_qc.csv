@@ -1,0 +1,7 @@
+id,lat,lon,date,dem_glo30_in_extent_500m,dem_glo30_n_pixels_500m,dem_glo30_had_nodata_500m,dem_glo30_coverage_pct_500m,dem_glo30_image_date_used_500m,dem_glo30_date_clamped_500m,dem_glo30_date_source_500m,dem_glo30_region_crs_500m,dem_local_in_extent_500m,dem_local_n_pixels_500m,dem_local_had_nodata_500m,dem_local_coverage_pct_500m,dem_local_region_crs_500m
+T2T1DJ,62.9768783,18.026823,2020-06-01,True,1,False,100.0,2006-01-01,True,clamped_to_nearest,EPSG:32634,True,2601,True,0.03844675124951942,EPSG:32634
+T6WPKD,62.9812956,18.0309905,2020-06-01,True,1,False,100.0,2006-01-01,True,clamped_to_nearest,EPSG:32634,True,2601,True,0.03844675124951942,EPSG:32634
+TCSZX1,62.9766708,18.0211542,2020-06-01,True,1,False,100.0,2006-01-01,True,clamped_to_nearest,EPSG:32634,True,2601,True,0.03844675124951942,EPSG:32634
+TG4NHB,62.9768433,18.0306489,2020-06-01,True,1,False,100.0,2006-01-01,True,clamped_to_nearest,EPSG:32634,True,2601,True,0.03844675124951942,EPSG:32634
+TVCC3Y,62.9767733,18.0167185,2020-06-01,True,1,False,100.0,2006-01-01,True,clamped_to_nearest,EPSG:32634,True,2601,True,0.03844675124951942,EPSG:32634
+TVNBV7,62.9786799,18.0311984,2020-06-01,True,1,False,100.0,2006-01-01,True,clamped_to_nearest,EPSG:32634,True,2601,True,0.03844675124951942,EPSG:32634
