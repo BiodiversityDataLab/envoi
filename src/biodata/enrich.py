@@ -73,7 +73,7 @@ def enrich(
     if input_crs is not None:
         input_crs_upper = input_crs.upper()
         if input_crs_upper != "EPSG:4326" and input_crs_upper != "WGS84":
-            logger.info("Reprojecting coordinates from %s to WGS84.", input_crs)
+            logger.info(f"Reprojecting coordinates from {input_crs} to WGS84.")
             transformer = Transformer.from_crs(input_crs, "EPSG:4326", always_xy=True)
             lons, lats = transformer.transform(
                 df["lon"].values, df["lat"].values,

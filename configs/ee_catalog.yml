@@ -8,7 +8,7 @@ datasets:
     path: path/to/dataset_on_earth_engine   # GEE asset ID; type (IMAGE / IMAGE_COLLECTION) is auto-detected
     data_type: type                 # "continuous" or "categorical"
 
-    # Band selection — if omitted, all bands are loaded
+    # Band selection - if omitted, all bands are loaded
     bands: [list, of, bands]                 # single string ("DEM") or list (["B4", "B8"])
 
     dataset_spec: # dataset-specific pre-processing and feature engineering options
@@ -27,50 +27,92 @@ datasets:
       license: "CC-BY-4.0"
   # ─────────────────────────────────────────────────────────────────────────
 
-  dem_aster:
-    source: earth_engine
-    path: projects/sat-io/open-datasets/ASTER/GDEM
-    data_type: continuous
-
   dem_glo30:
     source: earth_engine
     path: COPERNICUS/DEM/GLO30
     data_type: continuous
     bands: [DEM]
+    dataset_information:
+      description: "Copernicus DEM GLO-30 - global 30m digital surface model derived from TanDEM-X radar data."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_DEM_GLO30"
+      source_url: "https://dataspace.copernicus.eu/sites/default/files/media/files/2024-06/geo1988-copernicusdem-spe-002_producthandbook_i5.0.pdf"
+      citation: "© DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved."
+      license: "Copernicus Data License (free for most uses)"
 
   bioclim:
     source: earth_engine
     path: WORLDCLIM/V1/BIO
     data_type: continuous
+    dataset_information:
+      description: "WorldClim v1 bioclimatic variables - 19 variables derived from temperature and precipitation, ~1km resolution."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/WORLDCLIM_V1_BIO"
+      source_url: "https://www.worldclim.org/data/bioclim.html"
+      citation: "Hijmans, R.J., Cameron, S.E., Parra, J.L., Jones, P.G., & Jarvis, A. (2005). Very high resolution interpolated climate surfaces for global land areas. International Journal of Climatology, 25, 1965–1978."
+      license: "CC-BY-SA-4.0"
 
   era5_monthly:
     source: earth_engine
     path: ECMWF/ERA5/MONTHLY
     data_type: continuous
+    dataset_information:
+      description: "ERA5 monthly aggregates - global climate reanalysis from ECMWF covering 1979–present, ~27.8km resolution."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/ECMWF_ERA5_MONTHLY"
+      source_url: "https://www.ecmwf.int/en/forecasts/dataset/ecmwf-reanalysis-v5"
+      citation: "Copernicus Climate Change Service (C3S) (2017): ERA5: Fifth generation of ECMWF atmospheric reanalyses of the global climate. Copernicus Climate Change Service Climate Data Store (CDS), (date of access), https://cds.climate.copernicus.eu/cdsapp#!/home"
+      license: "Copernicus C3S/CAMS License"
 
   satellite_embeddings:
     source: earth_engine
     path: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
     data_type: continuous
+    dataset_information:
+      description: "Google Satellite Embeddings V1 - annual 64-dimensional embeddings for 2017-2025, 10m resolution."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/GOOGLE_SATELLITE_EMBEDDING_V1_ANNUAL"
+      source_url: "http://arxiv.org/abs/2507.22291"
+      citation: "Brown, C. F., Kazmierski, M. R., Pasquarella, V J., Rucklidge, W. J., Samsikova, M., Zhang, C., Shelhamer, E., Lahera, E., Wiles, O., Ilyushchenko, S., Gorelick, N., Zhang, L. L., Alj, S., Schechter, E., Askay, S., Guinan, O., Moore, R., Boukouvalas, A., & Kohli, P.(2025). AlphaEarth Foundations: An embedding field model for accurate and efficient global mapping from sparse label data. arXiv preprint arXiv.2507.22291. "
+      license: "CC-BY-4.0"
 
   human_impact_index:
     source: earth_engine
     path: projects/HII/v1/hii
     data_type: continuous
+    dataset_information:
+      description: "Human Impact Index (HII) - cumulative measure of human influence on terrestrial ecosystems."
+      ee_source_url: "https://code.earthengine.google.com/f904097220e577cad2e0dc5379371c91"
+      source_url: "https://wcshumanfootprint.org/"
+      citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
+      license: "CC BY-NC-SA-3.0"
 
   human_impact_index_drivers: # not working atm
     source: earth_engine
     path: projects/HII/v1/driver/infrastructure
     data_type: continuous
+    dataset_information:
+      description: "Human Impact Index - driver layers for HII (roads, railways, water etc.)."
+      ee_source_url: "https://code.earthengine.google.com/f904097220e577cad2e0dc5379371c91"
+      source_url: "https://wcshumanfootprint.org/"
+      citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
+      license: "CC BY-NC-SA-3.0"
 
   lulc_esa_worldcover_2021:
     source: earth_engine
     path: ESA/WorldCover/v200
     data_type: categorical
-
+    dataset_information:
+      description: "ESA WorldCover 2021 - global 10m land use / land cover map with 11 classes."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/ESA_WorldCover_v200"
+      source_url: "https://esa-worldcover.org"
+      citation: "Zanaga, D., Van De Kerchove, R., Daems, D., De Keersmaecker, W., Brockmann, C., Kirches, G., Wevers, J., Cartus, O., Santoro, M., Fritz, S., Lesiv, M., Herold, M., Tsendbazar, N.E., Xu, P., Ramoino, F., Arino, O., 2022. ESA WorldCover 10 m 2021 v200."
+      license: "CC-BY-4.0"
 
   lulc_cgls_lc100: # not working atm
     source: earth_engine
     path: COPERNICUS/Landcover/100m/Proba-V-C3/Global
     data_type: categorical
+    dataset_information:
+      description: "Copernicus Global Land Service Land Cover 100m - annual global land cover maps at 100m resolution."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_Landcover_100m_Proba-V-C3_Global"
+      source_url: "https://land.copernicus.eu/global/products/lc"
+      citation: "Buchhorn, M., Smets, B., Bertels, L., Roo, B. D., Lesiv, M., Tsendbazar, N.-E., Herold, M., & Fritz, S. (2020). Copernicus Global Land Service: Land Cover 100m: collection 3: epoch 2019: Globe (Version V3.0.1) [Data set]. Zenodo."
+      license: "Fully free and open to all users"
 
