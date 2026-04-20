@@ -76,7 +76,8 @@ def enrich(
             logger.info(f"Reprojecting coordinates from {input_crs} to WGS84.")
             transformer = Transformer.from_crs(input_crs, "EPSG:4326", always_xy=True)
             lons, lats = transformer.transform(
-                df["lon"].values, df["lat"].values,
+                df["lon"].values,
+                df["lat"].values,
             )
             df["lon"] = lons
             df["lat"] = lats
@@ -89,13 +90,9 @@ def enrich(
         bad_rows = df.loc[bad_mask, ["id", "lat", "lon"]]
         problems = []
         if bad_lat_mask.any():
-            problems.append(
-                f"lat values outside ±90°"
-            )
+            problems.append("lat values outside ±90°")
         if bad_lon_mask.any():
-            problems.append(
-                f"lon values outside ±180°"
-            )
+            problems.append("lon values outside ±180°")
         raise ValueError(
             f"Coordinates appear to not be in WGS84 (EPSG:4326): {'; '.join(problems)}.\n"
             f"Rows with invalid coordinates:\n{bad_rows.to_string(index=False)}\n"
@@ -159,20 +156,27 @@ def enrich(
 
                 if hasattr(adapter, "export_images"):
                     exported_paths = adapter.export_images(
-                        work.lat, work.lon, buf, tiles_root,
-                        ids=work["id"].tolist(), dates=dates, feature_name=p,
+                        work.lat,
+                        work.lon,
+                        buf,
+                        tiles_root,
+                        ids=work["id"].tolist(),
+                        dates=dates,
+                        feature_name=p,
                         resample_m=resample_m,
                     )
                 elif hasattr(adapter, "export_windows"):
                     exported_paths = adapter.export_windows(
-                        work.lat, work.lon, buf, tiles_root,
-                        ids=work["id"].tolist(), feature_name=p,
+                        work.lat,
+                        work.lon,
+                        buf,
+                        tiles_root,
+                        ids=work["id"].tolist(),
+                        feature_name=p,
                         resample_m=resample_m,
                     )
                 else:
-                    raise ValueError(
-                        f"Source '{source}' does not support raster export."
-                    )
+                    raise ValueError(f"Source '{source}' does not support raster export.")
                 n_exported = sum(1 for ep in (exported_paths or []) if ep is not None)
                 coverage_backlog[p]["tiles"] = {
                     "n_exported": n_exported,
@@ -196,7 +200,8 @@ def enrich(
                     if date_summary is not None:
                         date_backlog[p] = date_summary
                 feature_metas[p] = build_feature_meta(
-                    spec, adapter,
+                    spec,
+                    adapter,
                     tile_crs_zones=tile_crs_zones,
                 )
                 outputs[f"{gname}:{p}"] = tiles_root / p
@@ -206,15 +211,16 @@ def enrich(
             has_window = any(r != "point" for r in (stats or []))
             qc_suffix = f"_{buf}m" if has_window else "_point"
 
-            use_server_stats = (
-                hasattr(adapter, "fetch_stats_batch")
-                and stats
-            )
+            use_server_stats = hasattr(adapter, "fetch_stats_batch") and stats
 
             if use_server_stats:
                 reducer_names = list(stats)
                 ss_results = adapter.fetch_stats_batch(
-                    work.lat, work.lon, buf, reducer_names, dates=dates,
+                    work.lat,
+                    work.lon,
+                    buf,
+                    reducer_names,
+                    dates=dates,
                 )
                 # Use actual result keys — for multi-band datasets these are
                 # "{band}_{reducer}" (e.g. "bio01_mean"); for single-band just
@@ -234,8 +240,11 @@ def enrich(
                 # ----- Python-side stats fallback (adapters without fetch_stats_batch) -----
                 if hasattr(adapter, "fetch_batch"):
                     results = adapter.fetch_batch(
-                        work.lat, work.lon, buf,
-                        dates=dates, return_meta=True,
+                        work.lat,
+                        work.lon,
+                        buf,
+                        dates=dates,
+                        return_meta=True,
                     )
                 else:
                     results = [
@@ -254,7 +263,9 @@ def enrich(
                 band_nums = adapter.band if is_multiband_local else None
 
                 default = "point" if data_type == "categorical" else "mean"
-                reducer_names_iter = list(stats) if stats else [spec.get("default_reducer", default)]
+                reducer_names_iter = (
+                    list(stats) if stats else [spec.get("default_reducer", default)]
+                )
                 for rname in reducer_names_iter:
                     if rname == "point":
                         continue
@@ -262,9 +273,7 @@ def enrich(
                     if is_multiband_local:
                         for b_idx, band_num in enumerate(band_nums):
                             col = f"{p}_b{band_num}_{rname}_{buf}m"
-                            work[col] = [
-                                (reducer(v[b_idx]) if v.size else None) for v in vals_list
-                            ]
+                            work[col] = [(reducer(v[b_idx]) if v.size else None) for v in vals_list]
                     else:
                         col = f"{p}_{rname}_{buf}m"
                         work[col] = [(reducer(v) if v.size else None) for v in vals_list]
@@ -308,9 +317,16 @@ def enrich(
         if kind == "tabular":
             core_cols = [c for c in ("id", "lat", "lon", "date") if c in work.columns]
 
-            qc_keywords = ("_in_extent_", "_n_pixels_", "_had_nodata_", "_coverage_pct_",
-                           "_image_date_used_", "_date_clamped_", "_date_source_",
-                           "_region_crs_")
+            qc_keywords = (
+                "_in_extent_",
+                "_n_pixels_",
+                "_had_nodata_",
+                "_coverage_pct_",
+                "_image_date_used_",
+                "_date_clamped_",
+                "_date_source_",
+                "_region_crs_",
+            )
             qc_cols = [c for c in work.columns if any(kw in c for kw in qc_keywords)]
             stats_cols = [c for c in work.columns if c not in qc_cols]
 
@@ -322,7 +338,8 @@ def enrich(
             qc_path = group_om.write_tabular(qc_df, f"{gname}_qc")
 
             write_metadata(
-                out_dir, gname,
+                out_dir,
+                gname,
                 kind=kind,
                 n_points=len(work),
                 features=feature_metas,
@@ -341,7 +358,8 @@ def enrich(
 
         elif kind == "raster":
             write_metadata(
-                Path(out_dir) / gname, gname,
+                Path(out_dir) / gname,
+                gname,
                 kind=kind,
                 n_points=len(work),
                 features=feature_metas,

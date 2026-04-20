@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import pandas as pd
 
-
 _DATE_META_KEYS = ("image_date_used", "date_clamped", "date_source")
 
 

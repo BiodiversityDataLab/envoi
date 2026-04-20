@@ -100,7 +100,8 @@ def _get_collection_timestamps(collection_id: str) -> pd.DatetimeIndex | None:
 
 
 def _find_nearest_timestamp(
-    timestamps: pd.DatetimeIndex, target: pd.Timestamp,
+    timestamps: pd.DatetimeIndex,
+    target: pd.Timestamp,
 ) -> tuple[pd.Timestamp, bool]:
     """Return the timestamp closest to *target*, clamping to range.
 
@@ -243,15 +244,15 @@ def _build_image(
 # Maps EDDP/user-facing reducer names to GEE reducer constructors
 # and the suffix GEE appends to band names in reduceRegion output.
 _GEE_REDUCER_MAP = {
-    "mean":   ("mean",     "_mean"),
-    "median": ("median",   "_median"),
-    "mode":   ("mode",     "_mode"),
-    "std":    ("stdDev",   "_stdDev"),
-    "var":    ("variance", "_variance"),
-    "min":    ("min",      "_min"),
-    "max":    ("max",      "_max"),
-    "count":  ("count",    "_count"),
-    "sum":    ("sum",      "_sum"),
+    "mean": ("mean", "_mean"),
+    "median": ("median", "_median"),
+    "mode": ("mode", "_mode"),
+    "std": ("stdDev", "_stdDev"),
+    "var": ("variance", "_variance"),
+    "min": ("min", "_min"),
+    "max": ("max", "_max"),
+    "count": ("count", "_count"),
+    "sum": ("sum", "_sum"),
 }
 
 
@@ -392,8 +393,7 @@ class GeeRasterAdapter:
     def __post_init__(self):
         if ee is None:
             raise ImportError(
-                "earthengine-api is required for GEE adapter: "
-                "pip install earthengine-api"
+                "earthengine-api is required for GEE adapter: " "pip install earthengine-api"
             )
 
         _ensure_gee_init()
@@ -401,7 +401,11 @@ class GeeRasterAdapter:
         # dataset_spec holds extra config (bands, date windows, derivatives, etc.)
         # Always auto-detect asset type from GEE, then merge with user config.
         dataset_spec = dict(self.spec.get("dataset_spec") or {})
-        if self.spec.get("path") and "image" not in dataset_spec and "collection" not in dataset_spec:
+        if (
+            self.spec.get("path")
+            and "image" not in dataset_spec
+            and "collection" not in dataset_spec
+        ):
             asset_id = self.spec["path"]
             try:
                 asset_info = ee.data.getAsset(asset_id)
@@ -443,13 +447,10 @@ class GeeRasterAdapter:
         # from the first image of a collection or the image's first band.
         if is_collection:
             self._native_proj = (
-                ee.ImageCollection(dataset_spec["collection"])
-                .first().select(0).projection()
+                ee.ImageCollection(dataset_spec["collection"]).first().select(0).projection()
             )
             # Fetch available timestamps for automatic date selection
-            self._collection_timestamps = _get_collection_timestamps(
-                dataset_spec["collection"]
-            )
+            self._collection_timestamps = _get_collection_timestamps(dataset_spec["collection"])
             # Collections with timestamps use per-point date selection;
             # the static image is built lazily in _get_image when no date
             # is provided (most-recent fallback).
@@ -530,7 +531,9 @@ class GeeRasterAdapter:
         dt = pd.to_datetime(date)
         geom = ee.Geometry.Point([lon, lat]) if lat is not None else None
         return _build_image(
-            self._dataset_spec, dt, geometry=geom,
+            self._dataset_spec,
+            dt,
+            geometry=geom,
             collection_timestamps=self._collection_timestamps,
         )
 
@@ -554,7 +557,7 @@ class GeeRasterAdapter:
             try:
                 names = img.bandNames().getInfo()
                 self._cached_band_name = names[0] if names else "value"
-                self._cached_band_names = names        # full list for metadata
+                self._cached_band_names = names  # full list for metadata
                 self._cached_band_count = len(names)
             except Exception:
                 self._cached_band_name = "value"
@@ -799,15 +802,19 @@ class GeeRasterAdapter:
 
         if not props:
             return {}, {
-                "in_extent": False, "n_pixels": 0,
-                "had_nodata": False, "coverage_pct": 0.0,
+                "in_extent": False,
+                "n_pixels": 0,
+                "had_nodata": False,
+                "coverage_pct": 0.0,
                 "src_path": self._src_label(),
                 **date_info,
             }
 
         return props, {
-            "in_extent": True, "n_pixels": 1,
-            "had_nodata": False, "coverage_pct": 100.0,
+            "in_extent": True,
+            "n_pixels": 1,
+            "had_nodata": False,
+            "coverage_pct": 100.0,
             "src_path": self._src_label(),
             **date_info,
         }
@@ -844,6 +851,7 @@ class GeeRasterAdapter:
 
         # Project to UTM, snap to pixel grid, compute window corners
         from pyproj import Transformer
+
         transformer = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
         cx, cy = transformer.transform(lon, lat)
         cx = _snap_to_grid(cx, scale_m)
@@ -957,8 +965,12 @@ class GeeRasterAdapter:
                 future_to_idx = {
                     executor.submit(
                         self._fetch_stats_single,
-                        lat, lon, window_m,
-                        combined_reducer, window_reducers, suffixes,
+                        lat,
+                        lon,
+                        window_m,
+                        combined_reducer,
+                        window_reducers,
+                        suffixes,
                         date,
                     ): i
                     for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
@@ -1083,9 +1095,7 @@ class GeeRasterAdapter:
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {}
-            for i, (lat, lon, date, sample_id) in enumerate(
-                zip(lats, lons, date_list, id_list)
-            ):
+            for i, (lat, lon, date, sample_id) in enumerate(zip(lats, lons, date_list, id_list)):
                 out_path = out_dir / f"{sample_id}-{feature_name}.tif"
                 future = executor.submit(
                     self._export_single, lat, lon, window_m, out_path, date, resample_m

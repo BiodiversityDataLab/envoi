@@ -44,7 +44,9 @@ def _inspect_raster(name: str, spec: Dict[str, Any]) -> None:
 
             if "resolution_m" not in spec:
                 spec["resolution_m"] = abs(src.res[0])
-                logger.debug("datasets.%s: auto-detected resolution_m=%s", name, spec["resolution_m"])
+                logger.debug(
+                    "datasets.%s: auto-detected resolution_m=%s", name, spec["resolution_m"]
+                )
 
             if "type" not in spec:
                 spec["type"] = "raster"

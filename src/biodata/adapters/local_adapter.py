@@ -137,7 +137,17 @@ class LocalRasterAdapter(BaseAdapter):
         }
         return (np.asarray(vals), meta) if return_meta else np.asarray(vals)
 
-    def export_windows(self, lats, lons, window_m: int, out_dir, *, ids=None, feature_name: str = "feature", resample_m: float | None = None):
+    def export_windows(
+        self,
+        lats,
+        lons,
+        window_m: int,
+        out_dir,
+        *,
+        ids=None,
+        feature_name: str = "feature",
+        resample_m: float | None = None,
+    ):
         """Crop and save a GeoTIFF window centred on each point.
 
         If resample_m is set, the cropped window is resampled to
@@ -175,9 +185,12 @@ class LocalRasterAdapter(BaseAdapter):
                 # Build a new transform with the same top-left corner but stretched pixels
                 src_h, src_w = arr2d.shape
                 dst_res_x = (src_transform.a * src_w) / n_pixels  # total width / n_pixels
-                dst_res_y = (src_transform.e * src_h) / n_pixels  # total height / n_pixels (negative)
-                dst_transform = Affine(dst_res_x, 0.0, src_transform.c,
-                                       0.0, dst_res_y, src_transform.f)
+                dst_res_y = (
+                    src_transform.e * src_h
+                ) / n_pixels  # total height / n_pixels (negative)
+                dst_transform = Affine(
+                    dst_res_x, 0.0, src_transform.c, 0.0, dst_res_y, src_transform.f
+                )
                 reproject(
                     source=arr2d.astype(np.float32),
                     destination=dst_arr,
@@ -224,9 +237,7 @@ class LocalRasterAdapter(BaseAdapter):
         window_reducers = [r for r in reducer_names if r != "point"]
 
         if want_point and not hasattr(self, "fetch_points_batch"):
-            raise ValueError(
-                f"Adapter {type(self).__name__} does not support the 'point' reducer."
-            )
+            raise ValueError(f"Adapter {type(self).__name__} does not support the 'point' reducer.")
 
         window_reducer_fns = [(r, get_reducer(r)) for r in window_reducers]
 
@@ -321,8 +332,10 @@ class LocalRasterAdapter(BaseAdapter):
             except Exception:
                 values = {f"b{b}": None for b in self.band} if multiband else {"point": None}
                 meta = {
-                    "in_extent": False, "n_pixels": 0,
-                    "had_nodata": False, "coverage_pct": 0.0,
+                    "in_extent": False,
+                    "n_pixels": 0,
+                    "had_nodata": False,
+                    "coverage_pct": 0.0,
                     "src_path": str(self.path),
                 }
             results.append((values, meta))

@@ -157,9 +157,7 @@ def get_reducer(name: str) -> Callable:
     """
     lower = name.lower()
     if lower in SPECIAL_REDUCERS:
-        raise ValueError(
-            f"'{lower}' is an adapter-level reducer; call adapter.fetch_stats_batch"
-        )
+        raise ValueError(f"'{lower}' is an adapter-level reducer; call adapter.fetch_stats_batch")
     fn = _REGISTRY.get(lower)
     if fn is None:
         raise ValueError(f"Unknown reducer: {name}. Valid: {list(_REGISTRY)}")
@@ -167,12 +165,26 @@ def get_reducer(name: str) -> Callable:
 
 
 CONTINUOUS_ONLY_REDUCERS = {
-    "mean", "median", "std", "var", "sum", "min", "max",
-    "q05", "q10", "q25", "q50", "q75", "q90", "q95",
+    "mean",
+    "median",
+    "std",
+    "var",
+    "sum",
+    "min",
+    "max",
+    "q05",
+    "q10",
+    "q25",
+    "q50",
+    "q75",
+    "q90",
+    "q95",
 }
 
 
-def validate_reducers(reducer_names: list[str], data_type: str | None, feature_name: str) -> str | None:
+def validate_reducers(
+    reducer_names: list[str], data_type: str | None, feature_name: str
+) -> str | None:
     """Log a warning if any reducer is inappropriate for the data type.
 
     Returns the warning message string if a warning was raised, else None.
