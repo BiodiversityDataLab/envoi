@@ -92,23 +92,29 @@ class LocalRasterAdapter(BaseAdapter):
         else:
             window_arr = arr
 
-        # Coverage stats use the first (or only) band as representative
-        arr0 = arr[0] if arr.ndim == 3 else arr
-        total = arr0.size
-        valid = int(arr0.count()) if np.ma.isMaskedArray(arr0) else int(np.isfinite(arr0).sum())
-        had_nodata = bool(valid < total)
-        coverage_pct = 100.0 * (valid / total) if total else 0.0
-
         if arr.ndim == 3:
-            # Multi-band: return shape (n_bands, n_valid_pixels) so enrich.py can
-            # reduce per band and produce one column per band per reducer.
-            def _band_vals(b):
-                v = b.compressed() if np.ma.isMaskedArray(b) else b.ravel()
-                return v[np.isfinite(v)]
-            vals = np.stack([_band_vals(b) for b in arr], axis=0)
+            # Combine masks: a pixel is valid only if unmasked AND finite in every band.
+            # Per-band stats over one window must share a pixel set, else np.stack fails
+            # when bands have different nodata patterns.
+            if np.ma.isMaskedArray(arr):
+                band_mask = np.ma.getmaskarray(arr)
+                data = arr.filled(np.nan).astype(float, copy=False)
+            else:
+                band_mask = np.zeros(arr.shape, dtype=bool)
+                data = np.asarray(arr, dtype=float)
+            invalid = band_mask.any(axis=0) | (~np.isfinite(data)).any(axis=0)
+            valid_mask_2d = ~invalid
+            total = int(valid_mask_2d.size)
+            valid = int(valid_mask_2d.sum())
+            vals = np.stack([data[b][valid_mask_2d] for b in range(data.shape[0])], axis=0)
         else:
+            total = arr.size
+            valid = int(arr.count()) if np.ma.isMaskedArray(arr) else int(np.isfinite(arr).sum())
             vals = arr.compressed() if np.ma.isMaskedArray(arr) else arr.ravel()
             vals = vals[np.isfinite(vals)]
+
+        had_nodata = bool(valid < total)
+        coverage_pct = 100.0 * (valid / total) if total else 0.0
 
         # JSON-safe transform (list of 6 floats) to avoid breaking metadata JSON
         affine = win_transform(win, self.src.transform)

@@ -294,3 +294,39 @@ class TestErrors:
                 "predictors": ["dem_local"],
                 "output": {"kind": "banana", "window_m": 100},
             }, catalog=CATALOG, out_dir=tmp_path)
+
+
+# ------------------------------------------------------------------
+# Multi-band regression
+# ------------------------------------------------------------------
+
+def test_multiband_local_with_per_band_nodata(tmp_path):
+    """fetch_values must tolerate bands with different nodata patterns."""
+    from rasterio.transform import from_origin
+
+    arr = np.arange(30 * 30, dtype="float32").reshape(1, 30, 30)
+    arr3 = np.concatenate([arr, arr * 2, arr * 3], axis=0)
+    arr3[0, 5, 5] = -9999    # nodata in band 1 only
+    arr3[1, 10, 10] = -9999  # nodata in band 2 only
+    path = tmp_path / "mb.tif"
+    with rasterio.open(
+        path, "w", driver="GTiff", height=30, width=30, count=3,
+        dtype="float32", crs="EPSG:32634", nodata=-9999,
+        transform=from_origin(349170, 6986638, 10, 10),
+    ) as dst:
+        dst.write(arr3)
+
+    catalog = {"datasets": {"mb": {
+        "source": "local", "path": str(path), "data_type": "continuous",
+        "bands": [1, 2, 3],
+    }}}
+    df = pd.DataFrame({"id": ["a"], "lat": [62.9768], "lon": [18.0268]})
+    outputs = enrich(df, {
+        "name": "mb_test", "predictors": ["mb"],
+        "output": {"kind": "tabular", "reducers": ["mean"], "window_m": 200, "format": "csv"},
+    }, catalog=catalog, out_dir=tmp_path)
+
+    stats_df = pd.read_csv(outputs["mb_test"])
+    for col in ("mb_b1_mean_200m", "mb_b2_mean_200m", "mb_b3_mean_200m"):
+        assert col in stats_df.columns
+        assert stats_df[col].notna().all()
