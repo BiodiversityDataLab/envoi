@@ -14,6 +14,7 @@ from pyproj import Transformer
 from rasterio.errors import WindowError
 
 from .base import BaseAdapter
+from ..reducers import get_reducer
 
 try:
     from . import register as _register
@@ -94,7 +95,7 @@ class LocalRasterAdapter(BaseAdapter):
         # Coverage stats use the first (or only) band as representative
         arr0 = arr[0] if arr.ndim == 3 else arr
         total = arr0.size
-        valid = int(np.count_nonzero(~arr0.mask)) if np.ma.isMaskedArray(arr0) else int(np.isfinite(arr0).sum())
+        valid = int(arr0.count()) if np.ma.isMaskedArray(arr0) else int(np.isfinite(arr0).sum())
         had_nodata = bool(valid < total)
         coverage_pct = 100.0 * (valid / total) if total else 0.0
 
@@ -204,6 +205,84 @@ class LocalRasterAdapter(BaseAdapter):
             paths.append(out_path)
 
         return paths
+
+    def fetch_stats_batch(self, lats, lons, window_m, reducer_names, *, dates=None):
+        """Unified stats fetch: dispatches window reducers and 'point' to one call.
+
+        Returns ``[(stats_dict, meta), ...]`` per input point. Keys in ``stats_dict``:
+        single-band ``{rname}``, multi-band ``b{n}_{rname}``. Point values use the
+        ``point`` suffix (``point`` or ``b{n}_point``).
+        """
+        reducer_names = list(reducer_names)
+        want_point = "point" in reducer_names
+        window_reducers = [r for r in reducer_names if r != "point"]
+
+        if want_point and not hasattr(self, "fetch_points_batch"):
+            raise ValueError(
+                f"Adapter {type(self).__name__} does not support the 'point' reducer."
+            )
+
+        window_reducer_fns = [(r, get_reducer(r)) for r in window_reducers]
+
+        lats = list(lats)
+        lons = list(lons)
+        n = len(lats)
+        multiband = isinstance(self.band, list)
+
+        window_results: list[tuple[dict, dict]] = []
+        if window_reducers:
+            for lat, lon in zip(lats, lons):
+                vals, meta = self.fetch_values(lat, lon, window_m, return_meta=True)
+                vals = np.asarray(vals)
+                stats: dict[str, float | None] = {}
+                if multiband and vals.ndim == 2:
+                    for b_idx, band_num in enumerate(self.band):
+                        for rname, fn in window_reducer_fns:
+                            stats[f"b{band_num}_{rname}"] = (
+                                fn(vals[b_idx]) if vals[b_idx].size else None
+                            )
+                else:
+                    for rname, fn in window_reducer_fns:
+                        stats[rname] = fn(vals) if vals.size else None
+                window_results.append((stats, meta))
+
+        point_results: list[tuple[dict, dict]] = []
+        if want_point:
+            pt_raw = self.fetch_points_batch(lats, lons, dates=dates)
+            for pt_vals, pt_meta in pt_raw:
+                stats = {}
+                if multiband:
+                    for band_num in self.band:
+                        stats[f"b{band_num}_point"] = pt_vals.get(f"b{band_num}")
+                else:
+                    stats["point"] = pt_vals.get("point")
+                point_results.append((stats, pt_meta))
+
+        results: list[tuple[dict, dict]] = []
+        for i in range(n):
+            merged_stats: dict = {}
+            if window_reducers:
+                merged_stats.update(window_results[i][0])
+            if want_point:
+                merged_stats.update(point_results[i][0])
+
+            if window_reducers:
+                meta = window_results[i][1]
+            else:
+                pt_meta = point_results[i][1]
+                meta = {
+                    **pt_meta,
+                    "window_m": int(window_m),
+                    "raster_crs": str(self.raster_crs),
+                    "region_crs": str(self.raster_crs),
+                    "transform": None,
+                    "dtype": None,
+                    "nodata": None,
+                    "window_arr": None,
+                }
+            results.append((merged_stats, meta))
+
+        return results
 
     def fetch_points_batch(self, lats, lons, *, dates=None):
         """Sample the exact pixel value at each (lat, lon) coordinate."""

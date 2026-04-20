@@ -202,136 +202,104 @@ def enrich(
                 outputs[f"{gname}:{p}"] = tiles_root / p
                 continue  # skip stats for this feature
 
-            # ----- "point" reducer: exact pixel at coordinate, no window -----
-            if stats and "point" in stats:
-                if not hasattr(adapter, "fetch_points_batch"):
-                    raise ValueError(
-                        f"Source '{source}' does not support the 'point' reducer."
-                    )
-                pt_results = adapter.fetch_points_batch(
-                    work.lat, work.lon, dates=dates,
-                )
-                all_keys = {k for vals, _ in pt_results for k in vals}
-                for bk in sorted(all_keys):
-                    col = f"{p}_{bk}_point" if len(all_keys) > 1 else f"{p}_point"
-                    work[col] = [r[0].get(bk) for r in pt_results]
+            # ----- Unified stats path (window reducers and/or "point") -----
+            has_window = any(r != "point" for r in (stats or []))
+            qc_suffix = f"_{buf}m" if has_window else "_point"
 
-                meta_list = [r[1] for r in pt_results]
-                qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
-                qc_df = qc_df.add_prefix(f"{p}_").add_suffix("_point")
-                extra_dfs = []
-                date_df = extract_date_columns(meta_list)
-                if not date_df.empty:
-                    extra_dfs.append(date_df.add_prefix(f"{p}_").add_suffix("_point"))
-                    date_backlog[p] = summarize_date_info(meta_list)
-                crs_df = extract_crs_column(meta_list)
-                if not crs_df.empty:
-                    extra_dfs.append(crs_df.add_prefix(f"{p}_").add_suffix("_point"))
-                if extra_dfs:
-                    qc_df = pd.concat(
-                        [qc_df.reset_index(drop=True)] + [d.reset_index(drop=True) for d in extra_dfs],
-                        axis=1,
-                    )
-                work = pd.concat(
-                    [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
-                    axis=1,
+            use_server_stats = (
+                hasattr(adapter, "fetch_stats_batch")
+                and stats
+            )
+
+            if use_server_stats:
+                reducer_names = list(stats)
+                ss_results = adapter.fetch_stats_batch(
+                    work.lat, work.lon, buf, reducer_names, dates=dates,
                 )
-                coverage_backlog[p]["point"] = {
-                    "n_zero": int((qc_df[f"{p}_coverage_pct_point"] == 0).sum()),
-                    "n_full": int((qc_df[f"{p}_coverage_pct_point"] == 100).sum()),
-                    "total": int(len(pt_results)),
-                }
+                # Use actual result keys — for multi-band datasets these are
+                # "{band}_{reducer}" (e.g. "bio01_mean"); for single-band just
+                # "{reducer}" (e.g. "mean"). Point keys keep the "_point" suffix
+                # (no buffer) to preserve existing output schema.
+                all_stat_keys = dict.fromkeys(k for r, _ in ss_results for k in r)
+                for key in all_stat_keys:
+                    if key == "point" or key.endswith("_point"):
+                        col = f"{p}_{key}"
+                    else:
+                        col = f"{p}_{key}_{buf}m"
+                    work[col] = [r[0].get(key) for r in ss_results]
+
+                meta_list = [r[1] for r in ss_results]
 
             else:
-                # ----- Server-side stats (GEE fast path) -----
-                use_server_stats = (
-                    hasattr(adapter, "fetch_stats_batch")
-                    and stats
-                )
-
-                if use_server_stats:
-                    reducer_names = list(stats)
-                    ss_results = adapter.fetch_stats_batch(
-                        work.lat, work.lon, buf, reducer_names, dates=dates,
+                # ----- Python-side stats fallback (adapters without fetch_stats_batch) -----
+                if hasattr(adapter, "fetch_batch"):
+                    results = adapter.fetch_batch(
+                        work.lat, work.lon, buf,
+                        dates=dates, return_meta=True,
                     )
-                    # Use actual result keys — for multi-band datasets these are
-                    # "{band}_{reducer}" (e.g. "bio01_mean"); for single-band just
-                    # "{reducer}" (e.g. "mean"). dict.fromkeys preserves insertion order.
-                    all_stat_keys = dict.fromkeys(k for r, _ in ss_results for k in r)
-                    for key in all_stat_keys:
-                        col = f"{p}_{key}_{buf}m"
-                        work[col] = [r[0].get(key) for r in ss_results]
-
-                    meta_list = [r[1] for r in ss_results]
-
                 else:
-                    # ----- Python-side stats (local raster path) -----
-                    if hasattr(adapter, "fetch_batch"):
-                        results = adapter.fetch_batch(
-                            work.lat, work.lon, buf,
-                            dates=dates, return_meta=True,
-                        )
+                    results = [
+                        adapter.fetch_values(lat, lon, buf, return_meta=True)
+                        for lat, lon in zip(work.lat, work.lon)
+                    ]
+
+                vals_list: List[np.ndarray] = []
+                meta_list: List[Dict[str, Any]] = []
+                for arr, meta in results:
+                    arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
+                    vals_list.append(arr)
+                    meta_list.append(meta)
+
+                is_multiband_local = vals_list and vals_list[0].ndim == 2
+                band_nums = adapter.band if is_multiband_local else None
+
+                default = "point" if data_type == "categorical" else "mean"
+                reducer_names_iter = list(stats) if stats else [spec.get("default_reducer", default)]
+                for rname in reducer_names_iter:
+                    if rname == "point":
+                        continue
+                    reducer = get_reducer(rname)
+                    if is_multiband_local:
+                        for b_idx, band_num in enumerate(band_nums):
+                            col = f"{p}_b{band_num}_{rname}_{buf}m"
+                            work[col] = [
+                                (reducer(v[b_idx]) if v.size else None) for v in vals_list
+                            ]
                     else:
-                        results = [
-                            adapter.fetch_values(lat, lon, buf, return_meta=True)
-                            for lat, lon in zip(work.lat, work.lon)
-                        ]
+                        col = f"{p}_{rname}_{buf}m"
+                        work[col] = [(reducer(v) if v.size else None) for v in vals_list]
 
-                    vals_list: List[np.ndarray] = []
-                    meta_list: List[Dict[str, Any]] = []
-                    for arr, meta in results:
-                        arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
-                        vals_list.append(arr)
-                        meta_list.append(meta)
-
-                    # Apply Python reducers
-                    # Multi-band local: vals are shape (n_bands, n_pixels); reduce per band.
-                    is_multiband_local = vals_list and vals_list[0].ndim == 2
-                    band_nums = adapter.band if is_multiband_local else None
-
-                    default = "point" if data_type == "categorical" else "mean"
-                    reducer_names_iter = list(stats) if stats else [spec.get("default_reducer", default)]
-                    for rname in reducer_names_iter:
-                        reducer = get_reducer(rname)
-                        if is_multiband_local:
-                            for b_idx, band_num in enumerate(band_nums):
-                                col = f"{p}_b{band_num}_{rname}_{buf}m"
-                                work[col] = [
-                                    (reducer(v[b_idx]) if v.size else None) for v in vals_list
-                                ]
-                        else:
-                            col = f"{p}_{rname}_{buf}m"
-                            work[col] = [(reducer(v) if v.size else None) for v in vals_list]
-
-                # --- QA columns (also buffer-suffixed) ---
-                qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
-                qc_df = qc_df.add_prefix(f"{p}_").add_suffix(f"_{buf}m")
-                extra_dfs = []
-                date_df = extract_date_columns(meta_list)
-                if not date_df.empty:
-                    extra_dfs.append(date_df.add_prefix(f"{p}_").add_suffix(f"_{buf}m"))
-                    date_backlog[p] = summarize_date_info(meta_list)
-                crs_df = extract_crs_column(meta_list)
-                if not crs_df.empty:
-                    extra_dfs.append(crs_df.add_prefix(f"{p}_").add_suffix(f"_{buf}m"))
-                if extra_dfs:
-                    qc_df = pd.concat(
-                        [qc_df.reset_index(drop=True)] + [d.reset_index(drop=True) for d in extra_dfs],
-                        axis=1,
-                    )
-                work = pd.concat(
-                    [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
+            # --- QA columns ---
+            qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
+            qc_df = qc_df.add_prefix(f"{p}_").add_suffix(qc_suffix)
+            extra_dfs = []
+            date_df = extract_date_columns(meta_list)
+            if not date_df.empty:
+                extra_dfs.append(date_df.add_prefix(f"{p}_").add_suffix(qc_suffix))
+                date_backlog[p] = summarize_date_info(meta_list)
+            crs_df = extract_crs_column(meta_list)
+            if not crs_df.empty:
+                extra_dfs.append(crs_df.add_prefix(f"{p}_").add_suffix(qc_suffix))
+            if extra_dfs:
+                qc_df = pd.concat(
+                    [qc_df.reset_index(drop=True)] + [d.reset_index(drop=True) for d in extra_dfs],
                     axis=1,
                 )
+            work = pd.concat(
+                [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
+                axis=1,
+            )
 
-                # --- coverage summary for metadata ---
-                cov = qc_df[f"{p}_coverage_pct_{buf}m"].fillna(0)
-                coverage_backlog[p][str(buf)] = {
-                    "n_zero": int((cov == 0).sum()),
-                    "n_partial": int(((cov > 0) & (cov < 100)).sum()),
-                    "n_full": int((cov == 100).sum()),
-                    "total": int(cov.shape[0]),
-                }
+            # --- coverage summary for metadata ---
+            cov_col = f"{p}_coverage_pct{qc_suffix}"
+            cov = qc_df[cov_col].fillna(0)
+            backlog_key = str(buf) if has_window else "point"
+            coverage_backlog[p][backlog_key] = {
+                "n_zero": int((cov == 0).sum()),
+                "n_partial": int(((cov > 0) & (cov < 100)).sum()),
+                "n_full": int((cov == 100).sum()),
+                "total": int(cov.shape[0]),
+            }
 
             # Build feature metadata after fetching so band_names are cached
             feature_metas[p] = build_feature_meta(spec, adapter)

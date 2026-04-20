@@ -132,6 +132,7 @@ _REGISTRY: Dict[str, Callable] = {
     "std": r_std,
     "var": r_var,
     "count": r_count,
+    "mode": r_mode,
     # quantiles (rich but still lightweight)
     "q05": make_quantile(0.05),
     "q10": make_quantile(0.10),
@@ -143,6 +144,9 @@ _REGISTRY: Dict[str, Callable] = {
 }
 
 
+SPECIAL_REDUCERS = frozenset({"point"})
+
+
 def get_reducer(name: str) -> Callable:
     """
     Look up a reducer by name (case-insensitive).
@@ -151,7 +155,12 @@ def get_reducer(name: str) -> Callable:
         fn = get_reducer("mean")
         value = fn(window_values)
     """
-    fn = _REGISTRY.get(name.lower())
+    lower = name.lower()
+    if lower in SPECIAL_REDUCERS:
+        raise ValueError(
+            f"'{lower}' is an adapter-level reducer; call adapter.fetch_stats_batch"
+        )
+    fn = _REGISTRY.get(lower)
     if fn is None:
         raise ValueError(f"Unknown reducer: {name}. Valid: {list(_REGISTRY)}")
     return fn
@@ -182,7 +191,7 @@ def validate_reducers(reducer_names: list[str], data_type: str | None, feature_n
     return None
 
 
-__all__ = ["get_reducer", "_REGISTRY", "validate_reducers"]
+__all__ = ["get_reducer", "_REGISTRY", "SPECIAL_REDUCERS", "validate_reducers"]
 
 
 def list_reducers() -> list[str]:

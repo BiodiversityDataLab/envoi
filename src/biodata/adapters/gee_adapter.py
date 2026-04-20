@@ -935,33 +935,91 @@ class GeeRasterAdapter:
 
         Uses a single combined ``reduceRegion`` call per point with all
         requested reducers, avoiding the need to download raw pixel arrays.
+        When ``"point"`` is in ``reducer_names``, also samples the exact pixel
+        value via ``image.sample()`` and merges the result under ``point`` /
+        ``{band}_point`` keys.
 
         Returns a list of ``(stats_dict, meta_dict)`` tuples — one per point.
-        ``stats_dict`` maps each reducer name to its computed value.
         """
-        combined_reducer, suffixes = _build_combined_reducer(reducer_names)
+        reducer_names = list(reducer_names)
+        want_point = "point" in reducer_names
+        window_reducers = [r for r in reducer_names if r != "point"]
 
         n = len(lats)
+        lats = list(lats)
+        lons = list(lons)
         date_list = list(dates) if dates is not None else [None] * n
-        results: List = [None] * n
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_idx = {
-                executor.submit(
-                    self._fetch_stats_single,
-                    lat, lon, window_m,
-                    combined_reducer, reducer_names, suffixes,
-                    date,
-                ): i
-                for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
+        window_results: List = [None] * n
+        if window_reducers:
+            combined_reducer, suffixes = _build_combined_reducer(window_reducers)
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(
+                        self._fetch_stats_single,
+                        lat, lon, window_m,
+                        combined_reducer, window_reducers, suffixes,
+                        date,
+                    ): i
+                    for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        window_results[idx] = future.result()
+                    except Exception as e:
+                        logger.warning("GEE stats fetch failed for point %d: %s", idx, e)
+                        window_results[idx] = self._empty_stats_result(window_m, window_reducers)
+
+        point_results: List = [None] * n
+        if want_point:
+            # Resolve band layout to pick single-band vs multi-band point keys.
+            spec_band = self._dataset_spec.get("bands")
+            if not isinstance(spec_band, str):
                 try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    logger.warning("GEE stats fetch failed for point %d: %s", idx, e)
-                    results[idx] = self._empty_stats_result(window_m, reducer_names)
+                    self._get_band_name(self._get_image())
+                except Exception:
+                    pass
+            band_count = getattr(self, "_cached_band_count", 1)
+            multiband_point = not isinstance(spec_band, str) and band_count > 1
+            single_band_name = spec_band if isinstance(spec_band, str) else None
+            if single_band_name is None and not multiband_point:
+                single_band_name = getattr(self, "_cached_band_name", None)
+
+            pt_raw = self.fetch_points_batch(lats, lons, dates=date_list)
+            for i, (lon, lat, (props, pt_meta)) in enumerate(zip(lons, lats, pt_raw)):
+                stats: dict[str, float | None] = {}
+                if multiband_point:
+                    for k, v in props.items():
+                        stats[f"{k}_point"] = v
+                else:
+                    key = single_band_name if single_band_name in props else next(iter(props), None)
+                    stats["point"] = props.get(key) if key is not None else None
+                meta = {
+                    "window_m": int(window_m),
+                    "raster_crs": self.crs,
+                    "region_crs": _get_utm_crs(lon, lat),
+                    "transform": None,
+                    "dtype": "float64",
+                    "nodata": None,
+                    "window_arr": None,
+                    **pt_meta,
+                }
+                point_results[i] = (stats, meta)
+
+        results: List = [None] * n
+        for i in range(n):
+            merged_stats: dict = {}
+            if window_reducers:
+                merged_stats.update(window_results[i][0])
+            if want_point:
+                merged_stats.update(point_results[i][0])
+
+            if window_reducers:
+                meta = window_results[i][1]
+            else:
+                meta = point_results[i][1]
+            results[i] = (merged_stats, meta)
 
         return results
 

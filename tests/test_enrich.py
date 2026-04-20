@@ -123,6 +123,23 @@ class TestTabular:
         # Point values should be finite numbers for in-extent points
         assert stats_df["dem_local_point"].notna().any()
 
+    def test_point_mixed_with_window_reducers(self, sample_df, tmp_path):
+        """reducers: [mean, std, point] returns all three column families."""
+        outputs = enrich(sample_df, {
+            "name": "mixed",
+            "predictors": ["dem_local"],
+            "output": {
+                "kind": "tabular",
+                "reducers": ["mean", "std", "point"],
+                "window_m": 100,
+            },
+        }, catalog=CATALOG, out_dir=tmp_path)
+
+        stats_df = pd.read_csv(outputs["mixed"])
+        for col in ("dem_local_mean_100m", "dem_local_std_100m", "dem_local_point"):
+            assert col in stats_df.columns, f"missing {col}"
+            assert stats_df[col].notna().any(), f"all-null {col}"
+
 
 # ------------------------------------------------------------------
 # Raster output
@@ -207,7 +224,7 @@ class TestMetadata:
         assert "package_version" in meta["run"]
         assert meta["run"]["n_points"] == len(sample_df)
 
-        assert meta["config"]["group"] == "meta"
+        assert meta["config"]["name"] == "meta"
         assert meta["config"]["reducers"] == ["mean"]
 
         feat = meta["features"]["dem_local"]
