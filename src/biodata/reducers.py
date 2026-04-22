@@ -158,12 +158,26 @@ def get_reducer(name: str) -> Callable:
 
 
 CONTINUOUS_ONLY_REDUCERS = {
-    "mean", "median", "std", "var", "sum", "min", "max",
-    "q05", "q10", "q25", "q50", "q75", "q90", "q95",
+    "mean",
+    "median",
+    "std",
+    "var",
+    "sum",
+    "min",
+    "max",
+    "q05",
+    "q10",
+    "q25",
+    "q50",
+    "q75",
+    "q90",
+    "q95",
 }
 
 
-def validate_reducers(reducer_names: list[str], data_type: str | None, feature_name: str) -> str | None:
+def validate_reducers(
+    reducer_names: list[str], data_type: str | None, dataset_name: str
+) -> str | None:
     """Log a warning if any reducer is inappropriate for the data type.
 
     Returns the warning message string if a warning was raised, else None.
@@ -174,7 +188,7 @@ def validate_reducers(reducer_names: list[str], data_type: str | None, feature_n
     bad = [r for r in reducer_names if r.lower() in CONTINUOUS_ONLY_REDUCERS]
     if bad:
         msg = (
-            f"Feature '{feature_name}' is categorical but reducers {bad} assume "
+            f"Dataset '{dataset_name}' is categorical but reducers {bad} assume "
             f"continuous data. Consider using 'point', 'mode' or 'count' instead."
         )
         logger.warning(msg)

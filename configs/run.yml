@@ -1,7 +1,7 @@
 # Example: tabular stats for local DEM
-- name: terrain_stats
-  predictors: [dem_local]
-  output:
-    kind: tabular
-    reducers: [mean, std, q10, q90]
-    window_m: 200
+- run_id: terrain_stats
+  datasets: [dem_local]
+  settings:
+    output_type: tabular
+    statistics: [mean, std, q10, q90]
+    window_size_m: 200

@@ -94,7 +94,11 @@ class LocalRasterAdapter(BaseAdapter):
         # Coverage stats use the first (or only) band as representative
         arr0 = arr[0] if arr.ndim == 3 else arr
         total = arr0.size
-        valid = int(np.count_nonzero(~arr0.mask)) if np.ma.isMaskedArray(arr0) else int(np.isfinite(arr0).sum())
+        valid = (
+            int(np.count_nonzero(~arr0.mask))
+            if np.ma.isMaskedArray(arr0)
+            else int(np.isfinite(arr0).sum())
+        )
         had_nodata = bool(valid < total)
         coverage_pct = 100.0 * (valid / total) if total else 0.0
 
@@ -104,6 +108,7 @@ class LocalRasterAdapter(BaseAdapter):
             def _band_vals(b):
                 v = b.compressed() if np.ma.isMaskedArray(b) else b.ravel()
                 return v[np.isfinite(v)]
+
             vals = np.stack([_band_vals(b) for b in arr], axis=0)
         else:
             vals = arr.compressed() if np.ma.isMaskedArray(arr) else arr.ravel()
@@ -130,7 +135,18 @@ class LocalRasterAdapter(BaseAdapter):
         }
         return (np.asarray(vals), meta) if return_meta else np.asarray(vals)
 
-    def export_windows(self, lats, lons, window_m: int, out_dir, *, ids=None, feature_name: str = "feature", resample_m: float | None = None):
+    def export_tiles(
+        self,
+        lats,
+        lons,
+        window_m: int,
+        out_dir,
+        *,
+        ids=None,
+        dates=None,
+        dataset_name: str = "dataset",
+        resample_m: float | None = None,
+    ):
         """Crop and save a GeoTIFF window centred on each point.
 
         If resample_m is set, the cropped window is resampled to
@@ -140,7 +156,7 @@ class LocalRasterAdapter(BaseAdapter):
         from rasterio.transform import Affine
         from rasterio.warp import reproject, Resampling
 
-        out_dir = Path(out_dir) / feature_name
+        out_dir = Path(out_dir) / dataset_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
         id_list = list(ids) if ids is not None else [str(i) for i in range(len(list(lats)))]
@@ -149,7 +165,7 @@ class LocalRasterAdapter(BaseAdapter):
         n_pixels = max(1, round(window_m / resample_m)) if resample_m is not None else None
 
         for lat, lon, sample_id in zip(lats, lons, id_list):
-            out_path = out_dir / f"{sample_id}-{feature_name}.tif"
+            out_path = out_dir / f"{sample_id}-{dataset_name}.tif"
             _, meta = self.fetch_values(lat, lon, window_m, return_meta=True)
 
             arr2d = meta.get("window_arr")
@@ -168,9 +184,12 @@ class LocalRasterAdapter(BaseAdapter):
                 # Build a new transform with the same top-left corner but stretched pixels
                 src_h, src_w = arr2d.shape
                 dst_res_x = (src_transform.a * src_w) / n_pixels  # total width / n_pixels
-                dst_res_y = (src_transform.e * src_h) / n_pixels  # total height / n_pixels (negative)
-                dst_transform = Affine(dst_res_x, 0.0, src_transform.c,
-                                       0.0, dst_res_y, src_transform.f)
+                dst_res_y = (
+                    src_transform.e * src_h
+                ) / n_pixels  # total height / n_pixels (negative)
+                dst_transform = Affine(
+                    dst_res_x, 0.0, src_transform.c, 0.0, dst_res_y, src_transform.f
+                )
                 reproject(
                     source=arr2d.astype(np.float32),
                     destination=dst_arr,
@@ -203,7 +222,7 @@ class LocalRasterAdapter(BaseAdapter):
                 dst.write(out_arr, 1)
             paths.append(out_path)
 
-        return paths
+        return paths, [{}] * len(paths)
 
     def fetch_points_batch(self, lats, lons, *, dates=None):
         """Sample the exact pixel value at each (lat, lon) coordinate."""
@@ -236,8 +255,10 @@ class LocalRasterAdapter(BaseAdapter):
             except Exception:
                 values = {f"b{b}": None for b in self.band} if multiband else {"point": None}
                 meta = {
-                    "in_extent": False, "n_pixels": 0,
-                    "had_nodata": False, "coverage_pct": 0.0,
+                    "in_extent": False,
+                    "n_pixels": 0,
+                    "had_nodata": False,
+                    "coverage_pct": 0.0,
                     "src_path": str(self.path),
                 }
             results.append((values, meta))

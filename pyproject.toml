@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "biodata-enricher"
 version = "0.1.2"
-description = "Enrich points with environmental predictors from local/remote sources (MVP)."
+description = "Enrich points with environmental datasets from local/remote sources (MVP)."
 authors = [{ name = "Team Biodata", email = "team@example.com" }]
 readme = "README.md"
 requires-python = ">=3.10"

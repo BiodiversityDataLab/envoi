@@ -26,6 +26,13 @@ datasets:
       citation: "Author et al. (Year). Title. Journal. DOI."
       license: "CC-BY-4.0"
   # ─────────────────────────────────────────────────────────────────────────
+  
+  
+  dem_aster: # testing purpose only - remove later
+    source: earth_engine
+    path: projects/sat-io/open-datasets/ASTER/GDEM
+    data_type: continuous
+
 
   dem_glo30:
     source: earth_engine

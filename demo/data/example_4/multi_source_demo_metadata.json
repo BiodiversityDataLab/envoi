@@ -13,7 +13,7 @@
     "window_m": 500,
     "min_coverage_pct": 80
   },
-  "features": {
+  "datasets": {
     "dem_glo30": {
       "source": "earth_engine",
       "path": "COPERNICUS/DEM/GLO30",

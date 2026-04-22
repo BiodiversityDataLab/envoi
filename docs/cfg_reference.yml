@@ -7,32 +7,32 @@
 
 # --- Single output example ---
 
-name: terrain                   # Output name. Used for filenames (e.g. terrain.parquet)
+run_id: terrain                 # Run identifier. Used for filenames (e.g. terrain.parquet)
                                 # Default: "output1", "output2", ...
 
-predictors:                     # List of dataset names from catalog.yml
+datasets:                       # List of dataset names from catalog.yml
   - dem_aster
   - bioclim
 
-output:
-  kind: tabular                 # "tabular" or "raster"
+settings:
+  output_type: tabular          # "tabular" or "raster"
 
   # --- Tabular options ---
-  reducers:                     # Statistics to compute per point
+  statistics:                   # Statistics to compute per point
     - mean                      # Available: mean, median, min, max, sum, std, var, count
     - std                       #            q05, q10, q25, q50, q75, q90, q95
     - q10                       #            point (samples exact pixel, no window)
     - q90
-  window_m: 200                 # Side length of square window in metres. Default: 500
-  format: parquet               # "parquet" (default) or "csv"
+  window_size_m: 200            # Side length of square window in metres. Default: 500
+  output_format: parquet        # "parquet" (default) or "csv"
   min_coverage_pct: 80          # QC threshold for low-coverage warning. Default: 80
 
   --- Raster options ---
-  kind: raster
-  window_m: 200               # Crop window in metres
-  resample_m: 50              # Resample all tiles to this resolution (metres).
-                                Output will be round(window_m / resample_m) x round(window_m / resample_m) pixels.
-                                Omit to keep native resolution.
+  output_type: raster
+  window_size_m: 200            # Crop window in metres
+  resample_m: 50                # Resample all tiles to this resolution (metres).
+                                  Output will be round(window_size_m / resample_m) x round(window_size_m / resample_m) pixels.
+                                  Omit to keep native resolution.
 
 
 --- Multiple outputs example ---
@@ -40,14 +40,14 @@ Pass a list:
 
 enrich(df, [
     {
-        "name": "terrain_stats",
-        "predictors": ["dem_aster"],
-        "output": {"kind": "tabular", "reducers": ["mean", "std"], "window_m": 200},
+        "run_id": "terrain_stats",
+        "datasets": ["dem_aster"],
+        "settings": {"output_type": "tabular", "statistics": ["mean", "std"], "window_size_m": 200},
     },
     {
-        "name": "terrain_tiles",
-        "predictors": ["dem_aster"],
-        "output": {"kind": "raster", "window_m": 200, "resample_m": 10},
+        "run_id": "terrain_tiles",
+        "datasets": ["dem_aster"],
+        "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 10},
     },
 ])
 
@@ -104,10 +104,10 @@ df = pd.DataFrame({
 Output files
 ============================================================
 Tabular:
-  out/{name}.parquet          Stats (e.g. dem_aster_mean_b200)
-  out/{name}_qc.parquet       QC flags (in_extent, n_pixels, had_nodata, coverage_pct)
-  out/{name}_metadata.json    Sidecar metadata
+  out/{run_id}.parquet          Stats (e.g. dem_aster_mean_b200)
+  out/{run_id}_qc.parquet       QC flags (in_extent, n_pixels, had_nodata, coverage_pct)
+  out/{run_id}_metadata.json    Sidecar metadata
 
 Raster:
-  out/{name}/{predictor}/A-{predictor}.tif    One GeoTIFF per point
-  out/{name}/{name}_metadata.json             Sidecar metadata
+  out/{run_id}/{dataset}/A-{dataset}.tif      One GeoTIFF per point
+  out/{run_id}/{run_id}_metadata.json         Sidecar metadata

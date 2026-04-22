@@ -23,12 +23,12 @@ df = pd.read_csv("data/points_sample.csv")
 
 # Single output — tabular stats
 outputs = enrich(df, {
-    "name": "terrain",
-    "predictors": ["dem_local"],
-    "output": {
-        "kind": "tabular",
-        "reducers": ["mean", "std"],
-        "window_m": 200,
+    "run_id": "terrain",
+    "datasets": ["dem_local"],
+    "settings": {
+        "output_type": "tabular",
+        "statistics": ["mean", "std"],
+        "window_size_m": 200,
     },
 }, catalog="configs/catalog.yml", out_dir="out")
 
@@ -44,14 +44,14 @@ Pass a list to process several configurations in one call:
 ```python
 outputs = enrich(df, [
     {
-        "name": "terrain_stats",
-        "predictors": ["dem_local"],
-        "output": {"kind": "tabular", "reducers": ["mean", "std"], "window_m": 200},
+        "run_id": "terrain_stats",
+        "datasets": ["dem_local"],
+        "settings": {"output_type": "tabular", "statistics": ["mean", "std"], "window_size_m": 200},
     },
     {
-        "name": "terrain_tiles",
-        "predictors": ["dem_local"],
-        "output": {"kind": "raster", "window_m": 200, "resample_m": 10},
+        "run_id": "terrain_tiles",
+        "datasets": ["dem_local"],
+        "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 10},
     },
 ], catalog="configs/catalog.yml", out_dir="out")
 ```
