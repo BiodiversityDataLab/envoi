@@ -8,9 +8,9 @@ Update it as the project evolves.
 ## What this project is
 
 **biodata-enricher (EDDP)** is a Python package that enriches geographic point data
-with environmental predictors. The input is a table of sample points (`id`, `lat`, `lon`,
+with environmental datasets. The input is a table of sample points (`id`, `lat`, `lon`,
 optionally `date`); the output is either that same table with appended environmental columns 
-or images of environmental predictors, ready for spatial ecological modeling or similar analyses.
+or images of environmental datasets, ready for spatial ecological modeling or similar analyses.
 
 The primary use case is ecological research where you have field sample
 locations and want to attach climate, terrain, vegetation, or other environmental
@@ -53,13 +53,13 @@ or list of dicts (multiple outputs):
 
 ```python
 enrich(df, {
-    "name": "terrain",
-    "predictors": ["dem_local"],
-    "output": {
-        "kind": "tabular",          # "tabular" or "raster"
-        "reducers": ["mean", "std"],
-        "window_m": 200,
-        "format": "parquet",        # "parquet" or "csv"
+    "run_id": "terrain",
+    "datasets": ["dem_local"],
+    "settings": {
+        "output_type": "tabular",          # "tabular" or "raster"
+        "statistics": ["mean", "std"],
+        "window_size_m": 200,
+        "output_format": "parquet",        # "parquet" or "csv"
         "resample_m": 10,           # optional, for CNN-ready tiles
         "min_coverage_pct": 80,     # QC threshold
     },
