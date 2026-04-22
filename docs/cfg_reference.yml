@@ -2,7 +2,7 @@
 # biodata-enricher: cfg reference
 # ============================================================
 # Pass as a dict (single output) or list of dicts (multiple)
-# to enrich(df, cfg, catalog=..., out_dir=...)
+# to extract(df, cfg, catalog=..., out_dir=...)
 # ============================================================
 
 # --- Single output example ---
@@ -38,7 +38,7 @@ settings:
 --- Multiple outputs example ---
 Pass a list:
 
-enrich(df, [
+extract(df, [
     {
         "run_id": "terrain_stats",
         "datasets": ["dem_aster"],

@@ -5,7 +5,7 @@
 ```
                           User code
                              |
-                     enrich(df, cfg)                 <- src/biodata/enrich.py
+                     extract(df, cfg)                 <- src/biodata/extract.py
                              |
               +--------------+--------------+
               |                             |
@@ -54,7 +54,7 @@
           |                          |   output_type: tabular  |
           v                          |   statistics: [mean,std]|
  +--------+---------+               |   window_size_m: 200    |
- |    enrich()      | <-------------+-------------------------+
+ |    extract()      | <-------------+-------------------------+
  +--------+---------+
           |
           |  1. Load catalog -> resolve adapter per dataset
@@ -96,7 +96,7 @@
 
 | Module | Role |
 |---|---|
-| `enrich.py` | Orchestrator. Parses config, loops over datasets, dispatches to adapters, assembles outputs. |
+| `extract.py` | Orchestrator. Parses config, loops over datasets, dispatches to adapters, assembles outputs. |
 | `config.py` | Loads and validates `catalog.yml`. Auto-detects CRS/resolution for local rasters via rasterio. |
 | `adapters/__init__.py` | Adapter registry. Maps source names (`earth_engine`, `local`) to adapter classes. |
 | `gee_adapter.py` | GEE adapter. Handles asset type detection (IMAGE vs IMAGE_COLLECTION), image building (date filtering, cloud masking, mosaicking), server-side stats, point sampling, and raster export. Uses `filterBounds` for tiled collections and caches native projection. |
@@ -109,7 +109,7 @@
 
 ## Adapter interface
 
-Both adapters expose the same methods so `enrich.py` can treat them uniformly:
+Both adapters expose the same methods so `extract.py` can treat them uniformly:
 
 | Method | Mode | Returns |
 |---|---|---|

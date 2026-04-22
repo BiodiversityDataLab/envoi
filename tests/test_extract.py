@@ -1,4 +1,4 @@
-"""Tests for the enrich() pipeline using local raster data."""
+"""Tests for the extract() pipeline using local raster data."""
 
 from pathlib import Path
 import json
@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 import rasterio
 
-from biodata.enrich import enrich
+from biodata.extract import extract
 
 DATA_DIR = Path("data/for_testing")
 SAMPLE_CSV = DATA_DIR / "adrian_example.csv"
@@ -41,7 +41,7 @@ def sample_df():
 class TestTabular:
     def test_basic_stats(self, sample_df, tmp_path):
         """Stats csv has reducer columns, QC csv has QA columns."""
-        outputs = enrich(
+        outputs = extract(
             sample_df,
             {
                 "run_id": "dem_100m",
@@ -73,7 +73,7 @@ class TestTabular:
 
     def test_row_order_preserved(self, sample_df, tmp_path):
         """IDs in output match input order."""
-        outputs = enrich(
+        outputs = extract(
             sample_df,
             {
                 "run_id": "test",
@@ -93,7 +93,7 @@ class TestTabular:
 
     def test_csv_format(self, sample_df, tmp_path):
         """Default format is csv; parquet can be requested explicitly."""
-        outputs = enrich(
+        outputs = extract(
             sample_df,
             {
                 "run_id": "csv_test",
@@ -116,7 +116,7 @@ class TestTabular:
     def test_multiple_reducers(self, sample_df, tmp_path):
         """All requested reducers produce columns."""
         reducers = ["mean", "median", "min", "max", "std"]
-        outputs = enrich(
+        outputs = extract(
             sample_df,
             {
                 "run_id": "multi",
@@ -137,7 +137,7 @@ class TestTabular:
 
     def test_multiple_datasets(self, sample_df, tmp_path):
         """Multiple datasets produce separate columns."""
-        outputs = enrich(
+        outputs = extract(
             sample_df,
             {
                 "run_id": "multi_pred",
@@ -158,7 +158,7 @@ class TestTabular:
 
     def test_point_reducer(self, sample_df, tmp_path):
         """reducers: [point] samples exact pixel values."""
-        outputs = enrich(
+        outputs = extract(
             sample_df,
             {
                 "run_id": "point_test",
@@ -187,7 +187,7 @@ class TestTabular:
 class TestRaster:
     def test_export_tiles(self, sample_df, tmp_path):
         """kind: raster produces one GeoTIFF per point."""
-        enrich(
+        extract(
             sample_df,
             {
                 "run_id": "tiles",
@@ -204,7 +204,7 @@ class TestRaster:
 
     def test_tile_dimensions_consistent(self, sample_df, tmp_path):
         """All exported tiles have identical dimensions."""
-        enrich(
+        extract(
             sample_df,
             {
                 "run_id": "dim_test",
@@ -224,7 +224,7 @@ class TestRaster:
 
     def test_resample_m(self, sample_df, tmp_path):
         """resample_m produces tiles with expected pixel count."""
-        enrich(
+        extract(
             sample_df,
             {
                 "run_id": "resamp",
@@ -244,7 +244,7 @@ class TestRaster:
 
     def test_raster_metadata_json(self, sample_df, tmp_path):
         """Raster output writes a sidecar metadata JSON."""
-        enrich(
+        extract(
             sample_df,
             {
                 "run_id": "meta_test",
@@ -270,7 +270,7 @@ class TestRaster:
 class TestMetadata:
     def test_metadata_structure(self, sample_df, tmp_path):
         """Metadata JSON has run, config, datasets, quality sections."""
-        outputs = enrich(
+        outputs = extract(
             sample_df,
             {
                 "run_id": "meta",
@@ -313,7 +313,7 @@ class TestMetadata:
 class TestMultipleOutputs:
     def test_list_cfg(self, sample_df, tmp_path):
         """Passing a list of dicts processes all outputs."""
-        outputs = enrich(
+        outputs = extract(
             sample_df,
             [
                 {
@@ -351,7 +351,7 @@ class TestErrors:
         """Raises ValueError if required columns are missing."""
         df = pd.DataFrame({"x": [1], "y": [2]})
         with pytest.raises(ValueError, match="missing required column"):
-            enrich(
+            extract(
                 df,
                 {
                     "run_id": "fail",
@@ -369,7 +369,7 @@ class TestErrors:
     def test_unknown_dataset(self, sample_df, tmp_path):
         """Raises KeyError for a dataset not in catalog."""
         with pytest.raises(KeyError, match="nonexistent"):
-            enrich(
+            extract(
                 sample_df,
                 {
                     "run_id": "fail",
@@ -386,8 +386,8 @@ class TestErrors:
 
     def test_invalid_kind(self, sample_df, tmp_path):
         """Raises ValueError for an unknown output kind."""
-        with pytest.raises(ValueError, match="Unknown output_type"):
-            enrich(
+        with pytest.raises(ValueError, match="Unknown or missing output_type"):
+            extract(
                 sample_df,
                 {
                     "run_id": "fail",
