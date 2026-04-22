@@ -100,7 +100,8 @@ def _get_collection_timestamps(collection_id: str) -> pd.DatetimeIndex | None:
 
 
 def _find_nearest_timestamp(
-    timestamps: pd.DatetimeIndex, target: pd.Timestamp,
+    timestamps: pd.DatetimeIndex,
+    target: pd.Timestamp,
 ) -> tuple[pd.Timestamp, bool]:
     """Return the timestamp closest to *target*, clamping to range.
 
@@ -243,15 +244,15 @@ def _build_image(
 # Maps EDDP/user-facing reducer names to GEE reducer constructors
 # and the suffix GEE appends to band names in reduceRegion output.
 _GEE_REDUCER_MAP = {
-    "mean":   ("mean",     "_mean"),
-    "median": ("median",   "_median"),
-    "mode":   ("mode",     "_mode"),
-    "std":    ("stdDev",   "_stdDev"),
-    "var":    ("variance", "_variance"),
-    "min":    ("min",      "_min"),
-    "max":    ("max",      "_max"),
-    "count":  ("count",    "_count"),
-    "sum":    ("sum",      "_sum"),
+    "mean": ("mean", "_mean"),
+    "median": ("median", "_median"),
+    "mode": ("mode", "_mode"),
+    "std": ("stdDev", "_stdDev"),
+    "var": ("variance", "_variance"),
+    "min": ("min", "_min"),
+    "max": ("max", "_max"),
+    "count": ("count", "_count"),
+    "sum": ("sum", "_sum"),
 }
 
 
@@ -377,7 +378,7 @@ class GeeRasterAdapter:
     2. **fetch_stats_batch** — server-side statistics via ``reduceRegion``
        with combined reducers.  Much faster for the common stats use-case.
     3. **fetch_points_batch** — single pixel values via ``image.sample()``.
-    4. **export_images** — download full GeoTIFF tiles via ``geemap``.
+    4. **export_tiles** — download full GeoTIFF tiles via ``geemap``.
 
     For ImageCollections, the adapter automatically selects the nearest
     image to each point's date. When no date is provided, the most
@@ -392,8 +393,7 @@ class GeeRasterAdapter:
     def __post_init__(self):
         if ee is None:
             raise ImportError(
-                "earthengine-api is required for GEE adapter: "
-                "pip install earthengine-api"
+                "earthengine-api is required for GEE adapter: " "pip install earthengine-api"
             )
 
         _ensure_gee_init()
@@ -401,7 +401,11 @@ class GeeRasterAdapter:
         # dataset_spec holds extra config (bands, date windows, derivatives, etc.)
         # Always auto-detect asset type from GEE, then merge with user config.
         dataset_spec = dict(self.spec.get("dataset_spec") or {})
-        if self.spec.get("path") and "image" not in dataset_spec and "collection" not in dataset_spec:
+        if (
+            self.spec.get("path")
+            and "image" not in dataset_spec
+            and "collection" not in dataset_spec
+        ):
             asset_id = self.spec["path"]
             try:
                 asset_info = ee.data.getAsset(asset_id)
@@ -443,13 +447,10 @@ class GeeRasterAdapter:
         # from the first image of a collection or the image's first band.
         if is_collection:
             self._native_proj = (
-                ee.ImageCollection(dataset_spec["collection"])
-                .first().select(0).projection()
+                ee.ImageCollection(dataset_spec["collection"]).first().select(0).projection()
             )
             # Fetch available timestamps for automatic date selection
-            self._collection_timestamps = _get_collection_timestamps(
-                dataset_spec["collection"]
-            )
+            self._collection_timestamps = _get_collection_timestamps(dataset_spec["collection"])
             # Collections with timestamps use per-point date selection;
             # the static image is built lazily in _get_image when no date
             # is provided (most-recent fallback).
@@ -530,7 +531,9 @@ class GeeRasterAdapter:
         dt = pd.to_datetime(date)
         geom = ee.Geometry.Point([lon, lat]) if lat is not None else None
         return _build_image(
-            self._dataset_spec, dt, geometry=geom,
+            self._dataset_spec,
+            dt,
+            geometry=geom,
             collection_timestamps=self._collection_timestamps,
         )
 
@@ -554,7 +557,7 @@ class GeeRasterAdapter:
             try:
                 names = img.bandNames().getInfo()
                 self._cached_band_name = names[0] if names else "value"
-                self._cached_band_names = names        # full list for metadata
+                self._cached_band_names = names  # full list for metadata
                 self._cached_band_count = len(names)
             except Exception:
                 self._cached_band_name = "value"
@@ -799,15 +802,19 @@ class GeeRasterAdapter:
 
         if not props:
             return {}, {
-                "in_extent": False, "n_pixels": 0,
-                "had_nodata": False, "coverage_pct": 0.0,
+                "in_extent": False,
+                "n_pixels": 0,
+                "had_nodata": False,
+                "coverage_pct": 0.0,
                 "src_path": self._src_label(),
                 **date_info,
             }
 
         return props, {
-            "in_extent": True, "n_pixels": 1,
-            "had_nodata": False, "coverage_pct": 100.0,
+            "in_extent": True,
+            "n_pixels": 1,
+            "had_nodata": False,
+            "coverage_pct": 100.0,
             "src_path": self._src_label(),
             **date_info,
         }
@@ -844,6 +851,7 @@ class GeeRasterAdapter:
 
         # Project to UTM, snap to pixel grid, compute window corners
         from pyproj import Transformer
+
         transformer = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
         cx, cy = transformer.transform(lon, lat)
         cx = _snap_to_grid(cx, scale_m)
@@ -891,7 +899,7 @@ class GeeRasterAdapter:
             vals, meta = self._empty_result(window_m)
         return (vals, meta) if return_meta else vals
 
-    def fetch_batch(
+    def fetch_batch(  # todo: remove this function, since it's always better to use server-side reducers
         self,
         lats: Sequence[float],
         lons: Sequence[float],
@@ -949,8 +957,12 @@ class GeeRasterAdapter:
             future_to_idx = {
                 executor.submit(
                     self._fetch_stats_single,
-                    lat, lon, window_m,
-                    combined_reducer, reducer_names, suffixes,
+                    lat,
+                    lon,
+                    window_m,
+                    combined_reducer,
+                    reducer_names,
+                    suffixes,
                     date,
                 ): i
                 for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
@@ -996,7 +1008,7 @@ class GeeRasterAdapter:
 
         return results
 
-    def export_images(
+    def export_tiles(
         self,
         lats: Sequence[float],
         lons: Sequence[float],
@@ -1005,7 +1017,7 @@ class GeeRasterAdapter:
         *,
         ids: Sequence[str] | None = None,
         dates: Sequence | None = None,
-        feature_name: str = "feature",
+        dataset_name: str = "dataset",
         resample_m: float | None = None,
     ) -> List[Path]:
         """Export GeoTIFF tiles for many points in parallel (Mode 4).
@@ -1015,7 +1027,7 @@ class GeeRasterAdapter:
 
         Returns list of output file paths.
         """
-        out_dir = Path(out_dir) / feature_name
+        out_dir = Path(out_dir) / dataset_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
         n = len(lats)
@@ -1023,12 +1035,18 @@ class GeeRasterAdapter:
         id_list = list(ids) if ids is not None else [str(i) for i in range(n)]
         results: List = [None] * n
 
+        # Warm the band-name cache so build_dataset_meta can read it later.
+        try:
+            self._get_band_name(self._get_image())
+        except Exception:
+            pass
+
+        meta_list = [self._resolve_date_info(d) for d in date_list]
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {}
-            for i, (lat, lon, date, sample_id) in enumerate(
-                zip(lats, lons, date_list, id_list)
-            ):
-                out_path = out_dir / f"{sample_id}-{feature_name}.tif"
+            for i, (lat, lon, date, sample_id) in enumerate(zip(lats, lons, date_list, id_list)):
+                out_path = out_dir / f"{sample_id}-{dataset_name}.tif"
                 future = executor.submit(
                     self._export_single, lat, lon, window_m, out_path, date, resample_m
                 )
@@ -1042,7 +1060,7 @@ class GeeRasterAdapter:
                     logger.warning("GEE export failed for point %d: %s", idx, e)
                     results[idx] = None
 
-        return results
+        return results, meta_list
 
 
 if _register is not None:

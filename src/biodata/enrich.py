@@ -15,7 +15,16 @@ from .reducers import get_reducer, validate_reducers
 from .output import OutputManager
 from .config import load_catalogs
 from .qc import compute_qc_flags, extract_date_columns, extract_crs_column
-from .metadata import build_feature_meta, build_tile_crs_zones, write_metadata, summarize_date_info
+from .metadata import (
+    build_dataset_meta,
+    build_tile_crs_zones,
+    write_metadata,
+    summarize_date_info,
+    summarize_tile_export,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 def _load_yaml(path_or_dict):
@@ -25,7 +34,56 @@ def _load_yaml(path_or_dict):
         return yaml.safe_load(f)
 
 
-logger = logging.getLogger(__name__)
+def _normalize_cfg(cfg) -> list[dict]:
+    """Load and normalize cfg into a list of output config dicts."""
+    raw = _load_yaml(cfg)
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, list):
+        return raw
+    raise ValueError("cfg must be a dict, list, or path to a YAML file.")
+
+
+def _validate_required_columns(df: pd.DataFrame) -> None:
+    """Raise ValueError if df is missing any of the required id/lat/lon columns."""
+    required = {"id", "lat", "lon"}
+    if not required.issubset(df.columns):
+        missing = required - set(df.columns)
+        raise ValueError(
+            f"Input DataFrame is missing required column(s): {sorted(missing)}.\n"
+            f"Expected columns: id, lat, lon (and optionally: date).\n"
+            f"Found columns: {sorted(df.columns.tolist())}"
+        )
+
+
+def _validate_crs(df: pd.DataFrame, input_crs: str | None) -> pd.DataFrame:
+    """Reproject coordinates to WGS84 if needed, and raise if any lat/lon are out of range."""
+    if input_crs is not None:
+        input_crs_upper = input_crs.upper()
+        if input_crs_upper != "EPSG:4326" and input_crs_upper != "WGS84":
+            logger.info(f"Reprojecting coordinates from {input_crs} to WGS84.")
+            transformer = Transformer.from_crs(input_crs, "EPSG:4326", always_xy=True)
+            lons, lats = transformer.transform(df["lon"].values, df["lat"].values)
+            df["lon"] = lons
+            df["lat"] = lats
+
+    bad_lat_mask = df["lat"].abs() > 90
+    bad_lon_mask = df["lon"].abs() > 180
+    bad_mask = bad_lat_mask | bad_lon_mask
+    if bad_mask.any():
+        bad_rows = df.loc[bad_mask, ["id", "lat", "lon"]]
+        problems = []
+        if bad_lat_mask.any():
+            problems.append("latitude values outside ±90°")
+        if bad_lon_mask.any():
+            problems.append("longitude values outside ±180°")
+        raise ValueError(
+            f"Coordinates appear to not be in WGS84 (EPSG:4326): {'; '.join(problems)}.\n"
+            f"Rows with invalid coordinates:\n{bad_rows.to_string(index=False)}\n"
+            f"If your coordinates are in a different CRS, pass input_crs='EPSG:XXXX'"
+        )
+
+    return df
 
 
 def enrich(
@@ -41,13 +99,13 @@ def enrich(
 ) -> Dict[str, Path]:
     """Enrich sample points with environmental data.
 
-    ``cfg`` is a dict (single output) or list of dicts (multiple outputs),
-    each specifying name, predictors, and output settings.  Example::
+    ``cfg`` is a dict (single output) or list of dicts (multiple output_paths),
+    each specifying run_id, datasets, and settings.  Example::
 
         enrich(df, {
-            "name": "terrain",
-            "predictors": ["dem_aster"],
-            "output": {"kind": "tabular", "reducers": ["mean"], "window_m": 200},
+            "run_id": "terrain",
+            "datasets": ["dem_aster"],
+            "settings": {"output_type": "tabular", "statistics": ["mean"], "window_size_m": 200},
         })
 
     Parameters
@@ -59,226 +117,163 @@ def enrich(
 
     Returns a mapping of output-key -> Path written.
     """
-    required = {"id", "lat", "lon"}
-    if not required.issubset(df.columns):
-        missing = required - set(df.columns)
-        raise ValueError(
-            f"Input DataFrame is missing required column(s): {sorted(missing)}.\n"
-            f"Expected columns: id, lat, lon (and optionally: date).\n"
-            f"Found columns: {sorted(df.columns.tolist())}"
-        )
+    df_copy = df.copy()
+    output_paths: Dict[str, Path] = {}
 
-    df = df.copy()
-
-    if input_crs is not None:
-        input_crs_upper = input_crs.upper()
-        if input_crs_upper != "EPSG:4326" and input_crs_upper != "WGS84":
-            logger.info(f"Reprojecting coordinates from {input_crs} to WGS84.")
-            transformer = Transformer.from_crs(input_crs, "EPSG:4326", always_xy=True)
-            lons, lats = transformer.transform(
-                df["lon"].values, df["lat"].values,
-            )
-            df["lon"] = lons
-            df["lat"] = lats
-
-    # Validate WGS84 coordinate ranges
-    bad_lat_mask = df["lat"].abs() > 90
-    bad_lon_mask = df["lon"].abs() > 180
-    bad_mask = bad_lat_mask | bad_lon_mask
-    if bad_mask.any():
-        bad_rows = df.loc[bad_mask, ["id", "lat", "lon"]]
-        problems = []
-        if bad_lat_mask.any():
-            problems.append(
-                f"lat values outside ±90°"
-            )
-        if bad_lon_mask.any():
-            problems.append(
-                f"lon values outside ±180°"
-            )
-        raise ValueError(
-            f"Coordinates appear to not be in WGS84 (EPSG:4326): {'; '.join(problems)}.\n"
-            f"Rows with invalid coordinates:\n{bad_rows.to_string(index=False)}\n"
-            f"If your coordinates are in a different CRS, pass input_crs='EPSG:XXXX'"
-        )
+    _validate_required_columns(df_copy)
+    df_copy = _validate_crs(df_copy, input_crs)
 
     catalog_dict = load_catalogs(catalog, extra_catalog)
-    cat = catalog_dict["datasets"]
+    catalog_datasets = catalog_dict["datasets"]
 
-    outputs: Dict[str, Path] = {}
+    output_cfgs_list = _normalize_cfg(cfg)
 
-    # --- Normalise cfg into a list of output dicts ---
-    raw = _load_yaml(cfg)
-    if isinstance(raw, dict):
-        output_list = [raw]
-    elif isinstance(raw, list):
-        output_list = raw
-    else:
-        raise ValueError("cfg must be a dict, list, or path to a YAML file.")
-
-    for idx, group in enumerate(output_list):
-        gname = group.get("name", f"output{idx+1}")
-        feats: List[str] = group.get("features") or group.get("predictors", [])
-        out_cfg = group.get("output", {}) or {}
-        kind = out_cfg.get("kind", "tabular")
-
-        resample_m = out_cfg.get("resample_m")
-        fmt = out_cfg.get("format", "csv")
-        min_cov = out_cfg.get("min_coverage_pct", 80)
-
-        stats = out_cfg.get("reducers")
-        buf = out_cfg.get("window_m", 500)
-
-        work = df.copy()
-        feature_metas: Dict[str, Any] = {}
+    for idx, output_cfg in enumerate(output_cfgs_list):
+        dataset_metas: Dict[str, Any] = {}
         coverage_backlog: Dict[str, Dict[str, Dict[str, int]]] = {}
         date_backlog: Dict[str, Any] = {}
         warnings_backlog: Dict[str, str] = {}
 
-        for p in feats:
-            if p not in cat:
-                raise KeyError(f"Feature '{p}' not found in catalog {catalog}")
-            spec = cat[p]
-            source = spec.get("source")
-            data_type = spec.get("data_type")
+        run_id = output_cfg.get("run_id", f"output{idx+1}")
+        datasets: List[str] = output_cfg.get("datasets", [])
+        if not datasets:
+            raise ValueError(f"Output '{run_id}': missing required 'datasets' list")
+        settings = output_cfg.get("settings", {}) or {}
+        output_type = settings.get("output_type", "tabular")
+        if output_type not in ("tabular", "raster"):
+            raise ValueError(f"Unknown output_type: {output_type}")
+        resample_m = settings.get("resample_m")
+        output_format = settings.get("output_format", "csv")
+        min_coverage = settings.get("min_coverage_pct", 80)
+        stats = settings.get("statistics")
+        window_size = settings.get("window_size_m", 500)
 
-            AdapterCls = get_adapter(source)
-            adapter = AdapterCls(spec)
-            coverage_backlog[p] = {}
+        for dataset in datasets:
+            coverage_backlog[dataset] = {}
 
-            dates = work.date.tolist() if "date" in work.columns else None
+            if dataset not in catalog_datasets:
+                raise KeyError(f"Dataset '{dataset}' not found in catalog {catalog}")
+            dataset_cfg = catalog_datasets[dataset]
+            source = dataset_cfg.get("source")
+            data_type = dataset_cfg.get("data_type")
+            dates = df_copy.date.tolist() if "date" in df_copy.columns else None
 
-            if stats:
-                w = validate_reducers(list(stats), data_type, p)
-                if w:
-                    warnings_backlog[p] = w
+            AdapterClass = get_adapter(source)
+            adapter = AdapterClass(dataset_cfg)
 
-            # ----- kind: "raster" — export GeoTIFF tiles, skip stats -----
-            if kind == "raster":
-                tiles_root = Path(out_dir) / gname
+            # ----- output_type: "raster" — export GeoTIFF tiles, skip stats -----
+            if output_type == "raster":
+                tiles_root = Path(out_dir) / run_id
 
-                if hasattr(adapter, "export_images"):
-                    exported_paths = adapter.export_images(
-                        work.lat, work.lon, buf, tiles_root,
-                        ids=work["id"].tolist(), dates=dates, feature_name=p,
-                        resample_m=resample_m,
-                    )
-                elif hasattr(adapter, "export_windows"):
-                    exported_paths = adapter.export_windows(
-                        work.lat, work.lon, buf, tiles_root,
-                        ids=work["id"].tolist(), feature_name=p,
-                        resample_m=resample_m,
-                    )
-                else:
-                    raise ValueError(
-                        f"Source '{source}' does not support raster export."
-                    )
-                n_exported = sum(1 for ep in (exported_paths or []) if ep is not None)
-                coverage_backlog[p]["tiles"] = {
-                    "n_exported": n_exported,
-                    "n_failed": len(work) - n_exported,
-                    "total": len(work),
-                }
-                tile_crs_zones = build_tile_crs_zones(work.lat, work.lon)
-                # Band names are cached after stats fetching; for raster-only
-                # exports trigger the lookup via _get_image (works for both
-                # IMAGE assets and per-point-date collections).
-                if hasattr(adapter, "_get_band_name") and hasattr(adapter, "_get_image"):
-                    try:
-                        adapter._get_band_name(adapter._get_image())
-                    except Exception:
-                        pass
-                # Date info: build from _resolve_date_info (pure Python, no GEE calls)
-                if hasattr(adapter, "_resolve_date_info"):
-                    date_list_raster = dates if dates is not None else [None] * len(work)
-                    raster_meta_list = [adapter._resolve_date_info(d) for d in date_list_raster]
-                    date_summary = summarize_date_info(raster_meta_list)
-                    if date_summary is not None:
-                        date_backlog[p] = date_summary
-                feature_metas[p] = build_feature_meta(
-                    spec, adapter,
+                # ----- export tiles for this dataset -----
+                exported_paths, meta_list = adapter.export_tiles(
+                    df_copy.lat,
+                    df_copy.lon,
+                    window_size,
+                    tiles_root,
+                    ids=df_copy["id"].tolist(),
+                    dates=dates,
+                    dataset_name=dataset,
+                    resample_m=resample_m,
+                )
+
+                # ----- build metadata for tile export -----
+                coverage_backlog[dataset]["tiles"] = summarize_tile_export(
+                    exported_paths, len(df_copy)
+                )
+                tile_crs_zones = build_tile_crs_zones(df_copy.lat, df_copy.lon)
+                date_summary = summarize_date_info(meta_list)
+                if date_summary is not None:
+                    date_backlog[dataset] = date_summary
+                dataset_metas[dataset] = build_dataset_meta(
+                    dataset_cfg,
+                    adapter,
                     tile_crs_zones=tile_crs_zones,
                 )
-                outputs[f"{gname}:{p}"] = tiles_root / p
-                continue  # skip stats for this feature
+                output_paths[f"{run_id}:{dataset}"] = tiles_root / dataset
 
-            # ----- "point" reducer: exact pixel at coordinate, no window -----
-            if stats and "point" in stats:
+                continue  # skip stats for this dataset
+
+            elif output_type == "tabular" and stats and "point" in stats:
+                # remove point only and put that in adapters
+                # ----- "point" reducer: exact pixel at coordinate, no window -----
                 if not hasattr(adapter, "fetch_points_batch"):
-                    raise ValueError(
-                        f"Source '{source}' does not support the 'point' reducer."
-                    )
+                    raise ValueError(f"Source '{source}' does not support the 'point' reducer.")
                 pt_results = adapter.fetch_points_batch(
-                    work.lat, work.lon, dates=dates,
+                    df_copy.lat,
+                    df_copy.lon,
+                    dates=dates,
                 )
                 all_keys = {k for vals, _ in pt_results for k in vals}
                 for bk in sorted(all_keys):
-                    col = f"{p}_{bk}_point" if len(all_keys) > 1 else f"{p}_point"
-                    work[col] = [r[0].get(bk) for r in pt_results]
+                    col = f"{dataset}_{bk}_point" if len(all_keys) > 1 else f"{dataset}_point"
+                    df_copy[col] = [r[0].get(bk) for r in pt_results]
 
                 meta_list = [r[1] for r in pt_results]
-                qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
-                qc_df = qc_df.add_prefix(f"{p}_").add_suffix("_point")
+                qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_coverage)
+                qc_df = qc_df.add_prefix(f"{dataset}_").add_suffix("_point")
                 extra_dfs = []
                 date_df = extract_date_columns(meta_list)
                 if not date_df.empty:
-                    extra_dfs.append(date_df.add_prefix(f"{p}_").add_suffix("_point"))
-                    date_backlog[p] = summarize_date_info(meta_list)
+                    extra_dfs.append(date_df.add_prefix(f"{dataset}_").add_suffix("_point"))
+                    date_backlog[dataset] = summarize_date_info(meta_list)
                 crs_df = extract_crs_column(meta_list)
                 if not crs_df.empty:
-                    extra_dfs.append(crs_df.add_prefix(f"{p}_").add_suffix("_point"))
+                    extra_dfs.append(crs_df.add_prefix(f"{dataset}_").add_suffix("_point"))
                 if extra_dfs:
                     qc_df = pd.concat(
-                        [qc_df.reset_index(drop=True)] + [d.reset_index(drop=True) for d in extra_dfs],
+                        [qc_df.reset_index(drop=True)]
+                        + [d.reset_index(drop=True) for d in extra_dfs],
                         axis=1,
                     )
-                work = pd.concat(
-                    [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
+                df_copy = pd.concat(
+                    [df_copy.reset_index(drop=True), qc_df.reset_index(drop=True)],
                     axis=1,
                 )
-                coverage_backlog[p]["point"] = {
-                    "n_zero": int((qc_df[f"{p}_coverage_pct_point"] == 0).sum()),
-                    "n_full": int((qc_df[f"{p}_coverage_pct_point"] == 100).sum()),
+                coverage_backlog[dataset]["point"] = {
+                    "n_zero": int((qc_df[f"{dataset}_coverage_pct_point"] == 0).sum()),
+                    "n_full": int((qc_df[f"{dataset}_coverage_pct_point"] == 100).sum()),
                     "total": int(len(pt_results)),
                 }
 
             else:
-                # ----- Server-side stats (GEE fast path) -----
-                use_server_stats = (
-                    hasattr(adapter, "fetch_stats_batch")
-                    and stats
-                )
+                # ----- summary stats with window (both server-side and Python-side) -----
+                # TODO: this needs some work, have the same name for the fetch function in the adapters
+                # validate requested reducers per dataset and data type.
+                if stats:
+                    warning = validate_reducers(list(stats), data_type, dataset)
+                    if warning:
+                        warnings_backlog[dataset] = warning
 
-                if use_server_stats:
+                # ----- Earth Engine -----
+                if source == "earth_engine":
                     reducer_names = list(stats)
-                    ss_results = adapter.fetch_stats_batch(
-                        work.lat, work.lon, buf, reducer_names, dates=dates,
+                    stats_results = adapter.fetch_stats_batch(
+                        df_copy.lat,
+                        df_copy.lon,
+                        window_size,
+                        reducer_names,
+                        dates=dates,
                     )
-                    # Use actual result keys — for multi-band datasets these are
-                    # "{band}_{reducer}" (e.g. "bio01_mean"); for single-band just
-                    # "{reducer}" (e.g. "mean"). dict.fromkeys preserves insertion order.
-                    all_stat_keys = dict.fromkeys(k for r, _ in ss_results for k in r)
-                    for key in all_stat_keys:
-                        col = f"{p}_{key}_{buf}m"
-                        work[col] = [r[0].get(key) for r in ss_results]
+                    # For multi-band datasets keys are "{band}_{reducer}" (e.g. "bio01_mean");
+                    # for single-band just "{reducer}". dict.fromkeys preserves insertion order.
+                    stat_keys = dict.fromkeys(key for stats, _ in stats_results for key in stats)
+                    for stat_key in stat_keys:
+                        col = f"{dataset}_{stat_key}_{window_size}m"
+                        df_copy[col] = [stats.get(stat_key) for stats, _ in stats_results]
 
-                    meta_list = [r[1] for r in ss_results]
+                    meta_list = [meta for _, meta in stats_results]
 
                 else:
                     # ----- Python-side stats (local raster path) -----
-                    if hasattr(adapter, "fetch_batch"):
-                        results = adapter.fetch_batch(
-                            work.lat, work.lon, buf,
-                            dates=dates, return_meta=True,
-                        )
-                    else:
-                        results = [
-                            adapter.fetch_values(lat, lon, buf, return_meta=True)
-                            for lat, lon in zip(work.lat, work.lon)
-                        ]
-
                     vals_list: List[np.ndarray] = []
                     meta_list: List[Dict[str, Any]] = []
+
+                    results = [
+                        adapter.fetch_values(lat, lon, window_size, return_meta=True)
+                        for lat, lon in zip(df_copy.lat, df_copy.lon)
+                    ]
+
                     for arr, meta in results:
                         arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
                         vals_list.append(arr)
@@ -290,102 +285,116 @@ def enrich(
                     band_nums = adapter.band if is_multiband_local else None
 
                     default = "point" if data_type == "categorical" else "mean"
-                    reducer_names_iter = list(stats) if stats else [spec.get("default_reducer", default)]
+                    reducer_names_iter = (
+                        list(stats) if stats else [dataset_cfg.get("default_reducer", default)]
+                    )
                     for rname in reducer_names_iter:
                         reducer = get_reducer(rname)
                         if is_multiband_local:
                             for b_idx, band_num in enumerate(band_nums):
-                                col = f"{p}_b{band_num}_{rname}_{buf}m"
-                                work[col] = [
+                                col = f"{dataset}_b{band_num}_{rname}_{window_size}m"
+                                df_copy[col] = [
                                     (reducer(v[b_idx]) if v.size else None) for v in vals_list
                                 ]
                         else:
-                            col = f"{p}_{rname}_{buf}m"
-                            work[col] = [(reducer(v) if v.size else None) for v in vals_list]
+                            col = f"{dataset}_{rname}_{window_size}m"
+                            df_copy[col] = [(reducer(v) if v.size else None) for v in vals_list]
 
-                # --- QA columns (also buffer-suffixed) ---
-                qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_cov)
-                qc_df = qc_df.add_prefix(f"{p}_").add_suffix(f"_{buf}m")
+                # --- QA columns (also window_size-suffixed) ---
+                qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_coverage)
+                qc_df = qc_df.add_prefix(f"{dataset}_").add_suffix(f"_{window_size}m")
                 extra_dfs = []
                 date_df = extract_date_columns(meta_list)
                 if not date_df.empty:
-                    extra_dfs.append(date_df.add_prefix(f"{p}_").add_suffix(f"_{buf}m"))
-                    date_backlog[p] = summarize_date_info(meta_list)
+                    extra_dfs.append(
+                        date_df.add_prefix(f"{dataset}_").add_suffix(f"_{window_size}m")
+                    )
+                    date_backlog[dataset] = summarize_date_info(meta_list)
                 crs_df = extract_crs_column(meta_list)
                 if not crs_df.empty:
-                    extra_dfs.append(crs_df.add_prefix(f"{p}_").add_suffix(f"_{buf}m"))
+                    extra_dfs.append(
+                        crs_df.add_prefix(f"{dataset}_").add_suffix(f"_{window_size}m")
+                    )
                 if extra_dfs:
                     qc_df = pd.concat(
-                        [qc_df.reset_index(drop=True)] + [d.reset_index(drop=True) for d in extra_dfs],
+                        [qc_df.reset_index(drop=True)]
+                        + [d.reset_index(drop=True) for d in extra_dfs],
                         axis=1,
                     )
-                work = pd.concat(
-                    [work.reset_index(drop=True), qc_df.reset_index(drop=True)],
+                df_copy = pd.concat(
+                    [df_copy.reset_index(drop=True), qc_df.reset_index(drop=True)],
                     axis=1,
                 )
 
                 # --- coverage summary for metadata ---
-                cov = qc_df[f"{p}_coverage_pct_{buf}m"].fillna(0)
-                coverage_backlog[p][str(buf)] = {
+                cov = qc_df[f"{dataset}_coverage_pct_{window_size}m"].fillna(0)
+                coverage_backlog[dataset][str(window_size)] = {
                     "n_zero": int((cov == 0).sum()),
                     "n_partial": int(((cov > 0) & (cov < 100)).sum()),
                     "n_full": int((cov == 100).sum()),
                     "total": int(cov.shape[0]),
                 }
 
-            # Build feature metadata after fetching so band_names are cached
-            feature_metas[p] = build_feature_meta(spec, adapter)
+            # Build dataset metadata after fetching so band_names are cached
+            dataset_metas[dataset] = build_dataset_meta(dataset_cfg, adapter)
 
-        # --- after all features processed ---
-        if kind == "tabular":
-            core_cols = [c for c in ("id", "lat", "lon", "date") if c in work.columns]
+        # --- after all datasets processed ---
+        if output_type == "tabular":
+            core_cols = [c for c in ("id", "lat", "lon", "date") if c in df_copy.columns]
 
-            qc_keywords = ("_in_extent_", "_n_pixels_", "_had_nodata_", "_coverage_pct_",
-                           "_image_date_used_", "_date_clamped_", "_date_source_",
-                           "_region_crs_")
-            qc_cols = [c for c in work.columns if any(kw in c for kw in qc_keywords)]
-            stats_cols = [c for c in work.columns if c not in qc_cols]
+            qc_keywordataset = (
+                "_in_extent_",
+                "_n_pixels_",
+                "_had_nodata_",
+                "_coverage_pct_",
+                "_image_date_used_",
+                "_date_clamped_",
+                "_date_source_",
+                "_region_crs_",
+            )
+            qc_cols = [c for c in df_copy.columns if any(kw in c for kw in qc_keywordataset)]
+            stats_cols = [c for c in df_copy.columns if c not in qc_cols]
 
-            stats_df = work[core_cols + [c for c in stats_cols if c not in core_cols]].copy()
-            qc_df = work[core_cols + [c for c in qc_cols if c not in core_cols]].copy()
+            stats_df = df_copy[core_cols + [c for c in stats_cols if c not in core_cols]].copy()
+            qc_df = df_copy[core_cols + [c for c in qc_cols if c not in core_cols]].copy()
 
-            group_om = OutputManager(out_dir, fmt=fmt)
-            stats_path = group_om.write_tabular(stats_df, gname)
-            qc_path = group_om.write_tabular(qc_df, f"{gname}_qc")
+            output_cfg_om = OutputManager(out_dir, fmt=output_format)
+            stats_path = output_cfg_om.write_tabular(stats_df, run_id)
+            qc_path = output_cfg_om.write_tabular(qc_df, f"{run_id}_qc")
 
             write_metadata(
-                out_dir, gname,
-                kind=kind,
-                n_points=len(work),
-                features=feature_metas,
+                out_dir,
+                run_id,
+                output_type=output_type,
+                n_points=len(df_copy),
+                datasets=dataset_metas,
                 config={
-                    "reducers": stats,
-                    "window_m": buf,
-                    "min_coverage_pct": min_cov,
+                    "statistics": stats,
+                    "window_size_m": window_size,
+                    "min_coverage_pct": min_coverage,
                 },
                 quality=coverage_backlog,
                 date_info=date_backlog if date_backlog else None,
                 warnings=warnings_backlog if warnings_backlog else None,
             )
 
-            outputs[gname] = stats_path
-            outputs[f"{gname}_qc"] = qc_path
+            output_paths[run_id] = stats_path
+            output_paths[f"{run_id}_qc"] = qc_path
 
-        elif kind == "raster":
+        elif output_type == "raster":
             write_metadata(
-                Path(out_dir) / gname, gname,
-                kind=kind,
-                n_points=len(work),
-                features=feature_metas,
+                Path(out_dir) / run_id,
+                run_id,
+                output_type=output_type,
+                n_points=len(df_copy),
+                datasets=dataset_metas,
                 config={
-                    "window_m": buf,
+                    "window_size_m": window_size,
                     **({"resample_m": resample_m} if resample_m else {}),
                 },
                 quality=coverage_backlog if coverage_backlog else None,
                 date_info=date_backlog if date_backlog else None,
                 warnings=warnings_backlog if warnings_backlog else None,
             )
-        else:
-            raise ValueError(f"Unknown output kind: {kind}")
 
-    return outputs
+    return output_paths

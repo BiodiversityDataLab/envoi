@@ -1,8 +1,8 @@
 """Tests for the enrich() pipeline using local raster data."""
+
 from pathlib import Path
 import json
 
-import numpy as np
 import pandas as pd
 import pytest
 import rasterio
@@ -37,14 +37,24 @@ def sample_df():
 # Tabular output
 # ------------------------------------------------------------------
 
+
 class TestTabular:
     def test_basic_stats(self, sample_df, tmp_path):
         """Stats csv has reducer columns, QC csv has QA columns."""
-        outputs = enrich(sample_df, {
-            "name": "dem_100m",
-            "predictors": ["dem_local"],
-            "output": {"kind": "tabular", "reducers": ["mean", "std"], "window_m": 100},
-        }, catalog=CATALOG, out_dir=tmp_path)
+        outputs = enrich(
+            sample_df,
+            {
+                "run_id": "dem_100m",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean", "std"],
+                    "window_size_m": 100,
+                },
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         stats_df = pd.read_csv(outputs["dem_100m"])
         qc_df = pd.read_csv(outputs["dem_100m_qc"])
@@ -63,22 +73,40 @@ class TestTabular:
 
     def test_row_order_preserved(self, sample_df, tmp_path):
         """IDs in output match input order."""
-        outputs = enrich(sample_df, {
-            "name": "test",
-            "predictors": ["dem_local"],
-            "output": {"kind": "tabular", "reducers": ["mean"], "window_m": 100},
-        }, catalog=CATALOG, out_dir=tmp_path)
+        outputs = enrich(
+            sample_df,
+            {
+                "run_id": "test",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         result = pd.read_csv(outputs["test"])
         assert list(result["id"]) == list(sample_df["id"])
 
     def test_csv_format(self, sample_df, tmp_path):
         """Default format is csv; parquet can be requested explicitly."""
-        outputs = enrich(sample_df, {
-            "name": "csv_test",
-            "predictors": ["dem_local"],
-            "output": {"kind": "tabular", "reducers": ["mean"], "window_m": 100},
-        }, catalog=CATALOG, out_dir=tmp_path)
+        outputs = enrich(
+            sample_df,
+            {
+                "run_id": "csv_test",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         assert outputs["csv_test"].suffix == ".csv"
         assert outputs["csv_test_qc"].suffix == ".csv"
@@ -88,23 +116,41 @@ class TestTabular:
     def test_multiple_reducers(self, sample_df, tmp_path):
         """All requested reducers produce columns."""
         reducers = ["mean", "median", "min", "max", "std"]
-        outputs = enrich(sample_df, {
-            "name": "multi",
-            "predictors": ["dem_local"],
-            "output": {"kind": "tabular", "reducers": reducers, "window_m": 200},
-        }, catalog=CATALOG, out_dir=tmp_path)
+        outputs = enrich(
+            sample_df,
+            {
+                "run_id": "multi",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": reducers,
+                    "window_size_m": 200,
+                },
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         stats_df = pd.read_csv(outputs["multi"])
         for r in reducers:
             assert f"dem_local_{r}_200m" in stats_df.columns
 
-    def test_multiple_predictors(self, sample_df, tmp_path):
-        """Multiple predictors produce separate columns."""
-        outputs = enrich(sample_df, {
-            "name": "multi_pred",
-            "predictors": ["dem_local", "slope_local"],
-            "output": {"kind": "tabular", "reducers": ["mean"], "window_m": 100},
-        }, catalog=CATALOG, out_dir=tmp_path)
+    def test_multiple_datasets(self, sample_df, tmp_path):
+        """Multiple datasets produce separate columns."""
+        outputs = enrich(
+            sample_df,
+            {
+                "run_id": "multi_pred",
+                "datasets": ["dem_local", "slope_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         stats_df = pd.read_csv(outputs["multi_pred"])
         assert "dem_local_mean_100m" in stats_df.columns
@@ -112,11 +158,20 @@ class TestTabular:
 
     def test_point_reducer(self, sample_df, tmp_path):
         """reducers: [point] samples exact pixel values."""
-        outputs = enrich(sample_df, {
-            "name": "point_test",
-            "predictors": ["dem_local"],
-            "output": {"kind": "tabular", "reducers": ["point"], "window_m": 100},
-        }, catalog=CATALOG, out_dir=tmp_path)
+        outputs = enrich(
+            sample_df,
+            {
+                "run_id": "point_test",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["point"],
+                    "window_size_m": 100,
+                },
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         stats_df = pd.read_csv(outputs["point_test"])
         assert "dem_local_point" in stats_df.columns
@@ -128,14 +183,20 @@ class TestTabular:
 # Raster output
 # ------------------------------------------------------------------
 
+
 class TestRaster:
     def test_export_tiles(self, sample_df, tmp_path):
         """kind: raster produces one GeoTIFF per point."""
-        outputs = enrich(sample_df, {
-            "name": "tiles",
-            "predictors": ["dem_local"],
-            "output": {"kind": "raster", "window_m": 200},
-        }, catalog=CATALOG, out_dir=tmp_path)
+        enrich(
+            sample_df,
+            {
+                "run_id": "tiles",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         tile_dir = tmp_path / "tiles" / "dem_local"
         tifs = list(tile_dir.glob("*.tif"))
@@ -143,11 +204,16 @@ class TestRaster:
 
     def test_tile_dimensions_consistent(self, sample_df, tmp_path):
         """All exported tiles have identical dimensions."""
-        enrich(sample_df, {
-            "name": "dim_test",
-            "predictors": ["dem_local"],
-            "output": {"kind": "raster", "window_m": 200},
-        }, catalog=CATALOG, out_dir=tmp_path)
+        enrich(
+            sample_df,
+            {
+                "run_id": "dim_test",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         tile_dir = tmp_path / "dim_test" / "dem_local"
         sizes = set()
@@ -158,11 +224,16 @@ class TestRaster:
 
     def test_resample_m(self, sample_df, tmp_path):
         """resample_m produces tiles with expected pixel count."""
-        enrich(sample_df, {
-            "name": "resamp",
-            "predictors": ["dem_local"],
-            "output": {"kind": "raster", "window_m": 200, "resample_m": 25},
-        }, catalog=CATALOG, out_dir=tmp_path)
+        enrich(
+            sample_df,
+            {
+                "run_id": "resamp",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 25},
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         tile_dir = tmp_path / "resamp" / "dem_local"
         expected_pixels = round(200 / 25)  # 8
@@ -173,31 +244,46 @@ class TestRaster:
 
     def test_raster_metadata_json(self, sample_df, tmp_path):
         """Raster output writes a sidecar metadata JSON."""
-        enrich(sample_df, {
-            "name": "meta_test",
-            "predictors": ["dem_local"],
-            "output": {"kind": "raster", "window_m": 200},
-        }, catalog=CATALOG, out_dir=tmp_path)
+        enrich(
+            sample_df,
+            {
+                "run_id": "meta_test",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         meta_path = tmp_path / "meta_test" / "meta_test_metadata.json"
         assert meta_path.exists()
         meta = json.loads(meta_path.read_text())
-        assert meta["config"]["window_m"] == 200
-        assert "dem_local" in meta["features"]
+        assert meta["config"]["window_size_m"] == 200
+        assert "dem_local" in meta["datasets"]
 
 
 # ------------------------------------------------------------------
 # Metadata
 # ------------------------------------------------------------------
 
+
 class TestMetadata:
     def test_metadata_structure(self, sample_df, tmp_path):
-        """Metadata JSON has run, config, features, quality sections."""
-        outputs = enrich(sample_df, {
-            "name": "meta",
-            "predictors": ["dem_local"],
-            "output": {"kind": "tabular", "reducers": ["mean"], "window_m": 100},
-        }, catalog=CATALOG, out_dir=tmp_path)
+        """Metadata JSON has run, config, datasets, quality sections."""
+        outputs = enrich(
+            sample_df,
+            {
+                "run_id": "meta",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         meta_path = outputs["meta"].parent / "meta_metadata.json"
         meta = json.loads(meta_path.read_text())
@@ -207,13 +293,13 @@ class TestMetadata:
         assert "package_version" in meta["run"]
         assert meta["run"]["n_points"] == len(sample_df)
 
-        assert meta["config"]["group"] == "meta"
-        assert meta["config"]["reducers"] == ["mean"]
+        assert meta["config"]["run_id"] == "meta"
+        assert meta["config"]["statistics"] == ["mean"]
 
-        feat = meta["features"]["dem_local"]
-        assert feat["source"] == "local"
-        assert "native_crs" in feat
-        assert "native_spatial_resolution_m" in feat
+        ds_meta = meta["datasets"]["dem_local"]
+        assert ds_meta["source"] == "local"
+        assert "native_crs" in ds_meta
+        assert "native_spatial_resolution_m" in ds_meta
 
         assert "quality" in meta
         assert "dem_local" in meta["quality"]
@@ -223,21 +309,31 @@ class TestMetadata:
 # Multiple outputs (list cfg)
 # ------------------------------------------------------------------
 
+
 class TestMultipleOutputs:
     def test_list_cfg(self, sample_df, tmp_path):
         """Passing a list of dicts processes all outputs."""
-        outputs = enrich(sample_df, [
-            {
-                "name": "stats_out",
-                "predictors": ["dem_local"],
-                "output": {"kind": "tabular", "reducers": ["mean"], "window_m": 100},
-            },
-            {
-                "name": "tiles_out",
-                "predictors": ["dem_local"],
-                "output": {"kind": "raster", "window_m": 200},
-            },
-        ], catalog=CATALOG, out_dir=tmp_path)
+        outputs = enrich(
+            sample_df,
+            [
+                {
+                    "run_id": "stats_out",
+                    "datasets": ["dem_local"],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["mean"],
+                        "window_size_m": 100,
+                    },
+                },
+                {
+                    "run_id": "tiles_out",
+                    "datasets": ["dem_local"],
+                    "settings": {"output_type": "raster", "window_size_m": 200},
+                },
+            ],
+            catalog=CATALOG,
+            out_dir=tmp_path,
+        )
 
         assert "stats_out" in outputs
         assert outputs["stats_out"].exists()
@@ -249,31 +345,55 @@ class TestMultipleOutputs:
 # Error handling
 # ------------------------------------------------------------------
 
+
 class TestErrors:
     def test_missing_columns(self, tmp_path):
         """Raises ValueError if required columns are missing."""
         df = pd.DataFrame({"x": [1], "y": [2]})
         with pytest.raises(ValueError, match="missing required column"):
-            enrich(df, {
-                "name": "fail",
-                "predictors": ["dem_local"],
-                "output": {"kind": "tabular", "reducers": ["mean"], "window_m": 100},
-            }, catalog=CATALOG, out_dir=tmp_path)
+            enrich(
+                df,
+                {
+                    "run_id": "fail",
+                    "datasets": ["dem_local"],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["mean"],
+                        "window_size_m": 100,
+                    },
+                },
+                catalog=CATALOG,
+                out_dir=tmp_path,
+            )
 
-    def test_unknown_feature(self, sample_df, tmp_path):
-        """Raises KeyError for a feature not in catalog."""
+    def test_unknown_dataset(self, sample_df, tmp_path):
+        """Raises KeyError for a dataset not in catalog."""
         with pytest.raises(KeyError, match="nonexistent"):
-            enrich(sample_df, {
-                "name": "fail",
-                "predictors": ["nonexistent"],
-                "output": {"kind": "tabular", "reducers": ["mean"], "window_m": 100},
-            }, catalog=CATALOG, out_dir=tmp_path)
+            enrich(
+                sample_df,
+                {
+                    "run_id": "fail",
+                    "datasets": ["nonexistent"],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["mean"],
+                        "window_size_m": 100,
+                    },
+                },
+                catalog=CATALOG,
+                out_dir=tmp_path,
+            )
 
     def test_invalid_kind(self, sample_df, tmp_path):
         """Raises ValueError for an unknown output kind."""
-        with pytest.raises(ValueError, match="Unknown output kind"):
-            enrich(sample_df, {
-                "name": "fail",
-                "predictors": ["dem_local"],
-                "output": {"kind": "banana", "window_m": 100},
-            }, catalog=CATALOG, out_dir=tmp_path)
+        with pytest.raises(ValueError, match="Unknown output_type"):
+            enrich(
+                sample_df,
+                {
+                    "run_id": "fail",
+                    "datasets": ["dem_local"],
+                    "settings": {"output_type": "banana", "window_size_m": 100},
+                },
+                catalog=CATALOG,
+                out_dir=tmp_path,
+            )
