@@ -4,7 +4,7 @@ import json
 
 import pandas as pd
 import pytest
-from biodata.enrich import enrich
+from biodata.extract import extract
 
 try:
     from biodata.auth import init_gee
@@ -39,7 +39,7 @@ SAMPLE_DF = pd.DataFrame(
 class TestGeeTabular:
     def test_stats(self, tmp_path):
         """GEE adapter returns non-null stats for known locations."""
-        outputs = enrich(
+        outputs = extract(
             SAMPLE_DF,
             {
                 "run_id": "gee_stats",
@@ -61,7 +61,7 @@ class TestGeeTabular:
 
     def test_point_reducer(self, tmp_path):
         """GEE point sampling returns a value per point."""
-        outputs = enrich(
+        outputs = extract(
             SAMPLE_DF,
             {
                 "run_id": "gee_point",
@@ -84,7 +84,7 @@ class TestGeeTabular:
 class TestGeeRaster:
     def test_export_tiles(self, tmp_path):
         """GEE raster export produces GeoTIFF files."""
-        enrich(
+        extract(
             SAMPLE_DF,
             {
                 "run_id": "gee_tiles",
@@ -103,7 +103,7 @@ class TestGeeRaster:
         """GEE export with resample_m produces correctly sized tiles."""
         import rasterio
 
-        enrich(
+        extract(
             SAMPLE_DF,
             {
                 "run_id": "gee_resamp",
@@ -123,7 +123,7 @@ class TestGeeRaster:
 
     def test_metadata_json(self, tmp_path):
         """GEE raster output includes metadata with native CRS/scale."""
-        enrich(
+        extract(
             SAMPLE_DF,
             {
                 "run_id": "gee_meta",
