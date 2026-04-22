@@ -103,7 +103,7 @@ class LocalRasterAdapter(BaseAdapter):
         coverage_pct = 100.0 * (valid / total) if total else 0.0
 
         if arr.ndim == 3:
-            # Multi-band: return shape (n_bands, n_valid_pixels) so enrich.py can
+            # Multi-band: return shape (n_bands, n_valid_pixels) so extract.py can
             # reduce per band and produce one column per band per reducer.
             def _band_vals(b):
                 v = b.compressed() if np.ma.isMaskedArray(b) else b.ravel()

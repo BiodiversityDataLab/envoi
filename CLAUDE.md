@@ -37,7 +37,7 @@ experiance, the user interface should be as intuitive as possible.
 ## Architecture
 
 ```
-enrich(df, cfg)               ← main entry point
+extract(df, cfg)               ← main entry point
     ↓
 catalog.yml                   ← defines available datasets (source + path required)
     ↓
@@ -48,11 +48,11 @@ Adapter (per dataset)
 
 ## API
 
-The primary interface is `enrich(df, cfg)` where `cfg` is a dict (single output)
+The primary interface is `extract(df, cfg)` where `cfg` is a dict (single output)
 or list of dicts (multiple outputs):
 
 ```python
-enrich(df, {
+extract(df, {
     "run_id": "terrain",
     "datasets": ["dem_local"],
     "settings": {
@@ -113,7 +113,7 @@ most recent image is used. Date decisions are recorded in the output metadata.
 
 ```
 src/biodata/
-    enrich.py           ← main entry point
+    extract.py           ← main entry point
     config.py           ← catalog loading + local raster auto-detection
     metadata.py         ← per-feature metadata + sidecar JSON writer
     auth.py             ← GEE authentication from credentials/ee_credentials.json

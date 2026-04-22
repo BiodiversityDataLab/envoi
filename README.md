@@ -17,12 +17,12 @@ make test
 
 ```python
 import pandas as pd
-from biodata.enrich import enrich
+from biodata.extract import extract
 
 df = pd.read_csv("data/points_sample.csv")
 
 # Single output — tabular stats
-outputs = enrich(df, {
+outputs = extract(df, {
     "run_id": "terrain",
     "datasets": ["dem_local"],
     "settings": {
@@ -42,7 +42,7 @@ print(outputs["terrain_qc"])   # -> out/terrain_qc.parquet
 Pass a list to process several configurations in one call:
 
 ```python
-outputs = enrich(df, [
+outputs = extract(df, [
     {
         "run_id": "terrain_stats",
         "datasets": ["dem_local"],

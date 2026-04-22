@@ -6,7 +6,7 @@ Add a new test class or method here whenever a new GEE dataset is added to the c
 
 import pandas as pd
 import pytest
-from biodata.enrich import enrich
+from biodata.extract import extract
 
 try:
     from biodata.auth import init_gee
@@ -37,7 +37,7 @@ def _make_catalog(*datasets):
 def _run_stats(df, dataset_name, catalog, tmp_path, reducers=None):
     """Run tabular stats and return the stats DataFrame."""
     reducers = reducers or ["mean"]
-    outputs = enrich(
+    outputs = extract(
         df,
         {
             "run_id": "test",
@@ -146,7 +146,7 @@ class TestPointSampling:
 
     def test_point_dem_aster(self, tmp_path):
         cat = _make_catalog(("dem_aster", "projects/sat-io/open-datasets/ASTER/GDEM"))
-        outputs = enrich(
+        outputs = extract(
             SAMPLE_DF,
             {
                 "run_id": "pt",
@@ -165,7 +165,7 @@ class TestPointSampling:
 
     def test_point_worldcover(self, tmp_path):
         cat = _make_catalog(("lulc", "ESA/WorldCover/v200"))
-        outputs = enrich(
+        outputs = extract(
             SAMPLE_DF,
             {
                 "run_id": "pt",
@@ -193,7 +193,7 @@ class TestRasterExport:
 
     def test_tiles_dem_glo30(self, tmp_path):
         cat = _make_catalog(("dem_glo30", "COPERNICUS/DEM/GLO30"))
-        enrich(
+        extract(
             SAMPLE_DF,
             {
                 "run_id": "tiles",
@@ -210,7 +210,7 @@ class TestRasterExport:
         import rasterio
 
         cat = _make_catalog(("lulc", "ESA/WorldCover/v200"))
-        enrich(
+        extract(
             SAMPLE_DF,
             {
                 "run_id": "tiles",

@@ -1,4 +1,4 @@
-# src/biodata/enrich.py
+# src/biodata/extract.py
 from __future__ import annotations
 from typing import List, Dict, Any
 from pathlib import Path
@@ -86,7 +86,7 @@ def _validate_crs(df: pd.DataFrame, input_crs: str | None) -> pd.DataFrame:
     return df
 
 
-def enrich(
+def extract(
     df: pd.DataFrame,
     cfg: str | Path | dict | list,
     catalog: str | Path | dict | list | tuple = (
@@ -97,12 +97,12 @@ def enrich(
     out_dir: str | Path = "out",
     input_crs: str | None = None,
 ) -> Dict[str, Path]:
-    """Enrich sample points with environmental data.
+    """Extract environmental data for sample points.
 
     ``cfg`` is a dict (single output) or list of dicts (multiple output_paths),
     each specifying run_id, datasets, and settings.  Example::
 
-        enrich(df, {
+        extract(df, {
             "run_id": "terrain",
             "datasets": ["dem_aster"],
             "settings": {"output_type": "tabular", "statistics": ["mean"], "window_size_m": 200},
@@ -139,12 +139,12 @@ def enrich(
         if not datasets:
             raise ValueError(f"Output '{run_id}': missing required 'datasets' list")
         settings = output_cfg.get("settings", {}) or {}
-        output_type = settings.get("output_type", "tabular")
+        output_type = settings.get("output_type", None)
         if output_type not in ("tabular", "raster"):
-            raise ValueError(f"Unknown output_type: {output_type}")
+            raise ValueError(f"Unknown or missing output_type: {output_type}")
         resample_m = settings.get("resample_m")
         output_format = settings.get("output_format", "csv")
-        min_coverage = settings.get("min_coverage_pct", 80)
+        min_coverage = settings.get("min_coverage_pct", 0)
         stats = settings.get("statistics")
         window_size = settings.get("window_size_m", 500)
 
@@ -255,8 +255,8 @@ def enrich(
                         reducer_names,
                         dates=dates,
                     )
-                    # For multi-band datasets keys are "{band}_{reducer}" (e.g. "bio01_mean");
-                    # for single-band just "{reducer}". dict.fromkeys preserves insertion order.
+                    # For multi-band datasets keys are "{dataset}_{band}_{reducer}" (e.g. "bio01_mean");
+                    # for single-band just "{dataset}_{reducer}". dict.fromkeys preserves insertion order.
                     stat_keys = dict.fromkeys(key for stats, _ in stats_results for key in stats)
                     for stat_key in stat_keys:
                         col = f"{dataset}_{stat_key}_{window_size}m"

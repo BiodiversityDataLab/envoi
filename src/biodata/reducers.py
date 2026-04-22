@@ -132,6 +132,7 @@ _REGISTRY: Dict[str, Callable] = {
     "std": r_std,
     "var": r_var,
     "count": r_count,
+    "mode": r_mode,
     # quantiles (rich but still lightweight)
     "q05": make_quantile(0.05),
     "q10": make_quantile(0.10),
