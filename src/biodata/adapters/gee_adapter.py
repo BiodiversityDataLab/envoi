@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, List, Sequence
 
+from ..config import load_defaults
+from ..metadata import build_tile_crs_zones, summarize_date_info, summarize_tile_export
+
 import numpy as np
 import pandas as pd
 
@@ -426,7 +429,7 @@ class GeeRasterAdapter:
 
         self.scale = None  # always use the dataset's native resolution
         self.crs = self.spec.get("crs", "EPSG:4326")
-        self.max_workers = self.spec.get("max_workers", 8)
+        self.max_workers = self.spec.get("max_workers", load_defaults()["max_workers"])
         self._dataset_spec = dataset_spec
 
         # Warn about removed dataset_spec keys
@@ -943,37 +946,111 @@ class GeeRasterAdapter:
 
         Uses a single combined ``reduceRegion`` call per point with all
         requested reducers, avoiding the need to download raw pixel arrays.
+        When ``"point"`` is in ``reducer_names``, also samples the exact pixel
+        value via ``fetch_points_batch`` and merges the result under ``point``
+        / ``{band}_point`` keys.
 
         Returns a list of ``(stats_dict, meta_dict)`` tuples — one per point.
-        ``stats_dict`` maps each reducer name to its computed value.
         """
-        combined_reducer, suffixes = _build_combined_reducer(reducer_names)
+        # Split "point" from the window reducers. "point" is an exact-pixel
+        # sample and can't go through reduceRegion alongside window reducers.
+        reducer_names = list(reducer_names)
+        want_point = "point" in reducer_names
+        window_reducers = [r for r in reducer_names if r != "point"]
 
         n = len(lats)
+        lats = list(lats)
+        lons = list(lons)
         date_list = list(dates) if dates is not None else [None] * n
-        results: List = [None] * n
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_idx = {
-                executor.submit(
-                    self._fetch_stats_single,
-                    lat,
-                    lon,
-                    window_m,
-                    combined_reducer,
-                    reducer_names,
-                    suffixes,
-                    date,
-                ): i
-                for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
+        # ---------- window path ----------
+        # Classic reduceRegion-per-point, parallelised over self.max_workers.
+        window_results: List = [None] * n
+        if window_reducers:
+            combined_reducer, suffixes = _build_combined_reducer(window_reducers)
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(
+                        self._fetch_stats_single,
+                        lat,
+                        lon,
+                        window_m,
+                        combined_reducer,
+                        window_reducers,
+                        suffixes,
+                        date,
+                    ): i
+                    for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        window_results[idx] = future.result()
+                    except Exception as e:
+                        logger.warning("GEE stats fetch failed for point %d: %s", idx, e)
+                        window_results[idx] = self._empty_stats_result(window_m, window_reducers)
+
+        # ---------- point path ----------
+        # Use image.sample()-backed fetch_points_batch for exact pixel values,
+        # then re-key its output with the "_point" suffix so column names are
+        # unambiguous downstream.
+        point_results: List = [None] * n
+        if want_point:
+            # Resolve band layout (single- vs multi-band) to pick the right key
+            # convention. A string `bands` entry means a single explicit band;
+            # otherwise query the image to learn the band count.
+            spec_band = self._dataset_spec.get("bands")
+            if not isinstance(spec_band, str):
+                # Populate self._cached_band_count (first call may hit the network).
                 try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    logger.warning("GEE stats fetch failed for point %d: %s", idx, e)
-                    results[idx] = self._empty_stats_result(window_m, reducer_names)
+                    self._get_band_name(self._get_image())
+                except Exception:
+                    pass
+            band_count = getattr(self, "_cached_band_count", 1)
+            multiband_point = not isinstance(spec_band, str) and band_count > 1
+            single_band_name = spec_band if isinstance(spec_band, str) else None
+            if single_band_name is None and not multiband_point:
+                single_band_name = getattr(self, "_cached_band_name", None)
+
+            pt_raw = self.fetch_points_batch(lats, lons, dates=date_list)
+            for i, (lon, lat, (props, pt_meta)) in enumerate(zip(lons, lats, pt_raw)):
+                stats: dict[str, float | None] = {}
+                if multiband_point:
+                    # props already keyed by real band names from GEE.
+                    for k, v in props.items():
+                        stats[f"{k}_point"] = v
+                else:
+                    key = single_band_name if single_band_name in props else next(iter(props), None)
+                    stats["point"] = props.get(key) if key is not None else None
+                # Synthesize the extra meta fields window_results would have carried.
+                meta = {
+                    "window_m": int(window_m),
+                    "raster_crs": self.crs,
+                    "region_crs": _get_utm_crs(lon, lat),
+                    "transform": None,
+                    "dtype": "float64",
+                    "nodata": None,
+                    "window_arr": None,
+                    **pt_meta,
+                }
+                point_results[i] = (stats, meta)
+
+        # ---------- merge ----------
+        # Combine window + point stats per point. When both ran, prefer the
+        # window meta (carries crs/window info); otherwise use the point meta.
+        results: List = [None] * n
+        for i in range(n):
+            merged_stats: dict = {}
+            if window_reducers:
+                merged_stats.update(window_results[i][0])
+            if want_point:
+                merged_stats.update(point_results[i][0])
+
+            if window_reducers:
+                meta = window_results[i][1]
+            else:
+                meta = point_results[i][1]
+            results[i] = (merged_stats, meta)
 
         return results
 
@@ -1061,6 +1138,98 @@ class GeeRasterAdapter:
                     results[idx] = None
 
         return results, meta_list
+
+    def build_dataset_meta(
+        self,
+        spec: dict,
+        meta_list: list | None = None,
+        exported_paths: list | None = None,
+        quality: dict | None = None,
+        lats: Sequence[float] | None = None,
+        lons: Sequence[float] | None = None,
+    ) -> dict:
+        """Build per-dataset metadata using this adapter's cached state.
+
+        Includes GEE-specific fields like asset_type, collection date range,
+        and per-tile UTM zones (when lats/lons are supplied for the raster
+        path). Quality stats and date-selection info are added when present.
+        """
+        # Static dataset info from the catalog spec.
+        meta: Dict[str, Any] = {
+            "data_source": spec.get("data_source"),
+            "path": spec.get("path"),
+        }
+        if spec.get("data_type"):
+            meta["data_type"] = spec["data_type"]
+
+        # Asset type: IMAGE vs IMAGE_COLLECTION — determined during __post_init__.
+        if "collection" in self._dataset_spec:
+            meta["asset_type"] = "IMAGE_COLLECTION"
+        else:
+            meta["asset_type"] = "IMAGE"
+
+        # Native CRS (set in __post_init__).
+        meta["native_crs"] = str(self.crs)
+
+        # Native spatial resolution — one .getInfo() call on the cached projection.
+        if self._native_proj is not None:
+            try:
+                meta["native_spatial_resolution_m"] = round(
+                    float(self._native_proj.nominalScale().getInfo()), 2
+                )
+            except Exception:
+                pass
+
+        # Band names — populated on first fetch via _get_band_name().
+        band_names = getattr(self, "_cached_band_names", None)
+        if band_names:
+            meta["band_names"] = band_names
+
+        # Tile CRS: GEE exports each tile in the UTM zone of its centre point,
+        # so we list all unique zones touched by the input sample set.
+        if lats is not None and lons is not None:
+            zones = build_tile_crs_zones(lats, lons)
+            if zones:
+                meta["tile_crs"] = zones
+
+        # Collection date range: available when timestamps were fetched.
+        timestamps = getattr(self, "_collection_timestamps", None)
+        if timestamps is not None and len(timestamps) > 0:
+            meta["collection_date_range"] = [
+                timestamps.min().strftime("%Y-%m-%d"),
+                timestamps.max().strftime("%Y-%m-%d"),
+            ]
+
+        # Date-selection info for the single-image composite path.
+        date_source = getattr(self, "_date_source", None)
+        if date_source:
+            meta["date_source"] = date_source
+        image_date_used = getattr(self, "_image_date_used", None)
+        if image_date_used is not None:
+            meta["image_date_used"] = image_date_used.strftime("%Y-%m-%d")
+
+        # Pass-through catalog field for dataset description.
+        dataset_info = spec.get("dataset_information")
+        if dataset_info:
+            meta["dataset_information"] = dataset_info
+
+        # Per-point date-selection summary (nearest/clamped/most-recent counts).
+        if meta_list:
+            date_info = summarize_date_info(meta_list)
+            if date_info is not None:
+                meta["date_info"] = date_info
+
+        # QC/coverage stats accumulated during processing. Make a copy so we
+        # don't mutate the caller's dict when adding the tile-export summary.
+        quality = dict(quality or {})
+        # Tile-export summary: populated only when this call is for the raster path.
+        if exported_paths is not None:
+            n_points = len(lats) if lats is not None else len(exported_paths)
+            quality["tiles"] = summarize_tile_export(exported_paths, n_points)
+        if quality:
+            meta["quality"] = quality
+
+        return meta
 
 
 if _register is not None:

@@ -1,5 +1,5 @@
 # Example: tabular stats for local DEM
-- run_id: terrain_stats
+- batch_id: terrain_stats
   datasets: [dem_local]
   settings:
     output_type: tabular
