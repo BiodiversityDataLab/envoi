@@ -4,7 +4,7 @@ datasets:
   # Copy this block when adding a real dataset.
   # All fields except source, path and data_type are optional.
   dataset_name:  # provide a unique name for this dataset e.g. "sentinel_2_l2a"
-    source: earth_engine
+    data_source: earth_engine
     path: path/to/dataset_on_earth_engine   # GEE asset ID; type (IMAGE / IMAGE_COLLECTION) is auto-detected
     data_type: type                 # "continuous" or "categorical"
 
@@ -29,13 +29,13 @@ datasets:
   
   
   dem_aster: # testing purpose only - remove later
-    source: earth_engine
+    data_source: earth_engine
     path: projects/sat-io/open-datasets/ASTER/GDEM
     data_type: continuous
 
 
   dem_glo30:
-    source: earth_engine
+    data_source: earth_engine
     path: COPERNICUS/DEM/GLO30
     data_type: continuous
     bands: [DEM]
@@ -47,7 +47,7 @@ datasets:
       license: "Copernicus Data License (free for most uses)"
 
   bioclim:
-    source: earth_engine
+    data_source: earth_engine
     path: WORLDCLIM/V1/BIO
     data_type: continuous
     dataset_information:
@@ -58,7 +58,7 @@ datasets:
       license: "CC-BY-SA-4.0"
 
   era5_monthly:
-    source: earth_engine
+    data_source: earth_engine
     path: ECMWF/ERA5/MONTHLY
     data_type: continuous
     dataset_information:
@@ -69,7 +69,7 @@ datasets:
       license: "Copernicus C3S/CAMS License"
 
   satellite_embeddings:
-    source: earth_engine
+    data_source: earth_engine
     path: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
     data_type: continuous
     dataset_information:
@@ -80,7 +80,7 @@ datasets:
       license: "CC-BY-4.0"
 
   human_impact_index:
-    source: earth_engine
+    data_source: earth_engine
     path: projects/HII/v1/hii
     data_type: continuous
     dataset_information:
@@ -91,7 +91,7 @@ datasets:
       license: "CC BY-NC-SA-3.0"
 
   human_impact_index_drivers: # not working atm
-    source: earth_engine
+    data_source: earth_engine
     path: projects/HII/v1/driver/infrastructure
     data_type: continuous
     dataset_information:
@@ -102,7 +102,7 @@ datasets:
       license: "CC BY-NC-SA-3.0"
 
   lulc_esa_worldcover_2021:
-    source: earth_engine
+    data_source: earth_engine
     path: ESA/WorldCover/v200
     data_type: categorical
     dataset_information:
@@ -113,7 +113,7 @@ datasets:
       license: "CC-BY-4.0"
 
   lulc_cgls_lc100: # not working atm
-    source: earth_engine
+    data_source: earth_engine
     path: COPERNICUS/Landcover/100m/Proba-V-C3/Global
     data_type: categorical
     dataset_information:

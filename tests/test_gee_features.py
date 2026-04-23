@@ -31,7 +31,9 @@ SAMPLE_DF = pd.DataFrame(
 
 def _make_catalog(*datasets):
     """Helper to build a catalog dict from (name, path) tuples."""
-    return {"datasets": {name: {"source": "earth_engine", "path": path} for name, path in datasets}}
+    return {
+        "datasets": {name: {"data_source": "earth_engine", "path": path} for name, path in datasets}
+    }
 
 
 def _run_stats(df, dataset_name, catalog, tmp_path, reducers=None):
@@ -40,12 +42,12 @@ def _run_stats(df, dataset_name, catalog, tmp_path, reducers=None):
     outputs = extract(
         df,
         {
-            "run_id": "test",
+            "batch_id": "test",
             "datasets": [dataset_name],
             "settings": {"output_type": "tabular", "statistics": reducers, "window_size_m": 200},
         },
         catalog=catalog,
-        out_dir=tmp_path,
+        output_dir=tmp_path,
     )
     return pd.read_csv(outputs["test"])
 
@@ -90,7 +92,7 @@ class TestStaticDatasets:
         cat = {
             "datasets": {
                 "era5": {
-                    "source": "earth_engine",
+                    "data_source": "earth_engine",
                     "path": "ECMWF/ERA5/MONTHLY",
                 }
             }
@@ -105,7 +107,7 @@ class TestStaticDatasets:
         cat = {
             "datasets": {
                 "sat_emb": {
-                    "source": "earth_engine",
+                    "data_source": "earth_engine",
                     "path": "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL",
                 }
             }
@@ -149,7 +151,7 @@ class TestPointSampling:
         outputs = extract(
             SAMPLE_DF,
             {
-                "run_id": "pt",
+                "batch_id": "pt",
                 "datasets": ["dem_aster"],
                 "settings": {
                     "output_type": "tabular",
@@ -158,7 +160,7 @@ class TestPointSampling:
                 },
             },
             catalog=cat,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
         df = pd.read_csv(outputs["pt"])
         assert df["dem_aster_point"].notna().all()
@@ -168,7 +170,7 @@ class TestPointSampling:
         outputs = extract(
             SAMPLE_DF,
             {
-                "run_id": "pt",
+                "batch_id": "pt",
                 "datasets": ["lulc"],
                 "settings": {
                     "output_type": "tabular",
@@ -177,7 +179,7 @@ class TestPointSampling:
                 },
             },
             catalog=cat,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
         df = pd.read_csv(outputs["pt"])
         assert df["lulc_point"].notna().all()
@@ -196,12 +198,12 @@ class TestRasterExport:
         extract(
             SAMPLE_DF,
             {
-                "run_id": "tiles",
+                "batch_id": "tiles",
                 "datasets": ["dem_glo30"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
             catalog=cat,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
         tifs = list((tmp_path / "tiles" / "dem_glo30").glob("*.tif"))
         assert len(tifs) == 2
@@ -213,12 +215,12 @@ class TestRasterExport:
         extract(
             SAMPLE_DF,
             {
-                "run_id": "tiles",
+                "batch_id": "tiles",
                 "datasets": ["lulc"],
                 "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 50},
             },
             catalog=cat,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
         expected = round(200 / 50)  # 4x4
         for tif in (tmp_path / "tiles" / "lulc").glob("*.tif"):

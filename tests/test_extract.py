@@ -16,11 +16,11 @@ DEM_TIF = DATA_DIR / "dem/TG4NHB-dem.tif"
 CATALOG = {
     "datasets": {
         "dem_local": {
-            "source": "local",
+            "data_source": "local",
             "path": str(DEM_TIF),
         },
         "slope_local": {
-            "source": "local",
+            "data_source": "local",
             "path": str(DEM_TIF),
             "bands": 2,
         },
@@ -44,7 +44,7 @@ class TestTabular:
         outputs = extract(
             sample_df,
             {
-                "run_id": "dem_100m",
+                "batch_id": "dem_100m",
                 "datasets": ["dem_local"],
                 "settings": {
                     "output_type": "tabular",
@@ -53,7 +53,7 @@ class TestTabular:
                 },
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         stats_df = pd.read_csv(outputs["dem_100m"])
@@ -76,7 +76,7 @@ class TestTabular:
         outputs = extract(
             sample_df,
             {
-                "run_id": "test",
+                "batch_id": "test",
                 "datasets": ["dem_local"],
                 "settings": {
                     "output_type": "tabular",
@@ -85,7 +85,7 @@ class TestTabular:
                 },
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         result = pd.read_csv(outputs["test"])
@@ -96,7 +96,7 @@ class TestTabular:
         outputs = extract(
             sample_df,
             {
-                "run_id": "csv_test",
+                "batch_id": "csv_test",
                 "datasets": ["dem_local"],
                 "settings": {
                     "output_type": "tabular",
@@ -105,7 +105,7 @@ class TestTabular:
                 },
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         assert outputs["csv_test"].suffix == ".csv"
@@ -119,7 +119,7 @@ class TestTabular:
         outputs = extract(
             sample_df,
             {
-                "run_id": "multi",
+                "batch_id": "multi",
                 "datasets": ["dem_local"],
                 "settings": {
                     "output_type": "tabular",
@@ -128,7 +128,7 @@ class TestTabular:
                 },
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         stats_df = pd.read_csv(outputs["multi"])
@@ -140,7 +140,7 @@ class TestTabular:
         outputs = extract(
             sample_df,
             {
-                "run_id": "multi_pred",
+                "batch_id": "multi_pred",
                 "datasets": ["dem_local", "slope_local"],
                 "settings": {
                     "output_type": "tabular",
@@ -149,7 +149,7 @@ class TestTabular:
                 },
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         stats_df = pd.read_csv(outputs["multi_pred"])
@@ -161,7 +161,7 @@ class TestTabular:
         outputs = extract(
             sample_df,
             {
-                "run_id": "point_test",
+                "batch_id": "point_test",
                 "datasets": ["dem_local"],
                 "settings": {
                     "output_type": "tabular",
@@ -170,7 +170,7 @@ class TestTabular:
                 },
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         stats_df = pd.read_csv(outputs["point_test"])
@@ -190,12 +190,12 @@ class TestRaster:
         extract(
             sample_df,
             {
-                "run_id": "tiles",
+                "batch_id": "tiles",
                 "datasets": ["dem_local"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         tile_dir = tmp_path / "tiles" / "dem_local"
@@ -207,12 +207,12 @@ class TestRaster:
         extract(
             sample_df,
             {
-                "run_id": "dim_test",
+                "batch_id": "dim_test",
                 "datasets": ["dem_local"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         tile_dir = tmp_path / "dim_test" / "dem_local"
@@ -227,12 +227,12 @@ class TestRaster:
         extract(
             sample_df,
             {
-                "run_id": "resamp",
+                "batch_id": "resamp",
                 "datasets": ["dem_local"],
                 "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 25},
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         tile_dir = tmp_path / "resamp" / "dem_local"
@@ -247,12 +247,12 @@ class TestRaster:
         extract(
             sample_df,
             {
-                "run_id": "meta_test",
+                "batch_id": "meta_test",
                 "datasets": ["dem_local"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         meta_path = tmp_path / "meta_test" / "meta_test_metadata.json"
@@ -273,7 +273,7 @@ class TestMetadata:
         outputs = extract(
             sample_df,
             {
-                "run_id": "meta",
+                "batch_id": "meta",
                 "datasets": ["dem_local"],
                 "settings": {
                     "output_type": "tabular",
@@ -282,7 +282,7 @@ class TestMetadata:
                 },
             },
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         meta_path = outputs["meta"].parent / "meta_metadata.json"
@@ -293,31 +293,30 @@ class TestMetadata:
         assert "package_version" in meta["run"]
         assert meta["run"]["n_points"] == len(sample_df)
 
-        assert meta["config"]["run_id"] == "meta"
+        assert meta["config"]["batch_id"] == "meta"
         assert meta["config"]["statistics"] == ["mean"]
 
         ds_meta = meta["datasets"]["dem_local"]
-        assert ds_meta["source"] == "local"
+        assert ds_meta["data_source"] == "local"
         assert "native_crs" in ds_meta
         assert "native_spatial_resolution_m" in ds_meta
 
-        assert "quality" in meta
-        assert "dem_local" in meta["quality"]
+        assert "quality" in meta["datasets"]["dem_local"]
 
 
 # ------------------------------------------------------------------
-# Multiple outputs (list cfg)
+# Multiple outputs (list config)
 # ------------------------------------------------------------------
 
 
 class TestMultipleOutputs:
-    def test_list_cfg(self, sample_df, tmp_path):
+    def test_list_config(self, sample_df, tmp_path):
         """Passing a list of dicts processes all outputs."""
         outputs = extract(
             sample_df,
             [
                 {
-                    "run_id": "stats_out",
+                    "batch_id": "stats_out",
                     "datasets": ["dem_local"],
                     "settings": {
                         "output_type": "tabular",
@@ -326,13 +325,13 @@ class TestMultipleOutputs:
                     },
                 },
                 {
-                    "run_id": "tiles_out",
+                    "batch_id": "tiles_out",
                     "datasets": ["dem_local"],
                     "settings": {"output_type": "raster", "window_size_m": 200},
                 },
             ],
             catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         assert "stats_out" in outputs
@@ -354,7 +353,7 @@ class TestErrors:
             extract(
                 df,
                 {
-                    "run_id": "fail",
+                    "batch_id": "fail",
                     "datasets": ["dem_local"],
                     "settings": {
                         "output_type": "tabular",
@@ -363,7 +362,7 @@ class TestErrors:
                     },
                 },
                 catalog=CATALOG,
-                out_dir=tmp_path,
+                output_dir=tmp_path,
             )
 
     def test_unknown_dataset(self, sample_df, tmp_path):
@@ -372,7 +371,7 @@ class TestErrors:
             extract(
                 sample_df,
                 {
-                    "run_id": "fail",
+                    "batch_id": "fail",
                     "datasets": ["nonexistent"],
                     "settings": {
                         "output_type": "tabular",
@@ -381,7 +380,7 @@ class TestErrors:
                     },
                 },
                 catalog=CATALOG,
-                out_dir=tmp_path,
+                output_dir=tmp_path,
             )
 
     def test_invalid_kind(self, sample_df, tmp_path):
@@ -390,10 +389,24 @@ class TestErrors:
             extract(
                 sample_df,
                 {
-                    "run_id": "fail",
+                    "batch_id": "fail",
                     "datasets": ["dem_local"],
                     "settings": {"output_type": "banana", "window_size_m": 100},
                 },
                 catalog=CATALOG,
-                out_dir=tmp_path,
+                output_dir=tmp_path,
+            )
+
+    def test_tabular_requires_statistics(self, sample_df, tmp_path):
+        """Raises ValueError when tabular output omits the statistics list."""
+        with pytest.raises(ValueError, match="statistics"):
+            extract(
+                sample_df,
+                {
+                    "batch_id": "fail",
+                    "datasets": ["dem_local"],
+                    "settings": {"output_type": "tabular", "window_size_m": 100},
+                },
+                catalog=CATALOG,
+                output_dir=tmp_path,
             )
