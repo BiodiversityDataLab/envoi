@@ -44,7 +44,9 @@ def _inspect_raster(name: str, spec: Dict[str, Any]) -> None:
 
             if "resolution_m" not in spec:
                 spec["resolution_m"] = abs(src.res[0])
-                logger.debug("datasets.%s: auto-detected resolution_m=%s", name, spec["resolution_m"])
+                logger.debug(
+                    "datasets.%s: auto-detected resolution_m=%s", name, spec["resolution_m"]
+                )
 
             if "type" not in spec:
                 spec["type"] = "raster"
@@ -61,10 +63,10 @@ def _inspect_raster(name: str, spec: Dict[str, Any]) -> None:
 
 def load_catalog(path: str | Path) -> Dict[str, Any]:
     """
-    Load and validate the predictor catalog YAML.
+    Load and validate the dataset catalog YAML.
     Required structure:
       datasets:
-        <predictor_name>:
+        <dataset_name>:
           source: <str>
           path: <str>
           # optional: type, crs, resolution_m, default_reducer, band, ...
@@ -138,7 +140,7 @@ def _load_catalog_any(src: Any) -> Dict[str, Any]:
 def load_catalogs(*sources: Any) -> Dict[str, Any]:
     """
     Merge one or more catalogs (paths, dicts, or lists of paths/dicts) into a
-    single catalog. Later sources override earlier ones on a per-predictor basis.
+    single catalog. Later sources override earlier ones on a per-dataset basis.
     Always returns: {'datasets': {...}}.
     """
     merged: Dict[str, Any] = {"datasets": {}}

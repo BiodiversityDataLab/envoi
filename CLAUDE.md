@@ -8,9 +8,9 @@ Update it as the project evolves.
 ## What this project is
 
 **biodata-enricher (EDDP)** is a Python package that enriches geographic point data
-with environmental predictors. The input is a table of sample points (`id`, `lat`, `lon`,
+with environmental datasets. The input is a table of sample points (`id`, `lat`, `lon`,
 optionally `date`); the output is either that same table with appended environmental columns 
-or images of environmental predictors, ready for spatial ecological modeling or similar analyses.
+or images of environmental datasets, ready for spatial ecological modeling or similar analyses.
 
 The primary use case is ecological research where you have field sample
 locations and want to attach climate, terrain, vegetation, or other environmental
@@ -37,7 +37,7 @@ experiance, the user interface should be as intuitive as possible.
 ## Architecture
 
 ```
-enrich(df, cfg)               ← main entry point
+extract(df, cfg)               ← main entry point
     ↓
 catalog.yml                   ← defines available datasets (source + path required)
     ↓
@@ -48,18 +48,18 @@ Adapter (per dataset)
 
 ## API
 
-The primary interface is `enrich(df, cfg)` where `cfg` is a dict (single output)
+The primary interface is `extract(df, cfg)` where `cfg` is a dict (single output)
 or list of dicts (multiple outputs):
 
 ```python
-enrich(df, {
-    "name": "terrain",
-    "predictors": ["dem_local"],
-    "output": {
-        "kind": "tabular",          # "tabular" or "raster"
-        "reducers": ["mean", "std"],
-        "window_m": 200,
-        "format": "parquet",        # "parquet" or "csv"
+extract(df, {
+    "run_id": "terrain",
+    "datasets": ["dem_local"],
+    "settings": {
+        "output_type": "tabular",          # "tabular" or "raster"
+        "statistics": ["mean", "std"],
+        "window_size_m": 200,
+        "output_format": "parquet",        # "parquet" or "csv"
         "resample_m": 10,           # optional, for CNN-ready tiles
         "min_coverage_pct": 80,     # QC threshold
     },
@@ -113,7 +113,7 @@ most recent image is used. Date decisions are recorded in the output metadata.
 
 ```
 src/biodata/
-    enrich.py           ← main entry point
+    extract.py           ← main entry point
     config.py           ← catalog loading + local raster auto-detection
     metadata.py         ← per-feature metadata + sidecar JSON writer
     auth.py             ← GEE authentication from credentials/ee_credentials.json

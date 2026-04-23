@@ -1,6 +1,6 @@
 from importlib.metadata import version, PackageNotFoundError
 
-from .enrich import enrich
+from .extract import extract
 from .reducers import list_reducers
 
 try:
@@ -8,4 +8,4 @@ try:
 except PackageNotFoundError:  # local editable install
     __version__ = "0.0.0+local"
 
-__all__ = ["enrich", "list_reducers", "__version__"]
+__all__ = ["extract", "list_reducers", "__version__"]

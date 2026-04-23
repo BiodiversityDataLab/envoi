@@ -9,7 +9,7 @@
     "window_m": 200,
     "resample_m": 25
   },
-  "features": {
+  "datasets": {
     "dem_glo30": {
       "source": "earth_engine",
       "path": "COPERNICUS/DEM/GLO30",

@@ -3,15 +3,14 @@
 Skipped when GEE authentication is unavailable.
 Add a new test class or method here whenever a new GEE dataset is added to the catalog.
 """
-from pathlib import Path
-import json
 
 import pandas as pd
 import pytest
+from biodata.extract import extract
 
 try:
-    import ee
     from biodata.auth import init_gee
+
     init_gee()
     GEE_AVAILABLE = True
 except Exception:
@@ -19,41 +18,42 @@ except Exception:
 
 pytestmark = pytest.mark.skipif(not GEE_AVAILABLE, reason="GEE authentication unavailable")
 
-from biodata.enrich import enrich
-
 # Known points in Sweden — within extent of all global datasets
-SAMPLE_DF = pd.DataFrame({
-    "id": ["A", "B"],
-    "lat": [62.9768783, 62.9812956],
-    "lon": [18.026823, 18.0309905],
-    "date": ["2020-06-01", "2020-06-01"],
-})
+SAMPLE_DF = pd.DataFrame(
+    {
+        "id": ["A", "B"],
+        "lat": [62.9768783, 62.9812956],
+        "lon": [18.026823, 18.0309905],
+        "date": ["2020-06-01", "2020-06-01"],
+    }
+)
 
 
 def _make_catalog(*datasets):
     """Helper to build a catalog dict from (name, path) tuples."""
-    return {
-        "datasets": {
-            name: {"source": "earth_engine", "path": path}
-            for name, path in datasets
-        }
-    }
+    return {"datasets": {name: {"source": "earth_engine", "path": path} for name, path in datasets}}
 
 
 def _run_stats(df, dataset_name, catalog, tmp_path, reducers=None):
     """Run tabular stats and return the stats DataFrame."""
     reducers = reducers or ["mean"]
-    outputs = enrich(df, {
-        "name": "test",
-        "predictors": [dataset_name],
-        "output": {"kind": "tabular", "reducers": reducers, "window_m": 200},
-    }, catalog=catalog, out_dir=tmp_path)
+    outputs = extract(
+        df,
+        {
+            "run_id": "test",
+            "datasets": [dataset_name],
+            "settings": {"output_type": "tabular", "statistics": reducers, "window_size_m": 200},
+        },
+        catalog=catalog,
+        out_dir=tmp_path,
+    )
     return pd.read_csv(outputs["test"])
 
 
 # ------------------------------------------------------------------
 # Static datasets (IMAGE type — no date filtering)
 # ------------------------------------------------------------------
+
 
 class TestStaticDatasets:
     """Datasets that are single images, not time series."""
@@ -87,10 +87,14 @@ class TestStaticDatasets:
         assert df["hii_mean_200m"].notna().all()
 
     def test_era5_monthly(self, tmp_path):
-        cat = {"datasets": {"era5": {
-            "source": "earth_engine",
-            "path": "ECMWF/ERA5/MONTHLY",
-        }}}
+        cat = {
+            "datasets": {
+                "era5": {
+                    "source": "earth_engine",
+                    "path": "ECMWF/ERA5/MONTHLY",
+                }
+            }
+        }
         df = _run_stats(SAMPLE_DF, "era5", cat, tmp_path)
         # ERA5 has 9 bands — check first one
         era5_cols = [c for c in df.columns if c.startswith("era5_") and "_mean_" in c]
@@ -98,10 +102,14 @@ class TestStaticDatasets:
         assert df[era5_cols[0]].notna().all()
 
     def test_satellite_embeddings(self, tmp_path):
-        cat = {"datasets": {"sat_emb": {
-            "source": "earth_engine",
-            "path": "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL",
-        }}}
+        cat = {
+            "datasets": {
+                "sat_emb": {
+                    "source": "earth_engine",
+                    "path": "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL",
+                }
+            }
+        }
         df = _run_stats(SAMPLE_DF, "sat_emb", cat, tmp_path)
         # 64-band embeddings — check at least one
         emb_cols = [c for c in df.columns if c.startswith("sat_emb_") and "_mean_" in c]
@@ -112,6 +120,7 @@ class TestStaticDatasets:
 # ------------------------------------------------------------------
 # Land use / land cover
 # ------------------------------------------------------------------
+
 
 class TestLandCover:
     def test_esa_worldcover(self, tmp_path):
@@ -131,26 +140,45 @@ class TestLandCover:
 # Point sampling across datasets
 # ------------------------------------------------------------------
 
+
 class TestPointSampling:
     """Verify point reducer works for different dataset types."""
 
     def test_point_dem_aster(self, tmp_path):
         cat = _make_catalog(("dem_aster", "projects/sat-io/open-datasets/ASTER/GDEM"))
-        outputs = enrich(SAMPLE_DF, {
-            "name": "pt",
-            "predictors": ["dem_aster"],
-            "output": {"kind": "tabular", "reducers": ["point"], "window_m": 100},
-        }, catalog=cat, out_dir=tmp_path)
+        outputs = extract(
+            SAMPLE_DF,
+            {
+                "run_id": "pt",
+                "datasets": ["dem_aster"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["point"],
+                    "window_size_m": 100,
+                },
+            },
+            catalog=cat,
+            out_dir=tmp_path,
+        )
         df = pd.read_csv(outputs["pt"])
         assert df["dem_aster_point"].notna().all()
 
     def test_point_worldcover(self, tmp_path):
         cat = _make_catalog(("lulc", "ESA/WorldCover/v200"))
-        outputs = enrich(SAMPLE_DF, {
-            "name": "pt",
-            "predictors": ["lulc"],
-            "output": {"kind": "tabular", "reducers": ["point"], "window_m": 100},
-        }, catalog=cat, out_dir=tmp_path)
+        outputs = extract(
+            SAMPLE_DF,
+            {
+                "run_id": "pt",
+                "datasets": ["lulc"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["point"],
+                    "window_size_m": 100,
+                },
+            },
+            catalog=cat,
+            out_dir=tmp_path,
+        )
         df = pd.read_csv(outputs["pt"])
         assert df["lulc_point"].notna().all()
 
@@ -159,27 +187,39 @@ class TestPointSampling:
 # Raster export across datasets
 # ------------------------------------------------------------------
 
+
 class TestRasterExport:
     """Verify raster export works for different dataset types."""
 
     def test_tiles_dem_glo30(self, tmp_path):
         cat = _make_catalog(("dem_glo30", "COPERNICUS/DEM/GLO30"))
-        enrich(SAMPLE_DF, {
-            "name": "tiles",
-            "predictors": ["dem_glo30"],
-            "output": {"kind": "raster", "window_m": 200},
-        }, catalog=cat, out_dir=tmp_path)
+        extract(
+            SAMPLE_DF,
+            {
+                "run_id": "tiles",
+                "datasets": ["dem_glo30"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            catalog=cat,
+            out_dir=tmp_path,
+        )
         tifs = list((tmp_path / "tiles" / "dem_glo30").glob("*.tif"))
         assert len(tifs) == 2
 
     def test_tiles_worldcover_resample(self, tmp_path):
         import rasterio
+
         cat = _make_catalog(("lulc", "ESA/WorldCover/v200"))
-        enrich(SAMPLE_DF, {
-            "name": "tiles",
-            "predictors": ["lulc"],
-            "output": {"kind": "raster", "window_m": 200, "resample_m": 50},
-        }, catalog=cat, out_dir=tmp_path)
+        extract(
+            SAMPLE_DF,
+            {
+                "run_id": "tiles",
+                "datasets": ["lulc"],
+                "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 50},
+            },
+            catalog=cat,
+            out_dir=tmp_path,
+        )
         expected = round(200 / 50)  # 4x4
         for tif in (tmp_path / "tiles" / "lulc").glob("*.tif"):
             with rasterio.open(tif) as src:
@@ -191,28 +231,33 @@ class TestRasterExport:
 # Automatic date selection for ImageCollections
 # ------------------------------------------------------------------
 
+
 class TestAutoDateSelection:
     """Verify automatic nearest-image date selection for collections."""
 
     def test_collection_no_date_column(self, tmp_path):
         """DataFrame without a date column should use most recent image."""
-        df_no_date = pd.DataFrame({
-            "id": ["A", "B"],
-            "lat": [62.9768783, 62.9812956],
-            "lon": [18.026823, 18.0309905],
-        })
+        df_no_date = pd.DataFrame(
+            {
+                "id": ["A", "B"],
+                "lat": [62.9768783, 62.9812956],
+                "lon": [18.026823, 18.0309905],
+            }
+        )
         cat = _make_catalog(("bioclim", "WORLDCLIM/V1/BIO"))
         df = _run_stats(df_no_date, "bioclim", cat, tmp_path)
         assert df["bioclim_bio01_mean_200m"].notna().all()
 
     def test_date_clamping_to_range(self, tmp_path):
         """Dates outside collection range should clamp to nearest boundary."""
-        df_old_date = pd.DataFrame({
-            "id": ["A", "B"],
-            "lat": [62.9768783, 62.9812956],
-            "lon": [18.026823, 18.0309905],
-            "date": ["1920-01-01", "2099-01-01"],
-        })
+        df_old_date = pd.DataFrame(
+            {
+                "id": ["A", "B"],
+                "lat": [62.9768783, 62.9812956],
+                "lon": [18.026823, 18.0309905],
+                "date": ["1920-01-01", "2099-01-01"],
+            }
+        )
         cat = _make_catalog(("era5", "ECMWF/ERA5/MONTHLY"))
         df = _run_stats(df_old_date, "era5", cat, tmp_path)
         era5_cols = [c for c in df.columns if c.startswith("era5_") and "_mean_" in c]
