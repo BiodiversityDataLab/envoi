@@ -41,4 +41,5 @@ data/us_temp_annual.tif
 data/us_points.csv
 data/points_5.csv
 testing.ipynb
+adde_test.py
 

@@ -5,7 +5,7 @@
 ```
                           User code
                              |
-                     enrich(df, cfg)                 <- src/biodata/enrich.py
+                     extract(df, cfg)                 <- src/biodata/extract.py
                              |
               +--------------+--------------+
               |                             |
@@ -15,7 +15,7 @@
               |                             |
               +-------------+---------------+
                             |
-                   For each predictor:
+                    For each dataset:
                             |
               +-------------+-------------+
               |                           |
@@ -40,7 +40,7 @@
    qc.py           output.py   metadata.py
   coverage       Parquet/CSV    sidecar JSON
   flags          writer         (run/config/
-                                 features/quality)
+                                 datasets/quality)
 ```
 
 ## Data flow
@@ -48,17 +48,17 @@
 ```
  Input DataFrame                    Config (dict or YAML)
  +------------------+               +-------------------------+
- | id | lat | lon   |               | name: "terrain"         |
- |    | (date)      |               | predictors: [dem_aster] |
- +--------+---------+               | output:                 |
-          |                          |   kind: tabular/raster  |
-          v                          |   reducers: [mean, std] |
- +--------+---------+               |   window_m: 200         |
- |    enrich()      | <-------------+-------------------------+
+ | id | lat | lon   |               | run_id: "terrain"       |
+ |    | (date)      |               | datasets: [dem_aster]   |
+ +--------+---------+               | settings:               |
+          |                          |   output_type: tabular  |
+          v                          |   statistics: [mean,std]|
+ +--------+---------+               |   window_size_m: 200    |
+ |    extract()      | <-------------+-------------------------+
  +--------+---------+
           |
           |  1. Load catalog -> resolve adapter per dataset
-          |  2. For each predictor:
+          |  2. For each dataset:
           |
           +---> [tabular + server stats]  GEE fast path
           |     adapter.fetch_stats_batch()
@@ -82,11 +82,11 @@
  +-----------------+  +------------------+  +---------------------+
  | stats.parquet   |  | stats_qc.parquet |  | metadata.json       |
  | (or .csv)       |  | coverage flags   |  | run / config /      |
- +-----------------+  +------------------+  | features / quality  |
+ +-----------------+  +------------------+  | datasets / quality  |
                                             +---------------------+
     OR (raster mode):
  +------------------------------+
- | out/{name}/{predictor}/      |
+ | out/{name}/{dataset}/        |
  |   A-dem_aster.tif            |
  |   B-dem_aster.tif            |
  +------------------------------+
@@ -96,7 +96,7 @@
 
 | Module | Role |
 |---|---|
-| `enrich.py` | Orchestrator. Parses config, loops over predictors, dispatches to adapters, assembles outputs. |
+| `extract.py` | Orchestrator. Parses config, loops over datasets, dispatches to adapters, assembles outputs. |
 | `config.py` | Loads and validates `catalog.yml`. Auto-detects CRS/resolution for local rasters via rasterio. |
 | `adapters/__init__.py` | Adapter registry. Maps source names (`earth_engine`, `local`) to adapter classes. |
 | `gee_adapter.py` | GEE adapter. Handles asset type detection (IMAGE vs IMAGE_COLLECTION), image building (date filtering, cloud masking, mosaicking), server-side stats, point sampling, and raster export. Uses `filterBounds` for tiled collections and caches native projection. |
@@ -104,12 +104,12 @@
 | `reducers.py` | Python-side reducer registry (mean, std, quantiles, etc.). Used for local rasters; GEE uses server-side reducers instead. |
 | `output.py` | Writes tabular results as Parquet or CSV. |
 | `qc.py` | Computes QC flags (in_extent, n_pixels, had_nodata, coverage_pct) from adapter metadata. |
-| `metadata.py` | Writes sidecar JSON with run info, config, per-feature source details, and coverage quality summary. |
+| `metadata.py` | Writes sidecar JSON with run info, config, per-dataset source details, and coverage quality summary. |
 | `auth.py` | Initializes GEE from a service account credentials JSON file. |
 
 ## Adapter interface
 
-Both adapters expose the same methods so `enrich.py` can treat them uniformly:
+Both adapters expose the same methods so `extract.py` can treat them uniformly:
 
 | Method | Mode | Returns |
 |---|---|---|

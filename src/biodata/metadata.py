@@ -6,6 +6,16 @@ from datetime import datetime, timezone
 from typing import Sequence
 
 
+def summarize_tile_export(exported_paths: list, n_points: int) -> dict:
+    """Summarise the outcome of a raster tile export for inclusion in run metadata."""
+    n_exported = sum(1 for ep in (exported_paths or []) if ep is not None)
+    return {
+        "n_exported": n_exported,
+        "n_failed": n_points - n_exported,
+        "total": n_points,
+    }
+
+
 def summarize_date_info(meta_list: list[dict]) -> dict | None:
     """Summarise per-point date decisions for inclusion in group metadata.
 
@@ -38,12 +48,12 @@ def build_tile_crs_zones(lats: Sequence[float], lons: Sequence[float]) -> list[s
     return sorted(zones)
 
 
-def build_feature_meta(
+def build_dataset_meta(
     spec: dict,
     adapter,
     tile_crs_zones: list[str] | None = None,
 ) -> dict:
-    """Build per-feature metadata from catalog spec and adapter state."""
+    """Build per-dataset metadata from catalog spec and adapter state."""
     meta = {
         "source": spec.get("source"),
         "path": spec.get("path"),
@@ -119,9 +129,9 @@ def write_metadata(
     out_dir: str | Path,
     group_name: str,
     *,
-    kind: str,
+    output_type: str,
     n_points: int,
-    features: dict,
+    datasets: dict,
     config: dict,
     quality: dict | None = None,
     date_info: dict | None = None,
@@ -132,10 +142,10 @@ def write_metadata(
     Structure:
       run       — when and how (auto-generated)
       config    — what the user requested
-      features  — per-feature source details
-      quality   — per-feature coverage summary (tabular only)
-      date_info — per-feature date selection summary (GEE collections only)
-      warnings  — per-feature warnings raised during the run (e.g. wrong reducer for data type)
+      datasets  — per-dataset source details
+      quality   — per-dataset coverage summary (tabular only)
+      date_info — per-dataset date selection summary (GEE collections only)
+      warnings  — per-dataset warnings raised during the run (e.g. wrong reducer for data type)
     """
     from . import __version__
 
@@ -146,10 +156,10 @@ def write_metadata(
             "n_points": n_points,
         },
         "config": {
-            "name": group_name,
+            "run_id": group_name,
             **config,
         },
-        "features": features,
+        "datasets": datasets,
     }
 
     if quality:
