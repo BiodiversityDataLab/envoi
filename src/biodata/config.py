@@ -5,9 +5,37 @@ from typing import Dict, Any, Mapping
 import logging
 import yaml
 
-REQUIRED_DATASET_KEYS = {"source", "path"}
+REQUIRED_DATASET_KEYS = {"data_source", "path"}
+
+# Path to the defaults file, relative to this source file's location in the package.
+_DEFAULTS_PATH = Path(__file__).resolve().parent.parent.parent / "configs" / "defaults.yml"
+
+# Module-level cache so the file is only read once per process.
+_defaults_cache: Dict[str, Any] | None = None
 
 logger = logging.getLogger(__name__)
+
+
+def load_defaults() -> Dict[str, Any]:
+    """Load project-wide defaults from configs/defaults.yml.
+
+    Returns a dict of default values (e.g. window_size_m, output_file_format).
+    The result is cached after the first read so the file is only opened once.
+    """
+    global _defaults_cache
+    if _defaults_cache is not None:
+        return _defaults_cache
+
+    if not _DEFAULTS_PATH.exists():
+        raise FileNotFoundError(
+            f"Defaults file not found at {_DEFAULTS_PATH}. "
+            "Ensure configs/defaults.yml exists in the project root."
+        )
+
+    with _DEFAULTS_PATH.open("r", encoding="utf-8") as f:
+        _defaults_cache = yaml.safe_load(f) or {}
+
+    return _defaults_cache
 
 
 class CatalogError(ValueError):
@@ -23,7 +51,7 @@ def _require_keys(d: Dict[str, Any], required: set, ctx: str) -> None:
 def _inspect_raster(name: str, spec: Dict[str, Any]) -> None:
     """Read CRS, resolution, type, and nodata from a local raster file
     and fill in any missing spec fields automatically."""
-    if spec.get("source") != "local":
+    if spec.get("data_source") != "local":
         return
 
     p = Path(spec["path"])
@@ -94,8 +122,8 @@ def load_catalog(path: str | Path) -> Dict[str, Any]:
             raise CatalogError(f"datasets.{name}: must be a mapping")
         _require_keys(spec, REQUIRED_DATASET_KEYS, f"datasets.{name}")
 
-        if not isinstance(spec["source"], str) or not spec["source"]:
-            raise CatalogError(f"datasets.{name}.source must be a non-empty string")
+        if not isinstance(spec["data_source"], str) or not spec["data_source"]:
+            raise CatalogError(f"datasets.{name}.data_source must be a non-empty string")
         if not isinstance(spec["path"], str) or not spec["path"]:
             raise CatalogError(f"datasets.{name}.path must be a non-empty string")
 
@@ -120,10 +148,10 @@ def _load_catalog_any(src: Any) -> Dict[str, Any]:
         for name, spec in d["datasets"].items():
             if not isinstance(spec, dict):
                 raise CatalogError(f"datasets.{name}: must be a mapping")
-            if "source" not in spec or not spec.get("source"):
+            if "data_source" not in spec or not spec.get("data_source"):
                 raise CatalogError(
-                    f"datasets.{name}: missing required key 'source'.\n"
-                    f"Valid sources are: earth_engine, local."
+                    f"datasets.{name}: missing required key 'data_source'.\n"
+                    f"Valid values are: earth_engine, local."
                 )
             if "path" not in spec or not spec.get("path"):
                 raise CatalogError(

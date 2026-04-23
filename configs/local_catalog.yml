@@ -1,19 +1,19 @@
 datasets:
 
   dem_local:
-    source: local
+    data_source: local
     path: data/for_testing/dem/TG4NHB-dem.tif
     data_type: continuous
     bands: 1
 
   slope_local:
-    source: local
+    data_source: local
     path: data/for_testing/dem/TG4NHB-dem.tif
     data_type: continuous
     bands: 2
 
   aspect_local:
-    source: local
+    data_source: local
     path: data/for_testing/dem/TG4NHB-dem.tif
     data_type: continuous
     bands: 3

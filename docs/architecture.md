@@ -5,13 +5,13 @@
 ```
                           User code
                              |
-                     extract(df, cfg)                 <- src/biodata/extract.py
+                     extract(df, config)              <- src/biodata/extract.py
                              |
               +--------------+--------------+
               |                             |
          config.py                     catalog.yml
      load & validate catalog          dataset registry
-     auto-detect local raster         (source + path)
+     auto-detect local raster         (data_source + path)
               |                             |
               +-------------+---------------+
                             |
@@ -20,7 +20,7 @@
               +-------------+-------------+
               |                           |
         adapters/__init__.py         reducers.py
-        get_adapter(source)         get_reducer(name)
+        get_adapter(data_source)    get_reducer(name)
         adapter registry            mean, std, q10, ...
               |
      +--------+--------+
@@ -48,7 +48,7 @@
 ```
  Input DataFrame                    Config (dict or YAML)
  +------------------+               +-------------------------+
- | id | lat | lon   |               | run_id: "terrain"       |
+ | id | lat | lon   |               | batch_id: "terrain"     |
  |    | (date)      |               | datasets: [dem_aster]   |
  +--------+---------+               | settings:               |
           |                          |   output_type: tabular  |

@@ -18,6 +18,7 @@ data/*.gpkg
 data/*.geojson
 data/raw/
 out/
+outputs/
 .cache/
 .cache/**
 

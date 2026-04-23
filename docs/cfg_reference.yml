@@ -1,13 +1,13 @@
 # ============================================================
-# biodata-enricher: cfg reference
+# biodata-enricher: config reference
 # ============================================================
 # Pass as a dict (single output) or list of dicts (multiple)
-# to extract(df, cfg, catalog=..., out_dir=...)
+# to extract(df, config, catalog=..., output_dir=...)
 # ============================================================
 
 # --- Single output example ---
 
-run_id: terrain                 # Run identifier. Used for filenames (e.g. terrain.parquet)
+batch_id: terrain                 # Batch identifier. Used for filenames (e.g. terrain.parquet)
                                 # Default: "output1", "output2", ...
 
 datasets:                       # List of dataset names from catalog.yml
@@ -24,7 +24,7 @@ settings:
     - q10                       #            point (samples exact pixel, no window)
     - q90
   window_size_m: 200            # Side length of square window in metres. Default: 500
-  output_format: parquet        # "parquet" (default) or "csv"
+  output_file_format: parquet        # "parquet" (default) or "csv"
   min_coverage_pct: 80          # QC threshold for low-coverage warning. Default: 80
 
   --- Raster options ---
@@ -40,12 +40,12 @@ Pass a list:
 
 extract(df, [
     {
-        "run_id": "terrain_stats",
+        "batch_id": "terrain_stats",
         "datasets": ["dem_aster"],
         "settings": {"output_type": "tabular", "statistics": ["mean", "std"], "window_size_m": 200},
     },
     {
-        "run_id": "terrain_tiles",
+        "batch_id": "terrain_tiles",
         "datasets": ["dem_aster"],
         "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 10},
     },
@@ -60,7 +60,7 @@ Everything else is auto-detected or optional.
 
 datasets:
   dem_aster:
-    source: earth_engine                # "earth_engine" or "local"
+    data_source: earth_engine                # "earth_engine" or "local"
     path: projects/sat-io/open-datasets/ASTER/GDEM  # GEE asset ID or local file path
     data_type: continuous               # "continuous" or "categorical"
                                         # Affects default reducer (mean vs point) and
@@ -80,7 +80,7 @@ datasets:
     # - If no 'date' column is provided, the most recent image is used.
 
   dem_local:
-    source: local
+    data_source: local
     path: data/dem/my_dem.tif
     bands: 1                            # Optional, defaults to band 1
     # CRS, resolution, nodata are auto-detected from the file
@@ -104,10 +104,10 @@ df = pd.DataFrame({
 Output files
 ============================================================
 Tabular:
-  out/{run_id}.parquet          Stats (e.g. dem_aster_mean_b200)
-  out/{run_id}_qc.parquet       QC flags (in_extent, n_pixels, had_nodata, coverage_pct)
-  out/{run_id}_metadata.json    Sidecar metadata
+  out/{batch_id}.parquet          Stats (e.g. dem_aster_mean_b200)
+  out/{batch_id}_qc.parquet       QC flags (in_extent, n_pixels, had_nodata, coverage_pct)
+  out/{batch_id}_metadata.json    Sidecar metadata
 
 Raster:
-  out/{run_id}/{dataset}/A-{dataset}.tif      One GeoTIFF per point
-  out/{run_id}/{run_id}_metadata.json         Sidecar metadata
+  out/{batch_id}/{dataset}/A-{dataset}.tif      One GeoTIFF per point
+  out/{batch_id}/{batch_id}_metadata.json         Sidecar metadata

@@ -23,14 +23,14 @@ df = pd.read_csv("data/points_sample.csv")
 
 # Single output — tabular stats
 outputs = extract(df, {
-    "run_id": "terrain",
+    "batch_id": "terrain",
     "datasets": ["dem_local"],
     "settings": {
         "output_type": "tabular",
         "statistics": ["mean", "std"],
         "window_size_m": 200,
     },
-}, catalog="configs/catalog.yml", out_dir="out")
+}, catalog="configs/catalog.yml", output_dir="out")
 
 print(outputs["terrain"])      # -> out/terrain.parquet
 print(outputs["terrain_qc"])   # -> out/terrain_qc.parquet
@@ -44,16 +44,16 @@ Pass a list to process several configurations in one call:
 ```python
 outputs = extract(df, [
     {
-        "run_id": "terrain_stats",
+        "batch_id": "terrain_stats",
         "datasets": ["dem_local"],
         "settings": {"output_type": "tabular", "statistics": ["mean", "std"], "window_size_m": 200},
     },
     {
-        "run_id": "terrain_tiles",
+        "batch_id": "terrain_tiles",
         "datasets": ["dem_local"],
         "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 10},
     },
-], catalog="configs/catalog.yml", out_dir="out")
+], catalog="configs/catalog.yml", output_dir="out")
 ```
 
 ## Output kinds
@@ -85,11 +85,11 @@ The catalog tells the library where data lives. `configs/catalog.yml`:
 ```yaml
 datasets:
   dem_local:
-    source: local
+    data_source: local
     path: data/dem/my_dem.tif
 
   dem_aster:
-    source: earth_engine
+    data_source: earth_engine
     path: NASA/ASTER_GED/AG100_003
     bands: [elevation]
 ```
