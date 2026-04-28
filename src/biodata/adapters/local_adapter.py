@@ -35,8 +35,17 @@ class LocalRasterAdapter(BaseAdapter):
         self.src = rasterio.open(self.path)
         self.raster_crs = self.src.crs
 
-        # Band selection: 1-indexed, defaults to 1
-        self.band = self.spec.get("bands", 1)
+        # Determine which bands to read. If the user specifies "bands" in the catalog
+        # (a single int or list of ints), use that. Otherwise default to all bands in
+        # the file so no data is silently dropped.
+        bands_spec = self.spec.get("bands")
+        if bands_spec is None:
+            all_bands = list(range(1, self.src.count + 1))
+            # A single-band raster is treated as a scalar (int) so downstream
+            # code keeps the simpler single-band path and column naming.
+            self.band = all_bands[0] if len(all_bands) == 1 else all_bands
+        else:
+            self.band = bands_spec
 
     @staticmethod
     def _get_utm_crs(lon: float, lat: float) -> str:

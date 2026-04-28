@@ -47,6 +47,9 @@ gee = [
 [project.urls]
 Homepage = "https://github.com/AppleShay/biodata-enricher"
 
+[tool.setuptools.package-data]
+biodata = ["configs/*.yml"]
+
 [tool.ruff]
 line-length = 100
 
