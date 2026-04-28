@@ -9,19 +9,20 @@ import yaml
 from pyproj import Transformer
 
 from .adapters import get_adapter
-from .config import load_catalogs, load_defaults
+from .config import load_catalogs, load_defaults, BUILTIN_EE_CATALOG
 from .qc import attach_quality_control, split_stats_and_qc
 from .metadata import write_metadata
+
+# Default catalog tuple used when the caller does not supply one.
+# The sentinels tell load_catalogs() to load the YAML files that are
+# bundled inside the installed package, so this works regardless of
+# the user's working directory.
+_DEFAULT_CATALOGS = (BUILTIN_EE_CATALOG,)
 
 
 def extract(
     df: pd.DataFrame,
     config: str | Path | dict | list,
-    catalog: str | Path | dict | list | tuple = (
-        "configs/ee_catalog.yml",
-        "configs/local_catalog.yml",
-    ),
-    extra_catalog: str | Path | dict | None = None,
     output_dir: str | Path = "outputs",
     input_crs: str | None = None,
 ) -> Dict[str, Path]:
@@ -65,13 +66,6 @@ def extract(
     config : str, Path, dict, or list
         Output specification — see above. A path string or ``Path`` is loaded as
         YAML before processing.
-    catalog : str, Path, dict, list, or tuple, optional
-        Dataset catalog(s) that map dataset names to their source and path. Accepts
-        a single catalog file/dict, a list of them, or a tuple of paths. Defaults
-        to the project's built-in GEE and local catalogs.
-    extra_catalog : str, Path, dict, or None, optional
-        An additional catalog merged on top of ``catalog``. Useful for adding custom
-        datasets without modifying the built-in catalog files.
     output_dir : str or Path, optional
         Directory where all output files are written. Created automatically if it
         does not exist. Defaults to ``"outputs"``.
@@ -93,7 +87,7 @@ def extract(
 
     df = df.copy()
 
-    # Load project-wide defaults from configs/defaults.yml once per call.
+    # Load project-wide defaults from the bundled configs/defaults.yml once per call.
     # These are the fallback values used when settings are not specified
     # in the run config or as keyword arguments to this function.
     defaults = load_defaults()
@@ -103,10 +97,9 @@ def extract(
     df, dates, date_warnings = _parse_and_validate_dates(df)
     df, crs_warnings = _validate_and_reproject_crs(df, input_crs)
 
-    # this code might change
-    catalog_dict = load_catalogs(
-        catalog, extra_catalog
-    )  # should be a helper method to merge user updates with pre-existing catalog, separate from extract()
+    # Merge the built-in catalogs with any datasets registered via update_catalog().
+    # The user catalog is always applied last, so user entries override built-ins.
+    catalog_dict = load_catalogs(_DEFAULT_CATALOGS)
     catalog_datasets = catalog_dict["datasets"]
 
     # Normalize config into a list of output configs, whether the user passed a single dict or a list of dicts.
