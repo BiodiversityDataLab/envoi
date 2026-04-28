@@ -165,6 +165,44 @@ class TestPointSampling:
         df = pd.read_csv(outputs["pt"])
         assert df["dem_aster_point"].notna().all()
 
+    def test_point_dem_glo30_with_window_stats(self, tmp_path):
+        # Regression test: dem_glo30 is an IMAGE_COLLECTION with tiled global
+        # coverage and derived bands (slope, aspect). When "point" was combined
+        # with window reducers like "mean"/"std", the adapter cached a
+        # no-coords global static image during the band-name probe and then
+        # reused it for per-point sampling, causing img.sample() to return
+        # empty props and silently dropping every "_point" column from the
+        # output.
+        cat = {
+            "datasets": {
+                "dem_glo30": {
+                    "data_source": "earth_engine",
+                    "path": "COPERNICUS/DEM/GLO30",
+                    "bands": ["DEM"],
+                    "derived_bands": ["slope", "aspect"],
+                }
+            }
+        }
+        outputs = extract(
+            SAMPLE_DF,
+            {
+                "batch_id": "pt",
+                "datasets": ["dem_glo30"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean", "std", "point"],
+                    "window_size_m": 200,
+                },
+            },
+            catalog=cat,
+            output_dir=tmp_path,
+        )
+        df = pd.read_csv(outputs["pt"])
+        # All three bands must produce point columns alongside window stats.
+        for band in ("DEM", "slope", "aspect"):
+            assert f"dem_glo30_{band}_point" in df.columns
+            assert df[f"dem_glo30_{band}_point"].notna().all()
+
     def test_point_worldcover(self, tmp_path):
         cat = _make_catalog(("lulc", "ESA/WorldCover/v200"))
         outputs = extract(
@@ -249,6 +287,19 @@ class TestAutoDateSelection:
         cat = _make_catalog(("bioclim", "WORLDCLIM/V1/BIO"))
         df = _run_stats(df_no_date, "bioclim", cat, tmp_path)
         assert df["bioclim_bio01_mean_200m"].notna().all()
+
+    def test_dem_glo30_no_date_column(self, tmp_path):
+        """DEM collection without date column should still return values."""
+        df_no_date = pd.DataFrame(
+            {
+                "id": ["A", "B"],
+                "lat": [62.9768783, 62.9812956],
+                "lon": [18.026823, 18.0309905],
+            }
+        )
+        cat = _make_catalog(("dem_glo30", "COPERNICUS/DEM/GLO30"))
+        df = _run_stats(df_no_date, "dem_glo30", cat, tmp_path)
+        assert df["dem_glo30_DEM_mean_200m"].notna().all()
 
     def test_date_clamping_to_range(self, tmp_path):
         """Dates outside collection range should clamp to nearest boundary."""
