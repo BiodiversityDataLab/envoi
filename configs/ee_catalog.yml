@@ -7,15 +7,16 @@ datasets:
     data_source: earth_engine
     path: path/to/dataset_on_earth_engine   # GEE asset ID; type (IMAGE / IMAGE_COLLECTION) is auto-detected
     data_type: type                 # "continuous" or "categorical"
+    native_scale_m: 10              # native spatial resolution in meters (only for datasets that lacks a native scale property in GEE metadata)
 
     # Band selection - if omitted, all bands are loaded
     bands: [list, of, bands]                 # single string ("DEM") or list (["B4", "B8"])
+    derived_bands: [slope, aspect]           # compute and include derived bands (currently supported: slope, aspect — DEM-style datasets)
 
     dataset_spec: # dataset-specific pre-processing and feature engineering options
       # This example is for Sentinel-2 Level-2A, but other datasets may have different options.
       cloud_pct_max: 20                     # pre-filter: keep images with < 20 % cloud cover
       cloud_mask: s2                        # pixel-level mask using QA60 band
-      derived_bands: NDVI                    # add a derived band (e.g. NDVI) to the dataset
 
     dataset_information:
       # Optional free-form metadata fields, written to metadata JSON.
@@ -122,4 +123,16 @@ datasets:
       source_url: "https://land.copernicus.eu/global/products/lc"
       citation: "Buchhorn, M., Smets, B., Bertels, L., Roo, B. D., Lesiv, M., Tsendbazar, N.-E., Herold, M., & Fritz, S. (2020). Copernicus Global Land Service: Land Cover 100m: collection 3: epoch 2019: Globe (Version V3.0.1) [Data set]. Zenodo."
       license: "Fully free and open to all users"
+
+  landsat_annual_ndvi:
+    data_source: earth_engine
+    path: LANDSAT/COMPOSITES/C02/T1_L2_ANNUAL_NDVI
+    data_type: continuous
+    native_scale_m: 30
+    dataset_information:
+      description: "Landsat Annual NDVI - global annual composites of NDVI from 1984-present, 30m resolution."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/LANDSAT_COMPOSITES_C02_T1_L2_ANNUAL_NDVI"
+      source_url: "https://www.usgs.gov/landsat-missions/landsat-surface-reflectance-derived-spectral-indices"
+      citation: "Landsat NDVI products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center."
+      license: "Public Domain (free for all uses)"
 

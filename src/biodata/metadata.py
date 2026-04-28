@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Sequence
 
 
@@ -69,9 +69,15 @@ def write_metadata(
     """
     from . import __version__
 
+    # Use the system's local time with its UTC offset attached
+    # (e.g. "2026-04-28T14:30:00+02:00"). astimezone() with no argument
+    # tags the local datetime with the OS-configured timezone, so the
+    # timestamp is unambiguous and correct for whoever runs the package.
+    local_timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+
     meta = {
         "run": {
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "timestamp": local_timestamp,
             "package_version": __version__,
             "n_points": n_points,
         },
