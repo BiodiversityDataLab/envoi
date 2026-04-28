@@ -186,6 +186,12 @@ def extract(
             core_columns = [c for c in ("id", "lat", "lon", "date") if c in df_copy.columns]
             stats_df, qc_df = split_stats_and_qc(df_copy, core_columns)
 
+            # Round stat columns to the specified number of decimals so the output stays readable.
+            # Core columns (id/lat/lon/date) are excluded so coordinate
+            # precision is preserved exactly as the user supplied it.
+            stat_columns = [c for c in stats_df.columns if c not in core_columns]
+            stats_df[stat_columns] = stats_df[stat_columns].round(defaults["stats_output_decimals"])
+
             stats_path = _write_tabular(stats_df, batch_id, Path(output_dir), output_file_format)
             qc_path = _write_tabular(qc_df, f"{batch_id}_qc", Path(output_dir), output_file_format)
 
@@ -565,7 +571,7 @@ def _validate_and_reproject_crs(
     if input_crs is not None:
         input_crs_upper = input_crs.upper()
         if input_crs_upper != "EPSG:4326" and input_crs_upper != "WGS84":
-            message = f"Reprojecting coordinates from {input_crs} to WGS84."
+            message = f"Reprojecting coordinates from {input_crs} to EPSG:4326 (WGS84)."
             print(message)
             crs_warnings.append(message)
             transformer = Transformer.from_crs(input_crs, "EPSG:4326", always_xy=True)

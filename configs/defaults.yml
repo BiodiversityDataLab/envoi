@@ -17,4 +17,7 @@ min_coverage_pct: 0
 
 # Number of parallel threads used by the GEE adapter for server-side
 # requests. Higher values speed up large batches but increase API load.
-max_workers: 8
+max_workers: 20
+
+# Number of decimal places to round statistics to in the output.
+stats_output_decimals: 5

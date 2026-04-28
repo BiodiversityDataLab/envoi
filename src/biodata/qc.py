@@ -108,21 +108,43 @@ def build_quality_control_dataframe(
     )
 
 
-def summarize_coverage(qc_df: pd.DataFrame, coverage_column: str) -> dict:
+def summarize_coverage(
+    qc_df: pd.DataFrame,
+    coverage_column: str,
+    ids: pd.Series | list | None = None,
+) -> dict:
     """Count rows by coverage bucket (zero / partial / full) for metadata.
 
     Reads the per-row coverage_pct column and bins rows into three buckets
     plus a total count. NaN coverage values are treated as zero.
+
+    When ``ids`` is provided, the returned dict also includes ``ids_no_data``
+    — the list of input ids whose coverage fell into the zero bucket. This
+    lets users see exactly which sample points had no valid pixels for a
+    given dataset (e.g. points falling outside the dataset's extent).
     """
     # Missing coverage values (e.g. out-of-extent rows) are treated as 0%
     # so they fall into the n_zero bucket rather than being silently dropped.
     coverage_values = qc_df[coverage_column].fillna(0)
-    return {
+
+    summary = {
         "n_zero": int((coverage_values == 0).sum()),
         "n_partial": int(((coverage_values > 0) & (coverage_values < 100)).sum()),
         "n_full": int((coverage_values == 100).sum()),
         "total": int(coverage_values.shape[0]),
     }
+
+    # When the caller supplies the id column, attach the list of ids whose
+    # coverage was zero so the user can identify which exact points had no
+    # data without having to cross-reference the QC csv.
+    if ids is not None:
+        # Reset indexes so positional alignment between coverage_values and
+        # ids is reliable regardless of either input's original index.
+        ids_series = pd.Series(list(ids)).reset_index(drop=True)
+        zero_mask = coverage_values.reset_index(drop=True) == 0
+        summary["ids_no_data"] = ids_series[zero_mask].tolist()
+
+    return summary
 
 
 def attach_quality_control(
@@ -160,7 +182,13 @@ def attach_quality_control(
     # Reconstruct the fully-qualified coverage column name here so callers
     # never need to know the "{dataset}_coverage_pct{suffix}" convention.
     coverage_column = f"{dataset_name}_coverage_pct{result.column_suffix}"
-    coverage_summary = summarize_coverage(result.quality_control_dataframe, coverage_column)
+
+    # Pass the input ids (when present) so the coverage summary can include
+    # the list of point ids that had no data for this dataset.
+    ids = df["id"] if "id" in df.columns else None
+    coverage_summary = summarize_coverage(
+        result.quality_control_dataframe, coverage_column, ids=ids
+    )
 
     return df_with_qc, result.quality_key, coverage_summary
 

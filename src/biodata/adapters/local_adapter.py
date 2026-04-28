@@ -128,7 +128,9 @@ class LocalRasterAdapter(BaseAdapter):
 
         meta = {
             "in_extent": True,
-            "n_pixels": int(total),
+            # n_pixels reports valid (non-nodata, finite) cells only — total
+            # cells can be derived from window_m / native pixel size.
+            "n_pixels": int(valid),
             "had_nodata": had_nodata,
             "coverage_pct": float(coverage_pct),
             "window_m": int(window_m),
@@ -165,77 +167,90 @@ class LocalRasterAdapter(BaseAdapter):
           * multi-band window:  ``b{band_num}_{rname}``
           * single-band point:  ``point``
           * multi-band point:   ``b{band_num}_point``
+
+        Mirrors the GEE adapter's design: a single per-point worker handles
+        both the window and point branches, so callers see one consistent
+        merged ``(stats, meta)`` tuple per input row.
         """
-        # Separate "point" from ordinary window reducers — each has its own path.
+        # Separate "point" from ordinary window reducers — each has its own
+        # internal branch inside _fetch_stats_single.
         reducer_names = list(reducer_names)
         want_point = "point" in reducer_names
         window_reducers = [r for r in reducer_names if r != "point"]
 
-        # "point" requires fetch_points_batch (exact pixel sampling).
-        if want_point and not hasattr(self, "fetch_points_batch"):
-            raise ValueError(f"Adapter {type(self).__name__} does not support the 'point' reducer.")
-
-        # Pre-resolve reducer callables once (looked up by name in the registry).
+        # Pre-resolve window reducer callables once so we don't re-look them
+        # up by name on every point.
         window_reducer_fns = [(r, get_reducer(r)) for r in window_reducers]
 
-        lats = list(lats)
-        lons = list(lons)
-        n = len(lats)
+        # Single per-point loop — _fetch_stats_single returns the merged
+        # (stats, meta) tuple, so no separate merge pass is needed.
+        results: List[tuple[dict, dict]] = []
+        for lat, lon in zip(lats, lons):
+            results.append(
+                self._fetch_stats_single(
+                    lat, lon, window_m, window_reducer_fns, want_point=want_point
+                )
+            )
+        return results
+
+    def _fetch_stats_single(
+        self,
+        lat: float,
+        lon: float,
+        window_m: int,
+        window_reducer_fns: list[tuple[str, Any]],
+        *,
+        want_point: bool = False,
+    ) -> tuple[dict, dict]:
+        """Compute window stats and/or point sample at one (lat, lon).
+
+        Two branches share the same rasterio dataset and run sequentially:
+
+        - **window** — runs only when *window_reducer_fns* is non-empty.
+          Reads the buffered window via :meth:`fetch_values` and applies
+          each Python-side reducer to the valid pixels.
+        - **point** — runs only when *want_point* is True. Samples the
+          exact pixel containing (lat, lon) via ``self.src.sample()``.
+
+        When both branches run, the window branch's meta is used (it carries
+        transform/dtype/nodata fields needed by tile export). When only the
+        point branch runs, the meta is synthesized with placeholder transform
+        fields so callers downstream see a consistent shape.
+        """
         is_multiband = isinstance(self.band, (list, tuple))
         band_nums = self.band if is_multiband else None
 
-        # ---------- window path ----------
-        # For each point, read a window and apply each window reducer.
-        window_results: List[tuple[dict, dict]] = []
-        if window_reducers:
-            for lat, lon in zip(lats, lons):
-                vals, meta = self.fetch_values(lat, lon, window_m, return_meta=True)
-                vals = np.asarray(vals)
-                stats: Dict[str, Any] = {}
-                if is_multiband and vals.ndim == 2:
-                    # vals shape: (n_bands, n_valid_pixels)
-                    for b_idx, band_num in enumerate(band_nums):
-                        v = vals[b_idx]
-                        for rname, reducer in window_reducer_fns:
-                            stats[f"b{band_num}_{rname}"] = reducer(v) if v.size else None
-                else:
+        stats: Dict[str, Any] = {}
+        meta: Dict[str, Any] = {}
+
+        # ---- window branch ----
+        if window_reducer_fns:
+            vals, meta = self.fetch_values(lat, lon, window_m, return_meta=True)
+            vals = np.asarray(vals)
+            if is_multiband and vals.ndim == 2:
+                # vals shape: (n_bands, n_valid_pixels)
+                for b_idx, band_num in enumerate(band_nums):
+                    v = vals[b_idx]
                     for rname, reducer in window_reducer_fns:
-                        stats[rname] = reducer(vals) if vals.size else None
-                window_results.append((stats, meta))
-
-        # ---------- point path ----------
-        # Sample the exact pixel value at each coordinate (no window).
-        point_results: List[tuple[dict, dict]] = []
-        if want_point:
-            pt_raw = self.fetch_points_batch(lats, lons, dates=dates)
-            for pt_vals, pt_meta in pt_raw:
-                stats: Dict[str, Any] = {}
-                if is_multiband:
-                    # fetch_points_batch returns keys like "b1", "b2" — re-key
-                    # with the "_point" suffix so columns are unambiguous.
-                    for band_num in band_nums:
-                        stats[f"b{band_num}_point"] = pt_vals.get(f"b{band_num}")
-                else:
-                    stats["point"] = pt_vals.get("point")
-                point_results.append((stats, pt_meta))
-
-        # ---------- merge ----------
-        # For each point, combine the window and point stats into one dict.
-        # When both paths ran, we prefer the window meta (it carries full
-        # transform/dtype/nodata info); when only point ran, we synthesize the
-        # window_m / crs fields callers downstream expect.
-        results: List[tuple[dict, dict]] = []
-        for i in range(n):
-            merged_stats: Dict[str, Any] = {}
-            if window_reducers:
-                merged_stats.update(window_results[i][0])
-            if want_point:
-                merged_stats.update(point_results[i][0])
-
-            if window_reducers:
-                meta = window_results[i][1]
+                        stats[f"b{band_num}_{rname}"] = reducer(v) if v.size else None
             else:
-                pt_meta = point_results[i][1]
+                for rname, reducer in window_reducer_fns:
+                    stats[rname] = reducer(vals) if vals.size else None
+
+        # ---- point branch ----
+        if want_point:
+            pt_values, pt_meta = self._sample_point_single(lat, lon)
+            if is_multiband:
+                # _sample_point_single returns "b{n}" keys — re-key with the
+                # "_point" suffix so column names are unambiguous downstream.
+                for band_num in band_nums:
+                    stats[f"b{band_num}_point"] = pt_values.get(f"b{band_num}")
+            else:
+                stats["point"] = pt_values.get("point")
+
+            # If only the point branch ran, synthesize the meta fields that
+            # the window branch would normally have provided.
+            if not window_reducer_fns:
                 meta = {
                     **pt_meta,
                     "window_m": int(window_m),
@@ -246,9 +261,62 @@ class LocalRasterAdapter(BaseAdapter):
                     "nodata": None,
                     "window_arr": None,
                 }
-            results.append((merged_stats, meta))
 
-        return results
+        return stats, meta
+
+    def _sample_point_single(self, lat: float, lon: float) -> tuple[dict, dict]:
+        """Sample the exact pixel value at one (lat, lon) via rasterio.
+
+        Returns ``(values, meta)`` where:
+          * ``values`` is keyed ``"point"`` for single-band or ``"b{n}"``
+            per band for multi-band — callers re-key with the ``_point``
+            suffix as needed.
+          * ``meta`` carries the per-point QC fields (in_extent, n_pixels,
+            had_nodata, coverage_pct, src_path).
+        """
+        # Cache the WGS84 → raster-CRS transformer on first use; it's the
+        # same for every point, so building it once amortises pyproj setup.
+        if not hasattr(self, "_cached_raster_transformer"):
+            self._cached_raster_transformer = Transformer.from_crs(
+                "EPSG:4326", self.raster_crs, always_xy=True
+            )
+        transformer = self._cached_raster_transformer
+
+        multiband = isinstance(self.band, list)
+        try:
+            x, y = transformer.transform(lon, lat)
+            raw = next(self.src.sample([(x, y)], indexes=self.band))
+            nodata = self.src.nodata
+            if multiband:
+                values: Dict[str, Any] = {}
+                for band_num, v in zip(self.band, raw):
+                    fv = None if (nodata is not None and v == nodata) else float(v)
+                    values[f"b{band_num}"] = fv
+                any_valid = any(v is not None for v in values.values())
+            else:
+                v = raw[0]
+                fv = None if (nodata is not None and v == nodata) else float(v)
+                values = {"point": fv}
+                any_valid = fv is not None
+            meta = {
+                "in_extent": any_valid,
+                "n_pixels": 1 if any_valid else 0,
+                "had_nodata": not any_valid,
+                "coverage_pct": 100.0 if any_valid else 0.0,
+                "src_path": str(self.path),
+            }
+        except Exception:
+            # Out-of-extent points or any rasterio sampling failure — return
+            # None values so downstream code still sees a consistent schema.
+            values = {f"b{b}": None for b in self.band} if multiband else {"point": None}
+            meta = {
+                "in_extent": False,
+                "n_pixels": 0,
+                "had_nodata": False,
+                "coverage_pct": 0.0,
+                "src_path": str(self.path),
+            }
+        return values, meta
 
     def export_tiles(
         self,
@@ -338,46 +406,6 @@ class LocalRasterAdapter(BaseAdapter):
             paths.append(out_path)
 
         return paths, [{}] * len(paths)
-
-    def fetch_points_batch(self, lats, lons, *, dates=None):
-        """Sample the exact pixel value at each (lat, lon) coordinate."""
-        transformer = Transformer.from_crs("EPSG:4326", self.raster_crs, always_xy=True)
-        results = []
-        multiband = isinstance(self.band, list)
-        for lat, lon in zip(lats, lons):
-            try:
-                x, y = transformer.transform(lon, lat)
-                raw = next(self.src.sample([(x, y)], indexes=self.band))
-                nodata = self.src.nodata
-                if multiband:
-                    values = {}
-                    for band_num, v in zip(self.band, raw):
-                        fv = None if (nodata is not None and v == nodata) else float(v)
-                        values[f"b{band_num}"] = fv
-                    any_valid = any(v is not None for v in values.values())
-                else:
-                    v = raw[0]
-                    fv = None if (nodata is not None and v == nodata) else float(v)
-                    values = {"point": fv}
-                    any_valid = fv is not None
-                meta = {
-                    "in_extent": any_valid,
-                    "n_pixels": 1 if any_valid else 0,
-                    "had_nodata": not any_valid,
-                    "coverage_pct": 100.0 if any_valid else 0.0,
-                    "src_path": str(self.path),
-                }
-            except Exception:
-                values = {f"b{b}": None for b in self.band} if multiband else {"point": None}
-                meta = {
-                    "in_extent": False,
-                    "n_pixels": 0,
-                    "had_nodata": False,
-                    "coverage_pct": 0.0,
-                    "src_path": str(self.path),
-                }
-            results.append((values, meta))
-        return results
 
     def build_dataset_meta(
         self,
