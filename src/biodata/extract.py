@@ -25,6 +25,10 @@ def extract(
     config: str | Path | dict | list,
     output_dir: str | Path = "outputs",
     input_crs: str | None = None,
+    id_column: str = "id",
+    latitude_column: str = "lat",
+    longitude_column: str = "lon",
+    date_column: str = "date",
 ) -> Dict[str, Path]:
     """Extract environmental data for a set of geographic sample points.
 
@@ -60,9 +64,11 @@ def extract(
     Parameters
     ----------
     df : pd.DataFrame
-        Input table of sample points. Must contain columns ``id``, ``lat``, and
-        ``lon``. An optional ``date`` column (YYYY-MM-DD strings) enables
-        nearest-date image selection for time-varying datasets.
+        Input table of sample points. Must contain identifier and coordinate
+        columns (named ``id``, ``lat``, ``lon`` by default — override the names
+        with the ``*_column`` parameters below). An optional date column
+        (YYYY-MM-DD strings) enables nearest-date image selection for
+        time-varying datasets.
     config : str, Path, dict, or list
         Output specification — see above. A path string or ``Path`` is loaded as
         YAML before processing.
@@ -71,9 +77,23 @@ def extract(
         does not exist. Defaults to ``"outputs"``.
     input_crs : str or None, optional
         CRS of the coordinates in ``df`` as an EPSG code or proj string
-        (e.g. ``"EPSG:32634"``). When provided, ``lat`` and ``lon`` are
-        reprojected to WGS84 (EPSG:4326) before extraction. If omitted,
-        coordinates are assumed to already be in WGS84.
+        (e.g. ``"EPSG:32634"``). When provided, the latitude and longitude
+        columns are reprojected to WGS84 (EPSG:4326) before extraction. If
+        omitted, coordinates are assumed to already be in WGS84.
+    id_column : str, optional
+        Name of the input column containing each row's identifier.
+        Defaults to ``"id"``. The output tables will use the same name.
+    latitude_column : str, optional
+        Name of the input column containing latitude values. Defaults
+        to ``"lat"``. The output tables will use the same name.
+    longitude_column : str, optional
+        Name of the input column containing longitude values. Defaults
+        to ``"lon"``. The output tables will use the same name.
+    date_column : str, optional
+        Name of the optional input column containing per-row dates.
+        Defaults to ``"date"``. If absent from ``df`` the date branch is
+        simply skipped — the extractor never errors on a missing date column.
+        The output tables will use the same name.
 
     Returns
     -------
@@ -87,13 +107,27 @@ def extract(
 
     df = df.copy()
 
+    # Translate the user's column names to the canonical names used throughout
+    # the pipeline. Validation runs against the user-supplied names so error
+    # messages mention the columns the user actually has, then we rename to the
+    # canonical names ("id", "lat", "lon", "date") for the rest of processing.
+    # The output tables are renamed back to the user's names just before being
+    # written, so the user's chosen names round-trip through extract().
+    column_name_map = {
+        id_column: "id",
+        latitude_column: "lat",
+        longitude_column: "lon",
+        date_column: "date",
+    }
+    _validate_required_columns(df, id_column, latitude_column, longitude_column)
+    df = df.rename(columns=column_name_map)
+
     # Load project-wide defaults from the bundled configs/defaults.yml once per call.
     # These are the fallback values used when settings are not specified
     # in the run config or as keyword arguments to this function.
     defaults = load_defaults()
 
     # Validate inputs
-    _validate_required_columns(df)
     df, dates, date_warnings = _parse_and_validate_dates(df)
     df, crs_warnings = _validate_and_reproject_crs(df, input_crs)
 
@@ -120,46 +154,87 @@ def extract(
         datasets = run_settings.datasets
         output_type = run_settings.output_type
         output_file_format = run_settings.output_file_format
-        window_size = run_settings.window_size
+        window_sizes = run_settings.window_sizes
         min_coverage = run_settings.min_coverage
         stats = run_settings.stats
         resample_m = run_settings.resample_m
+
+        # When the user supplies more than one window size we need to keep the
+        # window suffix on raster filenames and on the per-window quality
+        # entries; with a single window we keep the legacy naming and metadata
+        # layout so existing outputs are byte-for-byte unchanged.
+        is_multi_window = len(window_sizes) > 1
 
         for dataset in datasets:
             # Look up the dataset's catalog entry once; both processing modes need it.
             dataset_config = catalog_datasets[dataset]
 
-            # Dispatch to the mode-specific helper. Each helper owns adapter
-            # instantiation, data fetching, and per-dataset metadata assembly.
+            for window_size in window_sizes:
+                # Dispatch to the mode-specific helper. Each helper owns adapter
+                # instantiation, data fetching, and per-dataset metadata assembly
+                # for one (dataset, window_size) pair.
 
-            # In tabular mode, the helper returns the input DataFrame with calculated summary statistics and QC columns appended, plus the per-dataset metadata dict.
-            if output_type == "tabular":
-                df_copy, dataset_meta = _process_dataset_tabular(
-                    df_copy,
-                    dataset,
-                    dataset_config,
-                    run_settings,
-                    dates,
-                )
+                if output_type == "tabular":
+                    df_copy, dataset_meta = _process_dataset_tabular(
+                        df_copy,
+                        dataset,
+                        dataset_config,
+                        run_settings,
+                        dates,
+                        window_size,
+                    )
 
-            # In raster mode, the helper exports a folder of GeoTIFF tiles and returns the path plus the per-dataset metadata dict.
-            # TODO: QC for raster mode is not yet implemented. Needed?
-            elif output_type == "raster":
-                tiles_root = Path(output_dir) / batch_id
-                tiles_path, dataset_meta = _process_dataset_raster(
-                    dataset,
-                    dataset_config,
-                    run_settings,
-                    dates,
-                    lats=df_copy.lat,
-                    lons=df_copy.lon,
-                    ids=df_copy["id"].tolist(),
-                    tiles_root=tiles_root,
-                )
-                output_paths[f"{batch_id}:{dataset}"] = tiles_path
+                # In raster mode, the helper exports a folder of GeoTIFF tiles
+                # and returns the path plus the per-dataset metadata dict. With
+                # multiple windows the filename suffix keeps each window's
+                # tiles distinct inside the same dataset folder.
+                # TODO: QC for raster mode is not yet implemented. Needed?
+                elif output_type == "raster":
+                    tiles_root = Path(output_dir) / batch_id
+                    suffix = f"{window_size}m" if is_multi_window else None
+                    tiles_path, dataset_meta = _process_dataset_raster(
+                        dataset,
+                        dataset_config,
+                        run_settings,
+                        dates,
+                        window_size,
+                        lats=df_copy.lat,
+                        lons=df_copy.lon,
+                        ids=df_copy["id"].tolist(),
+                        tiles_root=tiles_root,
+                        filename_suffix=suffix,
+                    )
+                    # Single-window: same key as before. Multi-window: append
+                    # the window so callers can locate each window's tiles.
+                    output_key = (
+                        f"{batch_id}:{dataset}:{window_size}m"
+                        if is_multi_window
+                        else f"{batch_id}:{dataset}"
+                    )
+                    output_paths[output_key] = tiles_path
 
-            # Store the per-dataset metadata assembled by the adapter in the dataset_metas dict for later inclusion in the output metadata file.
-            dataset_metas[dataset] = dataset_meta
+                # Merge the per-window metadata into the dataset's accumulator.
+                # First window for a dataset → store as-is (including static
+                # fields like data_source, native_crs). Subsequent windows →
+                # only their quality entries are merged in, since static
+                # fields are identical across windows for the same dataset.
+                if dataset not in dataset_metas:
+                    if is_multi_window and output_type == "raster":
+                        # Wrap the raster quality dict (currently {"tiles": ...})
+                        # under the window key so each window's tile summary
+                        # lands at quality["{window}m"]["tiles"].
+                        existing_quality = dataset_meta.get("quality", {})
+                        dataset_meta["quality"] = {f"{window_size}m": existing_quality}
+                    dataset_metas[dataset] = dataset_meta
+                else:
+                    accumulated_quality = dataset_metas[dataset].setdefault("quality", {})
+                    new_quality = dataset_meta.get("quality", {})
+                    if is_multi_window and output_type == "raster":
+                        accumulated_quality[f"{window_size}m"] = new_quality
+                    else:
+                        # Tabular quality is already keyed by window size, so
+                        # merging dicts gives the right structure for free.
+                        accumulated_quality.update(new_quality)
 
         # --- after all datasets processed for this run, write outputs and metadata ---
 
@@ -185,6 +260,13 @@ def extract(
             stat_columns = [c for c in stats_df.columns if c not in core_columns]
             stats_df[stat_columns] = stats_df[stat_columns].round(defaults["stats_output_decimals"])
 
+            # Rename the canonical core columns back to whatever names the
+            # user originally supplied so the output mirrors their input.
+            output_rename = {v: k for k, v in column_name_map.items() if v != k}
+            if output_rename:
+                stats_df = stats_df.rename(columns=output_rename)
+                qc_df = qc_df.rename(columns=output_rename)
+
             stats_path = _write_tabular(stats_df, batch_id, Path(output_dir), output_file_format)
             qc_path = _write_tabular(qc_df, f"{batch_id}_qc", Path(output_dir), output_file_format)
 
@@ -196,7 +278,8 @@ def extract(
                 datasets=dataset_metas,
                 config={
                     "statistics": stats,
-                    "window_size_m": window_size,
+                    # Preserve the user's input form: int stays int, list stays list.
+                    "window_size_m": run_settings.user_window_size,
                     "min_coverage_pct": min_coverage,
                 },
                 warnings=warnings_backlog if warnings_backlog else None,
@@ -213,7 +296,8 @@ def extract(
                 n_points=len(df_copy),
                 datasets=dataset_metas,
                 config={
-                    "window_size_m": window_size,
+                    # Preserve the user's input form: int stays int, list stays list.
+                    "window_size_m": run_settings.user_window_size,
                     **({"resample_m": resample_m} if resample_m else {}),
                 },
                 warnings=warnings_backlog if warnings_backlog else None,
@@ -228,12 +312,14 @@ def _process_dataset_tabular(
     dataset_config: dict,
     run_settings: "RunSettings",
     dates: list | None,
+    window_size: int,
 ) -> tuple[pd.DataFrame, dict]:
-    """Fetch stats and QC columns for one dataset in tabular mode.
+    """Fetch stats and QC columns for one dataset/window pair in tabular mode.
 
     Owns adapter instantiation, statistic computation, QC column assembly,
-    and per-dataset metadata construction. Returns the input DataFrame with
-    new stat + QC columns appended, plus the per-dataset metadata dict.
+    and per-dataset metadata construction for a single window size. The
+    caller is responsible for looping over multiple window sizes and merging
+    the resulting metadata dicts.
     """
     # Instantiate the adapter from the dataset's declared data_source
     # (earth_engine or local). The adapter encapsulates all source-specific
@@ -246,14 +332,14 @@ def _process_dataset_tabular(
     stats_results = adapter.fetch_stats_batch(
         df.lat,
         df.lon,
-        run_settings.window_size,
+        window_size,
         run_settings.stats,
         dates=dates,
     )
 
     # Append stat columns to the output DataFrame based on the keys in
     # stats_results, and assign values accordingly.
-    df = _append_stat_columns(df, dataset, run_settings.window_size, stats_results)
+    df = _append_stat_columns(df, dataset, window_size, stats_results)
 
     # Split the (stat, meta) tuples so meta_list can feed QC and dataset metadata.
     meta_list = [meta for _, meta in stats_results]
@@ -265,13 +351,14 @@ def _process_dataset_tabular(
         meta_list=meta_list,
         dataset_name=dataset,
         reducer_names=run_settings.stats,
-        window_size_m=run_settings.window_size,
+        window_size_m=window_size,
         min_coverage_pct=run_settings.min_coverage,
     )
 
     # Adapter assembles quality stats and date-selection info (GEE) into
     # one per-dataset dict. The quality dict is keyed by window_size (or
-    # "point") so the metadata layout supports future multi-window runs.
+    # "point") so multiple window sizes can coexist within the same dataset
+    # metadata when the caller loops and merges across windows.
     dataset_meta = adapter.build_dataset_meta(
         dataset_config,
         meta_list=meta_list,
@@ -286,17 +373,19 @@ def _process_dataset_raster(
     dataset_config: dict,
     run_settings: "RunSettings",
     dates: list | None,
+    window_size: int,
     *,
     lats,
     lons,
     ids: list,
     tiles_root: Path,
+    filename_suffix: str | None = None,
 ) -> tuple[Path, dict]:
-    """Export GeoTIFF tiles for one dataset in raster mode.
+    """Export GeoTIFF tiles for one dataset/window pair in raster mode.
 
-    Owns adapter instantiation, tile export, and per-dataset metadata
-    construction. Returns the path to the per-dataset tiles folder and
-    the per-dataset metadata dict.
+    When ``filename_suffix`` is set, it is appended to each tile's filename
+    (before the extension) so multiple window sizes for the same dataset
+    can coexist in the same folder without overwriting each other.
     """
     # Instantiate the adapter from the dataset's declared data_source.
     AdapterClass = get_adapter(dataset_config["data_source"])
@@ -307,12 +396,13 @@ def _process_dataset_raster(
     exported_paths, meta_list = adapter.export_tiles(
         lats,
         lons,
-        run_settings.window_size,
+        window_size,
         tiles_root,
         ids=ids,
         dates=dates,
         dataset_name=dataset,
         resample_m=run_settings.resample_m,
+        filename_suffix=filename_suffix,
     )
 
     # Adapter assembles the full per-dataset metadata dict, including
@@ -396,10 +486,11 @@ class RunSettings:
     datasets: List[str]
     output_type: str  # "tabular" or "raster"
     output_file_format: str  # "csv" or "parquet"
-    window_size: int  # square sampling window in metres
+    window_sizes: List[int]  # one or more square-sampling-window sizes in metres
     min_coverage: float  # 0–100 — threshold for low-coverage QC flag
     stats: list | None  # requested reducer names, or None to use the default
     resample_m: float | None  # target pixel size in metres (raster mode only)
+    user_window_size: int | List[int]  # original input form, preserved for metadata
 
 
 def _parse_run_config(
@@ -460,20 +551,30 @@ def _parse_run_config(
     if output_type == "tabular" and (not isinstance(stats, list) or len(stats) == 0):
         raise ValueError("For tabular output, 'statistics' must be provided as a non-empty list.")
 
-    # window_size_m must be a positive number of metres.
-    window_size = settings.get("window_size_m", defaults["window_size_m"])
-    if window_size <= 0:
-        raise ValueError(f"Invalid window_size_m: {window_size}. Must be a positive number.")
+    # window_size_m can be either a single positive number or a list of them.
+    # When the user supplies a list, statistics (or tiles) are produced for
+    # each window size and the column / filename suffix disambiguates them.
+    user_window_size = settings.get("window_size_m", defaults["window_size_m"])
+    if isinstance(user_window_size, (list, tuple)):
+        window_sizes = list(user_window_size)
+        if not window_sizes:
+            raise ValueError(f"Output '{batch_id}': window_size_m list must not be empty.")
+    else:
+        window_sizes = [user_window_size]
+    for window_size in window_sizes:
+        if not isinstance(window_size, (int, float)) or window_size <= 0:
+            raise ValueError(f"Invalid window_size_m: {window_size}. Must be a positive number.")
 
     return RunSettings(
         batch_id=batch_id,
         datasets=datasets,
         output_type=output_type,
         output_file_format=output_file_format,
-        window_size=window_size,
+        window_sizes=window_sizes,
         min_coverage=min_coverage,
         stats=stats,
         resample_m=resample_m,
+        user_window_size=user_window_size,
     )
 
 
@@ -538,14 +639,25 @@ def _write_tabular(df: pd.DataFrame, name: str, output_dir: Path, output_file_fo
     return path
 
 
-def _validate_required_columns(df: pd.DataFrame) -> None:
-    """Raise ValueError if df is missing any of the required id/lat/lon columns."""
-    required_columns = {"id", "lat", "lon"}
+def _validate_required_columns(
+    df: pd.DataFrame,
+    id_column: str,
+    latitude_column: str,
+    longitude_column: str,
+) -> None:
+    """Raise ValueError if df is missing any of the required id/lat/lon columns.
+
+    Uses the user-supplied column names so the error message points at the
+    columns the caller is actually expecting to find — not the canonical
+    internal names.
+    """
+    required_columns = {id_column, latitude_column, longitude_column}
     if not required_columns.issubset(df.columns):
         missing_columns = required_columns - set(df.columns)
         raise ValueError(
             f"Input DataFrame is missing required column(s): {sorted(missing_columns)}.\n"
-            f"Expected columns: id, lat, lon (and optionally: date).\n"
+            f"Expected columns: {id_column}, {latitude_column}, {longitude_column} "
+            f"(and optionally a date column).\n"
             f"Found columns: {sorted(df.columns.tolist())}"
         )
 
