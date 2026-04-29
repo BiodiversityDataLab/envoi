@@ -8,6 +8,7 @@ import pytest
 import rasterio
 
 from biodata.extract import extract
+from biodata import update_catalog, reset_catalog
 
 DATA_DIR = Path("data/for_testing")
 SAMPLE_CSV = DATA_DIR / "adrian_example.csv"
@@ -18,6 +19,7 @@ CATALOG = {
         "dem_local": {
             "data_source": "local",
             "path": str(DEM_TIF),
+            "bands": 1,
         },
         "slope_local": {
             "data_source": "local",
@@ -26,6 +28,14 @@ CATALOG = {
         },
     }
 }
+
+
+@pytest.fixture(autouse=True)
+def register_test_catalog():
+    """Register the local test datasets before each test and clean up after."""
+    update_catalog(CATALOG)
+    yield
+    reset_catalog()
 
 
 @pytest.fixture
@@ -52,7 +62,6 @@ class TestTabular:
                     "window_size_m": 100,
                 },
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -84,7 +93,6 @@ class TestTabular:
                     "window_size_m": 100,
                 },
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -104,7 +112,6 @@ class TestTabular:
                     "window_size_m": 100,
                 },
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -127,7 +134,6 @@ class TestTabular:
                     "window_size_m": 200,
                 },
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -148,7 +154,6 @@ class TestTabular:
                     "window_size_m": 100,
                 },
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -169,7 +174,6 @@ class TestTabular:
                     "window_size_m": 100,
                 },
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -194,7 +198,6 @@ class TestRaster:
                 "datasets": ["dem_local"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -211,7 +214,6 @@ class TestRaster:
                 "datasets": ["dem_local"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -231,7 +233,6 @@ class TestRaster:
                 "datasets": ["dem_local"],
                 "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 25},
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -251,7 +252,6 @@ class TestRaster:
                 "datasets": ["dem_local"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -281,7 +281,6 @@ class TestMetadata:
                     "window_size_m": 100,
                 },
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -330,7 +329,6 @@ class TestMultipleOutputs:
                     "settings": {"output_type": "raster", "window_size_m": 200},
                 },
             ],
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -361,7 +359,6 @@ class TestErrors:
                         "window_size_m": 100,
                     },
                 },
-                catalog=CATALOG,
                 output_dir=tmp_path,
             )
 
@@ -379,7 +376,6 @@ class TestErrors:
                         "window_size_m": 100,
                     },
                 },
-                catalog=CATALOG,
                 output_dir=tmp_path,
             )
 
@@ -393,7 +389,6 @@ class TestErrors:
                     "datasets": ["dem_local"],
                     "settings": {"output_type": "banana", "window_size_m": 100},
                 },
-                catalog=CATALOG,
                 output_dir=tmp_path,
             )
 
@@ -407,6 +402,5 @@ class TestErrors:
                     "datasets": ["dem_local"],
                     "settings": {"output_type": "tabular", "window_size_m": 100},
                 },
-                catalog=CATALOG,
                 output_dir=tmp_path,
             )
