@@ -5,6 +5,7 @@ import json
 import pandas as pd
 import pytest
 from biodata.extract import extract
+from biodata import update_catalog, reset_catalog
 
 try:
     from biodata.auth import init_gee
@@ -36,6 +37,14 @@ SAMPLE_DF = pd.DataFrame(
 )
 
 
+@pytest.fixture(autouse=True)
+def register_test_catalog():
+    """Register the GEE test datasets before each test and clean up after."""
+    update_catalog(CATALOG)
+    yield
+    reset_catalog()
+
+
 class TestGeeTabular:
     def test_stats(self, tmp_path):
         """GEE adapter returns non-null stats for known locations."""
@@ -50,7 +59,6 @@ class TestGeeTabular:
                     "window_size_m": 200,
                 },
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -72,7 +80,6 @@ class TestGeeTabular:
                     "window_size_m": 100,
                 },
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -91,7 +98,6 @@ class TestGeeRaster:
                 "datasets": ["dem_aster"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -110,7 +116,6 @@ class TestGeeRaster:
                 "datasets": ["dem_aster"],
                 "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 50},
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
@@ -130,7 +135,6 @@ class TestGeeRaster:
                 "datasets": ["dem_aster"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
-            catalog=CATALOG,
             output_dir=tmp_path,
         )
 
