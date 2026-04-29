@@ -67,9 +67,11 @@ def build_quality_control_dataframe(
     """
     # "point"-only requests keep the historical "_point" suffix. Any non-point
     # reducer means window-based statistics and therefore a "_{window}m" suffix.
+    # quality_key matches the column suffix style ("100m" / "point") so the
+    # metadata JSON is consistent across tabular and raster outputs.
     has_window_reducers = any(reducer_name != "point" for reducer_name in reducer_names)
     column_suffix = f"_{window_size_m}m" if has_window_reducers else "_point"
-    quality_key = str(window_size_m) if has_window_reducers else "point"
+    quality_key = f"{window_size_m}m" if has_window_reducers else "point"
 
     # Core QC flags (in_extent, n_pixels, had_nodata, coverage_pct) come from
     # adapter meta dicts and are always present for tabular extraction.

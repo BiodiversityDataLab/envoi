@@ -338,12 +338,18 @@ class LocalRasterAdapter(BaseAdapter):
         dates=None,
         dataset_name: str = "dataset",
         resample_m: float | None = None,
+        filename_suffix: str | None = None,
     ):
         """Crop and save a GeoTIFF window centred on each point.
 
         If resample_m is set, the cropped window is resampled to
         round(window_m / resample_m) × round(window_m / resample_m) pixels
         so all tiles have identical dimensions regardless of native resolution.
+
+        ``filename_suffix`` is inserted before the .tif extension so multi-
+        window runs can place every window's tiles in the same folder
+        without overwriting one another. Pass ``None`` for the original
+        ``"<id>-<dataset>.tif"`` naming.
         """
         from rasterio.transform import Affine
         from rasterio.warp import reproject, Resampling
@@ -356,8 +362,14 @@ class LocalRasterAdapter(BaseAdapter):
 
         n_pixels = max(1, round(window_m / resample_m)) if resample_m is not None else None
 
+        # Suffix wrangling: when caller passes "200m", filenames become
+        # "<id>-<dataset>-200m.tif". When suffix is None we keep the
+        # historical "<id>-<dataset>.tif" naming so single-window callers
+        # are completely unaffected.
+        suffix_part = f"-{filename_suffix}" if filename_suffix else ""
+
         for lat, lon, sample_id in zip(lats, lons, id_list):
-            out_path = out_dir / f"{sample_id}-{dataset_name}.tif"
+            out_path = out_dir / f"{sample_id}-{dataset_name}{suffix_part}.tif"
             _, meta = self.fetch_values(lat, lon, window_m, return_meta=True)
 
             arr2d = meta.get("window_arr")

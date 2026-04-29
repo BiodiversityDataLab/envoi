@@ -1261,11 +1261,16 @@ class GeeRasterAdapter:
         dates: Sequence | None = None,
         dataset_name: str = "dataset",
         resample_m: float | None = None,
+        filename_suffix: str | None = None,
     ) -> List[Path]:
         """Export GeoTIFF tiles for many points in parallel (Mode 4).
 
         If resample_m is set, all tiles are exported at that resolution so they
         are exactly round(window_m / resample_m) × round(window_m / resample_m) pixels.
+
+        ``filename_suffix`` is inserted before the .tif extension so multi-
+        window runs can place every window's tiles in the same folder
+        without overwriting one another.
 
         Returns list of output file paths.
         """
@@ -1285,10 +1290,16 @@ class GeeRasterAdapter:
 
         meta_list = [self._resolve_date_info(d) for d in date_list]
 
+        # Suffix wrangling: when caller passes "200m", filenames become
+        # "<id>-<dataset>-200m.tif". When suffix is None we keep the
+        # historical "<id>-<dataset>.tif" naming so single-window callers
+        # are completely unaffected.
+        suffix_part = f"-{filename_suffix}" if filename_suffix else ""
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {}
             for i, (lat, lon, date, sample_id) in enumerate(zip(lats, lons, date_list, id_list)):
-                out_path = out_dir / f"{sample_id}-{dataset_name}.tif"
+                out_path = out_dir / f"{sample_id}-{dataset_name}{suffix_part}.tif"
                 future = executor.submit(
                     self._export_single, lat, lon, window_m, out_path, date, resample_m
                 )
