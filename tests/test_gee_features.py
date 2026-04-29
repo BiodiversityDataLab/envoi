@@ -7,6 +7,7 @@ Add a new test class or method here whenever a new GEE dataset is added to the c
 import pandas as pd
 import pytest
 from biodata.extract import extract
+from biodata import update_catalog, reset_catalog
 
 try:
     from biodata.auth import init_gee
@@ -39,17 +40,24 @@ def _make_catalog(*datasets):
 def _run_stats(df, dataset_name, catalog, tmp_path, reducers=None):
     """Run tabular stats and return the stats DataFrame."""
     reducers = reducers or ["mean"]
-    outputs = extract(
-        df,
-        {
-            "batch_id": "test",
-            "datasets": [dataset_name],
-            "settings": {"output_type": "tabular", "statistics": reducers, "window_size_m": 200},
-        },
-        catalog=catalog,
-        output_dir=tmp_path,
-    )
-    return pd.read_csv(outputs["test"])
+    update_catalog(catalog)
+    try:
+        outputs = extract(
+            df,
+            {
+                "batch_id": "test",
+                "datasets": [dataset_name],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": reducers,
+                    "window_size_m": 200,
+                },
+            },
+            output_dir=tmp_path,
+        )
+        return pd.read_csv(outputs["test"])
+    finally:
+        reset_catalog()
 
 
 # ------------------------------------------------------------------
@@ -148,20 +156,23 @@ class TestPointSampling:
 
     def test_point_dem_aster(self, tmp_path):
         cat = _make_catalog(("dem_aster", "projects/sat-io/open-datasets/ASTER/GDEM"))
-        outputs = extract(
-            SAMPLE_DF,
-            {
-                "batch_id": "pt",
-                "datasets": ["dem_aster"],
-                "settings": {
-                    "output_type": "tabular",
-                    "statistics": ["point"],
-                    "window_size_m": 100,
+        update_catalog(cat)
+        try:
+            outputs = extract(
+                SAMPLE_DF,
+                {
+                    "batch_id": "pt",
+                    "datasets": ["dem_aster"],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["point"],
+                        "window_size_m": 100,
+                    },
                 },
-            },
-            catalog=cat,
-            output_dir=tmp_path,
-        )
+                output_dir=tmp_path,
+            )
+        finally:
+            reset_catalog()
         df = pd.read_csv(outputs["pt"])
         assert df["dem_aster_point"].notna().all()
 
@@ -183,20 +194,23 @@ class TestPointSampling:
                 }
             }
         }
-        outputs = extract(
-            SAMPLE_DF,
-            {
-                "batch_id": "pt",
-                "datasets": ["dem_glo30"],
-                "settings": {
-                    "output_type": "tabular",
-                    "statistics": ["mean", "std", "point"],
-                    "window_size_m": 200,
+        update_catalog(cat)
+        try:
+            outputs = extract(
+                SAMPLE_DF,
+                {
+                    "batch_id": "pt",
+                    "datasets": ["dem_glo30"],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["mean", "std", "point"],
+                        "window_size_m": 200,
+                    },
                 },
-            },
-            catalog=cat,
-            output_dir=tmp_path,
-        )
+                output_dir=tmp_path,
+            )
+        finally:
+            reset_catalog()
         df = pd.read_csv(outputs["pt"])
         # All three bands must produce point columns alongside window stats.
         for band in ("DEM", "slope", "aspect"):
@@ -205,20 +219,23 @@ class TestPointSampling:
 
     def test_point_worldcover(self, tmp_path):
         cat = _make_catalog(("lulc", "ESA/WorldCover/v200"))
-        outputs = extract(
-            SAMPLE_DF,
-            {
-                "batch_id": "pt",
-                "datasets": ["lulc"],
-                "settings": {
-                    "output_type": "tabular",
-                    "statistics": ["point"],
-                    "window_size_m": 100,
+        update_catalog(cat)
+        try:
+            outputs = extract(
+                SAMPLE_DF,
+                {
+                    "batch_id": "pt",
+                    "datasets": ["lulc"],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["point"],
+                        "window_size_m": 100,
+                    },
                 },
-            },
-            catalog=cat,
-            output_dir=tmp_path,
-        )
+                output_dir=tmp_path,
+            )
+        finally:
+            reset_catalog()
         df = pd.read_csv(outputs["pt"])
         assert df["lulc_point"].notna().all()
 
@@ -233,16 +250,19 @@ class TestRasterExport:
 
     def test_tiles_dem_glo30(self, tmp_path):
         cat = _make_catalog(("dem_glo30", "COPERNICUS/DEM/GLO30"))
-        extract(
-            SAMPLE_DF,
-            {
-                "batch_id": "tiles",
-                "datasets": ["dem_glo30"],
-                "settings": {"output_type": "raster", "window_size_m": 200},
-            },
-            catalog=cat,
-            output_dir=tmp_path,
-        )
+        update_catalog(cat)
+        try:
+            extract(
+                SAMPLE_DF,
+                {
+                    "batch_id": "tiles",
+                    "datasets": ["dem_glo30"],
+                    "settings": {"output_type": "raster", "window_size_m": 200},
+                },
+                output_dir=tmp_path,
+            )
+        finally:
+            reset_catalog()
         tifs = list((tmp_path / "tiles" / "dem_glo30").glob("*.tif"))
         assert len(tifs) == 2
 
@@ -250,16 +270,19 @@ class TestRasterExport:
         import rasterio
 
         cat = _make_catalog(("lulc", "ESA/WorldCover/v200"))
-        extract(
-            SAMPLE_DF,
-            {
-                "batch_id": "tiles",
-                "datasets": ["lulc"],
-                "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 50},
-            },
-            catalog=cat,
-            output_dir=tmp_path,
-        )
+        update_catalog(cat)
+        try:
+            extract(
+                SAMPLE_DF,
+                {
+                    "batch_id": "tiles",
+                    "datasets": ["lulc"],
+                    "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 50},
+                },
+                output_dir=tmp_path,
+            )
+        finally:
+            reset_catalog()
         expected = round(200 / 50)  # 4x4
         for tif in (tmp_path / "tiles" / "lulc").glob("*.tif"):
             with rasterio.open(tif) as src:
