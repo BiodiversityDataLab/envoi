@@ -144,6 +144,13 @@ _REGISTRY: Dict[str, Callable] = {
 }
 
 
+# Reducer names that are NOT backed by a numpy function in the registry.
+# These are handled at the adapter level (e.g. "point" samples the exact pixel
+# value instead of reducing a window of pixels), so looking them up via
+# get_reducer() is always a bug in the caller.
+SPECIAL_REDUCERS = frozenset({"point"})
+
+
 def get_reducer(name: str) -> Callable:
     """
     Look up a reducer by name (case-insensitive).
@@ -152,7 +159,15 @@ def get_reducer(name: str) -> Callable:
         fn = get_reducer("mean")
         value = fn(window_values)
     """
-    fn = _REGISTRY.get(name.lower())
+    lower = name.lower()
+    # Guard: "point" is handled by the adapter's fetch_stats_batch, not as a
+    # numpy reducer. If it ends up here, the extract pipeline routed incorrectly.
+    if lower in SPECIAL_REDUCERS:
+        raise ValueError(
+            f"'{lower}' is an adapter-level reducer; "
+            f"call adapter.fetch_stats_batch instead of get_reducer"
+        )
+    fn = _REGISTRY.get(lower)
     if fn is None:
         raise ValueError(f"Unknown reducer: {name}. Valid: {list(_REGISTRY)}")
     return fn

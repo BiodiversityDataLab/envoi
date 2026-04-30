@@ -1,0 +1,24 @@
+# Local raster catalog template
+# ============================================================
+# Add your own local datasets here using update_catalog() by
+# passing this file directly to update_catalog("local_catalog.yml").
+#
+# Each entry requires data_source and path. All other fields are
+# auto-detected from the raster file (CRS, resolution, nodata).
+#
+# Example:
+#
+# datasets:
+#   my_dem:
+#     data_source: local
+#     path: data/dem.tif        # path relative to your working directory
+#     data_type: continuous     # optional: "continuous" or "categorical"
+#     bands: 1                  # optional: which band(s) to read — single int or list
+#                               # e.g. bands: [1, 2, 3]. Defaults to all bands.
+
+datasets:
+  my_dem:
+    data_source: local
+    path: data/for_testing/dem/TG4NHB-dem.tif
+    data_type: continuous
+    bands: 1
