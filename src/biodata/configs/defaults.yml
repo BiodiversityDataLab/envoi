@@ -1,0 +1,23 @@
+# ============================================================
+# biodata-enricher: project-wide defaults
+# ============================================================
+# These values are used by extract() when not explicitly set
+# in the run config dict or as keyword arguments to the call.
+# Edit here to change defaults without touching Python source.
+
+# Output file format for tabular results: "csv" or "parquet".
+output_file_format: "csv"
+
+# Side length (metres) of the square sampling window around each point.
+window_size_m: 500
+
+# Minimum percentage of valid (non-nodata) pixels required in a window
+# before the result is flagged as low-coverage in the QC output.
+min_coverage_pct: 0
+
+# Number of parallel threads used by the GEE adapter for server-side
+# requests. Higher values speed up large batches but increase API load.
+max_workers: 20
+
+# Number of decimal places to round statistics to in the output.
+stats_output_decimals: 5

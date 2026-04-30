@@ -1,6 +1,6 @@
 # biodata-enricher
 
-Enrich a Pandas DataFrame of sample points (`id`, `lat`, `lon`, optional `date`) with environmental data from local GeoTIFFs or Google Earth Engine.
+Enrich a Pandas DataFrame of sample points (`id`, `lat`, `lon`, optional `date`) with environmental data from Google Earth Engine or local GeoTIFFs.
 
 Outputs **tabular** data (Parquet/CSV) with summary statistics and QC columns, or **raster** tiles (GeoTIFF) — plus sidecar metadata JSON.
 
@@ -9,28 +9,27 @@ Outputs **tabular** data (Parquet/CSV) with summary statistics and QC columns, o
 ## Install
 
 ```bash
-make install
-make test
+pip install biodata-enricher
 ```
 
 ## Quick start
 
 ```python
 import pandas as pd
-from biodata.extract import extract
+from biodata import extract
 
 df = pd.read_csv("data/points_sample.csv")
 
 # Single output — tabular stats
 outputs = extract(df, {
-    "run_id": "terrain",
-    "datasets": ["dem_local"],
+    "batch_id": "terrain",
+    "datasets": ["dem_aster"],
     "settings": {
         "output_type": "tabular",
         "statistics": ["mean", "std"],
         "window_size_m": 200,
     },
-}, catalog="configs/catalog.yml", out_dir="out")
+}, output_dir="out")
 
 print(outputs["terrain"])      # -> out/terrain.parquet
 print(outputs["terrain_qc"])   # -> out/terrain_qc.parquet
@@ -44,61 +43,61 @@ Pass a list to process several configurations in one call:
 ```python
 outputs = extract(df, [
     {
-        "run_id": "terrain_stats",
-        "datasets": ["dem_local"],
+        "batch_id": "terrain_stats",
+        "datasets": ["dem_aster"],
         "settings": {"output_type": "tabular", "statistics": ["mean", "std"], "window_size_m": 200},
     },
     {
-        "run_id": "terrain_tiles",
-        "datasets": ["dem_local"],
+        "batch_id": "terrain_tiles",
+        "datasets": ["dem_aster"],
         "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 10},
     },
-], catalog="configs/catalog.yml", out_dir="out")
+], output_dir="out")
 ```
+
+## Adding custom datasets
+
+Datasets not in the built-in catalog can be registered once with `update_catalog()` and are then available in all subsequent `extract()` calls:
+
+```python
+from biodata import extract, update_catalog
+
+# Register a local raster
+update_catalog({"datasets": {
+    "my_dem": {"data_source": "local", "path": "data/dem.tif"},
+}})
+
+# Or load from a YAML file
+update_catalog("my_catalog.yml")
+
+# Now use the dataset normally
+outputs = extract(df, {"batch_id": "terrain", "datasets": ["my_dem"], ...})
+```
+
+See `examples/run.yml` for an example catalog YAML structure.
 
 ## Output kinds
 
-### Tabular (`kind: "tabular"`)
+### Tabular (`output_type: "tabular"`)
 Produces Parquet (default) or CSV with reducer columns and a separate QC file.
 
 Available reducers: `mean`, `median`, `std`, `var`, `min`, `max`, `q10`, `q90`, `count`, `sum`, `point`
 
 The `point` reducer samples the exact pixel at each coordinate (no window).
 
-Options: `format: "csv"` to write CSV instead of Parquet.
-
-### Raster (`kind: "raster"`)
+### Raster (`output_type: "raster"`)
 Exports GeoTIFF tiles per point, cropped to the specified window.
 
 Option: `resample_m` resamples all tiles to a consistent resolution (e.g. for CNN input).
 
 ## Output columns
 
-**Stats file**: `dem_local_mean_b200`, `dem_local_std_b200`, ...
+**Stats file**: `dem_aster_mean_b200`, `dem_aster_std_b200`, ...
 
-**QC file**: `dem_local_in_extent_b200`, `dem_local_n_pixels_b200`, `dem_local_had_nodata_b200`, `dem_local_coverage_pct_b200`
-
-## Catalog
-
-The catalog tells the library where data lives. `configs/catalog.yml`:
-
-```yaml
-datasets:
-  dem_local:
-    source: local
-    path: data/dem/my_dem.tif
-
-  dem_aster:
-    source: earth_engine
-    path: NASA/ASTER_GED/AG100_003
-    bands: [elevation]
-```
-
-Sources: `local` (GeoTIFF via rasterio) or `earth_engine` (Google Earth Engine).
+**QC file**: `dem_aster_in_extent_b200`, `dem_aster_n_pixels_b200`, `dem_aster_had_nodata_b200`, `dem_aster_coverage_pct_b200`
 
 ## Notes
 
 - Windows are in meters, using each point's UTM zone for global coverage.
-- Works with any GeoTIFF readable by rasterio with a valid CRS.
 - CRS and resolution are detected from the data source — no manual configuration needed.
 - Low coverage is flagged in QC columns, not fatal. Filter by `*_coverage_pct` as needed.

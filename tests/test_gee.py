@@ -5,6 +5,7 @@ import json
 import pandas as pd
 import pytest
 from biodata.extract import extract
+from biodata import update_catalog, reset_catalog
 
 try:
     from biodata.auth import init_gee
@@ -19,7 +20,7 @@ pytestmark = pytest.mark.skipif(not GEE_AVAILABLE, reason="GEE authentication un
 CATALOG = {
     "datasets": {
         "dem_aster": {
-            "source": "earth_engine",
+            "data_source": "earth_engine",
             "path": "projects/sat-io/open-datasets/ASTER/GDEM",
         },
     }
@@ -36,13 +37,21 @@ SAMPLE_DF = pd.DataFrame(
 )
 
 
+@pytest.fixture(autouse=True)
+def register_test_catalog():
+    """Register the GEE test datasets before each test and clean up after."""
+    update_catalog(CATALOG)
+    yield
+    reset_catalog()
+
+
 class TestGeeTabular:
     def test_stats(self, tmp_path):
         """GEE adapter returns non-null stats for known locations."""
         outputs = extract(
             SAMPLE_DF,
             {
-                "run_id": "gee_stats",
+                "batch_id": "gee_stats",
                 "datasets": ["dem_aster"],
                 "settings": {
                     "output_type": "tabular",
@@ -50,8 +59,7 @@ class TestGeeTabular:
                     "window_size_m": 200,
                 },
             },
-            catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         stats_df = pd.read_csv(outputs["gee_stats"])
@@ -64,7 +72,7 @@ class TestGeeTabular:
         outputs = extract(
             SAMPLE_DF,
             {
-                "run_id": "gee_point",
+                "batch_id": "gee_point",
                 "datasets": ["dem_aster"],
                 "settings": {
                     "output_type": "tabular",
@@ -72,8 +80,7 @@ class TestGeeTabular:
                     "window_size_m": 100,
                 },
             },
-            catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         stats_df = pd.read_csv(outputs["gee_point"])
@@ -87,12 +94,11 @@ class TestGeeRaster:
         extract(
             SAMPLE_DF,
             {
-                "run_id": "gee_tiles",
+                "batch_id": "gee_tiles",
                 "datasets": ["dem_aster"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
-            catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         tile_dir = tmp_path / "gee_tiles" / "dem_aster"
@@ -106,12 +112,11 @@ class TestGeeRaster:
         extract(
             SAMPLE_DF,
             {
-                "run_id": "gee_resamp",
+                "batch_id": "gee_resamp",
                 "datasets": ["dem_aster"],
                 "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 50},
             },
-            catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         tile_dir = tmp_path / "gee_resamp" / "dem_aster"
@@ -126,16 +131,15 @@ class TestGeeRaster:
         extract(
             SAMPLE_DF,
             {
-                "run_id": "gee_meta",
+                "batch_id": "gee_meta",
                 "datasets": ["dem_aster"],
                 "settings": {"output_type": "raster", "window_size_m": 200},
             },
-            catalog=CATALOG,
-            out_dir=tmp_path,
+            output_dir=tmp_path,
         )
 
         meta_path = tmp_path / "gee_meta" / "gee_meta_metadata.json"
         assert meta_path.exists()
         meta = json.loads(meta_path.read_text())
         assert "dem_aster" in meta["datasets"]
-        assert meta["datasets"]["dem_aster"]["source"] == "earth_engine"
+        assert meta["datasets"]["dem_aster"]["data_source"] == "earth_engine"

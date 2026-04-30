@@ -18,6 +18,7 @@ data/*.gpkg
 data/*.geojson
 data/raw/
 out/
+outputs/
 .cache/
 .cache/**
 
@@ -42,4 +43,4 @@ data/us_points.csv
 data/points_5.csv
 testing.ipynb
 adde_test.py
-
+vj_data.py

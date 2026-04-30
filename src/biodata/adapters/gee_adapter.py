@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, List, Sequence
 
+from ..config import load_defaults
+from ..metadata import build_tile_crs_zones, summarize_date_info, summarize_tile_export
+
 import numpy as np
 import pandas as pd
 
@@ -143,20 +146,34 @@ def _apply_cloud_mask(col, mask_type: str):
     return col.map(fn)
 
 
-def _apply_derived_bandss(img, derived: str):
-    """Compute a derived band from an image (NDVI, EVI, slope, aspect)."""
-    if derived == "NDVI":
-        return img.normalizedDifference(["B8", "B4"]).rename("NDVI")
-    if derived == "EVI":
-        return img.expression(
-            "2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))",
-            {"NIR": img.select("B8"), "RED": img.select("B4"), "BLUE": img.select("B2")},
-        ).rename("EVI")
-    if derived == "slope":
-        return ee.Terrain.slope(img)
-    if derived == "aspect":
-        return ee.Terrain.aspect(img)
-    logger.warning("Unknown derived_bands '%s', returning image unchanged", derived)
+def _apply_derived_bands(img, derived):
+    """Compute derived bands and add them alongside the existing bands of `img`.
+
+    `derived` may be either a single band name (e.g. "slope") or a list of names
+    (e.g. ["slope", "aspect"]). Each derived band is computed from `img` and
+    added to the output via `addBands()`, so the source bands are preserved.
+
+    Currently supported: "slope", "aspect". Both operate on the first band of
+    the input image (GEE's `ee.Terrain.slope` / `ee.Terrain.aspect` convention),
+    so `img` should be an elevation image (or have elevation as its first band).
+
+    Raises ValueError if an unknown derived band name is given — silent fallback
+    was previously a trap that produced confusing "missing output" bugs.
+    """
+    # Normalize to a list so callers can pass either form.
+    if isinstance(derived, str):
+        derived_names = [derived]
+    else:
+        derived_names = list(derived)
+
+    for name in derived_names:
+        if name == "slope":
+            img = img.addBands(ee.Terrain.slope(img))
+        elif name == "aspect":
+            img = img.addBands(ee.Terrain.aspect(img))
+        else:
+            raise ValueError(f"Unknown derived band '{name}'. Supported: 'slope', 'aspect'.")
+
     return img
 
 
@@ -226,13 +243,28 @@ def _build_image(
     else:
         raise ValueError("dataset_spec must contain 'image' or 'collection'")
 
-    band = dataset_spec.get("bands")
-    if band is not None:
-        img = img.select(band if isinstance(band, list) else [band])
-
+    # Compute any derived bands FIRST, before filtering to `bands`. This matters
+    # for derivations that need access to source bands the user didn't list
+    # (e.g. if the user wanted only the derived output, they shouldn't have to
+    # also list the intermediate source bands). For slope/aspect this isn't
+    # strictly necessary since they read the first band, but keeping the order
+    # consistent means future derivations can freely reference source bands.
     derived = dataset_spec.get("derived_bands")
     if derived:
-        img = _apply_derived_bandss(img, derived)
+        img = _apply_derived_bands(img, derived)
+
+    # Build the final output band list. If the user specified both `bands` and
+    # `derived_bands`, the result is their concatenation so source bands are
+    # included alongside derived ones (e.g. DEM + slope + aspect). If only
+    # `derived_bands` is set, keep whatever source bands the image already has
+    # plus the derived ones. If neither is set, keep the image as-is.
+    bands = dataset_spec.get("bands")
+    if bands is not None:
+        source_bands = bands if isinstance(bands, list) else [bands]
+        derived_bands_list = (
+            [derived] if isinstance(derived, str) else list(derived) if derived else []
+        )
+        img = img.select(source_bands + derived_bands_list)
 
     return img
 
@@ -337,29 +369,89 @@ def _parse_multiband_result(
     Returns a flat dict keyed as ``{band}_{reducer_name}`` for every band
     present in *result*, e.g. ``{"bio01_mean": 27.0, "bio02_mean": 180.5}``.
 
-    GEE behaviour:
-    - Single reducer  → keys are bare band names (``{"bio01": 27.0}``)
-    - Combined reducer → keys are ``{band}{gee_suffix}`` (``{"bio01_mean": 27.0}``)
+    The caller (``_fetch_stats_single``) always combines a count reducer
+    onto the user-requested reducers so we get a valid-pixel count for QC.
+    Because the result is therefore always a combined-form dict, GEE
+    always emits ``{band}{gee_suffix}`` keys (e.g. ``"bio01_mean"``),
+    so we always use suffix-based parsing here.
     """
     if not result:
         return {}
 
     out: dict[str, float | None] = {}
-    is_combined = len(reducer_names) > 1
 
     for rname, gee_suffix in zip(reducer_names, suffixes):
-        if is_combined:
-            # Find all keys that end with the GEE suffix (e.g. "_mean")
-            for key, val in result.items():
-                if key.endswith(gee_suffix):
-                    band = key[: -len(gee_suffix)]
-                    out[f"{band}_{rname}"] = val
-        else:
-            # Single reducer: GEE uses bare band names as keys
-            for key, val in result.items():
-                out[f"{key}_{rname}"] = val
+        # Find every key that ends with this reducer's suffix (e.g. "_mean").
+        # Count keys (added by the caller for QC) are skipped here unless
+        # the user actually asked for a "count" reducer themselves.
+        for key, val in result.items():
+            if key.endswith(gee_suffix):
+                band = key[: -len(gee_suffix)]
+                out[f"{band}_{rname}"] = val
 
     return out
+
+
+def _parse_point_result(
+    result: dict | None,
+    band_name: str,
+    multiband: bool,
+) -> dict[str, float | None]:
+    """Parse a Point-geometry reduceRegion sub-result into _point-keyed stats.
+
+    The point reduction uses ee.Reducer.first() over an ee.Geometry.Point,
+    so GEE returns the bare band name(s) as keys with the single sampled
+    value(s). We re-key them with a "_point" suffix to match the column-
+    naming convention used by the rest of the pipeline:
+      - single band  → {"point": value}
+      - multi-band   → {"<band>_point": value, ...}
+
+    Returns the stats dict; an empty/None *result* yields a None-valued
+    placeholder so downstream callers see a consistent schema.
+    """
+    if not result:
+        # Preserve schema even on empty results — single-band callers expect
+        # the "point" key to exist; multi-band callers iterate the dict and
+        # are robust to it being empty.
+        return {} if multiband else {"point": None}
+
+    if multiband:
+        # GEE keys each band's value by the bare band name; just append "_point".
+        return {f"{band}_point": value for band, value in result.items()}
+
+    # Single-band: prefer the explicit band_name when present, otherwise
+    # fall back to the first value (handles unnamed-band edge cases).
+    value = result.get(band_name)
+    if value is None:
+        value = next(iter(result.values()), None)
+    return {"point": value}
+
+
+def _extract_count_from_reduce_result(
+    result: dict | None,
+    band_name: str,
+    multiband: bool,
+) -> int:
+    """Pull the count-reducer output from a reduceRegion result.
+
+    The combined reducer produces a "{band}_count" entry per band. For
+    single-band reductions we look up "{band_name}_count" directly. For
+    multi-band reductions we take the first "_count" entry we find — all
+    bands share the same window so the count is identical across them.
+    Returns 0 when the result is missing or has no count entry.
+    """
+    if not result:
+        return 0
+
+    if multiband:
+        # Find any "*_count" key — they all carry the same value for the same window.
+        for key, val in result.items():
+            if key.endswith("_count") and val is not None:
+                return int(val)
+        return 0
+
+    val = result.get(f"{band_name}_count")
+    return int(val) if val is not None else 0
 
 
 # ---------------------------------------------------------------------------
@@ -371,14 +463,16 @@ def _parse_multiband_result(
 class GeeRasterAdapter:
     """Adapter that samples data directly from Google Earth Engine.
 
-    Four extraction modes:
+    Three extraction modes:
 
     1. **fetch_batch / fetch_values** — raw pixel arrays via ``sampleRectangle``
        (feeds into Python-side reducers, same as LocalRasterAdapter).
     2. **fetch_stats_batch** — server-side statistics via ``reduceRegion``
        with combined reducers.  Much faster for the common stats use-case.
-    3. **fetch_points_batch** — single pixel values via ``image.sample()``.
-    4. **export_tiles** — download full GeoTIFF tiles via ``geemap``.
+       When ``"point"`` is included in the requested reducers, an exact-pixel
+       sample at each ``(lat, lon)`` is added as a second server-side branch
+       and resolved in the same round-trip.
+    3. **export_tiles** — download full GeoTIFF tiles via ``geemap``.
 
     For ImageCollections, the adapter automatically selects the nearest
     image to each point's date. When no date is provided, the most
@@ -423,10 +517,18 @@ class GeeRasterAdapter:
             logger.debug("Auto-detected %s as %s", asset_id, asset_type)
         if self.spec.get("bands") and "bands" not in dataset_spec:
             dataset_spec["bands"] = self.spec["bands"]
+        if self.spec.get("derived_bands") and "derived_bands" not in dataset_spec:
+            dataset_spec["derived_bands"] = self.spec["derived_bands"]
 
-        self.scale = None  # always use the dataset's native resolution
+        # Native scale resolution priority:
+        #   1. catalog override `native_scale_m` (set explicitly when GEE
+        #      auto-detection is unreliable, e.g. for composite collections
+        #      stored in EPSG:4326)
+        #   2. None → fall back to GEE's projection().nominalScale() at
+        #      query time (see _get_scale / _get_scale_value)
+        self.scale = self.spec.get("native_scale_m")
         self.crs = self.spec.get("crs", "EPSG:4326")
-        self.max_workers = self.spec.get("max_workers", 8)
+        self.max_workers = self.spec.get("max_workers", load_defaults()["max_workers"])
         self._dataset_spec = dataset_spec
 
         # Warn about removed dataset_spec keys
@@ -462,6 +564,54 @@ class GeeRasterAdapter:
             self._native_proj = ee.Image(dataset_spec["image"]).select(0).projection()
             self._static_image = _build_image(dataset_spec)
             self._needs_per_point_date = False
+
+        # If the user didn't supply a native_scale_m override, sanity-check
+        # that GEE's auto-detected scale isn't the EPSG:4326 default. Some
+        # composite collections (Landsat composites, Dynamic World, …) lose
+        # their native projection metadata and fall back to WGS84, in which
+        # case nominalScale() returns ~111319 m (one degree at the equator).
+        # We catch that here so the user gets a clear error at run start
+        # rather than silently producing 100 km tiles.
+        if self.scale is None and self._native_proj is not None:
+            self._validate_auto_detected_scale()
+
+    def _validate_auto_detected_scale(self) -> None:
+        """Raise if GEE auto-detection returned the EPSG:4326 default scale.
+
+        Reads the projection's CRS and nominal scale once via getInfo() and
+        caches the resolved scale so downstream calls don't pay the cost again.
+        """
+        # Pre-fetch the projection info — both fields come from a single
+        # getInfo() round-trip via projection().getInfo() if we want to,
+        # but two small calls are simpler and only happen once per adapter.
+        try:
+            proj_info = self._native_proj.getInfo()
+            native_scale = float(self._native_proj.nominalScale().getInfo())
+        except Exception:
+            # If GEE refuses to evaluate the projection, leave detection to
+            # the first sampling call rather than masking the underlying error.
+            return
+
+        # Cache the resolved scale so _get_scale_value() doesn't re-fetch it.
+        self._cached_native_scale = native_scale
+
+        crs = (proj_info or {}).get("crs", "")
+        # The GEE default is exactly 111319.49079327357 m, but allow a small
+        # tolerance to also catch close-but-not-identical values (e.g. when
+        # the asset reports a slightly different default-equivalent scale).
+        looks_like_default = crs.upper() == "EPSG:4326" and abs(native_scale - 111319.49) < 1.0
+
+        if looks_like_default:
+            asset_id = self._dataset_spec.get(
+                "collection", self._dataset_spec.get("image", "<unknown>")
+            )
+            raise ValueError(
+                f"Dataset '{asset_id}': GEE returned the EPSG:4326 default scale "
+                f"(~{native_scale:.0f} m), which means the asset's native projection "
+                f"metadata is unavailable. Add `native_scale_m: <true_resolution>` "
+                f"to the catalog entry to fix this "
+                f"(e.g. `native_scale_m: 30` for Landsat composites)."
+            )
 
     # ------------------------------------------------------------------
     # Internals
@@ -503,31 +653,55 @@ class GeeRasterAdapter:
         For IMAGE assets the pre-built static image is always returned.
         For ImageCollections:
         - date provided → select nearest image to that date
-        - no date → use most recent image (cached after first call)
+        - no date + point coords → select most recent image for that point
+        - no date + no coords → use most recent image (cached)
         """
-        # IMAGE assets or already-cached fallback
+        # Per-point branch has priority for collections that need spatial
+        # filtering (e.g. tiled DEM collections). When coordinates are given,
+        # always build a fresh per-point image — never reuse `_static_image`,
+        # which may have been built earlier for a no-coords call and would
+        # therefore point at an arbitrary global tile that doesn't cover the
+        # current sample. Reusing it caused `img.sample(point)` to return
+        # empty props, so the "point" reducer silently dropped its columns
+        # for tiled IMAGE_COLLECTIONs (issue with dem_glo30 + "point" stat).
+        if self._needs_per_point_date and lat is not None and lon is not None:
+            target_date = (
+                self._collection_timestamps.max() if date is None else pd.to_datetime(date)
+            )
+            geom = ee.Geometry.Point([lon, lat])
+            return _build_image(
+                self._dataset_spec,
+                date=target_date,
+                geometry=geom,
+                collection_timestamps=self._collection_timestamps,
+            )
+
+        # IMAGE assets or already-cached no-coords fallback.
         if date is None and self._static_image is not None:
             return self._static_image
 
-        # Collection with no date: select most recent image, cache it
+        # Collection with no date and no coords: build (and cache) a global
+        # most-recent fallback. Used by tile-export and band-name probing
+        # paths that don't have a specific point in mind.
         if date is None and self._needs_per_point_date:
-            if self._static_image is None:
-                most_recent = self._collection_timestamps.max()
-                logger.info(
-                    "No date provided for collection %s; using most recent image (%s).",
-                    self._dataset_spec.get("collection"),
-                    most_recent.strftime("%Y-%m-%d"),
-                )
-                self._static_image = _build_image(
-                    self._dataset_spec,
-                    date=most_recent,
-                    collection_timestamps=self._collection_timestamps,
-                )
-                self._date_source = "most_recent_no_date"
-                self._image_date_used = most_recent
+            most_recent = self._collection_timestamps.max()
+            logger.info(
+                "No date/geometry provided for collection %s; using most recent image (%s).",
+                self._dataset_spec.get("collection"),
+                most_recent.strftime("%Y-%m-%d"),
+            )
+            self._static_image = _build_image(
+                self._dataset_spec,
+                date=most_recent,
+                collection_timestamps=self._collection_timestamps,
+            )
+            self._date_source = "most_recent_no_date"
+            self._image_date_used = most_recent
             return self._static_image
 
-        # Per-point date selection
+        # Per-point date selection without per-point bounds requirement
+        # (e.g. an IMAGE_COLLECTION whose timestamps fetch failed but a
+        # date is still provided).
         dt = pd.to_datetime(date)
         geom = ee.Geometry.Point([lon, lat]) if lat is not None else None
         return _build_image(
@@ -540,18 +714,24 @@ class GeeRasterAdapter:
     def _get_band_name(self, img: ee.Image) -> str:
         """Get the first band name from the image (needed for result parsing)."""
         band = self._dataset_spec.get("bands")
-        if band and isinstance(band, str):
-            return band
-        if band and isinstance(band, list):
-            # Populate band cache from the explicit list — no GEE API call needed
-            if not hasattr(self, "_cached_band_name"):
-                self._cached_band_name = band[0]
-                self._cached_band_names = band
-                self._cached_band_count = len(band)
-            return self._cached_band_name
         derived = self._dataset_spec.get("derived_bands")
-        if derived:
-            return derived
+
+        # Normalize both settings to lists so we can handle the combined case.
+        source_bands = (
+            [band] if isinstance(band, str) else list(band) if isinstance(band, list) else []
+        )
+        derived_bands_list = (
+            [derived] if isinstance(derived, str) else list(derived) if derived else []
+        )
+        combined = source_bands + derived_bands_list
+
+        if combined:
+            # Populate band cache from the config — no GEE API call needed.
+            if not hasattr(self, "_cached_band_name"):
+                self._cached_band_name = combined[0]
+                self._cached_band_names = combined
+                self._cached_band_count = len(combined)
+            return self._cached_band_name
         # Fallback: ask GEE (costs one getInfo call, cached after first use)
         if not hasattr(self, "_cached_band_name"):
             try:
@@ -607,8 +787,42 @@ class GeeRasterAdapter:
         }
         return vals, meta
 
-    def _empty_stats_result(self, window_m: int, reducer_names: Sequence[str]):
-        stats = {r: None for r in reducer_names}
+    def _empty_stats_result(
+        self,
+        window_m: int,
+        reducer_names: Sequence[str],
+        *,
+        want_point: bool = False,
+    ):
+        """Return a (stats, meta) tuple matching the merged success schema.
+
+        Used when a fetch fails so callers see the same dict shape they'd
+        get on a successful call. Includes a "point" / "{band}_point" key
+        when the original request asked for the point reducer, regardless
+        of which window reducers were combined alongside it.
+        """
+        # Window-side: one None value per requested non-point reducer.
+        stats: dict[str, float | None] = {r: None for r in reducer_names}
+
+        # Point-side: mirror the success-path shape — multi-band emits one
+        # "{band}_point" key per band; single-band emits a bare "point" key.
+        if want_point:
+            spec_band = self._dataset_spec.get("bands")
+            band_count = getattr(self, "_cached_band_count", 1)
+            multiband = not isinstance(spec_band, str) and band_count > 1
+            if multiband:
+                # We may not have the full band list cached here; emit one
+                # placeholder per cached band name, falling back to a single
+                # "point" key when band names aren't known yet.
+                band_names = getattr(self, "_cached_band_names", None) or []
+                if band_names:
+                    for band in band_names:
+                        stats[f"{band}_point"] = None
+                else:
+                    stats["point"] = None
+            else:
+                stats["point"] = None
+
         _, meta = self._empty_result(window_m)
         return stats, meta
 
@@ -682,7 +896,10 @@ class GeeRasterAdapter:
 
         meta = {
             "in_extent": True,
-            "n_pixels": int(total),
+            # n_pixels reports valid (non-nodata) cells only — the total
+            # cell count in the window can be inferred from the window
+            # size and native resolution.
+            "n_pixels": int(valid_count),
             "had_nodata": valid_count < total,
             "coverage_pct": 100.0 * (valid_count / total) if total else 0.0,
             "window_m": int(window_m),
@@ -705,16 +922,30 @@ class GeeRasterAdapter:
         lat: float,
         lon: float,
         window_m: int,
-        combined_reducer: ee.Reducer,
+        combined_reducer: "ee.Reducer | None",
         reducer_names: Sequence[str],
         suffixes: list[str],
+        *,
+        want_point: bool = False,
         date=None,
     ):
         """Compute server-side stats for a single point via reduceRegion.
 
-        If no specific band is set in the dataset_spec, all bands are reduced
-        and returned as ``{band}_{reducer}`` keys (e.g. ``bio01_mean``).
-        If a band is explicitly specified, returns ``{reducer}`` keys as usual.
+        Two reductions are issued together as a single ``ee.Dictionary``
+        and resolved with one ``getInfo()`` round-trip:
+
+        - **window** — runs only when *combined_reducer* is provided. The
+          user's reducers are combined with ``ee.Reducer.count()`` for QC,
+          and ``reduceRegion`` is applied over the buffered square region.
+        - **point** — runs only when *want_point* is True. ``Reducer.first()``
+          is applied over an ``ee.Geometry.Point`` at the exact (lat, lon)
+          to fetch the value of the pixel containing the point.
+
+        When both branches run, GEE evaluates them in parallel server-side
+        so callers pay one round-trip for both. Returns a single
+        ``(stats_dict, meta_dict)`` tuple with merged keys:
+        - window keys: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
+        - point  keys: ``"point"``  (single band) or ``{band}_point``     (multi-band)
         """
         img = self._get_image(date, lat=lat, lon=lon)
         region = self._make_region(lat, lon, window_m)
@@ -723,7 +954,8 @@ class GeeRasterAdapter:
         native_m = self._get_scale_value(img)
 
         # If the window is smaller than the native pixel size, expand the
-        # region so at least one pixel center falls inside it.
+        # region so at least one pixel center falls inside it. Only affects
+        # the window branch — the point branch always uses the exact point.
         if window_m < native_m:
             region = self._make_region(lat, lon, int(native_m * 2))
 
@@ -741,30 +973,81 @@ class GeeRasterAdapter:
         else:
             img_to_reduce = img.select(band_name)
 
-        result = img_to_reduce.reduceRegion(
-            reducer=combined_reducer,
-            geometry=region,
-            scale=native_m,
-            crs=utm_crs,
-            bestEffort=True,
-        ).getInfo()
+        # Build up to two server-side reductions into a single ee.Dictionary.
+        # GEE evaluates them in parallel and we pay one HTTP round-trip total.
+        branches: dict[str, "ee.Dictionary"] = {}
 
-        if multiband:
-            stats = _parse_multiband_result(result, reducer_names, suffixes)
+        if combined_reducer is not None:
+            # Window branch: user reducers + count for QC. The combined reducer
+            # produces `{band}{suffix}` keys including a `{band}_count` entry.
+            full_reducer = combined_reducer.combine(reducer2=ee.Reducer.count(), sharedInputs=True)
+            branches["window"] = img_to_reduce.reduceRegion(
+                reducer=full_reducer,
+                geometry=region,
+                scale=native_m,
+                crs=utm_crs,
+                bestEffort=True,
+            )
+
+        if want_point:
+            # Point branch: exact pixel value at lat/lon. One pixel only —
+            # no need for bestEffort. Output keys are bare band names.
+            branches["point"] = img_to_reduce.reduceRegion(
+                reducer=ee.Reducer.first(),
+                geometry=ee.Geometry.Point([lon, lat]),
+                scale=native_m,
+                crs=utm_crs,
+            )
+
+        # Single round-trip — both branches resolved server-side.
+        full_result = ee.Dictionary(branches).getInfo() or {}
+
+        # ---- parse window branch ----
+        window_stats: dict[str, float | None] = {}
+        valid_count = 0
+        if combined_reducer is not None:
+            window_raw = full_result.get("window") or {}
+            if multiband:
+                window_stats = _parse_multiband_result(window_raw, reducer_names, suffixes)
+            else:
+                window_stats = _parse_reduce_result(window_raw, band_name, reducer_names, suffixes)
+            valid_count = _extract_count_from_reduce_result(window_raw, band_name, multiband)
+
+        # ---- parse point branch ----
+        point_stats: dict[str, float | None] = {}
+        if want_point:
+            point_raw = full_result.get("point") or {}
+            point_stats = _parse_point_result(point_raw, band_name, multiband)
+
+        # Merged stats dict — window keys first, then point keys.
+        stats = {**window_stats, **point_stats}
+
+        # ---- QC meta ----
+        # When the window branch ran we have a real valid-pixel count from
+        # GEE; otherwise we fall back to point-only semantics (n_pixels is
+        # 1 if the point sample returned a value, else 0).
+        if combined_reducer is not None:
+            total_cells = max(1, round((max(window_m, native_m) / native_m) ** 2))
+            coverage_pct = 100.0 * (valid_count / total_cells) if total_cells else 0.0
+            # Clamp to 100% — the geometric total can be off by a cell or two,
+            # so a fully-valid window can otherwise read as 101%.
+            coverage_pct = min(coverage_pct, 100.0)
+            has_values = any(v is not None for v in window_stats.values())
+            n_pixels = int(valid_count)
+            had_nodata = valid_count < total_cells
         else:
-            stats = _parse_reduce_result(result, band_name, reducer_names, suffixes)
+            # Point-only request — n_pixels is 1 if the sample returned a value, else 0.
+            any_pt = any(v is not None for v in point_stats.values())
+            n_pixels = 1 if any_pt else 0
+            coverage_pct = 100.0 if any_pt else 0.0
+            has_values = any_pt
+            had_nodata = not any_pt
 
-        # Build QC meta from a count reducer if available, else approximate
-        n_pixels = None
-        if "count" in stats and stats["count"] is not None:
-            n_pixels = int(stats["count"])
-
-        has_values = any(v is not None for v in stats.values())
         meta = {
             "in_extent": has_values,
-            "n_pixels": n_pixels or (1 if has_values else 0),
-            "had_nodata": False,
-            "coverage_pct": 100.0 if has_values else 0.0,
+            "n_pixels": n_pixels,
+            "had_nodata": had_nodata,
+            "coverage_pct": coverage_pct if has_values else 0.0,
             "window_m": int(window_m),
             "raster_crs": self.crs,
             "region_crs": utm_crs,
@@ -778,49 +1061,7 @@ class GeeRasterAdapter:
         return stats, meta
 
     # ------------------------------------------------------------------
-    # Mode 3: Single pixel values  (image.sample)
-    # ------------------------------------------------------------------
-
-    def _fetch_point_single(self, lat: float, lon: float, date=None):
-        """Sample a single pixel value at exact (lat, lon)."""
-        img = self._get_image(date, lat=lat, lon=lon)
-        point = ee.Geometry.Point([lon, lat])
-
-        try:
-            sample = img.sample(
-                region=point,
-                scale=self._get_scale(img),
-                numPixels=1,
-                dropNulls=False,
-            ).first()
-
-            props = sample.toDictionary().getInfo()
-        except Exception:
-            props = None
-
-        date_info = self._resolve_date_info(date)
-
-        if not props:
-            return {}, {
-                "in_extent": False,
-                "n_pixels": 0,
-                "had_nodata": False,
-                "coverage_pct": 0.0,
-                "src_path": self._src_label(),
-                **date_info,
-            }
-
-        return props, {
-            "in_extent": True,
-            "n_pixels": 1,
-            "had_nodata": False,
-            "coverage_pct": 100.0,
-            "src_path": self._src_label(),
-            **date_info,
-        }
-
-    # ------------------------------------------------------------------
-    # Mode 4: Image export  (geemap → GeoTIFF)
+    # Mode 3: Image export  (geemap → GeoTIFF)
     # ------------------------------------------------------------------
 
     def _export_single(
@@ -941,18 +1182,47 @@ class GeeRasterAdapter:
     ) -> List[tuple[dict[str, float | None], dict]]:
         """Compute server-side statistics for many points in parallel (Mode 2).
 
-        Uses a single combined ``reduceRegion`` call per point with all
-        requested reducers, avoiding the need to download raw pixel arrays.
+        Issues one ``reduceRegion`` call per point — or, when ``"point"`` is
+        in *reducer_names*, a single ``ee.Dictionary`` containing both the
+        window reduction and a Point-geometry reduction. GEE evaluates both
+        branches server-side in one ``getInfo()`` round-trip, so the cost
+        is one HTTP call per point regardless of whether the user asked
+        for window stats, point sampling, or both.
+
+        Output keys per point:
+          - window stats: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
+          - point sample: ``"point"``  (single band) or ``{band}_point``     (multi-band)
 
         Returns a list of ``(stats_dict, meta_dict)`` tuples — one per point.
-        ``stats_dict`` maps each reducer name to its computed value.
         """
-        combined_reducer, suffixes = _build_combined_reducer(reducer_names)
+        # Split "point" out of reducer_names — it doesn't go through the
+        # combined window reducer; it gets its own server-side branch.
+        reducer_names = list(reducer_names)
+        want_point = "point" in reducer_names
+        window_reducers = [r for r in reducer_names if r != "point"]
 
         n = len(lats)
+        lats = list(lats)
+        lons = list(lons)
         date_list = list(dates) if dates is not None else [None] * n
-        results: List = [None] * n
 
+        # Build the window reducer once when window stats are requested;
+        # leave it None for point-only runs.
+        if window_reducers:
+            combined_reducer, suffixes = _build_combined_reducer(window_reducers)
+        else:
+            combined_reducer, suffixes = None, []
+
+        # Warm the band cache once on the main thread so workers don't race
+        # to populate it (and we avoid an extra getInfo from inside a worker).
+        if not hasattr(self, "_cached_band_count"):
+            try:
+                self._get_band_name(self._get_image())
+            except Exception:
+                pass
+
+        # Single ThreadPool: each worker handles both branches for its point.
+        results: List = [None] * n
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {
                 executor.submit(
@@ -961,9 +1231,10 @@ class GeeRasterAdapter:
                     lon,
                     window_m,
                     combined_reducer,
-                    reducer_names,
+                    window_reducers,
                     suffixes,
-                    date,
+                    want_point=want_point,
+                    date=date,
                 ): i
                 for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
             }
@@ -973,38 +1244,9 @@ class GeeRasterAdapter:
                     results[idx] = future.result()
                 except Exception as e:
                     logger.warning("GEE stats fetch failed for point %d: %s", idx, e)
-                    results[idx] = self._empty_stats_result(window_m, reducer_names)
-
-        return results
-
-    def fetch_points_batch(
-        self,
-        lats: Sequence[float],
-        lons: Sequence[float],
-        *,
-        dates: Sequence | None = None,
-    ) -> List[tuple[dict, dict]]:
-        """Sample single pixel values for many points in parallel (Mode 3).
-
-        Returns a list of ``(values_dict, meta_dict)`` tuples.
-        ``values_dict`` maps band names to their sampled values.
-        """
-        n = len(lats)
-        date_list = list(dates) if dates is not None else [None] * n
-        results: List = [None] * n
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_idx = {
-                executor.submit(self._fetch_point_single, lat, lon, date): i
-                for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    logger.warning("GEE point fetch failed for point %d: %s", idx, e)
-                    results[idx] = ({}, {"in_extent": False, "src_path": self._src_label()})
+                    results[idx] = self._empty_stats_result(
+                        window_m, window_reducers, want_point=want_point
+                    )
 
         return results
 
@@ -1019,11 +1261,16 @@ class GeeRasterAdapter:
         dates: Sequence | None = None,
         dataset_name: str = "dataset",
         resample_m: float | None = None,
+        filename_suffix: str | None = None,
     ) -> List[Path]:
         """Export GeoTIFF tiles for many points in parallel (Mode 4).
 
         If resample_m is set, all tiles are exported at that resolution so they
         are exactly round(window_m / resample_m) × round(window_m / resample_m) pixels.
+
+        ``filename_suffix`` is inserted before the .tif extension so multi-
+        window runs can place every window's tiles in the same folder
+        without overwriting one another.
 
         Returns list of output file paths.
         """
@@ -1043,10 +1290,16 @@ class GeeRasterAdapter:
 
         meta_list = [self._resolve_date_info(d) for d in date_list]
 
+        # Suffix wrangling: when caller passes "200m", filenames become
+        # "<id>-<dataset>-200m.tif". When suffix is None we keep the
+        # historical "<id>-<dataset>.tif" naming so single-window callers
+        # are completely unaffected.
+        suffix_part = f"-{filename_suffix}" if filename_suffix else ""
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {}
             for i, (lat, lon, date, sample_id) in enumerate(zip(lats, lons, date_list, id_list)):
-                out_path = out_dir / f"{sample_id}-{dataset_name}.tif"
+                out_path = out_dir / f"{sample_id}-{dataset_name}{suffix_part}.tif"
                 future = executor.submit(
                     self._export_single, lat, lon, window_m, out_path, date, resample_m
                 )
@@ -1061,6 +1314,98 @@ class GeeRasterAdapter:
                     results[idx] = None
 
         return results, meta_list
+
+    def build_dataset_meta(
+        self,
+        spec: dict,
+        meta_list: list | None = None,
+        exported_paths: list | None = None,
+        quality: dict | None = None,
+        lats: Sequence[float] | None = None,
+        lons: Sequence[float] | None = None,
+    ) -> dict:
+        """Build per-dataset metadata using this adapter's cached state.
+
+        Includes GEE-specific fields like asset_type, collection date range,
+        and per-tile UTM zones (when lats/lons are supplied for the raster
+        path). Quality stats and date-selection info are added when present.
+        """
+        # Static dataset info from the catalog spec.
+        meta: Dict[str, Any] = {
+            "data_source": spec.get("data_source"),
+            "path": spec.get("path"),
+        }
+        if spec.get("data_type"):
+            meta["data_type"] = spec["data_type"]
+
+        # Asset type: IMAGE vs IMAGE_COLLECTION — determined during __post_init__.
+        if "collection" in self._dataset_spec:
+            meta["asset_type"] = "IMAGE_COLLECTION"
+        else:
+            meta["asset_type"] = "IMAGE"
+
+        # Native CRS (set in __post_init__).
+        meta["native_crs"] = str(self.crs)
+
+        # Native spatial resolution — one .getInfo() call on the cached projection.
+        if self._native_proj is not None:
+            try:
+                meta["native_spatial_resolution_m"] = round(
+                    float(self._native_proj.nominalScale().getInfo()), 2
+                )
+            except Exception:
+                pass
+
+        # Band names — populated on first fetch via _get_band_name().
+        band_names = getattr(self, "_cached_band_names", None)
+        if band_names:
+            meta["band_names"] = band_names
+
+        # Tile CRS: GEE exports each tile in the UTM zone of its centre point,
+        # so we list all unique zones touched by the input sample set.
+        if lats is not None and lons is not None:
+            zones = build_tile_crs_zones(lats, lons)
+            if zones:
+                meta["tile_crs"] = zones
+
+        # Collection date range: available when timestamps were fetched.
+        timestamps = getattr(self, "_collection_timestamps", None)
+        if timestamps is not None and len(timestamps) > 0:
+            meta["collection_date_range"] = [
+                timestamps.min().strftime("%Y-%m-%d"),
+                timestamps.max().strftime("%Y-%m-%d"),
+            ]
+
+        # Date-selection info for the single-image composite path.
+        date_source = getattr(self, "_date_source", None)
+        if date_source:
+            meta["date_source"] = date_source
+        image_date_used = getattr(self, "_image_date_used", None)
+        if image_date_used is not None:
+            meta["image_date_used"] = image_date_used.strftime("%Y-%m-%d")
+
+        # Pass-through catalog field for dataset description.
+        dataset_info = spec.get("dataset_information")
+        if dataset_info:
+            meta["dataset_information"] = dataset_info
+
+        # Per-point date-selection summary (nearest/clamped/most-recent counts).
+        if meta_list:
+            date_info = summarize_date_info(meta_list)
+            if date_info is not None:
+                meta["date_info"] = date_info
+
+        # QC/coverage stats accumulated during processing. Make a copy so we
+        # don't mutate the caller's dict when adding the tile-export summary.
+        quality = dict(quality or {})
+        # Tile-export summary: populated only when this call is for the raster path.
+        if exported_paths is not None:
+            n_points = len(lats) if lats is not None else len(exported_paths)
+            quality["tiles"] = summarize_tile_export(exported_paths, n_points)
+        if quality:
+            meta["quality"] = quality
+
+        return meta
 
 
 if _register is not None:

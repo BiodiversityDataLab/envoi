@@ -1,13 +1,47 @@
 # src/biodata/config.py
 from __future__ import annotations
+import importlib.resources as importlib_resources
 from pathlib import Path
 from typing import Dict, Any, Mapping
 import logging
 import yaml
 
-REQUIRED_DATASET_KEYS = {"source", "path"}
+REQUIRED_DATASET_KEYS = {"data_source", "path"}
+
+# Module-level cache so each bundled YAML is only read once per process.
+_defaults_cache: Dict[str, Any] | None = None
+
+# Datasets registered by the user via update_catalog(). Persists for the
+# duration of the Python session. Applied as the final merge layer in
+# load_catalogs() so user entries always override built-in ones.
+_user_catalog_datasets: Dict[str, Any] = {}
 
 logger = logging.getLogger(__name__)
+
+
+def _read_builtin_yaml(filename: str) -> Dict[str, Any]:
+    """Read a YAML file bundled inside the biodata package under configs/.
+
+    Uses importlib.resources so the file is found correctly whether the
+    package is installed via pip or run directly from source.
+    """
+    ref = importlib_resources.files("biodata").joinpath("configs").joinpath(filename)
+    text = ref.read_text(encoding="utf-8")
+    return yaml.safe_load(text) or {}
+
+
+def load_defaults() -> Dict[str, Any]:
+    """Load project-wide defaults from the bundled configs/defaults.yml.
+
+    Returns a dict of default values (e.g. window_size_m, output_file_format).
+    The result is cached after the first read so the file is only opened once.
+    """
+    global _defaults_cache
+    if _defaults_cache is not None:
+        return _defaults_cache
+
+    _defaults_cache = _read_builtin_yaml("defaults.yml")
+    return _defaults_cache
 
 
 class CatalogError(ValueError):
@@ -23,7 +57,7 @@ def _require_keys(d: Dict[str, Any], required: set, ctx: str) -> None:
 def _inspect_raster(name: str, spec: Dict[str, Any]) -> None:
     """Read CRS, resolution, type, and nodata from a local raster file
     and fill in any missing spec fields automatically."""
-    if spec.get("source") != "local":
+    if spec.get("data_source") != "local":
         return
 
     p = Path(spec["path"])
@@ -54,20 +88,49 @@ def _inspect_raster(name: str, spec: Dict[str, Any]) -> None:
             if "nodata" not in spec and src.nodata is not None:
                 spec["nodata"] = src.nodata
 
-            if "bands" not in spec:
-                spec["bands"] = src.count
+            if "band_count" not in spec:
+                # Store the number of bands as informational metadata only.
+                # Which bands to actually read is decided by the adapter at runtime.
+                spec["band_count"] = src.count
 
     except Exception as e:
         logger.warning("datasets.%s: could not read raster metadata from %s: %s", name, p, e)
 
 
-def load_catalog(path: str | Path) -> Dict[str, Any]:
+def _validate_catalog(data: Dict[str, Any], source_label: str) -> Dict[str, Any]:
+    """Validate a parsed catalog dict and run auto-inspection on local rasters.
+
+    Raises CatalogError if the structure is invalid.
+    Returns the (possibly mutated) data dict.
     """
-    Load and validate the dataset catalog YAML.
+    if not isinstance(data, dict):
+        raise CatalogError(f"Top-level YAML must be a mapping (dict), got {type(data)}")
+
+    if "datasets" not in data or not isinstance(data["datasets"], dict) or not data["datasets"]:
+        raise CatalogError("Top-level key 'datasets' must be a non-empty mapping")
+
+    for name, spec in data["datasets"].items():
+        if not isinstance(spec, dict):
+            raise CatalogError(f"datasets.{name}: must be a mapping")
+        _require_keys(spec, REQUIRED_DATASET_KEYS, f"datasets.{name}")
+
+        if not isinstance(spec["data_source"], str) or not spec["data_source"]:
+            raise CatalogError(f"datasets.{name}.data_source must be a non-empty string")
+        if not isinstance(spec["path"], str) or not spec["path"]:
+            raise CatalogError(f"datasets.{name}.path must be a non-empty string")
+
+        _inspect_raster(name, spec)
+
+    return data
+
+
+def load_catalog(path: str | Path) -> Dict[str, Any]:
+    """Load and validate a dataset catalog YAML from a file path.
+
     Required structure:
       datasets:
         <dataset_name>:
-          source: <str>
+          data_source: <str>
           path: <str>
           # optional: type, crs, resolution_m, default_reducer, band, ...
           # For local sources, crs and resolution_m are auto-detected from the file.
@@ -82,35 +145,26 @@ def load_catalog(path: str | Path) -> Dict[str, Any]:
     except yaml.YAMLError as e:
         raise CatalogError(f"Catalog YAML parse error in {p}: {e}") from e
 
-    if not isinstance(data, dict):
-        raise CatalogError(f"Top-level YAML must be a mapping (dict), got {type(data)}")
+    return _validate_catalog(data, str(p))
 
-    if "datasets" not in data or not isinstance(data["datasets"], dict) or not data["datasets"]:
-        raise CatalogError("Top-level key 'datasets' must be a non-empty mapping")
 
-    # Per-dataset validation and auto-inspection
-    for name, spec in data["datasets"].items():
-        if not isinstance(spec, dict):
-            raise CatalogError(f"datasets.{name}: must be a mapping")
-        _require_keys(spec, REQUIRED_DATASET_KEYS, f"datasets.{name}")
-
-        if not isinstance(spec["source"], str) or not spec["source"]:
-            raise CatalogError(f"datasets.{name}.source must be a non-empty string")
-        if not isinstance(spec["path"], str) or not spec["path"]:
-            raise CatalogError(f"datasets.{name}.path must be a non-empty string")
-
-        _inspect_raster(name, spec)
-
-    return data
+# Sentinel object used as a default value in extract() to mean "load the
+# bundled built-in EE catalog". Using an object instead of a string avoids
+# any accidental collision with a user-supplied file path.
+BUILTIN_EE_CATALOG = object()
 
 
 def _load_catalog_any(src: Any) -> Dict[str, Any]:
     """
-    Internal helper: accept a path or a dict-like catalog and return
-    a normalized {'datasets': {...}} structure.
+    Internal helper: accept a path, a dict-like catalog, or the BUILTIN_EE_CATALOG
+    sentinel and return a normalized {'datasets': {...}} structure.
     """
     if src is None:
         return {"datasets": {}}
+
+    # Load the built-in GEE catalog bundled with the package.
+    if src is BUILTIN_EE_CATALOG:
+        return _validate_catalog(_read_builtin_yaml("ee_catalog.yml"), "builtin:ee_catalog.yml")
 
     # If it's already a mapping, assume it's a parsed catalog dict.
     if isinstance(src, Mapping):
@@ -120,10 +174,10 @@ def _load_catalog_any(src: Any) -> Dict[str, Any]:
         for name, spec in d["datasets"].items():
             if not isinstance(spec, dict):
                 raise CatalogError(f"datasets.{name}: must be a mapping")
-            if "source" not in spec or not spec.get("source"):
+            if "data_source" not in spec or not spec.get("data_source"):
                 raise CatalogError(
-                    f"datasets.{name}: missing required key 'source'.\n"
-                    f"Valid sources are: earth_engine, local."
+                    f"datasets.{name}: missing required key 'data_source'.\n"
+                    f"Valid values are: earth_engine, local."
                 )
             if "path" not in spec or not spec.get("path"):
                 raise CatalogError(
@@ -157,4 +211,42 @@ def load_catalogs(*sources: Any) -> Dict[str, Any]:
         for name, spec in cat.get("datasets", {}).items():
             merged["datasets"][name] = spec
 
+    # Apply user-registered datasets as the final layer so they override
+    # both built-in and caller-supplied catalogs.
+    if _user_catalog_datasets:
+        merged["datasets"].update(_user_catalog_datasets)
+
     return merged
+
+
+def update_catalog(source: str | Path | dict) -> None:
+    """Register additional datasets into the session-wide user catalog.
+
+    Datasets added here are automatically available in every subsequent
+    extract() call without needing to pass extra_catalog=. Multiple calls
+    are cumulative — each call adds to (or updates) the existing user catalog.
+
+    Args:
+        source: A path to a catalog YAML file, or a dict in the format:
+                  {"datasets": {"my_dataset": {"data_source": ..., "path": ...}}}
+
+    Raises:
+        CatalogError: if the source is invalid or missing required keys.
+
+    Example:
+        update_catalog("my_catalog.yml")
+        update_catalog({"datasets": {"ndvi_local": {"data_source": "local", "path": "data/ndvi.tif"}}})
+    """
+    global _user_catalog_datasets
+    cat = _load_catalog_any(source)
+    _user_catalog_datasets.update(cat.get("datasets", {}))
+
+
+def reset_catalog() -> None:
+    """Clear all datasets previously registered with update_catalog().
+
+    After calling this, extract() will only see the built-in catalogs
+    (plus any catalog= or extra_catalog= arguments passed directly).
+    """
+    global _user_catalog_datasets
+    _user_catalog_datasets = {}
