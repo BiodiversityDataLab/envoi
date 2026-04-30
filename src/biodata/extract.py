@@ -1,67 +1,684 @@
 # src/biodata/extract.py
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import List, Dict, Any
 from pathlib import Path
 
-import logging
-
 import pandas as pd
 import yaml
-import numpy as np
 from pyproj import Transformer
 
 from .adapters import get_adapter
-from .reducers import get_reducer, validate_reducers
-from .output import OutputManager
-from .config import load_catalogs
-from .qc import compute_qc_flags, extract_date_columns, extract_crs_column
-from .metadata import (
-    build_dataset_meta,
-    build_tile_crs_zones,
-    write_metadata,
-    summarize_date_info,
-    summarize_tile_export,
-)
+from .config import load_catalogs, load_defaults, BUILTIN_EE_CATALOG
+from .qc import attach_quality_control, split_stats_and_qc
+from .metadata import write_metadata
+
+# Default catalog tuple used when the caller does not supply one.
+# The sentinels tell load_catalogs() to load the YAML files that are
+# bundled inside the installed package, so this works regardless of
+# the user's working directory.
+_DEFAULT_CATALOGS = (BUILTIN_EE_CATALOG,)
 
 
-logger = logging.getLogger(__name__)
+def extract(
+    df: pd.DataFrame,
+    config: str | Path | dict | list,
+    output_dir: str | Path = "outputs",
+    input_crs: str | None = None,
+    id_column: str = "id",
+    latitude_column: str = "lat",
+    longitude_column: str = "lon",
+    date_column: str = "date",
+) -> Dict[str, Path]:
+    """Extract environmental data for a set of geographic sample points.
+
+    For each dataset listed in ``config``, this function samples the environmental
+    data at every point in ``df`` and writes the results to ``output_dir``. Two
+    output modes are supported:
+
+    - ``"tabular"`` — computes summary statistics (mean, std, etc.) within a
+      square window around each point and writes a table (CSV or Parquet). A
+      separate QC table is also written with per-point coverage flags.
+    - ``"raster"`` — exports a GeoTIFF tile centred on each point and saves
+      the tiles to ``output_dir/<batch_id>/<dataset>/``.
+
+    A JSON metadata sidecar is always written alongside the output file(s).
+
+    ``config`` can be a dict (single output), a list of dicts (multiple outputs),
+    or a path to a YAML file containing either of those. Each dict must have the
+    following structure::
+
+        {
+            "batch_id": "terrain",          # used as the output file stem
+            "datasets": ["dem_aster"],      # one or more dataset names from the catalog
+            "settings": {
+                "output_type": "tabular",   # "tabular" or "raster"
+                "statistics": ["mean"],     # required for tabular; forbidden for raster
+                "window_size_m": 200,       # sampling window radius in metres
+                "output_file_format": "parquet",  # "parquet" or "csv" (tabular only)
+                "min_coverage_pct": 80,     # points below this coverage get a QC flag
+                "resample_m": 10,           # output pixel size in metres (raster only)
+            },
+        }
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input table of sample points. Must contain identifier and coordinate
+        columns (named ``id``, ``lat``, ``lon`` by default — override the names
+        with the ``*_column`` parameters below). An optional date column
+        (YYYY-MM-DD strings) enables nearest-date image selection for
+        time-varying datasets.
+    config : str, Path, dict, or list
+        Output specification — see above. A path string or ``Path`` is loaded as
+        YAML before processing.
+    output_dir : str or Path, optional
+        Directory where all output files are written. Created automatically if it
+        does not exist. Defaults to ``"outputs"``.
+    input_crs : str or None, optional
+        CRS of the coordinates in ``df`` as an EPSG code or proj string
+        (e.g. ``"EPSG:32634"``). When provided, the latitude and longitude
+        columns are reprojected to WGS84 (EPSG:4326) before extraction. If
+        omitted, coordinates are assumed to already be in WGS84.
+    id_column : str, optional
+        Name of the input column containing each row's identifier.
+        Defaults to ``"id"``. The output tables will use the same name.
+    latitude_column : str, optional
+        Name of the input column containing latitude values. Defaults
+        to ``"lat"``. The output tables will use the same name.
+    longitude_column : str, optional
+        Name of the input column containing longitude values. Defaults
+        to ``"lon"``. The output tables will use the same name.
+    date_column : str, optional
+        Name of the optional input column containing per-row dates.
+        Defaults to ``"date"``. If absent from ``df`` the date branch is
+        simply skipped — the extractor never errors on a missing date column.
+        The output tables will use the same name.
+
+    Returns
+    -------
+    dict[str, Path]
+        Mapping of output key to the file path that was written. For tabular
+        outputs the keys are ``"<batch_id>"`` (stats table) and
+        ``"<batch_id>_qc"`` (QC table). For raster outputs the key is
+        ``"<batch_id>:<dataset>"`` pointing to the tiles folder.
+    """
+    output_paths: Dict[str, Path] = {}
+
+    df = df.copy()
+
+    # Translate the user's column names to the canonical names used throughout
+    # the pipeline. Validation runs against the user-supplied names so error
+    # messages mention the columns the user actually has, then we rename to the
+    # canonical names ("id", "lat", "lon", "date") for the rest of processing.
+    # The output tables are renamed back to the user's names just before being
+    # written, so the user's chosen names round-trip through extract().
+    column_name_map = {
+        id_column: "id",
+        latitude_column: "lat",
+        longitude_column: "lon",
+        date_column: "date",
+    }
+    _validate_required_columns(df, id_column, latitude_column, longitude_column)
+    df = df.rename(columns=column_name_map)
+
+    # Load project-wide defaults from the bundled configs/defaults.yml once per call.
+    # These are the fallback values used when settings are not specified
+    # in the run config or as keyword arguments to this function.
+    defaults = load_defaults()
+
+    # Validate inputs
+    df, dates, date_warnings = _parse_and_validate_dates(df)
+    df, crs_warnings = _validate_and_reproject_crs(df, input_crs)
+
+    # Merge the built-in catalogs with any datasets registered via update_catalog().
+    # The user catalog is always applied last, so user entries override built-ins.
+    catalog_dict = load_catalogs(_DEFAULT_CATALOGS)
+    catalog_datasets = catalog_dict["datasets"]
+
+    # Normalize config into a list of output configs, whether the user passed a single dict or a list of dicts.
+    output_configs = _as_config_list(config)
+
+    for idx, run_config in enumerate(output_configs):
+        df_copy = df.copy()
+
+        # Per-dataset metadata accumulator. Each adapter builds its own entry
+        # (including any quality stats and date-selection info) and stores it here.
+        dataset_metas: Dict[str, Any] = {}
+        warnings_backlog: Dict[str, str] = {}
+
+        # Parse and validate all settings from this run's config dict.
+        # ValueError is raised for any missing or invalid setting
+        run_settings = _parse_run_config(run_config, defaults, idx, catalog_datasets)
+        batch_id = run_settings.batch_id
+        datasets = run_settings.datasets
+        output_type = run_settings.output_type
+        output_file_format = run_settings.output_file_format
+        window_sizes = run_settings.window_sizes
+        min_coverage = run_settings.min_coverage
+        stats = run_settings.stats
+        resample_m = run_settings.resample_m
+
+        # When the user supplies more than one window size we need to keep the
+        # window suffix on raster filenames and on the per-window quality
+        # entries; with a single window we keep the legacy naming and metadata
+        # layout so existing outputs are byte-for-byte unchanged.
+        is_multi_window = len(window_sizes) > 1
+
+        for dataset in datasets:
+            # Look up the dataset's catalog entry once; both processing modes need it.
+            dataset_config = catalog_datasets[dataset]
+
+            for window_size in window_sizes:
+                # Dispatch to the mode-specific helper. Each helper owns adapter
+                # instantiation, data fetching, and per-dataset metadata assembly
+                # for one (dataset, window_size) pair.
+
+                if output_type == "tabular":
+                    df_copy, dataset_meta = _process_dataset_tabular(
+                        df_copy,
+                        dataset,
+                        dataset_config,
+                        run_settings,
+                        dates,
+                        window_size,
+                    )
+
+                # In raster mode, the helper exports a folder of GeoTIFF tiles
+                # and returns the path plus the per-dataset metadata dict. With
+                # multiple windows the filename suffix keeps each window's
+                # tiles distinct inside the same dataset folder.
+                # TODO: QC for raster mode is not yet implemented. Needed?
+                elif output_type == "raster":
+                    tiles_root = Path(output_dir) / batch_id
+                    suffix = f"{window_size}m" if is_multi_window else None
+                    tiles_path, dataset_meta = _process_dataset_raster(
+                        dataset,
+                        dataset_config,
+                        run_settings,
+                        dates,
+                        window_size,
+                        lats=df_copy.lat,
+                        lons=df_copy.lon,
+                        ids=df_copy["id"].tolist(),
+                        tiles_root=tiles_root,
+                        filename_suffix=suffix,
+                    )
+                    # Single-window: same key as before. Multi-window: append
+                    # the window so callers can locate each window's tiles.
+                    output_key = (
+                        f"{batch_id}:{dataset}:{window_size}m"
+                        if is_multi_window
+                        else f"{batch_id}:{dataset}"
+                    )
+                    output_paths[output_key] = tiles_path
+
+                # Merge the per-window metadata into the dataset's accumulator.
+                # First window for a dataset → store as-is (including static
+                # fields like data_source, native_crs). Subsequent windows →
+                # only their quality entries are merged in, since static
+                # fields are identical across windows for the same dataset.
+                if dataset not in dataset_metas:
+                    if is_multi_window and output_type == "raster":
+                        # Wrap the raster quality dict (currently {"tiles": ...})
+                        # under the window key so each window's tile summary
+                        # lands at quality["{window}m"]["tiles"].
+                        existing_quality = dataset_meta.get("quality", {})
+                        dataset_meta["quality"] = {f"{window_size}m": existing_quality}
+                    dataset_metas[dataset] = dataset_meta
+                else:
+                    accumulated_quality = dataset_metas[dataset].setdefault("quality", {})
+                    new_quality = dataset_meta.get("quality", {})
+                    if is_multi_window and output_type == "raster":
+                        accumulated_quality[f"{window_size}m"] = new_quality
+                    else:
+                        # Tabular quality is already keyed by window size, so
+                        # merging dicts gives the right structure for free.
+                        accumulated_quality.update(new_quality)
+
+        # --- after all datasets processed for this run, write outputs and metadata ---
+
+        # If any incomplete dates were detected during parsing, add a summary message to the warnings backlog so it gets recorded in the metadata file.
+        if date_warnings:
+            warnings_backlog["date_parsing"] = "; ".join(date_warnings)
+
+        # If coordinates were reprojected to WGS84, record a note in the metadata file.
+        if crs_warnings:
+            warnings_backlog["crs"] = "; ".join(crs_warnings)
+
+        # In tabular mode, split stats and QC into separate DataFrames and write them out as CSV or Parquet.
+        # In raster mode, the tiles have already been written by the adapter, so just write the metadata.
+
+        if output_type == "tabular":
+            # Keep id/lat/lon/date on both output files so each is self-contained.
+            core_columns = [c for c in ("id", "lat", "lon", "date") if c in df_copy.columns]
+            stats_df, qc_df = split_stats_and_qc(df_copy, core_columns)
+
+            # Round stat columns to the specified number of decimals so the output stays readable.
+            # Core columns (id/lat/lon/date) are excluded so coordinate
+            # precision is preserved exactly as the user supplied it.
+            stat_columns = [c for c in stats_df.columns if c not in core_columns]
+            stats_df[stat_columns] = stats_df[stat_columns].round(defaults["stats_output_decimals"])
+
+            # Rename the canonical core columns back to whatever names the
+            # user originally supplied so the output mirrors their input.
+            output_rename = {v: k for k, v in column_name_map.items() if v != k}
+            if output_rename:
+                stats_df = stats_df.rename(columns=output_rename)
+                qc_df = qc_df.rename(columns=output_rename)
+
+            stats_path = _write_tabular(stats_df, batch_id, Path(output_dir), output_file_format)
+            qc_path = _write_tabular(qc_df, f"{batch_id}_qc", Path(output_dir), output_file_format)
+
+            write_metadata(
+                output_dir,
+                batch_id,
+                output_type=output_type,
+                n_points=len(df_copy),
+                datasets=dataset_metas,
+                config={
+                    "statistics": stats,
+                    # Preserve the user's input form: int stays int, list stays list.
+                    "window_size_m": run_settings.user_window_size,
+                    "min_coverage_pct": min_coverage,
+                },
+                warnings=warnings_backlog if warnings_backlog else None,
+            )
+
+            output_paths[batch_id] = stats_path
+            output_paths[f"{batch_id}_qc"] = qc_path
+
+        elif output_type == "raster":
+            write_metadata(
+                Path(output_dir) / batch_id,
+                batch_id,
+                output_type=output_type,
+                n_points=len(df_copy),
+                datasets=dataset_metas,
+                config={
+                    # Preserve the user's input form: int stays int, list stays list.
+                    "window_size_m": run_settings.user_window_size,
+                    **({"resample_m": resample_m} if resample_m else {}),
+                },
+                warnings=warnings_backlog if warnings_backlog else None,
+            )
+
+    return output_paths
+
+
+def _process_dataset_tabular(
+    df: pd.DataFrame,
+    dataset: str,
+    dataset_config: dict,
+    run_settings: "RunSettings",
+    dates: list | None,
+    window_size: int,
+) -> tuple[pd.DataFrame, dict]:
+    """Fetch stats and QC columns for one dataset/window pair in tabular mode.
+
+    Owns adapter instantiation, statistic computation, QC column assembly,
+    and per-dataset metadata construction for a single window size. The
+    caller is responsible for looping over multiple window sizes and merging
+    the resulting metadata dicts.
+    """
+    # Instantiate the adapter from the dataset's declared data_source
+    # (earth_engine or local). The adapter encapsulates all source-specific
+    # fetching and validation logic.
+    AdapterClass = get_adapter(dataset_config["data_source"])
+    adapter = AdapterClass(dataset_config)
+
+    # Ask the adapter to compute all requested statistics for every sample.
+    # Returns a list of (stats_dict, meta_dict) — one tuple per row in df.
+    stats_results = adapter.fetch_stats_batch(
+        df.lat,
+        df.lon,
+        window_size,
+        run_settings.stats,
+        dates=dates,
+    )
+
+    # Append stat columns to the output DataFrame based on the keys in
+    # stats_results, and assign values accordingly.
+    df = _append_stat_columns(df, dataset, window_size, stats_results)
+
+    # Split the (stat, meta) tuples so meta_list can feed QC and dataset metadata.
+    meta_list = [meta for _, meta in stats_results]
+
+    # Attach per-row QC columns and capture the coverage summary used below
+    # when assembling the per-dataset metadata dict.
+    df, quality_key, coverage_summary = attach_quality_control(
+        df,
+        meta_list=meta_list,
+        dataset_name=dataset,
+        reducer_names=run_settings.stats,
+        window_size_m=window_size,
+        min_coverage_pct=run_settings.min_coverage,
+    )
+
+    # Adapter assembles quality stats and date-selection info (GEE) into
+    # one per-dataset dict. The quality dict is keyed by window_size (or
+    # "point") so multiple window sizes can coexist within the same dataset
+    # metadata when the caller loops and merges across windows.
+    dataset_meta = adapter.build_dataset_meta(
+        dataset_config,
+        meta_list=meta_list,
+        quality={quality_key: coverage_summary},
+    )
+
+    return df, dataset_meta
+
+
+def _process_dataset_raster(
+    dataset: str,
+    dataset_config: dict,
+    run_settings: "RunSettings",
+    dates: list | None,
+    window_size: int,
+    *,
+    lats,
+    lons,
+    ids: list,
+    tiles_root: Path,
+    filename_suffix: str | None = None,
+) -> tuple[Path, dict]:
+    """Export GeoTIFF tiles for one dataset/window pair in raster mode.
+
+    When ``filename_suffix`` is set, it is appended to each tile's filename
+    (before the extension) so multiple window sizes for the same dataset
+    can coexist in the same folder without overwriting each other.
+    """
+    # Instantiate the adapter from the dataset's declared data_source.
+    AdapterClass = get_adapter(dataset_config["data_source"])
+    adapter = AdapterClass(dataset_config)
+
+    # Ask the adapter to export a tile per sample, writing GeoTIFFs under
+    # tiles_root / dataset / ... and returning the paths it wrote.
+    exported_paths, meta_list = adapter.export_tiles(
+        lats,
+        lons,
+        window_size,
+        tiles_root,
+        ids=ids,
+        dates=dates,
+        dataset_name=dataset,
+        resample_m=run_settings.resample_m,
+        filename_suffix=filename_suffix,
+    )
+
+    # Adapter assembles the full per-dataset metadata dict, including
+    # per-tile export info (paths, bounds, CRS).
+    dataset_meta = adapter.build_dataset_meta(
+        dataset_config,
+        meta_list=meta_list,
+        exported_paths=exported_paths,
+        lats=lats,
+        lons=lons,
+    )
+
+    return tiles_root / dataset, dataset_meta
+
+
+def _parse_and_validate_dates(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, list | None, list[str]]:
+    """Parse and validate the 'date' column from the input DataFrame.
+
+    Returns a tuple of (df, dates, date_warnings) where df has rows with missing
+    dates removed, dates is a list of YYYY-MM-DD strings (or None if no 'date'
+    column is present), and date_warnings is a list of messages the caller can
+    print and record in the output metadata.
+    """
+    date_warnings: list[str] = []
+
+    if "date" not in df.columns:
+        message = "No 'date' column found in input DataFrame; proceeding without dates."
+        print(message)
+        date_warnings.append(message)
+        return df, None, date_warnings
+
+    # Drop rows with missing dates rather than raising, so the user still gets
+    # results for the valid rows. The dropped ids are recorded in the warnings
+    # so the user can see exactly which points were skipped.
+    null_date_mask = df["date"].isna()
+    if null_date_mask.any():
+        null_ids = df.loc[null_date_mask, "id"].tolist()
+        message = (
+            f"Skipping {len(null_ids)} row(s) with missing dates "
+            f"(ids: {null_ids}). Provide a date for every row to include them."
+        )
+        print(message)
+        date_warnings.append(message)
+        df = df.loc[~null_date_mask].copy()
+
+    raw_dates = df["date"].tolist()
+
+    # format="mixed" lets pandas infer the format per-element, which is needed
+    # to accept a mix of full ("2021-06-15"), year-month ("2021-06"), and
+    # year-only ("2021") dates in the same column. Without this, pandas locks
+    # onto the first element's format and raises on any entry that doesn't match.
+    try:
+        parsed_dates = pd.to_datetime(raw_dates, format="mixed")
+    except Exception as e:
+        raise ValueError(f"Error parsing 'date' column: {e}. Expected dates in YYYY-MM-DD format.")
+
+    # Detect incomplete dates (year-only "2002" or year-month "2002-02") by splitting
+    # on "-". A complete date has 3 parts (YYYY-MM-DD); year-only has 1, year-month
+    # has 2. This correctly handles single-digit months/days like "2002-1-1"
+    # (still 3 parts → complete)
+    for raw_date, parsed_date in zip(raw_dates, parsed_dates):
+        raw_date_str = str(raw_date).strip()
+        if len(raw_date_str.split("-")) < 3:
+            message = (
+                f"Date '{raw_date_str}' interpreted as {parsed_date.strftime('%Y-%m-%d')}. "
+                f"Provide a full YYYY-MM-DD date if you want a specific day."
+            )
+            print(message)
+            date_warnings.append(message)
+
+    return df, parsed_dates.strftime("%Y-%m-%d").tolist(), date_warnings
+
+
+@dataclass
+class RunSettings:
+    """Validated and parsed settings for a single output run."""
+
+    batch_id: str
+    datasets: List[str]
+    output_type: str  # "tabular" or "raster"
+    output_file_format: str  # "csv" or "parquet"
+    window_sizes: List[int]  # one or more square-sampling-window sizes in metres
+    min_coverage: float  # 0–100 — threshold for low-coverage QC flag
+    stats: list | None  # requested reducer names, or None to use the default
+    resample_m: float | None  # target pixel size in metres (raster mode only)
+    user_window_size: int | List[int]  # original input form, preserved for metadata
+
+
+def _parse_run_config(
+    run_config: dict,
+    defaults: dict,
+    index: int,
+    catalog_datasets: dict,
+) -> RunSettings:
+    """Parse and validate a single output run config dict into a RunSettings instance.
+
+    Raises ValueError for any invalid or missing setting so callers don't need
+    to do any further validation on the returned object.
+    """
+    # Use a numbered fallback batch_id when the user didn't provide one.
+    batch_id = run_config.get("batch_id", f"output{index + 1}")
+
+    # datasets is required — must be a non-empty list of dataset names.
+    datasets = run_config.get("datasets", [])
+    if not datasets:
+        raise ValueError(f"Output '{batch_id}': missing required 'datasets' list")
+
+    # Validate that every requested dataset exists in the catalog.
+    missing_datasets = [d for d in datasets if d not in catalog_datasets]
+    if missing_datasets:
+        raise KeyError(f"Output '{batch_id}': dataset(s) {missing_datasets} not found in catalog.")
+
+    # settings is required — must be a non-empty dict.
+    settings = run_config.get("settings", {}) or {}
+    if not settings:
+        raise ValueError(f"Output '{batch_id}': missing required 'settings' dict")
+
+    # output_type controls the entire processing path (stats vs tile export).
+    output_type = settings.get("output_type")
+    if output_type not in ("tabular", "raster"):
+        raise ValueError(f"Unknown or missing output_type: {output_type}")
+
+    # resample_m is only meaningful for raster output.
+    resample_m = settings.get("resample_m")
+    if output_type == "raster" and resample_m is not None and resample_m <= 0:
+        raise ValueError(f"Invalid resample_m: {resample_m}. Must be a positive number.")
+    if output_type == "tabular" and resample_m is not None:
+        raise ValueError("resample_m is not applicable when output_type is 'tabular'.")
+
+    # output_file_format applies to tabular output only.
+    output_file_format = settings.get("output_file_format", defaults["output_file_format"])
+    if output_file_format not in ("csv", "parquet"):
+        raise ValueError(f"Unknown output_file_format: {output_file_format}")
+
+    # min_coverage_pct is a percentage — must be in [0, 100].
+    min_coverage = settings.get("min_coverage_pct", defaults["min_coverage_pct"])
+    if min_coverage < 0 or min_coverage > 100:
+        raise ValueError(f"Invalid min_coverage_pct: {min_coverage}. Must be between 0 and 100.")
+
+    # statistics (reducer names) are not supported for raster output.
+    stats = settings.get("statistics")
+    if output_type == "raster" and stats:
+        raise ValueError("Statistics cannot be computed when output_type is 'raster'.")
+    if output_type == "tabular" and (not isinstance(stats, list) or len(stats) == 0):
+        raise ValueError("For tabular output, 'statistics' must be provided as a non-empty list.")
+
+    # window_size_m can be either a single positive number or a list of them.
+    # When the user supplies a list, statistics (or tiles) are produced for
+    # each window size and the column / filename suffix disambiguates them.
+    user_window_size = settings.get("window_size_m", defaults["window_size_m"])
+    if isinstance(user_window_size, (list, tuple)):
+        window_sizes = list(user_window_size)
+        if not window_sizes:
+            raise ValueError(f"Output '{batch_id}': window_size_m list must not be empty.")
+    else:
+        window_sizes = [user_window_size]
+    for window_size in window_sizes:
+        if not isinstance(window_size, (int, float)) or window_size <= 0:
+            raise ValueError(f"Invalid window_size_m: {window_size}. Must be a positive number.")
+
+    return RunSettings(
+        batch_id=batch_id,
+        datasets=datasets,
+        output_type=output_type,
+        output_file_format=output_file_format,
+        window_sizes=window_sizes,
+        min_coverage=min_coverage,
+        stats=stats,
+        resample_m=resample_m,
+        user_window_size=user_window_size,
+    )
 
 
 def _load_yaml(path_or_dict):
+    """Load a YAML file if given a path, or return the dict/list if already loaded."""
     if isinstance(path_or_dict, (dict, list)):
         return path_or_dict
     with open(path_or_dict) as f:
         return yaml.safe_load(f)
 
 
-def _normalize_cfg(cfg) -> list[dict]:
-    """Load and normalize cfg into a list of output config dicts."""
-    raw = _load_yaml(cfg)
+def _as_config_list(config) -> list[dict]:
+    """Load and normalize config into a list of output config dicts."""
+    raw = _load_yaml(config)
     if isinstance(raw, dict):
         return [raw]
     if isinstance(raw, list):
         return raw
-    raise ValueError("cfg must be a dict, list, or path to a YAML file.")
+    raise ValueError("config must be a dict, list, or path to a YAML file.")
 
 
-def _validate_required_columns(df: pd.DataFrame) -> None:
-    """Raise ValueError if df is missing any of the required id/lat/lon columns."""
-    required = {"id", "lat", "lon"}
-    if not required.issubset(df.columns):
-        missing = required - set(df.columns)
+def _append_stat_columns(
+    df: pd.DataFrame,
+    dataset_name: str,
+    window_size_m: int,
+    stats_results: list[tuple[dict, dict]],
+) -> pd.DataFrame:
+    """Append adapter statistics columns to the output dataframe.
+
+    Expected stat keys from adapters:
+    - window, single-band: "{reducer}"      -> column "{dataset}_{reducer}_{buf}m"
+    - window, multi-band:  "b{n}_{reducer}" -> column "{dataset}_b{n}_{reducer}_{buf}m"
+    - point,  single-band: "point"          -> column "{dataset}_point"
+    - point,  multi-band:  "{band}_point"   -> column "{dataset}_{band}_point"
+
+    Point keys intentionally skip the buffer suffix to preserve the historical schema.
+    """
+    # Collect keys in first-seen order so output columns stay stable across runs.
+    stat_keys = dict.fromkeys(key for stat_dict, _ in stats_results for key in stat_dict)
+
+    for stat_key in stat_keys:
+        if stat_key == "point" or stat_key.endswith("_point"):
+            column_name = f"{dataset_name}_{stat_key}"
+        else:
+            column_name = f"{dataset_name}_{stat_key}_{window_size_m}m"
+
+        # Pull one value per sample row, defaulting to None if that key is absent.
+        df[column_name] = [stat_dict.get(stat_key) for stat_dict, _ in stats_results]
+
+    return df
+
+
+def _write_tabular(df: pd.DataFrame, name: str, output_dir: Path, output_file_format: str) -> Path:
+    """Write a DataFrame to a CSV or Parquet file and return the path written."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_file_format == "csv":
+        path = output_dir / f"{name}.csv"
+        df.to_csv(path, index=False)
+    else:
+        path = output_dir / f"{name}.parquet"
+        df.to_parquet(path, index=False)
+    return path
+
+
+def _validate_required_columns(
+    df: pd.DataFrame,
+    id_column: str,
+    latitude_column: str,
+    longitude_column: str,
+) -> None:
+    """Raise ValueError if df is missing any of the required id/lat/lon columns.
+
+    Uses the user-supplied column names so the error message points at the
+    columns the caller is actually expecting to find — not the canonical
+    internal names.
+    """
+    required_columns = {id_column, latitude_column, longitude_column}
+    if not required_columns.issubset(df.columns):
+        missing_columns = required_columns - set(df.columns)
         raise ValueError(
-            f"Input DataFrame is missing required column(s): {sorted(missing)}.\n"
-            f"Expected columns: id, lat, lon (and optionally: date).\n"
+            f"Input DataFrame is missing required column(s): {sorted(missing_columns)}.\n"
+            f"Expected columns: {id_column}, {latitude_column}, {longitude_column} "
+            f"(and optionally a date column).\n"
             f"Found columns: {sorted(df.columns.tolist())}"
         )
 
 
-def _validate_crs(df: pd.DataFrame, input_crs: str | None) -> pd.DataFrame:
-    """Reproject coordinates to WGS84 if needed, and raise if any lat/lon are out of range."""
+def _validate_and_reproject_crs(
+    df: pd.DataFrame, input_crs: str | None
+) -> tuple[pd.DataFrame, list[str]]:
+    """Reproject coordinates to WGS84 if needed, and raise if any lat/lon are out of range.
+
+    Returns a tuple of (df, crs_warnings) where crs_warnings is a list of messages
+    about CRS handling (e.g. a reprojection notice) that the caller can record in
+    the output metadata alongside the warnings_backlog.
+    """
+    crs_warnings: list[str] = []
+
     if input_crs is not None:
         input_crs_upper = input_crs.upper()
         if input_crs_upper != "EPSG:4326" and input_crs_upper != "WGS84":
-            logger.info(f"Reprojecting coordinates from {input_crs} to WGS84.")
+            message = f"Reprojecting coordinates from {input_crs} to EPSG:4326 (WGS84)."
+            print(message)
+            crs_warnings.append(message)
             transformer = Transformer.from_crs(input_crs, "EPSG:4326", always_xy=True)
             lons, lats = transformer.transform(df["lon"].values, df["lat"].values)
             df["lon"] = lons
@@ -83,318 +700,4 @@ def _validate_crs(df: pd.DataFrame, input_crs: str | None) -> pd.DataFrame:
             f"If your coordinates are in a different CRS, pass input_crs='EPSG:XXXX'"
         )
 
-    return df
-
-
-def extract(
-    df: pd.DataFrame,
-    cfg: str | Path | dict | list,
-    catalog: str | Path | dict | list | tuple = (
-        "configs/ee_catalog.yml",
-        "configs/local_catalog.yml",
-    ),
-    extra_catalog: str | Path | dict | None = None,
-    out_dir: str | Path = "out",
-    input_crs: str | None = None,
-) -> Dict[str, Path]:
-    """Extract environmental data for sample points.
-
-    ``cfg`` is a dict (single output) or list of dicts (multiple output_paths),
-    each specifying run_id, datasets, and settings.  Example::
-
-        extract(df, {
-            "run_id": "terrain",
-            "datasets": ["dem_aster"],
-            "settings": {"output_type": "tabular", "statistics": ["mean"], "window_size_m": 200},
-        })
-
-    Parameters
-    ----------
-    input_crs : str, optional
-        EPSG code or proj string for the input coordinates (e.g. "EPSG:32634").
-        If provided, lat/lon columns are reprojected to WGS84 (EPSG:4326)
-        before extraction. If omitted, coordinates are assumed to be WGS84.
-
-    Returns a mapping of output-key -> Path written.
-    """
-    df_copy = df.copy()
-    output_paths: Dict[str, Path] = {}
-
-    _validate_required_columns(df_copy)
-    df_copy = _validate_crs(df_copy, input_crs)
-
-    catalog_dict = load_catalogs(catalog, extra_catalog)
-    catalog_datasets = catalog_dict["datasets"]
-
-    output_cfgs_list = _normalize_cfg(cfg)
-
-    for idx, output_cfg in enumerate(output_cfgs_list):
-        dataset_metas: Dict[str, Any] = {}
-        coverage_backlog: Dict[str, Dict[str, Dict[str, int]]] = {}
-        date_backlog: Dict[str, Any] = {}
-        warnings_backlog: Dict[str, str] = {}
-
-        run_id = output_cfg.get("run_id", f"output{idx+1}")
-        datasets: List[str] = output_cfg.get("datasets", [])
-        if not datasets:
-            raise ValueError(f"Output '{run_id}': missing required 'datasets' list")
-        settings = output_cfg.get("settings", {}) or {}
-        output_type = settings.get("output_type", None)
-        if output_type not in ("tabular", "raster"):
-            raise ValueError(f"Unknown or missing output_type: {output_type}")
-        resample_m = settings.get("resample_m")
-        output_format = settings.get("output_format", "csv")
-        min_coverage = settings.get("min_coverage_pct", 0)
-        stats = settings.get("statistics")
-        window_size = settings.get("window_size_m", 500)
-
-        for dataset in datasets:
-            coverage_backlog[dataset] = {}
-
-            if dataset not in catalog_datasets:
-                raise KeyError(f"Dataset '{dataset}' not found in catalog {catalog}")
-            dataset_cfg = catalog_datasets[dataset]
-            source = dataset_cfg.get("source")
-            data_type = dataset_cfg.get("data_type")
-            dates = df_copy.date.tolist() if "date" in df_copy.columns else None
-
-            AdapterClass = get_adapter(source)
-            adapter = AdapterClass(dataset_cfg)
-
-            # ----- output_type: "raster" — export GeoTIFF tiles, skip stats -----
-            if output_type == "raster":
-                tiles_root = Path(out_dir) / run_id
-
-                # ----- export tiles for this dataset -----
-                exported_paths, meta_list = adapter.export_tiles(
-                    df_copy.lat,
-                    df_copy.lon,
-                    window_size,
-                    tiles_root,
-                    ids=df_copy["id"].tolist(),
-                    dates=dates,
-                    dataset_name=dataset,
-                    resample_m=resample_m,
-                )
-
-                # ----- build metadata for tile export -----
-                coverage_backlog[dataset]["tiles"] = summarize_tile_export(
-                    exported_paths, len(df_copy)
-                )
-                tile_crs_zones = build_tile_crs_zones(df_copy.lat, df_copy.lon)
-                date_summary = summarize_date_info(meta_list)
-                if date_summary is not None:
-                    date_backlog[dataset] = date_summary
-                dataset_metas[dataset] = build_dataset_meta(
-                    dataset_cfg,
-                    adapter,
-                    tile_crs_zones=tile_crs_zones,
-                )
-                output_paths[f"{run_id}:{dataset}"] = tiles_root / dataset
-
-                continue  # skip stats for this dataset
-
-            elif output_type == "tabular" and stats and "point" in stats:
-                # remove point only and put that in adapters
-                # ----- "point" reducer: exact pixel at coordinate, no window -----
-                if not hasattr(adapter, "fetch_points_batch"):
-                    raise ValueError(f"Source '{source}' does not support the 'point' reducer.")
-                pt_results = adapter.fetch_points_batch(
-                    df_copy.lat,
-                    df_copy.lon,
-                    dates=dates,
-                )
-                all_keys = {k for vals, _ in pt_results for k in vals}
-                for bk in sorted(all_keys):
-                    col = f"{dataset}_{bk}_point" if len(all_keys) > 1 else f"{dataset}_point"
-                    df_copy[col] = [r[0].get(bk) for r in pt_results]
-
-                meta_list = [r[1] for r in pt_results]
-                qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_coverage)
-                qc_df = qc_df.add_prefix(f"{dataset}_").add_suffix("_point")
-                extra_dfs = []
-                date_df = extract_date_columns(meta_list)
-                if not date_df.empty:
-                    extra_dfs.append(date_df.add_prefix(f"{dataset}_").add_suffix("_point"))
-                    date_backlog[dataset] = summarize_date_info(meta_list)
-                crs_df = extract_crs_column(meta_list)
-                if not crs_df.empty:
-                    extra_dfs.append(crs_df.add_prefix(f"{dataset}_").add_suffix("_point"))
-                if extra_dfs:
-                    qc_df = pd.concat(
-                        [qc_df.reset_index(drop=True)]
-                        + [d.reset_index(drop=True) for d in extra_dfs],
-                        axis=1,
-                    )
-                df_copy = pd.concat(
-                    [df_copy.reset_index(drop=True), qc_df.reset_index(drop=True)],
-                    axis=1,
-                )
-                coverage_backlog[dataset]["point"] = {
-                    "n_zero": int((qc_df[f"{dataset}_coverage_pct_point"] == 0).sum()),
-                    "n_full": int((qc_df[f"{dataset}_coverage_pct_point"] == 100).sum()),
-                    "total": int(len(pt_results)),
-                }
-
-            else:
-                # ----- summary stats with window (both server-side and Python-side) -----
-                # TODO: this needs some work, have the same name for the fetch function in the adapters
-                # validate requested reducers per dataset and data type.
-                if stats:
-                    warning = validate_reducers(list(stats), data_type, dataset)
-                    if warning:
-                        warnings_backlog[dataset] = warning
-
-                # ----- Earth Engine -----
-                if source == "earth_engine":
-                    reducer_names = list(stats)
-                    stats_results = adapter.fetch_stats_batch(
-                        df_copy.lat,
-                        df_copy.lon,
-                        window_size,
-                        reducer_names,
-                        dates=dates,
-                    )
-                    # For multi-band datasets keys are "{dataset}_{band}_{reducer}" (e.g. "bio01_mean");
-                    # for single-band just "{dataset}_{reducer}". dict.fromkeys preserves insertion order.
-                    stat_keys = dict.fromkeys(key for stats, _ in stats_results for key in stats)
-                    for stat_key in stat_keys:
-                        col = f"{dataset}_{stat_key}_{window_size}m"
-                        df_copy[col] = [stats.get(stat_key) for stats, _ in stats_results]
-
-                    meta_list = [meta for _, meta in stats_results]
-
-                else:
-                    # ----- Python-side stats (local raster path) -----
-                    vals_list: List[np.ndarray] = []
-                    meta_list: List[Dict[str, Any]] = []
-
-                    results = [
-                        adapter.fetch_values(lat, lon, window_size, return_meta=True)
-                        for lat, lon in zip(df_copy.lat, df_copy.lon)
-                    ]
-
-                    for arr, meta in results:
-                        arr = np.asarray(arr) if not isinstance(arr, np.ndarray) else arr
-                        vals_list.append(arr)
-                        meta_list.append(meta)
-
-                    # Apply Python reducers
-                    # Multi-band local: vals are shape (n_bands, n_pixels); reduce per band.
-                    is_multiband_local = vals_list and vals_list[0].ndim == 2
-                    band_nums = adapter.band if is_multiband_local else None
-
-                    default = "point" if data_type == "categorical" else "mean"
-                    reducer_names_iter = (
-                        list(stats) if stats else [dataset_cfg.get("default_reducer", default)]
-                    )
-                    for rname in reducer_names_iter:
-                        reducer = get_reducer(rname)
-                        if is_multiband_local:
-                            for b_idx, band_num in enumerate(band_nums):
-                                col = f"{dataset}_b{band_num}_{rname}_{window_size}m"
-                                df_copy[col] = [
-                                    (reducer(v[b_idx]) if v.size else None) for v in vals_list
-                                ]
-                        else:
-                            col = f"{dataset}_{rname}_{window_size}m"
-                            df_copy[col] = [(reducer(v) if v.size else None) for v in vals_list]
-
-                # --- QA columns (also window_size-suffixed) ---
-                qc_df = compute_qc_flags(meta_list, min_coverage_pct=min_coverage)
-                qc_df = qc_df.add_prefix(f"{dataset}_").add_suffix(f"_{window_size}m")
-                extra_dfs = []
-                date_df = extract_date_columns(meta_list)
-                if not date_df.empty:
-                    extra_dfs.append(
-                        date_df.add_prefix(f"{dataset}_").add_suffix(f"_{window_size}m")
-                    )
-                    date_backlog[dataset] = summarize_date_info(meta_list)
-                crs_df = extract_crs_column(meta_list)
-                if not crs_df.empty:
-                    extra_dfs.append(
-                        crs_df.add_prefix(f"{dataset}_").add_suffix(f"_{window_size}m")
-                    )
-                if extra_dfs:
-                    qc_df = pd.concat(
-                        [qc_df.reset_index(drop=True)]
-                        + [d.reset_index(drop=True) for d in extra_dfs],
-                        axis=1,
-                    )
-                df_copy = pd.concat(
-                    [df_copy.reset_index(drop=True), qc_df.reset_index(drop=True)],
-                    axis=1,
-                )
-
-                # --- coverage summary for metadata ---
-                cov = qc_df[f"{dataset}_coverage_pct_{window_size}m"].fillna(0)
-                coverage_backlog[dataset][str(window_size)] = {
-                    "n_zero": int((cov == 0).sum()),
-                    "n_partial": int(((cov > 0) & (cov < 100)).sum()),
-                    "n_full": int((cov == 100).sum()),
-                    "total": int(cov.shape[0]),
-                }
-
-            # Build dataset metadata after fetching so band_names are cached
-            dataset_metas[dataset] = build_dataset_meta(dataset_cfg, adapter)
-
-        # --- after all datasets processed ---
-        if output_type == "tabular":
-            core_cols = [c for c in ("id", "lat", "lon", "date") if c in df_copy.columns]
-
-            qc_keywordataset = (
-                "_in_extent_",
-                "_n_pixels_",
-                "_had_nodata_",
-                "_coverage_pct_",
-                "_image_date_used_",
-                "_date_clamped_",
-                "_date_source_",
-                "_region_crs_",
-            )
-            qc_cols = [c for c in df_copy.columns if any(kw in c for kw in qc_keywordataset)]
-            stats_cols = [c for c in df_copy.columns if c not in qc_cols]
-
-            stats_df = df_copy[core_cols + [c for c in stats_cols if c not in core_cols]].copy()
-            qc_df = df_copy[core_cols + [c for c in qc_cols if c not in core_cols]].copy()
-
-            output_cfg_om = OutputManager(out_dir, fmt=output_format)
-            stats_path = output_cfg_om.write_tabular(stats_df, run_id)
-            qc_path = output_cfg_om.write_tabular(qc_df, f"{run_id}_qc")
-
-            write_metadata(
-                out_dir,
-                run_id,
-                output_type=output_type,
-                n_points=len(df_copy),
-                datasets=dataset_metas,
-                config={
-                    "statistics": stats,
-                    "window_size_m": window_size,
-                    "min_coverage_pct": min_coverage,
-                },
-                quality=coverage_backlog,
-                date_info=date_backlog if date_backlog else None,
-                warnings=warnings_backlog if warnings_backlog else None,
-            )
-
-            output_paths[run_id] = stats_path
-            output_paths[f"{run_id}_qc"] = qc_path
-
-        elif output_type == "raster":
-            write_metadata(
-                Path(out_dir) / run_id,
-                run_id,
-                output_type=output_type,
-                n_points=len(df_copy),
-                datasets=dataset_metas,
-                config={
-                    "window_size_m": window_size,
-                    **({"resample_m": resample_m} if resample_m else {}),
-                },
-                quality=coverage_backlog if coverage_backlog else None,
-                date_info=date_backlog if date_backlog else None,
-                warnings=warnings_backlog if warnings_backlog else None,
-            )
-
-    return output_paths
+    return df, crs_warnings

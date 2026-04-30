@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Sequence
 
 
@@ -48,83 +48,6 @@ def build_tile_crs_zones(lats: Sequence[float], lons: Sequence[float]) -> list[s
     return sorted(zones)
 
 
-def build_dataset_meta(
-    spec: dict,
-    adapter,
-    tile_crs_zones: list[str] | None = None,
-) -> dict:
-    """Build per-dataset metadata from catalog spec and adapter state."""
-    meta = {
-        "source": spec.get("source"),
-        "path": spec.get("path"),
-    }
-    if spec.get("data_type"):
-        meta["data_type"] = spec["data_type"]
-
-    # Asset type
-    if spec.get("source") == "earth_engine":
-        dataset_spec = getattr(adapter, "_dataset_spec", {})
-        if "collection" in dataset_spec:
-            meta["asset_type"] = "IMAGE_COLLECTION"
-        else:
-            meta["asset_type"] = "IMAGE"
-    else:
-        meta["asset_type"] = "local_raster"
-
-    # Native CRS
-    if hasattr(adapter, "raster_crs"):
-        meta["native_crs"] = str(adapter.raster_crs)
-    elif hasattr(adapter, "crs"):
-        meta["native_crs"] = str(adapter.crs)
-
-    # Native spatial resolution
-    # Priority: local file → user-specified scale → GEE cached proj (one .getInfo() call)
-    res = None
-    if hasattr(adapter, "src") and hasattr(adapter.src, "res"):
-        res = float(adapter.src.res[0])
-    elif hasattr(adapter, "scale") and adapter.scale is not None:
-        res = float(adapter.scale)
-    elif hasattr(adapter, "_native_proj") and adapter._native_proj is not None:
-        try:
-            res = float(adapter._native_proj.nominalScale().getInfo())
-        except Exception:
-            pass
-    if res is not None:
-        meta["native_spatial_resolution_m"] = round(res, 2)
-
-    # Band names — available once _get_band_name has been called (after first fetch)
-    band_names = getattr(adapter, "_cached_band_names", None)
-    if band_names:
-        meta["band_names"] = band_names
-
-    # Tile CRS — how raster tiles are projected when exported
-    if spec.get("source") == "earth_engine":
-        if tile_crs_zones:
-            meta["tile_crs"] = tile_crs_zones
-    elif hasattr(adapter, "raster_crs"):
-        meta["tile_crs"] = str(adapter.raster_crs)
-
-    # Collection date range and date selection info
-    timestamps = getattr(adapter, "_collection_timestamps", None)
-    if timestamps is not None and len(timestamps) > 0:
-        meta["collection_date_range"] = [
-            timestamps.min().strftime("%Y-%m-%d"),
-            timestamps.max().strftime("%Y-%m-%d"),
-        ]
-    date_source = getattr(adapter, "_date_source", None)
-    if date_source:
-        meta["date_source"] = date_source
-    image_date_used = getattr(adapter, "_image_date_used", None)
-    if image_date_used is not None:
-        meta["image_date_used"] = image_date_used.strftime("%Y-%m-%d")
-
-    dataset_info = spec.get("dataset_information")
-    if dataset_info:
-        meta["dataset_information"] = dataset_info
-
-    return meta
-
-
 def write_metadata(
     out_dir: str | Path,
     group_name: str,
@@ -133,8 +56,6 @@ def write_metadata(
     n_points: int,
     datasets: dict,
     config: dict,
-    quality: dict | None = None,
-    date_info: dict | None = None,
     warnings: dict | None = None,
 ) -> Path:
     """Write a sidecar metadata JSON for a group output.
@@ -142,31 +63,30 @@ def write_metadata(
     Structure:
       run       — when and how (auto-generated)
       config    — what the user requested
-      datasets  — per-dataset source details
-      quality   — per-dataset coverage summary (tabular only)
-      date_info — per-dataset date selection summary (GEE collections only)
+      datasets  — per-dataset source details, including nested quality and
+                  date_info where applicable (built by each adapter)
       warnings  — per-dataset warnings raised during the run (e.g. wrong reducer for data type)
     """
     from . import __version__
 
+    # Use the system's local time with its UTC offset attached
+    # (e.g. "2026-04-28T14:30:00+02:00"). astimezone() with no argument
+    # tags the local datetime with the OS-configured timezone, so the
+    # timestamp is unambiguous and correct for whoever runs the package.
+    local_timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+
     meta = {
         "run": {
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "timestamp": local_timestamp,
             "package_version": __version__,
             "n_points": n_points,
         },
         "config": {
-            "run_id": group_name,
+            "batch_id": group_name,
             **config,
         },
         "datasets": datasets,
     }
-
-    if quality:
-        meta["quality"] = quality
-
-    if date_info:
-        meta["date_info"] = date_info
 
     if warnings:
         meta["warnings"] = warnings
