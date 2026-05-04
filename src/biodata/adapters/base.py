@@ -15,6 +15,7 @@ class BaseAdapter:
         reducer_names: Sequence[str],
         *,
         dates: Sequence | None = None,
+        progress_desc: str | None = None,
     ) -> List[tuple[dict, dict]]:
         raise NotImplementedError
 
