@@ -7,16 +7,16 @@ datasets:
     data_source: earth_engine
     path: path/to/dataset_on_earth_engine   # GEE asset ID; type (IMAGE / IMAGE_COLLECTION) is auto-detected
     data_type: type                 # "continuous" or "categorical"
-    native_scale_m: 10              # native spatial resolution in meters (only for datasets that lacks a native scale property in GEE metadata)
 
     # Band selection - if omitted, all bands are loaded
     bands: [list, of, bands]                 # single string ("DEM") or list (["B4", "B8"])
     derived_bands: [slope, aspect]           # compute and include derived bands (currently supported: slope, aspect — DEM-style datasets)
 
-    dataset_spec: # dataset-specific pre-processing and feature engineering options
-      # This example is for Sentinel-2 Level-2A, but other datasets may have different options.
-      cloud_pct_max: 20                     # pre-filter: keep images with < 20 % cloud cover
-      cloud_mask: s2                        # pixel-level mask using QA60 band
+    dataset_spec:
+      # Dataset-specific options
+      native_scale_m: 10            # native spatial resolution in meters (only needed for datasets that lack a native scale property in GEE metadata, e.g. composites stored in EPSG:4326)
+      use_utm_zone: true # true/false. for tiled collections, filter to the UTM zone of the point to avoid selecting the wrong tile.
+      collection_date_policy: contains # for interval-based collections (e.g. monthly aggregates), use the image whose time range satisfies start <= date < end, instead of nearest start date.
 
     dataset_information:
       # Optional free-form metadata fields, written to metadata JSON.
@@ -62,6 +62,8 @@ datasets:
     data_source: earth_engine
     path: ECMWF/ERA5/MONTHLY
     data_type: continuous
+    dataset_spec:
+      collection_date_policy: contains # for collections with multiple images per date, e.g. monthly aggregates, use the image that contains the date rather than the one closest to it.
     dataset_information:
       description: "ERA5 monthly aggregates - global climate reanalysis from ECMWF covering 1979–present, ~27.8km resolution."
       ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/ECMWF_ERA5_MONTHLY"
@@ -73,6 +75,9 @@ datasets:
     data_source: earth_engine
     path: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
     data_type: continuous
+    dataset_spec:
+      use_utm_zone: true # Some tiled collections need UTM-zone filtering to avoid selecting the wrong tile for a point.
+      collection_date_policy: contains
     dataset_information:
       description: "Google Satellite Embeddings V1 - annual 64-dimensional embeddings for 2017-2025, 10m resolution."
       ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/GOOGLE_SATELLITE_EMBEDDING_V1_ANNUAL"
@@ -128,7 +133,9 @@ datasets:
     data_source: earth_engine
     path: LANDSAT/COMPOSITES/C02/T1_L2_ANNUAL_NDVI
     data_type: continuous
-    native_scale_m: 30
+    dataset_spec:
+      native_scale_m: 30
+      collection_date_policy: contains
     dataset_information:
       description: "Landsat Annual NDVI - global annual composites of NDVI from 1984-present, 30m resolution."
       ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/LANDSAT_COMPOSITES_C02_T1_L2_ANNUAL_NDVI"
