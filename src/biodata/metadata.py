@@ -22,15 +22,28 @@ def summarize_date_info(meta_list: list[dict]) -> dict | None:
     Returns None when the meta dicts contain no date info (e.g. local rasters
     or IMAGE assets where date selection does not apply).
     """
-    if not meta_list or "image_date_used" not in meta_list[0]:
+    if not meta_list or "image_time_start" not in meta_list[0]:
         return None
     sources = [m.get("date_source", "") for m in meta_list]
-    dates_used = sorted({m["image_date_used"] for m in meta_list if m.get("image_date_used")})
+
+    # Collect unique [start, end] pairs actually used, sorted by start date.
+    # When image_time_end is absent (e.g. no system:time_end on the asset),
+    # record the range as [start, start] so the field stays a consistent list
+    # of two-element lists.
+    seen: dict[tuple, None] = {}
+    for m in meta_list:
+        start = m.get("image_time_start")
+        if start is None:
+            continue
+        end = m.get("image_time_end", start)
+        seen[(start, end)] = None
+    ranges_used = [[start, end] for start, end in sorted(seen)]
+
     return {
         "n_nearest_to_sample": sum(1 for s in sources if s == "nearest_to_sample"),
         "n_clamped_to_nearest": sum(1 for s in sources if s == "clamped_to_nearest"),
         "n_most_recent_no_date": sum(1 for s in sources if s == "most_recent_no_date"),
-        "image_dates_used": dates_used,
+        "image_date_ranges_used": ranges_used,
     }
 
 

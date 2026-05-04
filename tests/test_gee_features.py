@@ -117,6 +117,10 @@ class TestStaticDatasets:
                 "sat_emb": {
                     "data_source": "earth_engine",
                     "path": "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL",
+                    "dataset_spec": {
+                        "use_utm_zone": True,
+                        "collection_date_policy": "contains",
+                    },
                 }
             }
         }

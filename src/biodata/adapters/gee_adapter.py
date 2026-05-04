@@ -84,22 +84,76 @@ def _snap_to_grid(coord: float, scale: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _get_collection_timestamps(collection_id: str) -> pd.DatetimeIndex | None:
-    """Fetch all image timestamps from a GEE ImageCollection.
+def _get_collection_time_bounds(
+    collection_id: str,
+) -> tuple[pd.DatetimeIndex | None, pd.DatetimeIndex | None]:
+    """Fetch start/end timestamps for a GEE ImageCollection.
 
-    Returns a sorted DatetimeIndex or None if unavailable / fetch fails.
-    One getInfo() call, done once per dataset during __post_init__.
+    Returns (start_times, end_times) as sorted DatetimeIndex objects.
+    Returns (start_times, None) when end times are unavailable (e.g. user-uploaded
+    assets that omit system:time_end). Returns (None, None) only on total failure.
+    One getInfo() round-trip, done once per dataset during __post_init__.
     """
     try:
         col = ee.ImageCollection(collection_id)
-        timestamps = col.aggregate_array("system:time_start").getInfo()
-        clean_ts = [int(t) for t in timestamps if t is not None]
-        if not clean_ts:
-            return None
-        return pd.to_datetime(clean_ts, unit="ms", origin="unix").sort_values()
+        # Fetch both arrays in a single round-trip by wrapping in ee.Dictionary.
+        raw = ee.Dictionary(
+            {
+                "starts": col.aggregate_array("system:time_start"),
+                "ends": col.aggregate_array("system:time_end"),
+            }
+        ).getInfo()
+        start_times = raw["starts"]
+        end_times = raw["ends"]
+
+        # Build start-only index first — this is always needed.
+        clean_starts = [int(t) for t in start_times if t is not None]
+        if not clean_starts:
+            return None, None
+        start_series = (
+            pd.to_datetime(pd.Series(clean_starts), unit="ms", origin="unix")
+            .drop_duplicates()
+            .sort_values()
+        )
+        start_index = pd.DatetimeIndex(start_series)
+
+        # Build paired (start, end) index only when end times are all present.
+        clean_ends = [t for t in end_times if t is not None]
+        if len(clean_ends) != len(clean_starts):
+            # Some or all images lack system:time_end — return starts only.
+            logger.debug(
+                "system:time_end missing for some images in %s; interval-based "
+                "date selection will fall back to next-start boundaries.",
+                collection_id,
+            )
+            return start_index, None
+
+        # Keep only paired start/end values so the two indices stay aligned.
+        paired_times = sorted(zip(clean_starts, [int(e) for e in clean_ends]))
+        bounds_df = pd.DataFrame(paired_times, columns=["start", "end"])
+        # De-duplicate exact intervals, then sort by start for searchsorted.
+        bounds_df = bounds_df.drop_duplicates().sort_values("start")
+        end_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["end"], unit="ms", origin="unix"))
+        start_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["start"], unit="ms", origin="unix"))
+        return start_index, end_index
     except Exception as e:
         logger.warning("Failed to fetch timestamps for %s: %s", collection_id, e)
+        return None, None
+
+
+def _get_collection_timestamps(collection_id: str) -> pd.DatetimeIndex | None:
+    """Fetch all image start timestamps from a GEE ImageCollection.
+
+    Thin wrapper around _get_collection_time_bounds — reuses the same single
+    getInfo() round-trip and discards the end-time result.
+    Returns a sorted, deduplicated DatetimeIndex or None on failure.
+    """
+    start_times, _ = _get_collection_time_bounds(collection_id)
+    if start_times is None:
         return None
+    # Drop duplicates to keep the DatetimeIndex unique; get_indexer()
+    # with method="nearest" raises when the index has duplicates.
+    return pd.DatetimeIndex(start_times.unique()).sort_values()
 
 
 def _find_nearest_timestamp(
@@ -177,11 +231,75 @@ def _apply_derived_bands(img, derived):
     return img
 
 
+def _get_utm_zone_label(lon: float, lat: float) -> str:
+    """Return the UTM zone label like "33N" or "34S" for a lon/lat point."""
+    zone_number = int((lon + 180) / 6) + 1
+    hemisphere = "N" if lat >= 0 else "S"
+    return f"{zone_number}{hemisphere}"
+
+
+def _resolve_date_filter_range(
+    date_ts: pd.Timestamp,
+    policy: str,
+    timestamps: pd.DatetimeIndex | None = None,
+    time_ends: pd.DatetimeIndex | None = None,
+) -> tuple[str, str]:
+    """Return (start, end) date strings for col.filterDate().
+
+    When cached timestamps are available, uses them to pin the exact image
+    interval. When not (server-side fallback), broadens the window by ±1 day
+    so GEE can find the image without a client-side index.
+
+    policy="contains" selects the image whose interval contains date_ts.
+    policy="nearest"  selects the image with the closest start timestamp.
+    """
+    fmt = "%Y-%m-%d"
+
+    if timestamps is None:
+        # No cached index — let GEE resolve server-side with a wider window.
+        if policy == "contains":
+            return date_ts.strftime(fmt), (date_ts + pd.DateOffset(days=1)).strftime(fmt)
+        else:
+            return (date_ts - pd.DateOffset(days=1)).strftime(fmt), (
+                date_ts + pd.DateOffset(days=1)
+            ).strftime(fmt)
+
+    if policy == "nearest":
+        nearest, _ = _find_nearest_timestamp(timestamps, date_ts)
+        return nearest.strftime(fmt), (nearest + pd.DateOffset(days=1)).strftime(fmt)
+
+    # policy == "contains": find the image interval that contains date_ts.
+    # Clamp to collection boundaries when date_ts is out of range.
+    if date_ts <= timestamps.min():
+        idx = 0
+    elif date_ts >= timestamps.max():
+        idx = len(timestamps) - 1
+    else:
+        idx = int(timestamps.searchsorted(date_ts, side="right") - 1)
+        idx = max(0, min(idx, len(timestamps) - 1))
+
+    selected = timestamps[idx]
+
+    # Use true interval end when available, otherwise fall back to next start.
+    if time_ends is not None and len(time_ends) == len(timestamps):
+        next_dt = time_ends[idx]
+    elif idx + 1 < len(timestamps):
+        next_dt = timestamps[idx + 1]
+    else:
+        next_dt = selected + pd.DateOffset(days=1)
+
+    return selected.strftime(fmt), next_dt.strftime(fmt)
+
+
 def _build_image(
     dataset_spec: dict,
     date=None,
     geometry=None,
     collection_timestamps: pd.DatetimeIndex | None = None,
+    collection_time_ends: pd.DatetimeIndex | None = None,
+    *,
+    lat: float | None = None,
+    lon: float | None = None,
 ):
     """Build an ee.Image from a dataset_spec config dict.
 
@@ -201,8 +319,9 @@ def _build_image(
         ``filterBounds``.  Essential for large tiled collections
         (e.g. satellite embeddings with 97k global tiles).
     collection_timestamps : pd.DatetimeIndex, optional
-        Cached timestamps for the collection. Used to find the nearest
-        image to the sample date.
+        Cached start timestamps for the collection.
+    collection_time_ends : pd.DatetimeIndex, optional
+        Cached end timestamps for the collection (aligned with start times).
     """
     img = None
 
@@ -215,6 +334,12 @@ def _build_image(
         if geometry is not None:
             col = col.filterBounds(geometry)
 
+        # Some tiled collections (e.g. satellite embeddings) need UTM-zone
+        # filtering to avoid selecting the wrong tile for a point.
+        if dataset_spec.get("use_utm_zone") and lat is not None and lon is not None:
+            utm_zone = _get_utm_zone_label(lon, lat)
+            col = col.filter(ee.Filter.eq("UTM_ZONE", utm_zone))
+
         cloud_pct = dataset_spec.get("cloud_pct_max")
         if cloud_pct is not None:
             col = col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_pct))
@@ -224,16 +349,15 @@ def _build_image(
             col = _apply_cloud_mask(col, cloud_mask)
 
         # --- Date-based image selection ---
-        if date is not None and collection_timestamps is not None:
-            nearest, _ = _find_nearest_timestamp(collection_timestamps, date)
-            start = nearest.strftime("%Y-%m-%d")
-            end = (nearest + pd.DateOffset(days=1)).strftime("%Y-%m-%d")
-            col = col.filterDate(start, end)
-            img = col.first()
-        elif date is not None:
-            # Fallback: no cached timestamps, use server-side filtering
-            start = (date - pd.DateOffset(days=1)).strftime("%Y-%m-%d")
-            end = (date + pd.DateOffset(days=1)).strftime("%Y-%m-%d")
+        date_policy = str(dataset_spec.get("collection_date_policy", "nearest")).lower()
+        if date is not None:
+            date_ts = pd.to_datetime(date)
+            start, end = _resolve_date_filter_range(
+                date_ts,
+                date_policy,
+                timestamps=collection_timestamps,
+                time_ends=collection_time_ends,
+            )
             col = col.filterDate(start, end)
             img = col.first()
         else:
@@ -521,12 +645,12 @@ class GeeRasterAdapter:
             dataset_spec["derived_bands"] = self.spec["derived_bands"]
 
         # Native scale resolution priority:
-        #   1. catalog override `native_scale_m` (set explicitly when GEE
-        #      auto-detection is unreliable, e.g. for composite collections
+        #   1. catalog override `native_scale_m` under dataset_spec (set explicitly
+        #      when GEE auto-detection is unreliable, e.g. for composite collections
         #      stored in EPSG:4326)
         #   2. None → fall back to GEE's projection().nominalScale() at
         #      query time (see _get_scale / _get_scale_value)
-        self.scale = self.spec.get("native_scale_m")
+        self.scale = dataset_spec.get("native_scale_m")
         self.crs = self.spec.get("crs", "EPSG:4326")
         self.max_workers = self.spec.get("max_workers", load_defaults()["max_workers"])
         self._dataset_spec = dataset_spec
@@ -543,6 +667,7 @@ class GeeRasterAdapter:
 
         is_collection = "collection" in dataset_spec
         self._collection_timestamps = None
+        self._collection_time_ends = None
 
         # Cache the native projection from the source — composite images
         # (mosaic, mean, etc.) lose per-band projection info, so we grab it
@@ -551,8 +676,10 @@ class GeeRasterAdapter:
             self._native_proj = (
                 ee.ImageCollection(dataset_spec["collection"]).first().select(0).projection()
             )
-            # Fetch available timestamps for automatic date selection
-            self._collection_timestamps = _get_collection_timestamps(dataset_spec["collection"])
+            # Fetch available timestamps for automatic date selection.
+            start_times, end_times = _get_collection_time_bounds(dataset_spec["collection"])
+            self._collection_timestamps = start_times
+            self._collection_time_ends = end_times
             # Collections with timestamps use per-point date selection;
             # the static image is built lazily in _get_image when no date
             # is provided (most-recent fallback).
@@ -609,7 +736,7 @@ class GeeRasterAdapter:
                 f"Dataset '{asset_id}': GEE returned the EPSG:4326 default scale "
                 f"(~{native_scale:.0f} m), which means the asset's native projection "
                 f"metadata is unavailable. Add `native_scale_m: <true_resolution>` "
-                f"to the catalog entry to fix this "
+                f"under `dataset_spec` in the catalog entry to fix this "
                 f"(e.g. `native_scale_m: 30` for Landsat composites)."
             )
 
@@ -624,8 +751,8 @@ class GeeRasterAdapter:
     def _resolve_date_info(self, date=None) -> dict:
         """Compute date metadata for a single point fetch.
 
-        Returns a dict with image_date_used, date_clamped, date_source
-        to be merged into the per-point meta dict.
+        Returns a dict with image_time_start, image_time_end, date_clamped,
+        date_source to be merged into the per-point meta dict.
         """
         if self._collection_timestamps is None:
             return {}
@@ -633,18 +760,69 @@ class GeeRasterAdapter:
         if date is None:
             # No-date fallback: most recent image
             most_recent = self._collection_timestamps.max()
+            end_times = self._collection_time_ends
+            end_time = None
+            if end_times is not None and len(end_times) == len(self._collection_timestamps):
+                end_time = end_times[-1]
             return {
-                "image_date_used": most_recent.strftime("%Y-%m-%d"),
                 "date_clamped": False,
                 "date_source": "most_recent_no_date",
+                "image_time_start": most_recent.strftime("%Y-%m-%d"),
+                **({"image_time_end": end_time.strftime("%Y-%m-%d")} if end_time else {}),
             }
 
         dt = pd.to_datetime(date)
-        nearest, was_clamped = _find_nearest_timestamp(self._collection_timestamps, dt)
+        policy = str(self._dataset_spec.get("collection_date_policy", "nearest")).lower()
+        timestamps = self._collection_timestamps
+
+        if policy == "contains":
+            if dt <= timestamps.min():
+                nearest = timestamps.min()
+                end_time = None
+                if self._collection_time_ends is not None:
+                    end_time = self._collection_time_ends[0]
+                return {
+                    "date_clamped": True,
+                    "date_source": "clamped_to_nearest",
+                    "image_time_start": nearest.strftime("%Y-%m-%d"),
+                    **({"image_time_end": end_time.strftime("%Y-%m-%d")} if end_time else {}),
+                }
+            if dt >= timestamps.max():
+                nearest = timestamps.max()
+                end_time = None
+                if self._collection_time_ends is not None:
+                    end_time = self._collection_time_ends[-1]
+                return {
+                    "date_clamped": True,
+                    "date_source": "clamped_to_nearest",
+                    "image_time_start": nearest.strftime("%Y-%m-%d"),
+                    **({"image_time_end": end_time.strftime("%Y-%m-%d")} if end_time else {}),
+                }
+
+            idx = int(timestamps.searchsorted(dt, side="right") - 1)
+            idx = max(0, min(idx, len(timestamps) - 1))
+            selected = timestamps[idx]
+            end_time = None
+            if self._collection_time_ends is not None and len(self._collection_time_ends) > idx:
+                end_time = self._collection_time_ends[idx]
+            return {
+                "date_clamped": False,
+                "date_source": "contains_sample_date",
+                "image_time_start": selected.strftime("%Y-%m-%d"),
+                **({"image_time_end": end_time.strftime("%Y-%m-%d")} if end_time else {}),
+            }
+
+        nearest, was_clamped = _find_nearest_timestamp(timestamps, dt)
+        end_time = None
+        if self._collection_time_ends is not None:
+            idx = int(timestamps.get_indexer([nearest])[0])
+            if 0 <= idx < len(self._collection_time_ends):
+                end_time = self._collection_time_ends[idx]
         return {
-            "image_date_used": nearest.strftime("%Y-%m-%d"),
             "date_clamped": was_clamped,
             "date_source": "clamped_to_nearest" if was_clamped else "nearest_to_sample",
+            "image_time_start": nearest.strftime("%Y-%m-%d"),
+            **({"image_time_end": end_time.strftime("%Y-%m-%d")} if end_time else {}),
         }
 
     def _get_image(self, date=None, lat=None, lon=None) -> ee.Image:
@@ -674,6 +852,9 @@ class GeeRasterAdapter:
                 date=target_date,
                 geometry=geom,
                 collection_timestamps=self._collection_timestamps,
+                collection_time_ends=self._collection_time_ends,
+                lat=lat,
+                lon=lon,
             )
 
         # IMAGE assets or already-cached no-coords fallback.
@@ -694,6 +875,7 @@ class GeeRasterAdapter:
                 self._dataset_spec,
                 date=most_recent,
                 collection_timestamps=self._collection_timestamps,
+                collection_time_ends=self._collection_time_ends,
             )
             self._date_source = "most_recent_no_date"
             self._image_date_used = most_recent
@@ -709,6 +891,9 @@ class GeeRasterAdapter:
             dt,
             geometry=geom,
             collection_timestamps=self._collection_timestamps,
+            collection_time_ends=self._collection_time_ends,
+            lat=lat,
+            lon=lon,
         )
 
     def _get_band_name(self, img: ee.Image) -> str:
@@ -1347,8 +1532,14 @@ class GeeRasterAdapter:
         # Native CRS (set in __post_init__).
         meta["native_crs"] = str(self.crs)
 
-        # Native spatial resolution — one .getInfo() call on the cached projection.
-        if self._native_proj is not None:
+        # Native spatial resolution — prefer the catalog override when set
+        # (GEE's nominalScale() returns the projection unit size, which is
+        # misleading for datasets stored in geographic CRS, e.g. ~111km for
+        # EPSG:4326 even when the true resolution is 30 m).
+        catalog_scale = spec.get("dataset_spec", {}).get("native_scale_m")
+        if catalog_scale is not None:
+            meta["native_spatial_resolution_m"] = float(catalog_scale)
+        elif self._native_proj is not None:
             try:
                 meta["native_spatial_resolution_m"] = round(
                     float(self._native_proj.nominalScale().getInfo()), 2
@@ -1375,14 +1566,6 @@ class GeeRasterAdapter:
                 timestamps.min().strftime("%Y-%m-%d"),
                 timestamps.max().strftime("%Y-%m-%d"),
             ]
-
-        # Date-selection info for the single-image composite path.
-        date_source = getattr(self, "_date_source", None)
-        if date_source:
-            meta["date_source"] = date_source
-        image_date_used = getattr(self, "_image_date_used", None)
-        if image_date_used is not None:
-            meta["image_date_used"] = image_date_used.strftime("%Y-%m-%d")
 
         # Pass-through catalog field for dataset description.
         dataset_info = spec.get("dataset_information")
