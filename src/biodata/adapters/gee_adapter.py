@@ -146,6 +146,14 @@ def _apply_cloud_mask(col, mask_type: str):
     return col.map(fn)
 
 
+# Names that are recognised as *derived* bands. When the user passes a unified
+# bands list at the call site (via extract()), names appearing in this set are
+# split out and forwarded to the adapter as `derived_bands` rather than `bands`.
+# Keep this in sync with the if/elif dispatch inside `_apply_derived_bands`
+# below — adding a new derived-band name requires updating both places.
+KNOWN_DERIVED_BANDS = frozenset({"slope", "aspect"})
+
+
 def _apply_derived_bands(img, derived):
     """Compute derived bands and add them alongside the existing bands of `img`.
 
@@ -980,7 +988,15 @@ class GeeRasterAdapter:
         if combined_reducer is not None:
             # Window branch: user reducers + count for QC. The combined reducer
             # produces `{band}{suffix}` keys including a `{band}_count` entry.
-            full_reducer = combined_reducer.combine(reducer2=ee.Reducer.count(), sharedInputs=True)
+            # Skip adding the QC count when the user already requested "count"
+            # — combining a second count reducer with the same output name
+            # causes GEE to raise "Duplicate output name: 'count'".
+            if "count" not in reducer_names:
+                full_reducer = combined_reducer.combine(
+                    reducer2=ee.Reducer.count(), sharedInputs=True
+                )
+            else:
+                full_reducer = combined_reducer
             branches["window"] = img_to_reduce.reduceRegion(
                 reducer=full_reducer,
                 geometry=region,
