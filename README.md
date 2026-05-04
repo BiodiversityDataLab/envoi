@@ -76,6 +76,47 @@ outputs = extract(df, {"batch_id": "terrain", "datasets": ["my_dem"], ...})
 
 See `examples/run.yml` for an example catalog YAML structure.
 
+## Mixing categorical and continuous datasets
+
+When a run includes both continuous (e.g. elevation, climate) and categorical (e.g. land cover) datasets, use a typed dict for `statistics` to assign the right reducers to each type:
+
+```python
+outputs = extract(df, {
+    "batch_id": "mixed",
+    "datasets": ["dem_glo30", "lulc_esa_worldcover_2021"],
+    "settings": {
+        "output_type": "tabular",
+        "statistics": {
+            "continuous":  ["mean", "std", "q10", "q90"],
+            "categorical": ["mode", "count"],
+        },
+        "window_size_m": 200,
+    },
+})
+```
+
+Each dataset's `data_type` field in the catalog controls which list is used. A reducer that makes sense for both types (e.g. `mode`) can appear in both lists. Datasets without a `data_type` default to `continuous`. A flat list (the existing form) still works and applies to all datasets — no changes needed for single-type runs.
+
+## Selecting bands per call
+
+The catalog defines each dataset's default bands. To override them for a single `extract()` call without re-registering the catalog, replace a string entry in `datasets` with a single-key dict whose value is the unified band list:
+
+```python
+outputs = extract(df, {
+    "batch_id": "satellite",
+    "datasets": [
+        "dem_glo30",                           # catalog defaults
+        {"sentinel2": ["B4", "B8"]},           # narrow bands for this run only
+        {"dem_aster": ["DEM", "slope"]},       # mix source + derived names
+    ],
+    "settings": {"output_type": "tabular", "statistics": ["mean"], "window_size_m": 200},
+})
+```
+
+Names recognised as derived bands (currently `slope` and `aspect`, computed from the dataset's first band) are split out automatically — you don't need a separate key for them. Derived bands are only supported for Earth Engine datasets; supplying one for a local raster raises a `ValueError`.
+
+A one-element list (`{"sentinel2": ["B4"]}`) keeps the multi-band column naming (`sentinel2_B4_mean_<window>m`); use the catalog if you want the bare single-band form (`sentinel2_mean_<window>m`).
+
 ## Output kinds
 
 ### Tabular (`output_type: "tabular"`)
