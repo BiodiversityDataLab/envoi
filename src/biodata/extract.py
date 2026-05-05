@@ -378,12 +378,15 @@ def _process_dataset_tabular(
 
     # Ask the adapter to compute all requested statistics for every sample.
     # Returns a list of (stats_dict, meta_dict) — one tuple per row in df.
+    # progress_desc is shown in the per-point tqdm bar so the user can tell at
+    # a glance which dataset/window the bar belongs to when several run in series.
     stats_results = adapter.fetch_stats_batch(
         df.lat,
         df.lon,
         window_size,
         resolved_stats,
         dates=dates,
+        progress_desc=f"{dataset} | {window_size}m | tabular",
     )
 
     # Append stat columns to the output DataFrame based on the keys in
@@ -453,6 +456,8 @@ def _process_dataset_raster(
 
     # Ask the adapter to export a tile per sample, writing GeoTIFFs under
     # tiles_root / dataset / ... and returning the paths it wrote.
+    # progress_desc is shown in the per-tile tqdm bar so the user can tell at
+    # a glance which dataset/window the bar belongs to when several run in series.
     exported_paths, meta_list = adapter.export_tiles(
         lats,
         lons,
@@ -463,6 +468,7 @@ def _process_dataset_raster(
         dataset_name=dataset,
         resample_m=run_settings.resample_m,
         filename_suffix=filename_suffix,
+        progress_desc=f"{dataset} | {window_size}m | raster",
     )
 
     # Adapter assembles the full per-dataset metadata dict, including
