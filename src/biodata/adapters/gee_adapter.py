@@ -29,7 +29,7 @@ _gee_initialized = False
 
 
 # ---------------------------------------------------------------------------
-# GEE initialisation
+# GEE initialization
 # ---------------------------------------------------------------------------
 
 
@@ -49,7 +49,7 @@ def _ensure_gee_init():
 
 
 # ---------------------------------------------------------------------------
-# UTM helpers
+# Geometry helpers  (UTM zones, pixel-grid snapping)
 # ---------------------------------------------------------------------------
 
 
@@ -60,6 +60,13 @@ def _get_utm_crs(lon: float, lat: float) -> str:
     zone_number = int((lon + 180) / 6) + 1
     base_epsg = 32600 if lat >= 0 else 32700
     return f"EPSG:{base_epsg + zone_number}"
+
+
+def _get_utm_zone_label(lon: float, lat: float) -> str:
+    """Return the UTM zone label like "33N" or "34S" for a lon/lat point."""
+    zone_number = int((lon + 180) / 6) + 1
+    hemisphere = "N" if lat >= 0 else "S"
+    return f"{zone_number}{hemisphere}"
 
 
 def _snap_to_grid(coord: float, scale: float) -> float:
@@ -75,7 +82,7 @@ def _snap_to_grid(coord: float, scale: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Image building (collection reduction, date filtering, cloud masking, derived bands)
+# Timestamp helpers  (collection time bounds, nearest-image lookup, date filters)
 # ---------------------------------------------------------------------------
 
 
@@ -136,21 +143,6 @@ def _get_collection_time_bounds(
         return None, None
 
 
-def _get_collection_timestamps(collection_id: str) -> pd.DatetimeIndex | None:
-    """Fetch all image start timestamps from a GEE ImageCollection.
-
-    Thin wrapper around _get_collection_time_bounds — reuses the same single
-    getInfo() round-trip and discards the end-time result.
-    Returns a sorted, deduplicated DatetimeIndex or None on failure.
-    """
-    start_times, _ = _get_collection_time_bounds(collection_id)
-    if start_times is None:
-        return None
-    # Drop duplicates to keep the DatetimeIndex unique; get_indexer()
-    # with method="nearest" raises when the index has duplicates.
-    return pd.DatetimeIndex(start_times.unique()).sort_values()
-
-
 def _find_nearest_timestamp(
     timestamps: pd.DatetimeIndex,
     target: pd.Timestamp,
@@ -165,80 +157,6 @@ def _find_nearest_timestamp(
         return timestamps.max(), target > timestamps.max()
     idx = timestamps.get_indexer([target], method="nearest")[0]
     return timestamps[idx], False
-
-
-def _mask_clouds_s2(image):
-    """Mask clouds and cirrus for Sentinel-2 using QA60 band."""
-    qa = image.select("QA60")
-    cloud_mask = qa.bitwiseAnd(1 << 10).eq(0)
-    cirrus_mask = qa.bitwiseAnd(1 << 11).eq(0)
-    mask = cloud_mask.And(cirrus_mask)
-    return (
-        image.updateMask(mask)
-        .divide(10000)
-        .select("B.*")
-        .copyProperties(image, ["system:time_start"])
-    )
-
-
-_CLOUD_MASK_FNS = {
-    "s2": _mask_clouds_s2,
-}
-
-
-def _apply_cloud_mask(col, mask_type: str):
-    """Apply a cloud mask function to a collection, if mask_type is known."""
-    fn = _CLOUD_MASK_FNS.get(mask_type)
-    if fn is None:
-        logger.warning("Unknown cloud_mask type '%s', skipping", mask_type)
-        return col
-    return col.map(fn)
-
-
-# Names that are recognised as *derived* bands. When the user passes a unified
-# bands list at the call site (via extract()), names appearing in this set are
-# split out and forwarded to the adapter as `derived_bands` rather than `bands`.
-# Keep this in sync with the if/elif dispatch inside `_apply_derived_bands`
-# below — adding a new derived-band name requires updating both places.
-KNOWN_DERIVED_BANDS = frozenset({"slope", "aspect"})
-
-
-def _apply_derived_bands(img, derived):
-    """Compute derived bands and add them alongside the existing bands of `img`.
-
-    `derived` may be either a single band name (e.g. "slope") or a list of names
-    (e.g. ["slope", "aspect"]). Each derived band is computed from `img` and
-    added to the output via `addBands()`, so the source bands are preserved.
-
-    Currently supported: "slope", "aspect". Both operate on the first band of
-    the input image (GEE's `ee.Terrain.slope` / `ee.Terrain.aspect` convention),
-    so `img` should be an elevation image (or have elevation as its first band).
-
-    Raises ValueError if an unknown derived band name is given — silent fallback
-    was previously a trap that produced confusing "missing output" bugs.
-    """
-    # Normalize to a list so callers can pass either form.
-    if isinstance(derived, str):
-        derived_names = [derived]
-    else:
-        derived_names = list(derived)
-
-    for name in derived_names:
-        if name == "slope":
-            img = img.addBands(ee.Terrain.slope(img))
-        elif name == "aspect":
-            img = img.addBands(ee.Terrain.aspect(img))
-        else:
-            raise ValueError(f"Unknown derived band '{name}'. Supported: 'slope', 'aspect'.")
-
-    return img
-
-
-def _get_utm_zone_label(lon: float, lat: float) -> str:
-    """Return the UTM zone label like "33N" or "34S" for a lon/lat point."""
-    zone_number = int((lon + 180) / 6) + 1
-    hemisphere = "N" if lat >= 0 else "S"
-    return f"{zone_number}{hemisphere}"
 
 
 def _resolve_date_filter_range(
@@ -294,6 +212,50 @@ def _resolve_date_filter_range(
     return selected.strftime(fmt), next_dt.strftime(fmt)
 
 
+# ---------------------------------------------------------------------------
+# Derived bands  (slope, aspect, …)
+# ---------------------------------------------------------------------------
+
+# Names that are recognised as *derived* bands. When the user passes a unified
+# bands list at the call site (via extract()), names appearing in this set are
+# split out and forwarded to the adapter as `derived_bands` rather than `bands`.
+# Keep this in sync with the if/elif dispatch inside `_apply_derived_bands`
+# below — adding a new derived-band name requires updating both places.
+KNOWN_DERIVED_BANDS = frozenset({"slope", "aspect"})
+
+
+def _apply_derived_bands(img, derived):
+    """Compute derived bands and add them alongside the existing bands of `img`.
+
+    `derived` may be either a single band name (e.g. "slope") or a list of names
+    (e.g. ["slope", "aspect"]). Each derived band is computed from `img` and
+    added to the output via `addBands()`, so the source bands are preserved.
+
+    Raises ValueError if an unknown derived band name is given — silent fallback
+    was previously a trap that produced confusing "missing output" bugs.
+    """
+    # Normalize to a list so callers can pass either form.
+    if isinstance(derived, str):
+        derived_names = [derived]
+    else:
+        derived_names = list(derived)
+
+    for name in derived_names:
+        if name == "slope":
+            img = img.addBands(ee.Terrain.slope(img))
+        elif name == "aspect":
+            img = img.addBands(ee.Terrain.aspect(img))
+        else:
+            raise ValueError(f"Unknown derived band '{name}'. Supported: 'slope', 'aspect'.")
+
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Image building  (load → filter → date select → cloud mask → reduce → bands)
+# ---------------------------------------------------------------------------
+
+
 def _build_image(
     dataset_spec: dict,
     date=None,
@@ -343,14 +305,6 @@ def _build_image(
             utm_zone = _get_utm_zone_label(lon, lat)
             col = col.filter(ee.Filter.eq("UTM_ZONE", utm_zone))
 
-        cloud_pct = dataset_spec.get("cloud_pct_max")
-        if cloud_pct is not None:
-            col = col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_pct))
-
-        cloud_mask = dataset_spec.get("cloud_mask")
-        if cloud_mask:
-            col = _apply_cloud_mask(col, cloud_mask)
-
         # --- Date-based image selection ---
         date_policy = str(dataset_spec.get("collection_date_policy", "nearest")).lower()
         if date is not None:
@@ -397,7 +351,7 @@ def _build_image(
 
 
 # ---------------------------------------------------------------------------
-# EE Reducer helpers  (combined reducer pattern)
+# EE reducer helpers  (combined reducer pattern + result parsing)
 # ---------------------------------------------------------------------------
 
 # Maps EDDP/user-facing reducer names to GEE reducer constructors
@@ -590,16 +544,14 @@ def _extract_count_from_reduce_result(
 class GeeRasterAdapter:
     """Adapter that samples data directly from Google Earth Engine.
 
-    Three extraction modes:
+    Two extraction modes:
 
-    1. **fetch_batch / fetch_values** — raw pixel arrays via ``sampleRectangle``
-       (feeds into Python-side reducers, same as LocalRasterAdapter).
-    2. **fetch_stats_batch** — server-side statistics via ``reduceRegion``
+    1. **fetch_stats_batch** — server-side statistics via ``reduceRegion``
        with combined reducers.  Much faster for the common stats use-case.
        When ``"point"`` is included in the requested reducers, an exact-pixel
        sample at each ``(lat, lon)`` is added as a second server-side branch
        and resolved in the same round-trip.
-    3. **export_tiles** — download full GeoTIFF tiles via ``geemap``.
+    2. **export_tiles** — download full GeoTIFF tiles via ``geemap``.
 
     For ImageCollections, the adapter automatically selects the nearest
     image to each point's date. When no date is provided, the most
@@ -611,12 +563,11 @@ class GeeRasterAdapter:
     _needs_per_point_date: bool = field(default=False, init=False, repr=False)
     _native_proj: Any = field(default=None, init=False, repr=False)
 
-    def __post_init__(self):
-        if ee is None:
-            raise ImportError(
-                "earthengine-api is required for GEE adapter: " "pip install earthengine-api"
-            )
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
 
+    def __post_init__(self):
         _ensure_gee_init()
 
         # dataset_spec holds extra config (bands, date windows, derivatives, etc.)
@@ -657,16 +608,6 @@ class GeeRasterAdapter:
         self.crs = self.spec.get("crs", "EPSG:4326")
         self.max_workers = self.spec.get("max_workers", load_defaults()["max_workers"])
         self._dataset_spec = dataset_spec
-
-        # Warn about removed dataset_spec keys
-        _deprecated = {"temporal_window_days", "start_date", "end_date"}
-        found = _deprecated & set(dataset_spec)
-        if found:
-            logger.warning(
-                "dataset_spec keys %s are deprecated and ignored. "
-                "Date selection is now automatic for ImageCollections.",
-                sorted(found),
-            )
 
         is_collection = "collection" in dataset_spec
         self._collection_timestamps = None
@@ -744,89 +685,8 @@ class GeeRasterAdapter:
             )
 
     # ------------------------------------------------------------------
-    # Internals
+    # Image resolution  (which ee.Image to sample, plus its band/scale)
     # ------------------------------------------------------------------
-
-    def _src_label(self) -> str:
-        cfg = self._dataset_spec
-        return f"gee://{cfg.get('image', cfg.get('collection', 'unknown'))}"
-
-    def _resolve_date_info(self, date=None) -> dict:
-        """Compute date metadata for a single point fetch.
-
-        Returns a dict with image_time_start, image_time_end, date_clamped,
-        date_source to be merged into the per-point meta dict.
-        """
-        if self._collection_timestamps is None:
-            return {}
-
-        if date is None:
-            # No-date fallback: most recent image
-            most_recent = self._collection_timestamps.max()
-            end_times = self._collection_time_ends
-            end_time = None
-            if end_times is not None and len(end_times) == len(self._collection_timestamps):
-                end_time = end_times[-1]
-            return {
-                "date_clamped": False,
-                "date_source": "most_recent_no_date",
-                "image_time_start": most_recent.strftime("%Y-%m-%d"),
-                **({"image_time_end": end_time.strftime("%Y-%m-%d")} if end_time else {}),
-            }
-
-        dt = pd.to_datetime(date)
-        policy = str(self._dataset_spec.get("collection_date_policy", "nearest")).lower()
-        timestamps = self._collection_timestamps
-
-        if policy == "contains":
-            if dt <= timestamps.min():
-                nearest = timestamps.min()
-                end_time = None
-                if self._collection_time_ends is not None:
-                    end_time = self._collection_time_ends[0]
-                return {
-                    "date_clamped": True,
-                    "date_source": "clamped_to_nearest",
-                    "image_time_start": nearest.strftime("%Y-%m-%d"),
-                    **({"image_time_end": end_time.strftime("%Y-%m-%d")} if end_time else {}),
-                }
-            if dt >= timestamps.max():
-                nearest = timestamps.max()
-                end_time = None
-                if self._collection_time_ends is not None:
-                    end_time = self._collection_time_ends[-1]
-                return {
-                    "date_clamped": True,
-                    "date_source": "clamped_to_nearest",
-                    "image_time_start": nearest.strftime("%Y-%m-%d"),
-                    **({"image_time_end": end_time.strftime("%Y-%m-%d")} if end_time else {}),
-                }
-
-            idx = int(timestamps.searchsorted(dt, side="right") - 1)
-            idx = max(0, min(idx, len(timestamps) - 1))
-            selected = timestamps[idx]
-            end_time = None
-            if self._collection_time_ends is not None and len(self._collection_time_ends) > idx:
-                end_time = self._collection_time_ends[idx]
-            return {
-                "date_clamped": False,
-                "date_source": "contains_sample_date",
-                "image_time_start": selected.strftime("%Y-%m-%d"),
-                **({"image_time_end": end_time.strftime("%Y-%m-%d")} if end_time else {}),
-            }
-
-        nearest, was_clamped = _find_nearest_timestamp(timestamps, dt)
-        end_time = None
-        if self._collection_time_ends is not None:
-            idx = int(timestamps.get_indexer([nearest])[0])
-            if 0 <= idx < len(self._collection_time_ends):
-                end_time = self._collection_time_ends[idx]
-        return {
-            "date_clamped": was_clamped,
-            "date_source": "clamped_to_nearest" if was_clamped else "nearest_to_sample",
-            "image_time_start": nearest.strftime("%Y-%m-%d"),
-            **({"image_time_end": end_time.strftime("%Y-%m-%d")} if end_time else {}),
-        }
 
     def _get_image(self, date=None, lat=None, lon=None) -> ee.Image:
         """Return the ee.Image to sample, building per-point if needed.
@@ -950,6 +810,10 @@ class GeeRasterAdapter:
             self._cached_native_scale = float(proj.nominalScale().getInfo())
         return self._cached_native_scale
 
+    # ------------------------------------------------------------------
+    # Region & labels
+    # ------------------------------------------------------------------
+
     def _make_region(self, lat: float, lon: float, window_m: int) -> ee.Geometry:
         """Build a meter-accurate square region using the point's UTM zone."""
         point = ee.Geometry.Point([lon, lat])
@@ -957,6 +821,113 @@ class GeeRasterAdapter:
             return point
         utm = _get_utm_crs(lon, lat)
         return point.buffer(window_m / 2, proj=ee.Projection(utm)).bounds(maxError=1)
+
+    def _src_label(self) -> str:
+        cfg = self._dataset_spec
+        return f"gee://{cfg.get('image', cfg.get('collection', 'unknown'))}"
+
+    # ------------------------------------------------------------------
+    # Date metadata  (per-point image timestamps for the meta sidecar)
+    # ------------------------------------------------------------------
+
+    def _make_date_info(
+        self,
+        image_start: pd.Timestamp,
+        *,
+        end_index: int | None,
+        clamped: bool,
+        source: str,
+    ) -> dict:
+        """Build the date metadata dict for one resolved image timestamp.
+
+        ``end_index`` is the position of the matching end-time inside
+        ``_collection_time_ends``; pass ``None`` when no end-time should be
+        emitted. The ``image_time_end`` key is included only when the index
+        is valid for the cached end-times array.
+        """
+        # Always include the start-of-image timestamp; this is the only
+        # mandatory field.
+        info = {
+            "date_clamped": clamped,
+            "date_source": source,
+            "image_time_start": image_start.strftime("%Y-%m-%d"),
+        }
+        # Only emit image_time_end when we have a cached end-times array
+        # AND the requested index is in-bounds. Some collections expose
+        # mismatched-length start/end arrays, so the bounds check matters.
+        end_times = self._collection_time_ends
+        if end_times is not None and end_index is not None and 0 <= end_index < len(end_times):
+            info["image_time_end"] = end_times[end_index].strftime("%Y-%m-%d")
+        return info
+
+    def _resolve_date_info(self, date=None) -> dict:
+        """Compute date metadata for a single point fetch.
+
+        Returns a dict with image_time_start, image_time_end, date_clamped,
+        date_source to be merged into the per-point meta dict.
+        """
+        if self._collection_timestamps is None:
+            return {}
+
+        timestamps = self._collection_timestamps
+        last_index = len(timestamps) - 1
+
+        if date is None:
+            # No-date fallback: most recent image (last entry in the
+            # timestamps array).
+            return self._make_date_info(
+                timestamps.max(),
+                end_index=last_index,
+                clamped=False,
+                source="most_recent_no_date",
+            )
+
+        dt = pd.to_datetime(date)
+        policy = str(self._dataset_spec.get("collection_date_policy", "nearest")).lower()
+
+        if policy == "contains":
+            # "contains" policy: pick the image whose time interval contains
+            # the sample date. When the date falls outside the collection's
+            # full range, clamp to the nearest boundary image.
+            if dt <= timestamps.min():
+                return self._make_date_info(
+                    timestamps.min(),
+                    end_index=0,
+                    clamped=True,
+                    source="clamped_to_nearest",
+                )
+            if dt >= timestamps.max():
+                return self._make_date_info(
+                    timestamps.max(),
+                    end_index=last_index,
+                    clamped=True,
+                    source="clamped_to_nearest",
+                )
+
+            # In-range: find the latest start-time that's still <= dt.
+            idx = int(timestamps.searchsorted(dt, side="right") - 1)
+            idx = max(0, min(idx, last_index))
+            return self._make_date_info(
+                timestamps[idx],
+                end_index=idx,
+                clamped=False,
+                source="contains_sample_date",
+            )
+
+        # Default "nearest" policy: pick whichever image timestamp is closest
+        # to the sample date, even if the date is outside the range.
+        nearest, was_clamped = _find_nearest_timestamp(timestamps, dt)
+        nearest_index = int(timestamps.get_indexer([nearest])[0])
+        return self._make_date_info(
+            nearest,
+            end_index=nearest_index,
+            clamped=was_clamped,
+            source="clamped_to_nearest" if was_clamped else "nearest_to_sample",
+        )
+
+    # ------------------------------------------------------------------
+    # Empty-result builders  (failure-path skeletons matching success shape)
+    # ------------------------------------------------------------------
 
     def _empty_result(self, window_m: int):
         vals = np.array([])
@@ -1015,94 +986,7 @@ class GeeRasterAdapter:
         return stats, meta
 
     # ------------------------------------------------------------------
-    # Mode 1: Raw pixel arrays  (sampleRectangle)
-    # ------------------------------------------------------------------
-
-    def _fetch_single(self, lat: float, lon: float, window_m: int, date=None):
-        """Core pixel-array fetch for one point."""
-        img = self._get_image(date, lat=lat, lon=lon)
-        region = self._make_region(lat, lon, window_m)
-        utm = _get_utm_crs(lon, lat)
-
-        if window_m <= 0:
-            return self._sample_pixel(img, region, window_m, utm)
-        return self._sample_window(img, region, window_m, utm)
-
-    def _sample_pixel(self, img, region, window_m, utm: str = ""):
-        result = img.reduceRegion(
-            reducer=ee.Reducer.first(),
-            geometry=region,
-            scale=self._get_scale(img),
-        ).getInfo()
-
-        if not result:
-            return self._empty_result(window_m)
-
-        val = next((v for v in result.values() if v is not None), None)
-        if val is None:
-            return self._empty_result(window_m)
-
-        vals = np.array([val], dtype=np.float64)
-        meta = {
-            "in_extent": True,
-            "n_pixels": 1,
-            "had_nodata": False,
-            "coverage_pct": 100.0,
-            "window_m": int(window_m),
-            "raster_crs": self.crs,
-            "region_crs": utm,
-            "transform": None,
-            "dtype": "float64",
-            "nodata": None,
-            "src_path": self._src_label(),
-            "window_arr": vals.reshape(1, 1),
-        }
-        return vals, meta
-
-    def _sample_window(self, img, region, window_m, utm: str = ""):
-        result = img.sampleRectangle(
-            region=region,
-            defaultValue=-9999,
-        ).getInfo()
-
-        if not result or "properties" not in result:
-            return self._empty_result(window_m)
-
-        props = result["properties"]
-        band_data = next(iter(props.values()), None) if props else None
-        if band_data is None:
-            return self._empty_result(window_m)
-
-        arr_2d = np.array(band_data, dtype=np.float64)
-        arr_2d[arr_2d == -9999] = np.nan
-
-        flat = arr_2d.ravel()
-        valid_mask = np.isfinite(flat)
-        vals = flat[valid_mask]
-        total = flat.size
-        valid_count = int(valid_mask.sum())
-
-        meta = {
-            "in_extent": True,
-            # n_pixels reports valid (non-nodata) cells only — the total
-            # cell count in the window can be inferred from the window
-            # size and native resolution.
-            "n_pixels": int(valid_count),
-            "had_nodata": valid_count < total,
-            "coverage_pct": 100.0 * (valid_count / total) if total else 0.0,
-            "window_m": int(window_m),
-            "raster_crs": self.crs,
-            "region_crs": utm,
-            "transform": None,
-            "dtype": "float64",
-            "nodata": None,
-            "src_path": self._src_label(),
-            "window_arr": arr_2d,
-        }
-        return vals, meta
-
-    # ------------------------------------------------------------------
-    # Mode 2: Server-side stats  (reduceRegion with combined reducers)
+    # Mode 1: Server-side stats  (reduceRegion with combined reducers)
     # ------------------------------------------------------------------
 
     def _fetch_stats_single(
@@ -1256,121 +1140,6 @@ class GeeRasterAdapter:
         }
         return stats, meta
 
-    # ------------------------------------------------------------------
-    # Mode 3: Image export  (geemap → GeoTIFF)
-    # ------------------------------------------------------------------
-
-    def _export_single(
-        self,
-        lat: float,
-        lon: float,
-        window_m: int,
-        out_path: Path,
-        date=None,
-        resample_m: float | None = None,
-    ):
-        """Export a GeoTIFF tile for one point with pixel-grid-snapped window.
-
-        Snapping the centre coordinate to the nearest pixel grid multiple
-        ensures all exported tiles have identical dimensions.
-
-        If resample_m is set, the tile is exported at that resolution instead
-        of the native image resolution — all tiles will be exactly
-        round(window_m / resample_m) × round(window_m / resample_m) pixels.
-        """
-        if geemap is None:
-            raise ImportError("geemap is required for image export: pip install geemap")
-
-        img = self._get_image(date, lat=lat, lon=lon)
-        # Use resample_m as the export scale when provided; fall back to native.
-        scale_m = float(resample_m) if resample_m is not None else self._get_scale_value(img)
-        utm = _get_utm_crs(lon, lat)
-
-        # Project to UTM, snap to pixel grid, compute window corners
-        from pyproj import Transformer
-
-        transformer = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
-        cx, cy = transformer.transform(lon, lat)
-        cx = _snap_to_grid(cx, scale_m)
-        cy = _snap_to_grid(cy, scale_m)
-
-        # Snap half-window to nearest whole pixel count so output dimensions
-        # are consistent across points (window_m is approximate, not exact).
-        half_pixels = max(1, round(window_m / 2 / scale_m))
-        half_m = half_pixels * scale_m
-        region = ee.Geometry.Rectangle(
-            [cx - half_m, cy - half_m, cx + half_m, cy + half_m],
-            proj=ee.Projection(utm),
-            geodesic=False,
-        )
-
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # verbose=False suppresses geemap's per-tile "Downloading data from..."
-        # and "Data downloaded to..." prints, which otherwise interleave with
-        # and disrupt the tqdm progress bar in export_tiles.
-        geemap.ee_export_image(
-            img,
-            filename=str(out_path),
-            scale=scale_m,
-            region=region,
-            crs=utm,
-            verbose=False,
-        )
-        return out_path
-
-    # ==================================================================
-    # Public interface
-    # ==================================================================
-
-    def fetch_values(
-        self,
-        lat: float,
-        lon: float,
-        window_m: int,
-        *,
-        return_meta: bool = False,
-    ):
-        """Sample raw pixel values (Mode 1).  Compatible with LocalRasterAdapter."""
-        try:
-            vals, meta = self._fetch_single(lat, lon, window_m)
-        except Exception as e:
-            logger.warning("GEE fetch failed for (%.4f, %.4f): %s", lat, lon, e)
-            vals, meta = self._empty_result(window_m)
-        return (vals, meta) if return_meta else vals
-
-    def fetch_batch(  # todo: remove this function, since it's always better to use server-side reducers
-        self,
-        lats: Sequence[float],
-        lons: Sequence[float],
-        window_m: int,
-        *,
-        dates: Sequence | None = None,
-        return_meta: bool = False,
-    ) -> List:
-        """Fetch raw pixel arrays for many points in parallel (Mode 1)."""
-        n = len(lats)
-        date_list = list(dates) if dates is not None else [None] * n
-        results: List = [None] * n
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_idx = {
-                executor.submit(self._fetch_single, lat, lon, window_m, date): i
-                for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    logger.warning("GEE batch fetch failed for point %d: %s", idx, e)
-                    results[idx] = self._empty_result(window_m)
-
-        if return_meta:
-            return results
-        return [r[0] for r in results]
-
     def fetch_stats_batch(
         self,
         lats: Sequence[float],
@@ -1381,7 +1150,7 @@ class GeeRasterAdapter:
         dates: Sequence | None = None,
         progress_desc: str | None = None,
     ) -> List[tuple[dict[str, float | None], dict]]:
-        """Compute server-side statistics for many points in parallel (Mode 2).
+        """Compute server-side statistics for many points in parallel (Mode 1).
 
         Issues one ``reduceRegion`` call per point — or, when ``"point"`` is
         in *reducer_names*, a single ``ee.Dictionary`` containing both the
@@ -1455,6 +1224,67 @@ class GeeRasterAdapter:
 
         return results
 
+    # ------------------------------------------------------------------
+    # Mode 2: Image export  (geemap → GeoTIFF)
+    # ------------------------------------------------------------------
+
+    def _export_single(
+        self,
+        lat: float,
+        lon: float,
+        window_m: int,
+        out_path: Path,
+        date=None,
+        resample_m: float | None = None,
+    ):
+        """Export a GeoTIFF tile for one point with pixel-grid-snapped window.
+
+        Snapping the centre coordinate to the nearest pixel grid multiple
+        ensures all exported tiles have identical dimensions.
+
+        If resample_m is set, the tile is exported at that resolution instead
+        of the native image resolution — all tiles will be exactly
+        round(window_m / resample_m) × round(window_m / resample_m) pixels.
+        """
+        img = self._get_image(date, lat=lat, lon=lon)
+        # Use resample_m as the export scale when provided; fall back to native.
+        scale_m = float(resample_m) if resample_m is not None else self._get_scale_value(img)
+        utm = _get_utm_crs(lon, lat)
+
+        # Project to UTM, snap to pixel grid, compute window corners
+        from pyproj import Transformer
+
+        transformer = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
+        cx, cy = transformer.transform(lon, lat)
+        cx = _snap_to_grid(cx, scale_m)
+        cy = _snap_to_grid(cy, scale_m)
+
+        # Snap half-window to nearest whole pixel count so output dimensions
+        # are consistent across points (window_m is approximate, not exact).
+        half_pixels = max(1, round(window_m / 2 / scale_m))
+        half_m = half_pixels * scale_m
+        region = ee.Geometry.Rectangle(
+            [cx - half_m, cy - half_m, cx + half_m, cy + half_m],
+            proj=ee.Projection(utm),
+            geodesic=False,
+        )
+
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # verbose=False suppresses geemap's per-tile "Downloading data from..."
+        # and "Data downloaded to..." prints, which otherwise interleave with
+        # and disrupt the tqdm progress bar in export_tiles.
+        geemap.ee_export_image(
+            img,
+            filename=str(out_path),
+            scale=scale_m,
+            region=region,
+            crs=utm,
+            verbose=False,
+        )
+        return out_path
+
     def export_tiles(
         self,
         lats: Sequence[float],
@@ -1469,7 +1299,7 @@ class GeeRasterAdapter:
         filename_suffix: str | None = None,
         progress_desc: str | None = None,
     ) -> List[Path]:
-        """Export GeoTIFF tiles for many points in parallel (Mode 4).
+        """Export GeoTIFF tiles for many points in parallel (Mode 2).
 
         If resample_m is set, all tiles are exported at that resolution so they
         are exactly round(window_m / resample_m) × round(window_m / resample_m) pixels.
@@ -1523,6 +1353,10 @@ class GeeRasterAdapter:
                     pbar.update(1)
 
         return results, meta_list
+
+    # ------------------------------------------------------------------
+    # Dataset metadata  (sidecar JSON for one dataset's run)
+    # ------------------------------------------------------------------
 
     def build_dataset_meta(
         self,
