@@ -108,35 +108,38 @@ def _get_collection_time_bounds(
         start_times = raw["starts"]
         end_times = raw["ends"]
 
-        # Build start-only index first — this is always needed.
+        # Drop None entries up front — we still need at least one valid start
+        # to do anything useful, regardless of which branch we end up in.
         clean_starts = [int(t) for t in start_times if t is not None]
         if not clean_starts:
             return None, None
-        start_series = (
-            pd.to_datetime(pd.Series(clean_starts), unit="ms", origin="unix")
-            .drop_duplicates()
-            .sort_values()
-        )
-        start_index = pd.DatetimeIndex(start_series)
-
-        # Build paired (start, end) index only when end times are all present.
         clean_ends = [t for t in end_times if t is not None]
+
+        # Branch 1: end-times are missing or partial → return a start-only
+        # index. Build it from clean_starts (sorted + deduped) so it's
+        # directly usable for nearest-neighbour lookups downstream.
         if len(clean_ends) != len(clean_starts):
-            # Some or all images lack system:time_end — return starts only.
             logger.debug(
                 "system:time_end missing for some images in %s; interval-based "
                 "date selection will fall back to next-start boundaries.",
                 collection_id,
             )
-            return start_index, None
+            start_series = (
+                pd.to_datetime(pd.Series(clean_starts), unit="ms", origin="unix")
+                .drop_duplicates()
+                .sort_values()
+            )
+            return pd.DatetimeIndex(start_series), None
 
-        # Keep only paired start/end values so the two indices stay aligned.
+        # Branch 2: every image has a paired (start, end). Build both indices
+        # from the same de-duplicated, sorted DataFrame so they stay aligned
+        # element-by-element — required for `time_ends[idx]` lookups to map
+        # back to the correct start.
         paired_times = sorted(zip(clean_starts, [int(e) for e in clean_ends]))
         bounds_df = pd.DataFrame(paired_times, columns=["start", "end"])
-        # De-duplicate exact intervals, then sort by start for searchsorted.
         bounds_df = bounds_df.drop_duplicates().sort_values("start")
-        end_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["end"], unit="ms", origin="unix"))
         start_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["start"], unit="ms", origin="unix"))
+        end_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["end"], unit="ms", origin="unix"))
         return start_index, end_index
     except Exception as e:
         logger.warning("Failed to fetch timestamps for %s: %s", collection_id, e)
@@ -208,6 +211,14 @@ def _resolve_date_filter_range(
         next_dt = timestamps[idx + 1]
     else:
         next_dt = selected + pd.DateOffset(days=1)
+
+    # filterDate(start, end) is half-open. Some collections have images with
+    # system:time_end == system:time_start (instantaneous events); using the
+    # raw end would produce an empty filter and .first() would return null.
+    # Bump by one second whenever end <= start so the selected image is
+    # always inside the range.
+    if next_dt <= selected:
+        next_dt = selected + pd.Timedelta(seconds=1)
 
     return selected.strftime(fmt), next_dt.strftime(fmt)
 
@@ -1031,8 +1042,15 @@ class GeeRasterAdapter:
         # If the window is smaller than the native pixel size, expand the
         # region so at least one pixel center falls inside it. Only affects
         # the window branch — the point branch always uses the exact point.
+        # Track the *effective* window size so the coverage calculation
+        # below uses the size GEE actually reduced over, not the user's
+        # original window_m. Otherwise total_cells would be derived from
+        # window_m (=1 cell here) while valid_count reflects the larger
+        # expanded region (~4 cells), inflating coverage past 100%.
+        effective_window_m = window_m
         if window_m < native_m:
-            region = self._make_region(lat, lon, int(native_m * 2))
+            effective_window_m = int(native_m * 2)
+            region = self._make_region(lat, lon, effective_window_m)
 
         # Resolve band name (also populates _cached_band_count on first call)
         band_name = self._get_band_name(img)
@@ -1110,7 +1128,7 @@ class GeeRasterAdapter:
         # GEE; otherwise we fall back to point-only semantics (n_pixels is
         # 1 if the point sample returned a value, else 0).
         if combined_reducer is not None:
-            total_cells = max(1, round((max(window_m, native_m) / native_m) ** 2))
+            total_cells = max(1, round((max(effective_window_m, native_m) / native_m) ** 2))
             coverage_pct = 100.0 * (valid_count / total_cells) if total_cells else 0.0
             # Clamp to 100% — the geometric total can be off by a cell or two,
             # so a fully-valid window can otherwise read as 101%.
