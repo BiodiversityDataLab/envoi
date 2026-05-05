@@ -12,7 +12,7 @@ from .adapters import get_adapter
 from .adapters.gee_adapter import KNOWN_DERIVED_BANDS
 from .config import load_catalogs, load_defaults, BUILTIN_EE_CATALOG
 from .qc import attach_quality_control, split_stats_and_qc
-from .metadata import write_metadata
+from .metadata import write_metadata_sidecar
 
 # Keys allowed inside the full-form dict value
 # (e.g. {"sen2": {"bands": [...]}}). Adding more per-call band_overrides in the
@@ -36,7 +36,8 @@ def extract(
     latitude_column: str = "lat",
     longitude_column: str = "lon",
     date_column: str = "date",
-) -> Dict[str, Path]:
+    write_metadata: bool = True,
+) -> Dict[str, Path | pd.DataFrame]:
     """Extract environmental data for a set of geographic sample points.
 
     For each dataset listed in ``config``, this function samples the environmental
@@ -49,7 +50,8 @@ def extract(
     - ``"raster"`` — exports a GeoTIFF tile centred on each point and saves
       the tiles to ``output_dir/<batch_id>/<dataset>/``.
 
-    A JSON metadata sidecar is always written alongside the output file(s).
+    A JSON metadata sidecar is written alongside the output file(s) by default.
+    Pass ``write_metadata=False`` to suppress it.
 
     ``config`` can be a dict (single output), a list of dicts (multiple outputs),
     or a path to a YAML file containing either of those. Each dict must have the
@@ -64,7 +66,7 @@ def extract(
                 # Typed-dict form for mixed runs:
                 # "statistics": {"continuous": ["mean", "std"], "categorical": ["mode"]},
                 "window_size_m": 200,       # sampling window radius in metres
-                "output_file_format": "parquet",  # "parquet" or "csv" (tabular only)
+                "output_file_format": "parquet",  # "parquet", "csv", or "dataframe" (tabular only)
                 "min_coverage_pct": 80,     # points below this coverage get a QC flag
                 "resample_m": 10,           # output pixel size in metres (raster only)
             },
@@ -119,16 +121,22 @@ def extract(
         Defaults to ``"date"``. If absent from ``df`` the date branch is
         simply skipped — the extractor never errors on a missing date column.
         The output tables will use the same name.
+    write_metadata : bool, optional
+        Whether to write a JSON metadata sidecar alongside the output files.
+        Defaults to ``True``. Set to ``False`` to suppress the sidecar, for
+        example when running interactively and the output will not be kept on
+        disk.
 
     Returns
     -------
-    dict[str, Path]
-        Mapping of output key to the file path that was written. For tabular
-        outputs the keys are ``"<batch_id>"`` (stats table) and
-        ``"<batch_id>_qc"`` (QC table). For raster outputs the key is
-        ``"<batch_id>:<dataset>"`` pointing to the tiles folder.
+    dict[str, Path | pd.DataFrame]
+        Mapping of output key to the result. For tabular outputs the keys are
+        ``"<batch_id>"`` (stats table) and ``"<batch_id>_qc"`` (QC table);
+        for raster outputs the key is ``"<batch_id>:<dataset>"`` pointing to
+        the tiles folder. When ``output_file_format`` is ``"dataframe"``, the
+        values are pandas DataFrames rather than file paths.
     """
-    output_paths: Dict[str, Path] = {}
+    output_paths: Dict[str, Path | pd.DataFrame] = {}
 
     df = df.copy()
 
@@ -288,48 +296,56 @@ def extract(
             )
             stats_df, qc_df = _restore_user_column_names(stats_df, qc_df, column_name_map)
 
-            stats_path = _write_tabular(stats_df, batch_id, Path(output_dir), output_file_format)
-            qc_path = _write_tabular(qc_df, f"{batch_id}_qc", Path(output_dir), output_file_format)
+            # When format is "dataframe", return the DataFrames directly instead
+            # of writing them to disk. CSV/Parquet still write as before.
+            if output_file_format == "dataframe":
+                output_paths[batch_id] = stats_df
 
-            write_metadata(
-                output_dir,
-                batch_id,
-                output_type=output_type,
-                n_points=len(df_copy),
-                datasets=dataset_metas,
-                config={
-                    # Resolved per-dataset settings (name + effective bands /
-                    # derived_bands) so the metadata fully captures what was run.
-                    "datasets": resolved_datasets,
-                    # Preserve the user's original form (flat list or typed dict)
-                    # so the metadata round-trips it without normalizing.
-                    "statistics": run_settings.user_stats,
-                    # Preserve the user's input form: int stays int, list stays list.
-                    "window_size_m": run_settings.user_window_size,
-                    "min_coverage_pct": min_coverage,
-                },
-                warnings=warnings_backlog if warnings_backlog else None,
-            )
+            else:
+                stats_path = _write_tabular(
+                    stats_df, batch_id, Path(output_dir), output_file_format
+                )
+                output_paths[batch_id] = stats_path
 
-            output_paths[batch_id] = stats_path
-            output_paths[f"{batch_id}_qc"] = qc_path
+            if write_metadata:
+                _write_tabular(qc_df, f"{batch_id}_qc", Path(output_dir), output_file_format)
+                write_metadata_sidecar(
+                    output_dir,
+                    batch_id,
+                    output_type=output_type,
+                    n_points=len(df_copy),
+                    datasets=dataset_metas,
+                    config={
+                        # Resolved per-dataset settings (name + effective bands /
+                        # derived_bands) so the metadata fully captures what was run.
+                        "datasets": resolved_datasets,
+                        # Preserve the user's original form (flat list or typed dict)
+                        # so the metadata round-trips it without normalizing.
+                        "statistics": run_settings.user_stats,
+                        # Preserve the user's input form: int stays int, list stays list.
+                        "window_size_m": run_settings.user_window_size,
+                        "min_coverage_pct": min_coverage,
+                    },
+                    warnings=warnings_backlog if warnings_backlog else None,
+                )
 
         elif output_type == "raster":
-            write_metadata(
-                Path(output_dir) / batch_id,
-                batch_id,
-                output_type=output_type,
-                n_points=len(df_copy),
-                datasets=dataset_metas,
-                config={
-                    # Resolved per-dataset settings — see tabular branch above.
-                    "datasets": resolved_datasets,
-                    # Preserve the user's input form: int stays int, list stays list.
-                    "window_size_m": run_settings.user_window_size,
-                    **({"resample_m": resample_m} if resample_m else {}),
-                },
-                warnings=warnings_backlog if warnings_backlog else None,
-            )
+            if write_metadata:
+                write_metadata_sidecar(
+                    Path(output_dir) / batch_id,
+                    batch_id,
+                    output_type=output_type,
+                    n_points=len(df_copy),
+                    datasets=dataset_metas,
+                    config={
+                        # Resolved per-dataset settings — see tabular branch above.
+                        "datasets": resolved_datasets,
+                        # Preserve the user's input form: int stays int, list stays list.
+                        "window_size_m": run_settings.user_window_size,
+                        **({"resample_m": resample_m} if resample_m else {}),
+                    },
+                    warnings=warnings_backlog if warnings_backlog else None,
+                )
 
     return output_paths
 
@@ -556,7 +572,7 @@ class RunSettings:
     # override (e.g. {"sen2": ["B4", "B8"]} or {"sen2": {"bands": ["B4"]}}).
     datasets: List[Tuple[str, Dict[str, Any]]]
     output_type: str  # "tabular" or "raster"
-    output_file_format: str  # "csv" or "parquet"
+    output_file_format: str  # "csv", "parquet", or "dataframe"
     window_sizes: List[int]  # one or more square-sampling-window sizes in metres
     min_coverage: float  # 0–100 — threshold for low-coverage QC flag
     # Normalized stats dict: {"continuous": [...], "categorical": [...]}.
@@ -725,7 +741,7 @@ def _parse_run_config(
 
     # output_file_format applies to tabular output only.
     output_file_format = settings.get("output_file_format", defaults["output_file_format"])
-    if output_file_format not in ("csv", "parquet"):
+    if output_file_format not in ("csv", "parquet", "dataframe"):
         raise ValueError(f"Unknown output_file_format: {output_file_format}")
 
     # min_coverage_pct is a percentage — must be in [0, 100].
@@ -1017,12 +1033,12 @@ def _append_stat_columns(
 def _write_tabular(df: pd.DataFrame, name: str, output_dir: Path, output_file_format: str) -> Path:
     """Write a DataFrame to a CSV or Parquet file and return the path written."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    if output_file_format == "csv":
-        path = output_dir / f"{name}.csv"
-        df.to_csv(path, index=False)
-    else:
+    if output_file_format == "parquet":
         path = output_dir / f"{name}.parquet"
         df.to_parquet(path, index=False)
+    else:
+        path = output_dir / f"{name}.csv"
+        df.to_csv(path, index=False)
     return path
 
 
