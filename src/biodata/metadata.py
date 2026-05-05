@@ -61,7 +61,7 @@ def build_tile_crs_zones(lats: Sequence[float], lons: Sequence[float]) -> list[s
     return sorted(zones)
 
 
-def write_metadata(
+def write_metadata_sidecar(
     out_dir: str | Path,
     group_name: str,
     *,
