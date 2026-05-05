@@ -97,12 +97,12 @@ def _get_collection_time_bounds(
     One getInfo() round-trip, done once per dataset during __post_init__.
     """
     try:
-        col = ee.ImageCollection(collection_id)
+        image_collection = ee.ImageCollection(collection_id)
         # Fetch both arrays in a single round-trip by wrapping in ee.Dictionary.
         raw = ee.Dictionary(
             {
-                "starts": col.aggregate_array("system:time_start"),
-                "ends": col.aggregate_array("system:time_end"),
+                "starts": image_collection.aggregate_array("system:time_start"),
+                "ends": image_collection.aggregate_array("system:time_end"),
             }
         ).getInfo()
         start_times = raw["starts"]
@@ -165,7 +165,7 @@ def _resolve_date_filter_range(
     timestamps: pd.DatetimeIndex | None = None,
     time_ends: pd.DatetimeIndex | None = None,
 ) -> tuple[str, str]:
-    """Return (start, end) date strings for col.filterDate().
+    """Return (start, end) date strings for ImageCollection.filterDate().
 
     When cached timestamps are available, uses them to pin the exact image
     interval. When not (server-side fallback), broadens the window by ±1 day
@@ -294,16 +294,16 @@ def _build_image(
         img = ee.Image(dataset_spec["image"])
 
     elif "collection" in dataset_spec:
-        col = ee.ImageCollection(dataset_spec["collection"])
+        image_collection = ee.ImageCollection(dataset_spec["collection"])
 
         if geometry is not None:
-            col = col.filterBounds(geometry)
+            image_collection = image_collection.filterBounds(geometry)
 
         # Some tiled collections (e.g. satellite embeddings) need UTM-zone
         # filtering to avoid selecting the wrong tile for a point.
         if dataset_spec.get("use_utm_zone") and lat is not None and lon is not None:
             utm_zone = _get_utm_zone_label(lon, lat)
-            col = col.filter(ee.Filter.eq("UTM_ZONE", utm_zone))
+            image_collection = image_collection.filter(ee.Filter.eq("UTM_ZONE", utm_zone))
 
         # --- Date-based image selection ---
         date_policy = str(dataset_spec.get("collection_date_policy", "nearest")).lower()
@@ -315,11 +315,11 @@ def _build_image(
                 timestamps=collection_timestamps,
                 time_ends=collection_time_ends,
             )
-            col = col.filterDate(start, end)
-            img = col.first()
+            image_collection = image_collection.filterDate(start, end)
+            img = image_collection.first()
         else:
             # No date: mosaic (most recent non-masked pixel per position)
-            img = col.mosaic()
+            img = image_collection.mosaic()
 
     else:
         raise ValueError("dataset_spec must contain 'image' or 'collection'")
@@ -721,6 +721,11 @@ class GeeRasterAdapter:
             )
 
         # IMAGE assets or already-cached no-coords fallback.
+        # Invariant: for IMAGE_COLLECTIONs, _static_image is only ever set by
+        # the most-recent-fallback branch below — so reusing it here for a
+        # no-coords call returns the same most-recent global image, which is
+        # safe for band-name probing and global tile-export, but never for
+        # per-point sampling (the per-point branch above runs first).
         if date is None and self._static_image is not None:
             return self._static_image
 
@@ -740,8 +745,6 @@ class GeeRasterAdapter:
                 collection_timestamps=self._collection_timestamps,
                 collection_time_ends=self._collection_time_ends,
             )
-            self._date_source = "most_recent_no_date"
-            self._image_date_used = most_recent
             return self._static_image
 
         # Per-point date selection without per-point bounds requirement
@@ -823,8 +826,8 @@ class GeeRasterAdapter:
         return point.buffer(window_m / 2, proj=ee.Projection(utm)).bounds(maxError=1)
 
     def _src_label(self) -> str:
-        cfg = self._dataset_spec
-        return f"gee://{cfg.get('image', cfg.get('collection', 'unknown'))}"
+        dataset_config = self._dataset_spec
+        return f"gee://{dataset_config.get('image', dataset_config.get('collection', 'unknown'))}"
 
     # ------------------------------------------------------------------
     # Date metadata  (per-point image timestamps for the meta sidecar)
@@ -1233,7 +1236,7 @@ class GeeRasterAdapter:
         lat: float,
         lon: float,
         window_m: int,
-        out_path: Path,
+        output_path: Path,
         date=None,
         resample_m: float | None = None,
     ):
@@ -1269,28 +1272,28 @@ class GeeRasterAdapter:
             geodesic=False,
         )
 
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # verbose=False suppresses geemap's per-tile "Downloading data from..."
         # and "Data downloaded to..." prints, which otherwise interleave with
         # and disrupt the tqdm progress bar in export_tiles.
         geemap.ee_export_image(
             img,
-            filename=str(out_path),
+            filename=str(output_path),
             scale=scale_m,
             region=region,
             crs=utm,
             verbose=False,
         )
-        return out_path
+        return output_path
 
     def export_tiles(
         self,
         lats: Sequence[float],
         lons: Sequence[float],
         window_m: int,
-        out_dir: str | Path,
+        output_dir: str | Path,
         *,
         ids: Sequence[str] | None = None,
         dates: Sequence | None = None,
@@ -1308,10 +1311,11 @@ class GeeRasterAdapter:
         window runs can place every window's tiles in the same folder
         without overwriting one another.
 
-        Returns list of output file paths.
+        Returns ``(paths, meta_list)`` — one entry per input point in each
+        list. ``paths[i]`` is ``None`` when the export for that point failed.
         """
-        out_dir = Path(out_dir) / dataset_name
-        out_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = Path(output_dir) / dataset_name
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         n = len(lats)
         date_list = list(dates) if dates is not None else [None] * n
@@ -1335,9 +1339,9 @@ class GeeRasterAdapter:
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {}
             for i, (lat, lon, date, sample_id) in enumerate(zip(lats, lons, date_list, id_list)):
-                out_path = out_dir / f"{sample_id}-{dataset_name}{suffix_part}.tif"
+                output_path = output_dir / f"{sample_id}-{dataset_name}{suffix_part}.tif"
                 future = executor.submit(
-                    self._export_single, lat, lon, window_m, out_path, date, resample_m
+                    self._export_single, lat, lon, window_m, output_path, date, resample_m
                 )
                 future_to_idx[future] = i
 
@@ -1449,5 +1453,9 @@ class GeeRasterAdapter:
         return meta
 
 
+# Module-level side effect: registers this adapter under the "earth_engine"
+# data_source so config.py can dispatch to it without an explicit import.
+# The try/except around the `_register` import at the top of the file makes
+# this no-op if the registry isn't available (avoids circular-import pain).
 if _register is not None:
     _register("earth_engine", GeeRasterAdapter)
