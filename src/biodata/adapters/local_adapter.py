@@ -6,9 +6,8 @@ from typing import Dict, Any, List, Sequence
 
 import numpy as np
 import rasterio
-from rasterio.features import geometry_window
+from rasterio.mask import mask as rio_mask
 from rasterio.warp import transform_geom
-from rasterio.windows import transform as win_transform
 from shapely.geometry import box, mapping
 from pyproj import Transformer
 from rasterio.errors import WindowError
@@ -73,10 +72,18 @@ class LocalRasterAdapter(BaseAdapter):
     def fetch_values(self, lat: float, lon: float, window_m: int, *, return_meta: bool = False):
         geom_raster = self._project_meter_square_to_raster_geom(lat, lon, window_m)
         try:
-            # north_up / rotated were removed in newer rasterio; passing them
-            # triggers a RasterioDeprecationWarning per call. The defaults
-            # already match what we want, so omit them.
-            win = geometry_window(self.src, [geom_raster], pad_x=0, pad_y=0)
+            # all_touched=False (default) uses center-in-polygon: only pixels
+            # whose centres fall inside the polygon are included. This avoids
+            # the bounding-box overshoot of geometry_window and matches GEE's
+            # reduceRegion pixel-selection rule.
+            arr, window_affine = rio_mask(
+                self.src,
+                [geom_raster],
+                crop=True,
+                all_touched=False,
+                filled=False,
+                indexes=self.band,
+            )
         except (ValueError, WindowError):
             vals = np.array([])
             meta = {
@@ -96,7 +103,6 @@ class LocalRasterAdapter(BaseAdapter):
             }
             return (vals, meta) if return_meta else vals
 
-        arr = self.src.read(self.band, window=win, masked=True)
         # arr is 2D (H, W) for a single band int, 3D (n_bands, H, W) for a list
 
         if np.ma.isMaskedArray(arr):
@@ -134,8 +140,15 @@ class LocalRasterAdapter(BaseAdapter):
         coverage_pct = 100.0 * (valid / total) if total else 0.0
 
         # JSON-safe transform (list of 6 floats) to avoid breaking metadata JSON
-        affine = win_transform(win, self.src.transform)
-        transform_list = [affine.a, affine.b, affine.c, affine.d, affine.e, affine.f]
+        # window_affine is returned directly by rio_mask, no win needed.
+        transform_list = [
+            window_affine.a,
+            window_affine.b,
+            window_affine.c,
+            window_affine.d,
+            window_affine.e,
+            window_affine.f,
+        ]
 
         meta = {
             "in_extent": True,
