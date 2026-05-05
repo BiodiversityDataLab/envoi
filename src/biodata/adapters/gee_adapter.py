@@ -829,9 +829,17 @@ class GeeRasterAdapter:
     # ------------------------------------------------------------------
 
     def _make_region(self, lat: float, lon: float, window_m: int) -> ee.Geometry:
-        """Build a meter-accurate square region using the point's UTM zone."""
+        """Build a meter-accurate square region using the point's UTM zone.
+
+        ``window_m == 0`` returns the bare point geometry, which yields a
+        single-pixel reduction at (lat, lon). Negative values are rejected
+        so a bad config (e.g. accidental sign flip in a YAML) surfaces as a
+        clear error rather than silently degrading to point-only output.
+        """
+        if window_m < 0:
+            raise ValueError(f"window_m must be >= 0, got {window_m}")
         point = ee.Geometry.Point([lon, lat])
-        if window_m <= 0:
+        if window_m == 0:
             return point
         utm = _get_utm_crs(lon, lat)
         return point.buffer(window_m / 2, proj=ee.Projection(utm)).bounds(maxError=1)
