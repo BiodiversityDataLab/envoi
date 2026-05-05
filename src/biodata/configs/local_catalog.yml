@@ -22,3 +22,9 @@ datasets:
     path: data/for_testing/dem/TG4NHB-dem.tif
     data_type: continuous
     bands: 1
+
+  dem_glo30_local:
+    data_source: local
+    path: adrians/dem_glo30_for_local_test/dem_glo30/T2T1DJ-dem_glo30.tif
+    data_type: continuous
+

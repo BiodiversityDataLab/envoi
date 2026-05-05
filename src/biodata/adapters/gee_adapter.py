@@ -13,15 +13,9 @@ from ..metadata import build_tile_crs_zones, summarize_date_info, summarize_tile
 import numpy as np
 import pandas as pd
 
-try:
-    import ee
-except ImportError:
-    ee = None
+import ee
+import geemap
 
-try:
-    import geemap
-except ImportError:
-    geemap = None
 
 try:
     from . import register as _register
