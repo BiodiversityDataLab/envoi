@@ -19,6 +19,7 @@ dependencies = [
     "geopandas>=0.14",
     "pyyaml>=6.0.1",
     "pyarrow>=17.0.0",
+    "tqdm>=4.65",
     # "earthengine-api>=0.1.398",   # add when implementing GEE adapter
 ]
 
