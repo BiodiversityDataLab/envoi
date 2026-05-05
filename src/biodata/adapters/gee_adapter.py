@@ -12,6 +12,7 @@ from ..metadata import build_tile_crs_zones, summarize_date_info, summarize_tile
 
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 
 try:
     import ee
@@ -1312,12 +1313,16 @@ class GeeRasterAdapter:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # verbose=False suppresses geemap's per-tile "Downloading data from..."
+        # and "Data downloaded to..." prints, which otherwise interleave with
+        # and disrupt the tqdm progress bar in export_tiles.
         geemap.ee_export_image(
             img,
             filename=str(out_path),
             scale=scale_m,
             region=region,
             crs=utm,
+            verbose=False,
         )
         return out_path
 
@@ -1380,6 +1385,7 @@ class GeeRasterAdapter:
         reducer_names: Sequence[str],
         *,
         dates: Sequence | None = None,
+        progress_desc: str | None = None,
     ) -> List[tuple[dict[str, float | None], dict]]:
         """Compute server-side statistics for many points in parallel (Mode 2).
 
@@ -1423,6 +1429,8 @@ class GeeRasterAdapter:
                 pass
 
         # Single ThreadPool: each worker handles both branches for its point.
+        # Progress bar advances as each per-point future completes — gives the
+        # user visible feedback for what is otherwise a long, opaque GEE call.
         results: List = [None] * n
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {
@@ -1439,15 +1447,17 @@ class GeeRasterAdapter:
                 ): i
                 for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
             }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    logger.warning("GEE stats fetch failed for point %d: %s", idx, e)
-                    results[idx] = self._empty_stats_result(
-                        window_m, window_reducers, want_point=want_point
-                    )
+            with tqdm(total=n, desc=progress_desc or "GEE stats", unit="pt") as pbar:
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        results[idx] = future.result()
+                    except Exception as e:
+                        logger.warning("GEE stats fetch failed for point %d: %s", idx, e)
+                        results[idx] = self._empty_stats_result(
+                            window_m, window_reducers, want_point=want_point
+                        )
+                    pbar.update(1)
 
         return results
 
@@ -1463,6 +1473,7 @@ class GeeRasterAdapter:
         dataset_name: str = "dataset",
         resample_m: float | None = None,
         filename_suffix: str | None = None,
+        progress_desc: str | None = None,
     ) -> List[Path]:
         """Export GeoTIFF tiles for many points in parallel (Mode 4).
 
@@ -1506,13 +1517,16 @@ class GeeRasterAdapter:
                 )
                 future_to_idx[future] = i
 
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    logger.warning("GEE export failed for point %d: %s", idx, e)
-                    results[idx] = None
+            # Progress bar advances as each tile finishes downloading from GEE.
+            with tqdm(total=n, desc=progress_desc or "GEE tiles", unit="tile") as pbar:
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        results[idx] = future.result()
+                    except Exception as e:
+                        logger.warning("GEE export failed for point %d: %s", idx, e)
+                        results[idx] = None
+                    pbar.update(1)
 
         return results, meta_list
 
