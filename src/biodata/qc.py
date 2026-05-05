@@ -4,7 +4,12 @@ from dataclasses import dataclass
 import logging
 import pandas as pd
 
-_DATE_META_KEYS = ("image_date_used", "date_clamped", "date_source")
+_DATE_META_KEYS = (
+    "date_clamped",
+    "date_source",
+    "image_time_start",
+    "image_time_end",
+)
 
 # Substrings identifying QC columns in the final tabular output. QC columns
 # are produced by `attach_quality_control` with a "{dataset}_<name>_<suffix>"
@@ -16,7 +21,8 @@ _QC_COLUMN_KEYWORDS = (
     "_n_pixels_",
     "_had_nodata_",
     "_coverage_pct_",
-    "_image_date_used_",
+    "_image_time_start_",
+    "_image_time_end_",
     "_date_clamped_",
     "_date_source_",
     "_region_crs_",
@@ -232,9 +238,10 @@ def extract_crs_column(meta_list: list[dict]) -> pd.DataFrame:
 def extract_date_columns(meta_list: list[dict]) -> pd.DataFrame:
     """Extract per-point date info from adapter meta dicts into a DataFrame.
 
-    Returns columns: image_date_used, date_clamped, date_source.
-    Returns an empty DataFrame if no date info is present in the meta dicts.
-    No GEE calls — reads only from the already-collected meta dicts.
+    Returns columns: image_time_start, image_time_end, date_clamped,
+    date_source. Returns an empty DataFrame if no date info is present in
+    the meta dicts. No GEE calls — reads only from the already-collected
+    meta dicts.
     """
     if not meta_list or _DATE_META_KEYS[0] not in meta_list[0]:
         return pd.DataFrame()
