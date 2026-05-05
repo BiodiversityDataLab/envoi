@@ -14,15 +14,9 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
-try:
-    import ee
-except ImportError:
-    ee = None
+import ee
+import geemap
 
-try:
-    import geemap
-except ImportError:
-    geemap = None
 
 try:
     from . import register as _register
