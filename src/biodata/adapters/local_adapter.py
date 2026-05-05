@@ -11,6 +11,7 @@ from rasterio.warp import transform_geom
 from shapely.geometry import box, mapping
 from pyproj import Transformer
 from rasterio.errors import WindowError
+from tqdm.auto import tqdm
 
 from .base import BaseAdapter
 from ..reducers import get_reducer
@@ -176,6 +177,7 @@ class LocalRasterAdapter(BaseAdapter):
         reducer_names: Sequence[str],
         *,
         dates: Sequence | None = None,
+        progress_desc: str | None = None,
     ) -> List[tuple[dict, dict]]:
         """Unified stats fetch: dispatches window reducers and the "point" reducer.
 
@@ -207,8 +209,16 @@ class LocalRasterAdapter(BaseAdapter):
 
         # Single per-point loop — _fetch_stats_single returns the merged
         # (stats, meta) tuple, so no separate merge pass is needed.
+        # The tqdm wrapper gives users per-point progress feedback, mirroring
+        # the GEE adapter's progress UI so behaviour is consistent across sources.
+        total_points = len(lats)
         results: List[tuple[dict, dict]] = []
-        for lat, lon in zip(lats, lons):
+        for lat, lon in tqdm(
+            zip(lats, lons),
+            total=total_points,
+            desc=progress_desc or "Local stats",
+            unit="pt",
+        ):
             results.append(
                 self._fetch_stats_single(
                     lat, lon, window_m, window_reducer_fns, want_point=want_point
@@ -353,6 +363,7 @@ class LocalRasterAdapter(BaseAdapter):
         dataset_name: str = "dataset",
         resample_m: float | None = None,
         filename_suffix: str | None = None,
+        progress_desc: str | None = None,
     ):
         """Crop and save a GeoTIFF window centred on each point.
 
@@ -382,7 +393,14 @@ class LocalRasterAdapter(BaseAdapter):
         # are completely unaffected.
         suffix_part = f"-{filename_suffix}" if filename_suffix else ""
 
-        for lat, lon, sample_id in zip(lats, lons, id_list):
+        # Wrap the per-point tile loop with tqdm so users get visible progress
+        # for what can be a long sequential operation on large input sets.
+        for lat, lon, sample_id in tqdm(
+            zip(lats, lons, id_list),
+            total=len(id_list),
+            desc=progress_desc or "Local tiles",
+            unit="tile",
+        ):
             out_path = out_dir / f"{sample_id}-{dataset_name}{suffix_part}.tif"
             _, meta = self.fetch_values(lat, lon, window_m, return_meta=True)
 
