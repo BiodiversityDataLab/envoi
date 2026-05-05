@@ -981,6 +981,11 @@ def _append_stat_columns(
     # Collect keys in first-seen order so output columns stay stable across runs.
     stat_keys = dict.fromkeys(key for stat_dict, _ in stats_results for key in stat_dict)
 
+    # Build a batch of new columns so we can add them in one concat.
+    # Columns that already exist should be overwritten (not duplicated),
+    # which can happen for point stats when multiple window sizes are run.
+    new_columns: dict[str, list] = {}
+    existing_columns = set(df.columns)
     for stat_key in stat_keys:
         if stat_key == "point" or stat_key.endswith("_point"):
             column_name = f"{dataset_name}_{stat_key}"
@@ -988,7 +993,17 @@ def _append_stat_columns(
             column_name = f"{dataset_name}_{stat_key}_{window_size_m}m"
 
         # Pull one value per sample row, defaulting to None if that key is absent.
-        df[column_name] = [stat_dict.get(stat_key) for stat_dict, _ in stats_results]
+        column_values = [stat_dict.get(stat_key) for stat_dict, _ in stats_results]
+
+        # Overwrite existing columns (keeps schema stable across windows).
+        if column_name in existing_columns:
+            df[column_name] = column_values
+        else:
+            new_columns[column_name] = column_values
+
+    # Add all new columns at once to avoid DataFrame fragmentation warnings.
+    if new_columns:
+        df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
 
     return df
 
