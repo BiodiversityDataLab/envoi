@@ -5,7 +5,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, List, Sequence
+from typing import Any, Sequence
 
 from ..config import load_defaults
 from ..metadata import build_tile_crs_zones, summarize_date_info, summarize_tile_export
@@ -147,80 +147,86 @@ def _get_collection_time_bounds(
 
 
 def _find_nearest_timestamp(
-    timestamps: pd.DatetimeIndex,
+    time_starts: pd.DatetimeIndex,
     target: pd.Timestamp,
 ) -> tuple[pd.Timestamp, bool]:
     """Return the timestamp closest to *target*, clamping to range.
 
     Returns (nearest_timestamp, was_clamped).
     """
-    if target <= timestamps.min():
-        return timestamps.min(), target < timestamps.min()
-    if target >= timestamps.max():
-        return timestamps.max(), target > timestamps.max()
-    idx = timestamps.get_indexer([target], method="nearest")[0]
-    return timestamps[idx], False
+    if target <= time_starts.min():
+        return time_starts.min(), target < time_starts.min()
+    if target >= time_starts.max():
+        return time_starts.max(), target > time_starts.max()
+    idx = time_starts.get_indexer([target], method="nearest")[0]
+    return time_starts[idx], False
 
 
 def _resolve_date_filter_range(
-    date_ts: pd.Timestamp,
+    date_timestamp: pd.Timestamp,
     policy: str,
-    timestamps: pd.DatetimeIndex | None = None,
+    time_starts: pd.DatetimeIndex | None = None,
     time_ends: pd.DatetimeIndex | None = None,
 ) -> tuple[str, str]:
     """Return (start, end) date strings for ImageCollection.filterDate().
 
     When cached timestamps are available, uses them to pin the exact image
-    interval. When not (server-side fallback), broadens the window by ±1 day
-    so GEE can find the image without a client-side index.
+    interval. When not (server-side fallback), broadens the window so GEE
+    can resolve the image without a client-side index — asymmetrically:
+        - policy="nearest"  → [date - 1d, date + 1d]
+        - policy="contains" → [date,      date + 1d]
 
-    policy="contains" selects the image whose interval contains date_ts.
+    policy="contains" selects the image whose interval contains date_timestamp.
     policy="nearest"  selects the image with the closest start timestamp.
     """
-    fmt = "%Y-%m-%d"
+    date_format = "%Y-%m-%d"
 
-    if timestamps is None:
+    if time_starts is None:
         # No cached index — let GEE resolve server-side with a wider window.
         if policy == "contains":
-            return date_ts.strftime(fmt), (date_ts + pd.DateOffset(days=1)).strftime(fmt)
+            return date_timestamp.strftime(date_format), (
+                date_timestamp + pd.DateOffset(days=1)
+            ).strftime(date_format)
         else:
-            return (date_ts - pd.DateOffset(days=1)).strftime(fmt), (
-                date_ts + pd.DateOffset(days=1)
-            ).strftime(fmt)
+            return (date_timestamp - pd.DateOffset(days=1)).strftime(date_format), (
+                date_timestamp + pd.DateOffset(days=1)
+            ).strftime(date_format)
 
     if policy == "nearest":
-        nearest, _ = _find_nearest_timestamp(timestamps, date_ts)
-        return nearest.strftime(fmt), (nearest + pd.DateOffset(days=1)).strftime(fmt)
+        nearest, _ = _find_nearest_timestamp(time_starts, date_timestamp)
+        return nearest.strftime(date_format), (nearest + pd.DateOffset(days=1)).strftime(
+            date_format
+        )
 
-    # policy == "contains": find the image interval that contains date_ts.
-    # Clamp to collection boundaries when date_ts is out of range.
-    if date_ts <= timestamps.min():
+    # --- policy == "contains": find the image interval that contains date_timestamp. ---
+    # Clamp to collection boundaries when date_timestamp is out of range.
+    if date_timestamp <= time_starts.min():
         idx = 0
-    elif date_ts >= timestamps.max():
-        idx = len(timestamps) - 1
+    elif date_timestamp >= time_starts.max():
+        idx = len(time_starts) - 1
     else:
-        idx = int(timestamps.searchsorted(date_ts, side="right") - 1)
-        idx = max(0, min(idx, len(timestamps) - 1))
+        idx = int(time_starts.searchsorted(date_timestamp, side="right") - 1)
+        idx = max(0, min(idx, len(time_starts) - 1))
 
-    selected = timestamps[idx]
+    start_date = time_starts[idx]
 
     # Use true interval end when available, otherwise fall back to next start.
-    if time_ends is not None and len(time_ends) == len(timestamps):
-        next_dt = time_ends[idx]
-    elif idx + 1 < len(timestamps):
-        next_dt = timestamps[idx + 1]
+    if time_ends is not None and len(time_ends) == len(time_starts):
+        end_date = time_ends[idx]
+    elif idx + 1 < len(time_starts):
+        end_date = time_starts[idx + 1]
     else:
-        next_dt = selected + pd.DateOffset(days=1)
+        end_date = start_date + pd.DateOffset(days=1)
 
     # filterDate(start, end) is half-open. Some collections have images with
     # system:time_end == system:time_start (instantaneous events); using the
     # raw end would produce an empty filter and .first() would return null.
     # Bump by one second whenever end <= start so the selected image is
     # always inside the range.
-    if next_dt <= selected:
-        next_dt = selected + pd.Timedelta(seconds=1)
+    if end_date <= start_date:
+        end_date = start_date + pd.Timedelta(seconds=1)
 
-    return selected.strftime(fmt), next_dt.strftime(fmt)
+    return start_date.strftime(date_format), end_date.strftime(date_format)
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +241,11 @@ def _resolve_date_filter_range(
 KNOWN_DERIVED_BANDS = frozenset({"slope", "aspect"})
 
 
-def _apply_derived_bands(img, derived):
-    """Compute derived bands and add them alongside the existing bands of `img`.
+def _apply_derived_bands(image, derived):
+    """Compute derived bands and add them alongside the existing bands of `image`.
 
     `derived` may be either a single band name (e.g. "slope") or a list of names
-    (e.g. ["slope", "aspect"]). Each derived band is computed from `img` and
+    (e.g. ["slope", "aspect"]). Each derived band is computed from `image` and
     added to the output via `addBands()`, so the source bands are preserved.
 
     Raises ValueError if an unknown derived band name is given — silent fallback
@@ -251,15 +257,18 @@ def _apply_derived_bands(img, derived):
     else:
         derived_names = list(derived)
 
-    for name in derived_names:
-        if name == "slope":
-            img = img.addBands(ee.Terrain.slope(img))
-        elif name == "aspect":
-            img = img.addBands(ee.Terrain.aspect(img))
+    for derived_band_name in derived_names:
+        if derived_band_name == "slope":
+            image = image.addBands(ee.Terrain.slope(image))
+        elif derived_band_name == "aspect":
+            image = image.addBands(ee.Terrain.aspect(image))
         else:
-            raise ValueError(f"Unknown derived band '{name}'. Supported: 'slope', 'aspect'.")
+            raise ValueError(
+                f"Unknown derived band '{derived_band_name}'. "
+                f"Supported: {', '.join(sorted(KNOWN_DERIVED_BANDS))}."
+            )
 
-    return img
+    return image
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +280,7 @@ def _build_image(
     dataset_spec: dict,
     date=None,
     geometry=None,
-    collection_timestamps: pd.DatetimeIndex | None = None,
+    collection_time_starts: pd.DatetimeIndex | None = None,
     collection_time_ends: pd.DatetimeIndex | None = None,
     *,
     lat: float | None = None,
@@ -279,9 +288,13 @@ def _build_image(
 ):
     """Build an ee.Image from a dataset_spec config dict.
 
-    Pipeline: load image/collection → bounds filter → date selection →
-              cloud_pct filter → cloud mask → reduce → band select →
-              derived band.
+    Pipeline:
+        1. Load image (single asset) or ImageCollection.
+        2. For collections only: filterBounds → optional UTM-zone filter
+           → date selection (filterDate + .first(), or mosaic when no date).
+        3. Compute derived bands (slope, aspect, …) and addBands them.
+        4. Final band select — drop source bands when only derived
+           bands were requested, otherwise keep both.
 
     For collections, the date handling strategy is:
     - date provided + timestamps cached: find nearest timestamp, filterDate, .first()
@@ -294,15 +307,15 @@ def _build_image(
         Point or region to spatially constrain the collection via
         ``filterBounds``.  Essential for large tiled collections
         (e.g. satellite embeddings with 97k global tiles).
-    collection_timestamps : pd.DatetimeIndex, optional
+    collection_time_starts : pd.DatetimeIndex, optional
         Cached start timestamps for the collection.
     collection_time_ends : pd.DatetimeIndex, optional
         Cached end timestamps for the collection (aligned with start times).
     """
-    img = None
+    image = None
 
     if "image" in dataset_spec:
-        img = ee.Image(dataset_spec["image"])
+        image = ee.Image(dataset_spec["image"])
 
     elif "collection" in dataset_spec:
         image_collection = ee.ImageCollection(dataset_spec["collection"])
@@ -323,51 +336,52 @@ def _build_image(
             start, end = _resolve_date_filter_range(
                 date_ts,
                 date_policy,
-                timestamps=collection_timestamps,
+                time_starts=collection_time_starts,
                 time_ends=collection_time_ends,
             )
             image_collection = image_collection.filterDate(start, end)
-            img = image_collection.first()
+            image = image_collection.first()
         else:
             # No date: mosaic (most recent non-masked pixel per position)
-            img = image_collection.mosaic()
+            image = image_collection.mosaic()
 
     else:
         raise ValueError("dataset_spec must contain 'image' or 'collection'")
 
-    # Compute any derived bands FIRST, before filtering to `bands`. This matters
-    # for derivations that need access to source bands the user didn't list
-    # (e.g. if the user wanted only the derived output, they shouldn't have to
-    # also list the intermediate source bands). For slope/aspect this isn't
-    # strictly necessary since they read the first band, but keeping the order
-    # consistent means future derivations can freely reference source bands.
-    derived = dataset_spec.get("derived_bands")
-    if derived:
-        img = _apply_derived_bands(img, derived)
+    # Compute derived bands BEFORE selecting `bands`. This allows derived bands
+    # to read any source band they need internally — the user doesn't have to
+    # list those source bands in `bands` just to make the derivation work.
+    derived_bands = dataset_spec.get("derived_bands")
+    if derived_bands:
+        image = _apply_derived_bands(image, derived_bands)
 
-    # Build the final output band list. If the user specified both `bands` and
-    # `derived_bands`, the result is their concatenation so source bands are
-    # included alongside derived ones (e.g. DEM + slope + aspect). If only
-    # `derived_bands` is set, keep whatever source bands the image already has
-    # plus the derived ones. If neither is set, keep the image as-is.
+    # Determine the final output bands.
     bands = dataset_spec.get("bands")
+    derived_bands_list = (
+        [derived_bands]
+        if isinstance(derived_bands, str)
+        else list(derived_bands) if derived_bands else []
+    )
+
     if bands is not None:
+        # Both source and derived specified — include all of them.
         source_bands = bands if isinstance(bands, list) else [bands]
-        derived_bands_list = (
-            [derived] if isinstance(derived, str) else list(derived) if derived else []
-        )
-        img = img.select(source_bands + derived_bands_list)
+        image = image.select(source_bands + derived_bands_list)
+    elif derived_bands_list:
+        # Only derived bands specified — drop source bands from the output.
+        image = image.select(derived_bands_list)
+    # else: neither specified — return the image as-is.
 
-    return img
+    return image
 
 
 # ---------------------------------------------------------------------------
-# EE reducer helpers  (combined reducer pattern + result parsing)
+# Earth Engine reducer helpers  (combined reducer pattern + result parsing)
 # ---------------------------------------------------------------------------
 
-# Maps EDDP/user-facing reducer names to GEE reducer constructors
+# Maps user-facing reducer names to GEE reducer constructors
 # and the suffix GEE appends to band names in reduceRegion output.
-_GEE_REDUCER_MAP = {
+_EE_REDUCER_MAP = {
     "mean": ("mean", "_mean"),
     "median": ("median", "_median"),
     "mode": ("mode", "_mode"),
@@ -380,30 +394,30 @@ _GEE_REDUCER_MAP = {
 }
 
 
-def _get_ee_reducer(name: str) -> tuple[ee.Reducer, str]:
-    """Convert an EDDP reducer name to an (ee.Reducer, output_suffix) pair.
+def _get_ee_reducer(reducer_name: str) -> tuple[ee.Reducer, str]:
+    """Convert a reducer name to an (ee.Reducer, output_suffix) pair.
 
     Supports standard names (mean, std, …) and percentile shorthands
     in both ``q``-style (q05, q25, q90) and ``p``-style (p10, p50).
     """
     # Standard reducers
-    if name in _GEE_REDUCER_MAP:
-        factory_name, suffix = _GEE_REDUCER_MAP[name]
+    if reducer_name in _EE_REDUCER_MAP:
+        factory_name, suffix = _EE_REDUCER_MAP[reducer_name]
         reducer = getattr(ee.Reducer, factory_name)()
         return reducer, suffix
 
     # Percentiles: q05 / q10 / q25 / q50 / q75 / q90 / q95 or p10 / p50 …
     pct_value = None
-    if name.startswith("q") and name[1:].isdigit():
-        pct_value = int(name[1:])
-    elif name.startswith("p") and name[1:].isdigit():
-        pct_value = int(name[1:])
+    if reducer_name.startswith("q") and reducer_name[1:].isdigit():
+        pct_value = int(reducer_name[1:])
+    elif reducer_name.startswith("p") and reducer_name[1:].isdigit():
+        pct_value = int(reducer_name[1:])
 
     if pct_value is not None and 0 < pct_value <= 100:
-        reducer = ee.Reducer.percentile([pct_value]).setOutputs([name])
-        return reducer, f"_{name}"
+        reducer = ee.Reducer.percentile([pct_value]).setOutputs([reducer_name])
+        return reducer, f"_{reducer_name}"
 
-    raise ValueError(f"Unsupported reducer name: {name!r}")
+    raise ValueError(f"Unsupported reducer name: {reducer_name!r}")
 
 
 def _build_combined_reducer(reducer_names: Sequence[str]) -> tuple[ee.Reducer, list[str]]:
@@ -416,8 +430,8 @@ def _build_combined_reducer(reducer_names: Sequence[str]) -> tuple[ee.Reducer, l
     combined = first_reducer
     suffixes = [first_suffix]
 
-    for name in reducer_names[1:]:
-        next_reducer, suffix = _get_ee_reducer(name)
+    for reducer_name in reducer_names[1:]:
+        next_reducer, suffix = _get_ee_reducer(reducer_name)
         combined = combined.combine(reducer2=next_reducer, sharedInputs=True)
         suffixes.append(suffix)
 
@@ -436,19 +450,19 @@ def _parse_reduce_result(
     For a single reducer with no combination, GEE may omit the suffix and
     use just the band name.
     """
-    out: dict[str, float | None] = {}
+    result_dict: dict[str, float | None] = {}
     if not result:
         return {r: None for r in reducer_names}
 
-    for rname, suffix in zip(reducer_names, suffixes):
+    for reducer_name, suffix in zip(reducer_names, suffixes):
         # Try with suffix first, then bare band name (single-reducer case)
-        key = f"{band_name}{suffix}"
-        val = result.get(key)
-        if val is None and len(reducer_names) == 1:
-            val = result.get(band_name)
-        out[rname] = val
+        output_key = f"{band_name}{suffix}"
+        value = result.get(output_key)
+        if value is None and len(reducer_names) == 1:
+            value = result.get(band_name)
+        result_dict[reducer_name] = value
 
-    return out
+    return result_dict
 
 
 def _parse_multiband_result(
@@ -461,27 +475,28 @@ def _parse_multiband_result(
     Returns a flat dict keyed as ``{band}_{reducer_name}`` for every band
     present in *result*, e.g. ``{"bio01_mean": 27.0, "bio02_mean": 180.5}``.
 
-    The caller (``_fetch_stats_single``) always combines a count reducer
-    onto the user-requested reducers so we get a valid-pixel count for QC.
-    Because the result is therefore always a combined-form dict, GEE
-    always emits ``{band}{gee_suffix}`` keys (e.g. ``"bio01_mean"``),
-    so we always use suffix-based parsing here.
+    The caller (``_fetch_stats_single``) arranges for ``{band}_count``
+    keys to be present in *result* — either by combining a count reducer
+    itself for QC, or by passing through the user's own ``"count"``
+    request. Either way the result is a combined-form dict, so GEE emits
+    ``{band}{gee_suffix}`` keys (e.g. ``"bio01_mean"``) and we always use
+    suffix-based parsing here.
     """
     if not result:
         return {}
 
-    out: dict[str, float | None] = {}
+    result_dict: dict[str, float | None] = {}
 
-    for rname, gee_suffix in zip(reducer_names, suffixes):
+    for reducer_name, suffix in zip(reducer_names, suffixes):
         # Find every key that ends with this reducer's suffix (e.g. "_mean").
         # Count keys (added by the caller for QC) are skipped here unless
         # the user actually asked for a "count" reducer themselves.
-        for key, val in result.items():
-            if key.endswith(gee_suffix):
-                band = key[: -len(gee_suffix)]
-                out[f"{band}_{rname}"] = val
+        for output_key, val in result.items():
+            if output_key.endswith(suffix):
+                band = output_key[: -len(suffix)]
+                result_dict[f"{band}_{reducer_name}"] = val
 
-    return out
+    return result_dict
 
 
 def _parse_point_result(
@@ -582,7 +597,7 @@ def _summarize_band_coverage(meta_list: list[dict]) -> dict[str, dict[str, float
         for band, coverage_pct in point_meta.get("band_coverage_pct", {}).items():
             all_band_values.setdefault(band, []).append(coverage_pct)
 
-    return {
+    per_band = {
         band: {
             "min": round(min(values), 2),
             "mean": round(sum(values) / len(values), 2),
@@ -590,6 +605,15 @@ def _summarize_band_coverage(meta_list: list[dict]) -> dict[str, dict[str, float
         }
         for band, values in all_band_values.items()
     }
+
+    # If every band's summary is identical, all bands share the same pixel
+    # grid and the breakdown adds no information beyond coverage_pct. Return
+    # empty so build_dataset_meta omits the key entirely.
+    summaries = list(per_band.values())
+    if summaries and all(s == summaries[0] for s in summaries[1:]):
+        return {}
+
+    return per_band
 
 
 # ---------------------------------------------------------------------------
@@ -610,12 +634,15 @@ class GeeRasterAdapter:
        and resolved in the same round-trip.
     2. **export_tiles** — download full GeoTIFF tiles via ``geemap``.
 
-    For ImageCollections, the adapter automatically selects the nearest
-    image to each point's date. When no date is provided, the most
-    recent image is used.
+    For ImageCollections, the adapter selects an image per point based
+    on the catalog's ``collection_date_policy``: ``"nearest"`` (default)
+    picks the image whose start timestamp is closest to the sample
+    date; ``"contains"`` picks the image whose interval covers the
+    sample date. When no date is provided, the most recent image is
+    used.
     """
 
-    spec: Dict[str, Any]
+    spec: dict[str, Any]
     _static_image: Any = field(default=None, init=False, repr=False)
     _needs_per_point_date: bool = field(default=False, init=False, repr=False)
     _native_proj: Any = field(default=None, init=False, repr=False)
@@ -627,8 +654,9 @@ class GeeRasterAdapter:
     def __post_init__(self):
         _ensure_gee_init()
 
-        # dataset_spec holds extra config (bands, date windows, derivatives, etc.)
-        # Always auto-detect asset type from GEE, then merge with user config.
+        # dataset_spec holds extra config (bands, derived bands, asset
+        # type override, native scale override, etc.). Always auto-detect
+        # asset type from GEE, then merge with user config.
         dataset_spec = dict(self.spec.get("dataset_spec") or {})
         if (
             self.spec.get("path")
@@ -667,7 +695,7 @@ class GeeRasterAdapter:
         self._dataset_spec = dataset_spec
 
         is_collection = "collection" in dataset_spec
-        self._collection_timestamps = None
+        self._collection_time_starts = None
         self._collection_time_ends = None
 
         # Cache the native projection from the source — composite images
@@ -679,12 +707,12 @@ class GeeRasterAdapter:
             )
             # Fetch available timestamps for automatic date selection.
             start_times, end_times = _get_collection_time_bounds(dataset_spec["collection"])
-            self._collection_timestamps = start_times
+            self._collection_time_starts = start_times
             self._collection_time_ends = end_times
             # Collections with timestamps use per-point date selection;
             # the static image is built lazily in _get_image when no date
             # is provided (most-recent fallback).
-            self._needs_per_point_date = self._collection_timestamps is not None
+            self._needs_per_point_date = self._collection_time_starts is not None
             if not self._needs_per_point_date:
                 # Timestamp fetch failed — fall back to static mosaic
                 self._static_image = _build_image(dataset_spec)
@@ -753,11 +781,17 @@ class GeeRasterAdapter:
     def _get_image(self, date=None, lat=None, lon=None) -> ee.Image:
         """Return the ee.Image to sample, building per-point if needed.
 
-        For IMAGE assets the pre-built static image is always returned.
+        For IMAGE assets the pre-built static image is always returned,
+        regardless of date or coordinates.
+
         For ImageCollections:
-        - date provided → select nearest image to that date
-        - no date + point coords → select most recent image for that point
-        - no date + no coords → use most recent image (cached)
+        - date provided + coords → per-point image picked via
+          ``collection_date_policy`` (nearest/contains)
+        - date provided + no coords → server-side date filter only
+          (no spatial selection — used when timestamps weren't cached
+          or for global probes)
+        - no date + coords → per-point most-recent image
+        - no date + no coords → most-recent image, cached on first call
         """
         # Per-point branch has priority for collections that need spatial
         # filtering (e.g. tiled DEM collections). When coordinates are given,
@@ -769,14 +803,14 @@ class GeeRasterAdapter:
         # for tiled IMAGE_COLLECTIONs (issue with dem_glo30 + "point" stat).
         if self._needs_per_point_date and lat is not None and lon is not None:
             target_date = (
-                self._collection_timestamps.max() if date is None else pd.to_datetime(date)
+                self._collection_time_starts.max() if date is None else pd.to_datetime(date)
             )
             geom = ee.Geometry.Point([lon, lat])
             return _build_image(
                 self._dataset_spec,
                 date=target_date,
                 geometry=geom,
-                collection_timestamps=self._collection_timestamps,
+                collection_time_starts=self._collection_time_starts,
                 collection_time_ends=self._collection_time_ends,
                 lat=lat,
                 lon=lon,
@@ -795,7 +829,7 @@ class GeeRasterAdapter:
         # most-recent fallback. Used by tile-export and band-name probing
         # paths that don't have a specific point in mind.
         if date is None and self._needs_per_point_date:
-            most_recent = self._collection_timestamps.max()
+            most_recent = self._collection_time_starts.max()
             logger.info(
                 "No date/geometry provided for collection %s; using most recent image (%s).",
                 self._dataset_spec.get("collection"),
@@ -804,28 +838,38 @@ class GeeRasterAdapter:
             self._static_image = _build_image(
                 self._dataset_spec,
                 date=most_recent,
-                collection_timestamps=self._collection_timestamps,
+                collection_time_starts=self._collection_time_starts,
                 collection_time_ends=self._collection_time_ends,
             )
             return self._static_image
 
-        # Per-point date selection without per-point bounds requirement
-        # (e.g. an IMAGE_COLLECTION whose timestamps fetch failed but a
-        # date is still provided).
+        # Final fallback — a date was provided but neither the per-point
+        # branch (no coords) nor the static-image branch (date is None)
+        # could handle it. Two real paths reach here:
+        #   1. Collection whose timestamp fetch failed and date is not
+        #      None (server-side date filter with no client-side index).
+        #   2. Collection with timestamps but no coords and date is not
+        #      None (per-point date selection without a spatial filter).
         dt = pd.to_datetime(date)
         geom = ee.Geometry.Point([lon, lat]) if lat is not None else None
         return _build_image(
             self._dataset_spec,
             dt,
             geometry=geom,
-            collection_timestamps=self._collection_timestamps,
+            collection_time_starts=self._collection_time_starts,
             collection_time_ends=self._collection_time_ends,
             lat=lat,
             lon=lon,
         )
 
     def _get_band_name(self, img: ee.Image) -> str:
-        """Get the first band name from the image (needed for result parsing)."""
+        """Get the first band name from the image (needed for result parsing).
+
+        Side effect: populates ``_cached_band_name``, ``_cached_band_names``,
+        and ``_cached_band_count`` on first call. Other methods
+        (``_empty_stats_result``, ``_fetch_stats_single``, ``build_dataset_meta``)
+        rely on these caches being warm.
+        """
         band = self._dataset_spec.get("bands")
         derived = self._dataset_spec.get("derived_bands")
 
@@ -926,8 +970,11 @@ class GeeRasterAdapter:
             "image_time_start": image_start.strftime("%Y-%m-%d"),
         }
         # Only emit image_time_end when we have a cached end-times array
-        # AND the requested index is in-bounds. Some collections expose
-        # mismatched-length start/end arrays, so the bounds check matters.
+        # AND the requested index is in-bounds. Defensive bounds check —
+        # _get_collection_time_bounds() returns time_ends=None whenever
+        # the start/end array lengths don't match, so by the time we
+        # reach here the index *should* always be valid; the guard is
+        # belt-and-braces in case that upstream invariant ever breaks.
         end_times = self._collection_time_ends
         if end_times is not None and end_index is not None and 0 <= end_index < len(end_times):
             info["image_time_end"] = end_times[end_index].strftime("%Y-%m-%d")
@@ -939,17 +986,17 @@ class GeeRasterAdapter:
         Returns a dict with image_time_start, image_time_end, date_clamped,
         date_source to be merged into the per-point meta dict.
         """
-        if self._collection_timestamps is None:
+        if self._collection_time_starts is None:
             return {}
 
-        timestamps = self._collection_timestamps
-        last_index = len(timestamps) - 1
+        time_starts = self._collection_time_starts
+        last_index = len(time_starts) - 1
 
         if date is None:
             # No-date fallback: most recent image (last entry in the
-            # timestamps array).
+            # time_starts array).
             return self._make_date_info(
-                timestamps.max(),
+                time_starts.max(),
                 end_index=last_index,
                 clamped=False,
                 source="most_recent_no_date",
@@ -962,26 +1009,26 @@ class GeeRasterAdapter:
             # "contains" policy: pick the image whose time interval contains
             # the sample date. When the date falls outside the collection's
             # full range, clamp to the nearest boundary image.
-            if dt <= timestamps.min():
+            if dt <= time_starts.min():
                 return self._make_date_info(
-                    timestamps.min(),
+                    time_starts.min(),
                     end_index=0,
                     clamped=True,
                     source="clamped_to_nearest",
                 )
-            if dt >= timestamps.max():
+            if dt >= time_starts.max():
                 return self._make_date_info(
-                    timestamps.max(),
+                    time_starts.max(),
                     end_index=last_index,
                     clamped=True,
                     source="clamped_to_nearest",
                 )
 
             # In-range: find the latest start-time that's still <= dt.
-            idx = int(timestamps.searchsorted(dt, side="right") - 1)
+            idx = int(time_starts.searchsorted(dt, side="right") - 1)
             idx = max(0, min(idx, last_index))
             return self._make_date_info(
-                timestamps[idx],
+                time_starts[idx],
                 end_index=idx,
                 clamped=False,
                 source="contains_sample_date",
@@ -989,8 +1036,8 @@ class GeeRasterAdapter:
 
         # Default "nearest" policy: pick whichever image timestamp is closest
         # to the sample date, even if the date is outside the range.
-        nearest, was_clamped = _find_nearest_timestamp(timestamps, dt)
-        nearest_index = int(timestamps.get_indexer([nearest])[0])
+        nearest, was_clamped = _find_nearest_timestamp(time_starts, dt)
+        nearest_index = int(time_starts.get_indexer([nearest])[0])
         return self._make_date_info(
             nearest,
             end_index=nearest_index,
@@ -1033,15 +1080,21 @@ class GeeRasterAdapter:
         when the original request asked for the point reducer, regardless
         of which window reducers were combined alongside it.
         """
+        # Determine multiband once — the same flag governs both the point-side
+        # placeholder shape and the band_coverage_pct emit below. A single
+        # named band ("bands": "DEM") is always single-band, regardless of how
+        # many bands the underlying image carries; otherwise we trust the
+        # cached band count populated by _get_band_name on first fetch.
+        spec_band = self._dataset_spec.get("bands")
+        band_count = getattr(self, "_cached_band_count", 1)
+        multiband = not isinstance(spec_band, str) and band_count > 1
+
         # Window-side: one None value per requested non-point reducer.
         stats: dict[str, float | None] = {r: None for r in reducer_names}
 
         # Point-side: mirror the success-path shape — multi-band emits one
         # "{band}_point" key per band; single-band emits a bare "point" key.
         if want_point:
-            spec_band = self._dataset_spec.get("bands")
-            band_count = getattr(self, "_cached_band_count", 1)
-            multiband = not isinstance(spec_band, str) and band_count > 1
             if multiband:
                 # We may not have the full band list cached here; emit one
                 # placeholder per cached band name, falling back to a single
@@ -1058,9 +1111,7 @@ class GeeRasterAdapter:
         _, meta = self._empty_result(window_m)
         # Emit an empty band_coverage_pct for multiband failure paths so
         # callers always see a consistent schema regardless of success/failure.
-        spec_band = self._dataset_spec.get("bands")
-        band_count = getattr(self, "_cached_band_count", 1)
-        if not isinstance(spec_band, str) and band_count > 1:
+        if multiband:
             meta["band_coverage_pct"] = {}
         return stats, meta
 
@@ -1250,15 +1301,16 @@ class GeeRasterAdapter:
         *,
         dates: Sequence | None = None,
         progress_desc: str | None = None,
-    ) -> List[tuple[dict[str, float | None], dict]]:
+    ) -> list[tuple[dict[str, float | None], dict]]:
         """Compute server-side statistics for many points in parallel (Mode 1).
 
-        Issues one ``reduceRegion`` call per point — or, when ``"point"`` is
-        in *reducer_names*, a single ``ee.Dictionary`` containing both the
-        window reduction and a Point-geometry reduction. GEE evaluates both
-        branches server-side in one ``getInfo()`` round-trip, so the cost
-        is one HTTP call per point regardless of whether the user asked
-        for window stats, point sampling, or both.
+        Each point is resolved with one server-side ``ee.Dictionary``
+        containing one or two reductions: a window reduction (whenever
+        any non-point reducer was requested) and a point reduction
+        (whenever ``"point"`` is in *reducer_names*). GEE evaluates the
+        branches in parallel server-side and we pull them back together
+        with one ``getInfo()`` round-trip, so the cost is one HTTP call
+        per point regardless of which combination the user requested.
 
         Output keys per point:
           - window stats: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
@@ -1295,7 +1347,7 @@ class GeeRasterAdapter:
         # Single ThreadPool: each worker handles both branches for its point.
         # Progress bar advances as each per-point future completes — gives the
         # user visible feedback for what is otherwise a long, opaque GEE call.
-        results: List = [None] * n
+        results: list = [None] * n
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {
                 executor.submit(
@@ -1418,7 +1470,7 @@ class GeeRasterAdapter:
         n = len(lats)
         date_list = list(dates) if dates is not None else [None] * n
         id_list = list(ids) if ids is not None else [str(i) for i in range(n)]
-        results: List = [None] * n
+        results: list = [None] * n
 
         # Warm the band-name cache so build_dataset_meta can read it later.
         try:
@@ -1476,7 +1528,7 @@ class GeeRasterAdapter:
         path). Quality stats and date-selection info are added when present.
         """
         # Static dataset info from the catalog spec.
-        meta: Dict[str, Any] = {
+        meta: dict[str, Any] = {
             "data_source": spec.get("data_source"),
             "path": spec.get("path"),
         }
@@ -1520,11 +1572,11 @@ class GeeRasterAdapter:
                 meta["tile_crs"] = zones
 
         # Collection date range: available when timestamps were fetched.
-        timestamps = getattr(self, "_collection_timestamps", None)
-        if timestamps is not None and len(timestamps) > 0:
+        time_starts = getattr(self, "_collection_time_starts", None)
+        if time_starts is not None and len(time_starts) > 0:
             meta["collection_date_range"] = [
-                timestamps.min().strftime("%Y-%m-%d"),
-                timestamps.max().strftime("%Y-%m-%d"),
+                time_starts.min().strftime("%Y-%m-%d"),
+                time_starts.max().strftime("%Y-%m-%d"),
             ]
 
         # Pass-through catalog field for dataset description.
