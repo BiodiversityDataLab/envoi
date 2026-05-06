@@ -101,6 +101,12 @@ def build_quality_control_dataframe(
             crs_column_dataframe.add_prefix(f"{dataset_name}_").add_suffix(column_suffix)
         )
 
+    band_coverage_dataframe = extract_band_coverage_columns(meta_list)
+    if not band_coverage_dataframe.empty:
+        additional_quality_dataframes.append(
+            band_coverage_dataframe.add_prefix(f"{dataset_name}_").add_suffix(column_suffix)
+        )
+
     # Reset indexes before concat so row alignment is explicit and robust.
     if additional_quality_dataframes:
         quality_control_dataframe = pd.concat(
@@ -233,6 +239,36 @@ def extract_crs_column(meta_list: list[dict]) -> pd.DataFrame:
     if not meta_list or "region_crs" not in meta_list[0]:
         return pd.DataFrame()
     return pd.DataFrame({"region_crs": [m.get("region_crs") for m in meta_list]})
+
+
+def extract_band_coverage_columns(meta_list: list[dict]) -> pd.DataFrame:
+    """Extract per-point, per-band coverage from adapter meta dicts into a DataFrame.
+
+    Each row in the result corresponds to one sample point. Columns are named
+    ``{band}_coverage_pct`` (e.g. ``bio01_coverage_pct``) so that after the
+    caller applies add_prefix/add_suffix the final column names follow the
+    ``{dataset}_{band}_coverage_pct_{window}m`` convention — which already
+    matches the ``_coverage_pct_`` keyword in _QC_COLUMN_KEYWORDS and is
+    therefore automatically routed to the QC output file.
+
+    Returns an empty DataFrame when no meta dict contains band_coverage_pct
+    (i.e. single-band datasets, point-only runs, or failure-path metas).
+    """
+    # Only emit columns when at least the first point has non-empty band data.
+    # Failure-path metas carry band_coverage_pct: {} so this correctly skips
+    # datasets where every point failed.
+    first_band_data = next(
+        (m.get("band_coverage_pct") for m in meta_list if m.get("band_coverage_pct")),
+        None,
+    )
+    if not first_band_data:
+        return pd.DataFrame()
+
+    rows = [m.get("band_coverage_pct", {}) for m in meta_list]
+    band_df = pd.DataFrame(rows)
+    # Rename "bio01" → "bio01_coverage_pct" so the column name survives
+    # add_prefix/add_suffix intact and still matches _QC_COLUMN_KEYWORDS.
+    return band_df.rename(columns={col: f"{col}_coverage_pct" for col in band_df.columns})
 
 
 def extract_date_columns(meta_list: list[dict]) -> pd.DataFrame:

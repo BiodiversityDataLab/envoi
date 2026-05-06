@@ -564,6 +564,35 @@ def _extract_count_from_reduce_result(
 
 
 # ---------------------------------------------------------------------------
+# Dataset-level summary helpers  (aggregates over the full point set)
+# ---------------------------------------------------------------------------
+
+
+def _summarize_band_coverage(meta_list: list[dict]) -> dict[str, dict[str, float]]:
+    """Aggregate per-point band_coverage_pct across all sample points.
+
+    Returns ``{band: {"min": x, "mean": x, "max": x}}`` for each band that
+    appeared in at least one point's metadata. Failure-path metas carry an
+    empty ``band_coverage_pct`` dict and are skipped automatically, so the
+    summary only reflects points that actually ran. Returns an empty dict for
+    single-band datasets or when no point produced band-level coverage data.
+    """
+    all_band_values: dict[str, list[float]] = {}
+    for point_meta in meta_list:
+        for band, coverage_pct in point_meta.get("band_coverage_pct", {}).items():
+            all_band_values.setdefault(band, []).append(coverage_pct)
+
+    return {
+        band: {
+            "min": round(min(values), 2),
+            "mean": round(sum(values) / len(values), 2),
+            "max": round(max(values), 2),
+        }
+        for band, values in all_band_values.items()
+    }
+
+
+# ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
 
@@ -1508,6 +1537,14 @@ class GeeRasterAdapter:
             date_info = summarize_date_info(meta_list)
             if date_info is not None:
                 meta["date_info"] = date_info
+
+        # Per-band coverage summary across all points, for multi-band datasets.
+        # Reported as {band: {min, mean, max}} so users can spot bands with
+        # systematically lower data density without inspecting the QC CSV.
+        if meta_list:
+            band_coverage_summary = _summarize_band_coverage(meta_list)
+            if band_coverage_summary:
+                meta["band_coverage_pct"] = band_coverage_summary
 
         # QC/coverage stats accumulated during processing. Make a copy so we
         # don't mutate the caller's dict when adding the tile-export summary.
