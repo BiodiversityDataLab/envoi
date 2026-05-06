@@ -663,12 +663,17 @@ class GeeRasterAdapter:
         Reads the projection's CRS and nominal scale once via getInfo() and
         caches the resolved scale so downstream calls don't pay the cost again.
         """
-        # Pre-fetch the projection info — both fields come from a single
-        # getInfo() round-trip via projection().getInfo() if we want to,
-        # but two small calls are simpler and only happen once per adapter.
+        # Fetch projection CRS and nominal scale in a single round-trip by
+        # wrapping both server-side expressions in one ee.Dictionary.
         try:
-            proj_info = self._native_proj.getInfo()
-            native_scale = float(self._native_proj.nominalScale().getInfo())
+            raw = ee.Dictionary(
+                {
+                    "proj_info": self._native_proj,
+                    "scale": self._native_proj.nominalScale(),
+                }
+            ).getInfo()
+            proj_info = raw.get("proj_info") or {}
+            native_scale = float(raw["scale"])
         except Exception:
             # If GEE refuses to evaluate the projection, leave detection to
             # the first sampling call rather than masking the underlying error.
@@ -1327,7 +1332,7 @@ class GeeRasterAdapter:
         resample_m: float | None = None,
         filename_suffix: str | None = None,
         progress_desc: str | None = None,
-    ) -> List[Path]:
+    ) -> tuple[list[Path | None], list[dict]]:
         """Export GeoTIFF tiles for many points in parallel (Mode 2).
 
         If resample_m is set, all tiles are exported at that resolution so they
