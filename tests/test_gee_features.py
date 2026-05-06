@@ -90,7 +90,6 @@ class TestStaticDatasets:
         bioclim_cols = [c for c in df.columns if c.startswith("bioclim_bio")]
         assert len(bioclim_cols) == 19
 
-    @pytest.mark.xfail(reason="HII dataset has incomplete coverage at test coordinates")
     def test_human_impact_index(self, tmp_path):
         cat = _make_catalog(("hii", "projects/HII/v1/hii"))
         df = _run_stats(SAMPLE_DF, "hii", cat, tmp_path)
@@ -142,7 +141,6 @@ class TestLandCover:
         df = _run_stats(SAMPLE_DF, "lulc", cat, tmp_path)
         assert df["lulc_mean_200m"].notna().all()
 
-    @pytest.mark.xfail(reason="IMAGE_COLLECTION — needs band homogeneity handling")
     def test_cgls_lc100(self, tmp_path):
         cat = _make_catalog(("lc100", "COPERNICUS/Landcover/100m/Proba-V-C3/Global"))
         df = _run_stats(SAMPLE_DF, "lc100", cat, tmp_path)
