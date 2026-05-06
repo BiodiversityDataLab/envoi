@@ -266,6 +266,16 @@ def extract_band_coverage_columns(meta_list: list[dict]) -> pd.DataFrame:
 
     rows = [m.get("band_coverage_pct", {}) for m in meta_list]
     band_df = pd.DataFrame(rows)
+
+    # Cheap uniformity check: when all bands share the same pixel grid
+    # (e.g. a multi-band composite image like WorldClim) every band will
+    # have identical coverage at every point. The existing coverage_pct
+    # column already captures that value, so emitting 19 duplicate columns
+    # adds no information — skip the per-band breakdown in that case.
+    first_column = band_df.iloc[:, 0]
+    if all(band_df[col].equals(first_column) for col in band_df.columns[1:]):
+        return pd.DataFrame()
+
     # Rename "bio01" → "bio01_coverage_pct" so the column name survives
     # add_prefix/add_suffix intact and still matches _QC_COLUMN_KEYWORDS.
     return band_df.rename(columns={col: f"{col}_coverage_pct" for col in band_df.columns})
