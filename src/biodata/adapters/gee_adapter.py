@@ -519,6 +519,23 @@ def _parse_point_result(
     return {"point": value}
 
 
+def _extract_per_band_counts(result: dict | None) -> dict[str, int]:
+    """Return {band_name: valid_pixel_count} for every band in a multiband result.
+
+    The combined reducer emits a "{band}_count" entry per band; this helper
+    strips the suffix and collects all of them so callers can compute
+    per-band coverage or pick the worst-case band.
+    Returns an empty dict when result is None or has no count entries.
+    """
+    if not result:
+        return {}
+    return {
+        key[:-6]: int(val)  # strip trailing "_count" (6 chars)
+        for key, val in result.items()
+        if key.endswith("_count") and val is not None
+    }
+
+
 def _extract_count_from_reduce_result(
     result: dict | None,
     band_name: str,
@@ -528,19 +545,19 @@ def _extract_count_from_reduce_result(
 
     The combined reducer produces a "{band}_count" entry per band. For
     single-band reductions we look up "{band_name}_count" directly. For
-    multi-band reductions we take the first "_count" entry we find — all
-    bands share the same window so the count is identical across them.
+    multi-band reductions we use the minimum count across all bands —
+    i.e. the worst-case band — so that coverage reflects the most
+    data-sparse band rather than an arbitrarily chosen one.
     Returns 0 when the result is missing or has no count entry.
     """
     if not result:
         return 0
 
     if multiband:
-        # Find any "*_count" key — they all carry the same value for the same window.
-        for key, val in result.items():
-            if key.endswith("_count") and val is not None:
-                return int(val)
-        return 0
+        # Use min so coverage is conservative: the window is "fully valid"
+        # only when every band has data at every pixel.
+        per_band = _extract_per_band_counts(result)
+        return min(per_band.values(), default=0)
 
     val = result.get(f"{band_name}_count")
     return int(val) if val is not None else 0
@@ -1010,6 +1027,12 @@ class GeeRasterAdapter:
                 stats["point"] = None
 
         _, meta = self._empty_result(window_m)
+        # Emit an empty band_coverage_pct for multiband failure paths so
+        # callers always see a consistent schema regardless of success/failure.
+        spec_band = self._dataset_spec.get("bands")
+        band_count = getattr(self, "_cached_band_count", 1)
+        if not isinstance(spec_band, str) and band_count > 1:
+            meta["band_coverage_pct"] = {}
         return stats, meta
 
     # ------------------------------------------------------------------
@@ -1119,10 +1142,13 @@ class GeeRasterAdapter:
         # ---- parse window branch ----
         window_stats: dict[str, float | None] = {}
         valid_count = 0
+        per_band_counts: dict[str, int] = {}
         if combined_reducer is not None:
             window_raw = full_result.get("window") or {}
             if multiband:
                 window_stats = _parse_multiband_result(window_raw, reducer_names, suffixes)
+                # Collect per-band counts for individual coverage reporting.
+                per_band_counts = _extract_per_band_counts(window_raw)
             else:
                 window_stats = _parse_reduce_result(window_raw, band_name, reducer_names, suffixes)
             valid_count = _extract_count_from_reduce_result(window_raw, band_name, multiband)
@@ -1157,11 +1183,23 @@ class GeeRasterAdapter:
             has_values = any_pt
             had_nodata = not any_pt
 
+        # Build per-band coverage breakdown for multiband datasets. Each entry
+        # shows what fraction of window cells had valid data for that band —
+        # useful when bands carry independent nodata masks (e.g. a derived band
+        # may introduce NaNs that source bands don't have).
+        band_coverage_pct: dict[str, float] = {}
+        if per_band_counts and combined_reducer is not None:
+            band_coverage_pct = {
+                band: min(round(100.0 * count / total_cells, 2), 100.0)
+                for band, count in per_band_counts.items()
+            }
+
         meta = {
             "in_extent": has_values,
             "n_pixels": n_pixels,
             "had_nodata": had_nodata,
             "coverage_pct": coverage_pct if has_values else 0.0,
+            **({"band_coverage_pct": band_coverage_pct} if band_coverage_pct else {}),
             "window_m": int(window_m),
             "raster_crs": self.crs,
             "region_crs": utm_crs,
