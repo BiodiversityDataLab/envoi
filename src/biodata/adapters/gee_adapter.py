@@ -757,6 +757,11 @@ class GeeRasterAdapter:
         self._cached_native_scale = native_scale
 
         crs = (proj_info or {}).get("crs", "")
+        # Cache the resolved CRS so build_dataset_meta can report the asset's
+        # actual projection rather than the spec/default fallback. Empty
+        # string is preserved as-is so the build_dataset_meta truthiness
+        # check falls back to self.crs in that case.
+        self._cached_native_crs = crs
         # The GEE default is exactly 111319.49079327357 m, but allow a small
         # tolerance to also catch close-but-not-identical values (e.g. when
         # the asset reports a slightly different default-equivalent scale).
@@ -1541,8 +1546,11 @@ class GeeRasterAdapter:
         else:
             meta["asset_type"] = "IMAGE"
 
-        # Native CRS (set in __post_init__).
-        meta["native_crs"] = str(self.crs)
+        # Native CRS — prefer the projection resolved from the asset itself
+        # (cached during __post_init__'s scale validation). Fall back to the
+        # spec value (or the EPSG:4326 default) only when GEE couldn't
+        # resolve the projection — in which case self.crs is the best we have.
+        meta["native_crs"] = getattr(self, "_cached_native_crs", None) or str(self.crs)
 
         # Native spatial resolution — prefer the catalog override when set
         # (GEE's nominalScale() returns the projection unit size, which is
