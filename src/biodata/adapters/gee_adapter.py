@@ -9,6 +9,7 @@ from typing import Any, Sequence
 
 from ..config import load_defaults
 from ..metadata import build_tile_crs_zones, summarize_date_info, summarize_tile_export
+from .base import BaseAdapter
 
 import numpy as np
 import pandas as pd
@@ -622,7 +623,7 @@ def _summarize_band_coverage(meta_list: list[dict]) -> dict[str, dict[str, float
 
 
 @dataclass
-class GeeRasterAdapter:
+class GeeRasterAdapter(BaseAdapter):
     """Adapter that samples data directly from Google Earth Engine.
 
     Two extraction modes:
