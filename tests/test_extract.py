@@ -2,10 +2,13 @@
 
 from pathlib import Path
 import json
+import math
 
+import numpy as np
 import pandas as pd
 import pytest
 import rasterio
+from rasterio.transform import from_bounds
 
 from biodata.extract import extract
 from biodata import update_catalog, reset_catalog
@@ -198,6 +201,65 @@ class TestTabular:
         # Point values should be finite numbers for in-extent points
         assert stats_df["dem_local_point"].notna().any()
 
+    def test_multiband_out_of_extent_keeps_per_band_schema(self, sample_df, tmp_path):
+        """Out-of-extent points in a multi-band dataset must produce per-band-named
+        stat columns (b1_mean, b2_mean, ...) — not flat-named columns (mean, std).
+
+        Regression: previously fetch_values returned a 1D empty array for out-of-
+        extent points regardless of band count, so the multi-band branch in
+        _fetch_stats_single (which keys off ``ndim == 2``) silently fell through
+        to the single-band path and wrote flat keys. With three bands, that meant
+        a row could end up populating ``mean``/``std`` columns that don't exist
+        for any other row, polluting the output schema.
+        """
+        # Append one out-of-extent point (lat=0, lon=0 is well outside the
+        # northern-Sweden raster used by the sample fixtures). This guarantees
+        # at least one row hits the rio_mask exception path.
+        out_of_extent_row = pd.DataFrame(
+            [{"id": "OOB", "n_otu": 0, "lat": 0.0, "lon": 0.0, "date": "2025-01-01"}]
+        )
+        df_with_oob = pd.concat([sample_df, out_of_extent_row], ignore_index=True)
+
+        outputs = extract(
+            df_with_oob,
+            {
+                "batch_id": "mb_oob",
+                "datasets": ["multi_band_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean", "std"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        stats_df = pd.read_csv(outputs["mb_oob"])
+
+        # Per-band columns must exist for every band×reducer combination.
+        for band_index in (1, 2, 3):
+            for reducer_name in ("mean", "std"):
+                expected_column = f"multi_band_local_b{band_index}_{reducer_name}_100m"
+                assert expected_column in stats_df.columns, (
+                    f"missing expected column {expected_column}; " f"got {sorted(stats_df.columns)}"
+                )
+
+        # Flat-named columns must NOT exist — they are the symptom of the bug.
+        forbidden_columns = {"multi_band_local_mean_100m", "multi_band_local_std_100m"}
+        leaked_columns = forbidden_columns & set(stats_df.columns)
+        assert (
+            not leaked_columns
+        ), f"flat-named columns leaked into multi-band output: {leaked_columns}"
+
+        # The out-of-extent row should have NaN in every per-band stat column.
+        oob_row = stats_df.loc[stats_df["id"] == "OOB"].iloc[0]
+        for band_index in (1, 2, 3):
+            for reducer_name in ("mean", "std"):
+                value = oob_row[f"multi_band_local_b{band_index}_{reducer_name}_100m"]
+                assert pd.isna(
+                    value
+                ), f"expected NaN at b{band_index}_{reducer_name} for OOB point, got {value}"
+
 
 # ------------------------------------------------------------------
 # Raster output
@@ -276,6 +338,195 @@ class TestRaster:
         meta = json.loads(meta_path.read_text())
         assert meta["config"]["window_size_m"] == 200
         assert "dem_local" in meta["datasets"]
+
+    def test_multiband_tile_preserves_all_bands(self, sample_df, tmp_path):
+        """Multi-band local raster is exported with every band intact."""
+        # `multi_band_local` is registered with bands=[1, 2, 3], so the
+        # exported GeoTIFFs must have count == 3 — previously the adapter
+        # silently kept only band 1.
+        extract(
+            sample_df,
+            {
+                "batch_id": "mb_tiles",
+                "datasets": ["multi_band_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            output_dir=tmp_path,
+        )
+
+        tile_dir = tmp_path / "mb_tiles" / "multi_band_local"
+        tifs = list(tile_dir.glob("*.tif"))
+        assert tifs, "expected at least one tile to be exported"
+        for tif in tifs:
+            with rasterio.open(tif) as src:
+                assert src.count == 3, f"{tif.name} has {src.count} bands, expected 3"
+
+    def test_uint8_no_nodata_propagates_synthetic_sentinel(self, tmp_path):
+        """A no-declared-nodata uint8 raster's exported tile declares the
+        synthetic 255 sentinel and writes it into polygon-exterior corners.
+
+        Regression: previously meta["nodata"] reported None for bands without
+        declared nodata while window_arr contained fabricated 0s. Downstream
+        consumers reading the tile back had no signal that the corner pixels
+        were synthetic, silently folding them into stats.
+        """
+        raster_path = _build_synthetic_raster(
+            tmp_path / "uint8_nonodata.tif",
+            dtype="uint8",
+            fill_value=10,
+            declare_nodata=False,
+        )
+        update_catalog(
+            {"datasets": {"uint8_test": {"data_source": "local", "path": str(raster_path)}}}
+        )
+
+        # Place the point at the centre of the synthetic raster. The polygon
+        # is built in UTM and reprojected to the raster's EPSG:4326 CRS, so it
+        # ends up as a non-axis-aligned quadrilateral — corner pixels of the
+        # cropped bounding box fall outside the polygon and get masked.
+        df = pd.DataFrame({"id": ["centre"], "lat": [62.98], "lon": [18.025]})
+        extract(
+            df,
+            {
+                "batch_id": "uint8_tile",
+                "datasets": ["uint8_test"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            output_dir=tmp_path,
+        )
+
+        tile_path = next((tmp_path / "uint8_tile" / "uint8_test").glob("*.tif"))
+        with rasterio.open(tile_path) as exported:
+            assert exported.dtypes[0] == "uint8"
+            # Synthetic sentinel for uint8 is np.iinfo(uint8).max == 255.
+            assert (
+                exported.nodata == 255
+            ), f"expected exported tile to declare nodata=255, got {exported.nodata}"
+            tile_data = exported.read(1)
+            # Real pixels (filled with 10) and synthetic corners (255) should both appear.
+            assert (tile_data == 10).any(), "expected at least one real-data pixel"
+            assert (tile_data == 255).any(), "expected at least one synthetic corner pixel"
+
+    def test_float32_no_nodata_propagates_nan_sentinel(self, tmp_path):
+        """A no-declared-nodata float32 raster's exported tile declares NaN
+        as nodata and writes NaN into polygon-exterior corners.
+        """
+        raster_path = _build_synthetic_raster(
+            tmp_path / "float32_nonodata.tif",
+            dtype="float32",
+            fill_value=10.0,
+            declare_nodata=False,
+        )
+        update_catalog(
+            {"datasets": {"float32_test": {"data_source": "local", "path": str(raster_path)}}}
+        )
+
+        df = pd.DataFrame({"id": ["centre"], "lat": [62.98], "lon": [18.025]})
+        extract(
+            df,
+            {
+                "batch_id": "float32_tile",
+                "datasets": ["float32_test"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            output_dir=tmp_path,
+        )
+
+        tile_path = next((tmp_path / "float32_tile" / "float32_test").glob("*.tif"))
+        with rasterio.open(tile_path) as exported:
+            assert exported.dtypes[0] == "float32"
+            # NaN equality is special — must use math.isnan (or np.isnan).
+            assert exported.nodata is not None and math.isnan(
+                exported.nodata
+            ), f"expected NaN nodata, got {exported.nodata}"
+            tile_data = exported.read(1)
+            assert np.isnan(tile_data).any(), "expected at least one NaN corner pixel"
+            assert (tile_data == 10.0).any(), "expected at least one real-data pixel"
+
+
+def _build_synthetic_raster(
+    output_path: Path,
+    *,
+    dtype: str,
+    fill_value,
+    declare_nodata: bool,
+) -> Path:
+    """Build a small EPSG:4326 raster covering the existing test sample area.
+
+    Used by the no-declared-nodata tile-export tests. The raster is in WGS84
+    so the UTM polygon built by the adapter must be reprojected to a non-
+    axis-aligned shape — that's what triggers the masked-corner code path
+    inside _fill_masked_window.
+    """
+    # ~2km × 2km area straddling the same ground as the existing DEM fixture.
+    bounds = (18.0, 62.96, 18.05, 63.0)  # (left, bottom, right, top) in degrees
+    width, height = 200, 200
+    transform = from_bounds(*bounds, width=width, height=height)
+
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": 1,
+        "dtype": dtype,
+        "crs": "EPSG:4326",
+        "transform": transform,
+    }
+    # Only set nodata when the test wants it declared. Omitting the key
+    # results in a GeoTIFF with no declared nodata, which is exactly the
+    # configuration the synthetic-sentinel logic is designed to handle.
+    if declare_nodata:
+        profile["nodata"] = 0
+
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(np.full((height, width), fill_value, dtype=np.dtype(dtype)), 1)
+    return output_path
+
+
+# ------------------------------------------------------------------
+# Adapter helpers (unit tests, no rasterio fixtures)
+# ------------------------------------------------------------------
+
+
+class TestResolveTileDtype:
+    """Unit tests for LocalRasterAdapter._resolve_tile_dtype.
+
+    Building a real heterogeneous-dtype multi-band GeoTIFF is awkward — most
+    drivers refuse mixed dtypes. So we exercise the helper directly with the
+    list/scalar/None inputs it has to handle when called from export_tiles.
+    """
+
+    def test_uniform_list_returns_first_dtype(self):
+        """Multi-band with all bands sharing a dtype returns that dtype."""
+        from biodata.adapters.local_adapter import LocalRasterAdapter
+
+        result = LocalRasterAdapter._resolve_tile_dtype(
+            ["uint8", "uint8", "uint8"], np.dtype("float32")
+        )
+        assert result == np.dtype("uint8")
+
+    def test_mixed_list_promotes_and_warns(self):
+        """Multi-band with mixed dtypes promotes via np.result_type and warns."""
+        from biodata.adapters.local_adapter import LocalRasterAdapter
+
+        with pytest.warns(UserWarning, match="heterogeneous band dtypes"):
+            result = LocalRasterAdapter._resolve_tile_dtype(["uint8", "float32"], np.dtype("uint8"))
+        # NumPy's standard rule: uint8 + float32 → float32 (preserves both).
+        assert result == np.dtype("float32")
+
+    def test_scalar_string_returns_dtype(self):
+        """Single-band passes a str — helper resolves it via np.dtype."""
+        from biodata.adapters.local_adapter import LocalRasterAdapter
+
+        result = LocalRasterAdapter._resolve_tile_dtype("int16", np.dtype("float64"))
+        assert result == np.dtype("int16")
+
+    def test_none_falls_back(self):
+        """No meta dtype recorded → fall back to the in-memory window dtype."""
+        from biodata.adapters.local_adapter import LocalRasterAdapter
+
+        result = LocalRasterAdapter._resolve_tile_dtype(None, np.dtype("uint16"))
+        assert result == np.dtype("uint16")
 
 
 # ------------------------------------------------------------------
@@ -657,3 +908,51 @@ class TestTypedStatistics:
         statistics = {"continuous": ["mean", "std"], "categorical": ["mode"]}
         _, meta = _run_typed_stats(sample_df, ["dem_local"], statistics, tmp_path)
         assert meta["config"]["statistics"] == statistics
+
+
+# ------------------------------------------------------------------
+# LocalRasterAdapter unit tests
+# ------------------------------------------------------------------
+#
+# These exercise behaviours that aren't easily reachable through the
+# extract() entry point: lifecycle / resource cleanup, and edge cases in
+# the UTM-zone helper. They import the adapter directly.
+
+
+class TestLocalRasterAdapterLifecycle:
+    def test_context_manager_closes_dataset(self):
+        """`with` block releases the rasterio dataset when it exits."""
+        from biodata.adapters.local_adapter import LocalRasterAdapter
+
+        spec = {"data_source": "local", "path": str(DEM_TIF), "bands": 1}
+        with LocalRasterAdapter(spec) as adapter:
+            # Inside the block the underlying dataset is open and usable.
+            assert adapter.src.closed is False
+            handle = adapter.src
+        # After the block, close() has been called and the rasterio
+        # DatasetReader reports itself as closed — important to avoid
+        # leaking file descriptors when many datasets are processed.
+        assert handle.closed is True
+
+    def test_close_is_idempotent(self):
+        """Calling close() twice (e.g. via with + manual close) is a no-op."""
+        from biodata.adapters.local_adapter import LocalRasterAdapter
+
+        spec = {"data_source": "local", "path": str(DEM_TIF), "bands": 1}
+        adapter = LocalRasterAdapter(spec)
+        adapter.close()
+        # Second call must not raise even though the dataset is already closed.
+        adapter.close()
+        assert adapter.src.closed is True
+
+    def test_get_utm_crs_clamps_at_antimeridian(self):
+        """lon == 180 must produce a valid UTM zone (1-60), not zone 61."""
+        from biodata.adapters.local_adapter import LocalRasterAdapter
+
+        # Northern hemisphere: zones 32601..32660. Southern: 32701..32760.
+        # The naive `(lon + 180) / 6 + 1` formula gives 61 at lon == 180,
+        # which would yield EPSG:32661 — outside the UTM range.
+        assert LocalRasterAdapter._get_utm_crs(180.0, 0.0) == "EPSG:32660"
+        assert LocalRasterAdapter._get_utm_crs(180.0, -1.0) == "EPSG:32760"
+        # Spot-check that an ordinary longitude still resolves correctly.
+        assert LocalRasterAdapter._get_utm_crs(0.0, 0.0) == "EPSG:32631"
