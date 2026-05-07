@@ -362,62 +362,63 @@ def _process_dataset_tabular(
 
     # Instantiate the adapter from the dataset's declared data_source
     # (earth_engine or local). The adapter encapsulates all source-specific
-    # fetching and validation logic.
+    # fetching and validation logic. The `with` block guarantees that any
+    # adapter-held resources (e.g. an open rasterio dataset) are released
+    # even if the per-point batch raises mid-flight.
     AdapterClass = get_adapter(merged_config["data_source"])
-    adapter = AdapterClass(merged_config)
+    with AdapterClass(merged_config) as adapter:
+        # Select the reducer list appropriate for this dataset's data_type.
+        # For typed-dict statistics configs, a continuous dataset uses the
+        # "continuous" list and a categorical dataset uses "categorical".
+        # For flat-list configs both keys map to the same list, so the result
+        # is unchanged from the previous behaviour.
+        data_type = merged_config.get("data_type")
+        resolved_stats = _resolve_stats_for_dataset(
+            data_type, run_settings.stats, dataset, run_settings.batch_id
+        )
 
-    # Select the reducer list appropriate for this dataset's data_type.
-    # For typed-dict statistics configs, a continuous dataset uses the
-    # "continuous" list and a categorical dataset uses "categorical".
-    # For flat-list configs both keys map to the same list, so the result
-    # is unchanged from the previous behaviour.
-    data_type = merged_config.get("data_type")
-    resolved_stats = _resolve_stats_for_dataset(
-        data_type, run_settings.stats, dataset, run_settings.batch_id
-    )
+        # Ask the adapter to compute all requested statistics for every sample.
+        # Returns a list of (stats_dict, meta_dict) — one tuple per row in df.
+        # progress_desc is shown in the per-point tqdm bar so the user can tell at
+        # a glance which dataset/window the bar belongs to when several run in series.
+        stats_results = adapter.fetch_stats_batch(
+            df.lat,
+            df.lon,
+            window_size,
+            resolved_stats,
+            dates=dates,
+            progress_desc=f"{dataset} | {window_size}m | tabular",
+        )
 
-    # Ask the adapter to compute all requested statistics for every sample.
-    # Returns a list of (stats_dict, meta_dict) — one tuple per row in df.
-    # progress_desc is shown in the per-point tqdm bar so the user can tell at
-    # a glance which dataset/window the bar belongs to when several run in series.
-    stats_results = adapter.fetch_stats_batch(
-        df.lat,
-        df.lon,
-        window_size,
-        resolved_stats,
-        dates=dates,
-        progress_desc=f"{dataset} | {window_size}m | tabular",
-    )
+        # Append stat columns to the output DataFrame based on the keys in
+        # stats_results, and assign values accordingly.
+        df = _append_stat_columns(df, dataset, window_size, stats_results)
 
-    # Append stat columns to the output DataFrame based on the keys in
-    # stats_results, and assign values accordingly.
-    df = _append_stat_columns(df, dataset, window_size, stats_results)
+        # Split the (stat, meta) tuples so meta_list can feed QC and dataset metadata.
+        meta_list = [meta for _, meta in stats_results]
 
-    # Split the (stat, meta) tuples so meta_list can feed QC and dataset metadata.
-    meta_list = [meta for _, meta in stats_results]
+        # Attach per-row QC columns and capture the coverage summary used below
+        # when assembling the per-dataset metadata dict.
+        df, quality_key, coverage_summary = attach_quality_control(
+            df,
+            meta_list=meta_list,
+            dataset_name=dataset,
+            reducer_names=resolved_stats,
+            window_size_m=window_size,
+            min_coverage_pct=run_settings.min_coverage,
+        )
 
-    # Attach per-row QC columns and capture the coverage summary used below
-    # when assembling the per-dataset metadata dict.
-    df, quality_key, coverage_summary = attach_quality_control(
-        df,
-        meta_list=meta_list,
-        dataset_name=dataset,
-        reducer_names=resolved_stats,
-        window_size_m=window_size,
-        min_coverage_pct=run_settings.min_coverage,
-    )
-
-    # Adapter assembles quality stats and date-selection info (GEE) into
-    # one per-dataset dict. The quality dict is keyed by window_size (or
-    # "point") so multiple window sizes can coexist within the same dataset
-    # metadata when the caller loops and merges across windows.
-    # Pass the merged spec (catalog + band_overrides) so the metadata reflects
-    # the resolved bands the user actually ran with.
-    dataset_meta = adapter.build_dataset_meta(
-        merged_config,
-        meta_list=meta_list,
-        quality={quality_key: coverage_summary},
-    )
+        # Adapter assembles quality stats and date-selection info (GEE) into
+        # one per-dataset dict. The quality dict is keyed by window_size (or
+        # "point") so multiple window sizes can coexist within the same dataset
+        # metadata when the caller loops and merges across windows.
+        # Pass the merged spec (catalog + band_overrides) so the metadata reflects
+        # the resolved bands the user actually ran with.
+        dataset_meta = adapter.build_dataset_meta(
+            merged_config,
+            meta_list=meta_list,
+            quality={quality_key: coverage_summary},
+        )
 
     return df, dataset_meta
 
@@ -450,37 +451,38 @@ def _process_dataset_raster(
     # catalog values without mutating the catalog dict.
     merged_config = {**dataset_config, **(band_overrides or {})}
 
-    # Instantiate the adapter from the dataset's declared data_source.
+    # Instantiate the adapter from the dataset's declared data_source. The
+    # `with` block guarantees that any adapter-held resources (e.g. an open
+    # rasterio dataset) are released after tile export, even if it raises.
     AdapterClass = get_adapter(merged_config["data_source"])
-    adapter = AdapterClass(merged_config)
+    with AdapterClass(merged_config) as adapter:
+        # Ask the adapter to export a tile per sample, writing GeoTIFFs under
+        # tiles_root / dataset / ... and returning the paths it wrote.
+        # progress_desc is shown in the per-tile tqdm bar so the user can tell at
+        # a glance which dataset/window the bar belongs to when several run in series.
+        exported_paths, meta_list = adapter.export_tiles(
+            lats,
+            lons,
+            window_size,
+            tiles_root,
+            ids=ids,
+            dates=dates,
+            dataset_name=dataset,
+            resample_m=run_settings.resample_m,
+            filename_suffix=filename_suffix,
+            progress_desc=f"{dataset} | {window_size}m | raster",
+        )
 
-    # Ask the adapter to export a tile per sample, writing GeoTIFFs under
-    # tiles_root / dataset / ... and returning the paths it wrote.
-    # progress_desc is shown in the per-tile tqdm bar so the user can tell at
-    # a glance which dataset/window the bar belongs to when several run in series.
-    exported_paths, meta_list = adapter.export_tiles(
-        lats,
-        lons,
-        window_size,
-        tiles_root,
-        ids=ids,
-        dates=dates,
-        dataset_name=dataset,
-        resample_m=run_settings.resample_m,
-        filename_suffix=filename_suffix,
-        progress_desc=f"{dataset} | {window_size}m | raster",
-    )
-
-    # Adapter assembles the full per-dataset metadata dict, including
-    # per-tile export info (paths, bounds, CRS). Pass the merged spec so
-    # the metadata reflects the resolved bands the user actually ran with.
-    dataset_meta = adapter.build_dataset_meta(
-        merged_config,
-        meta_list=meta_list,
-        exported_paths=exported_paths,
-        lats=lats,
-        lons=lons,
-    )
+        # Adapter assembles the full per-dataset metadata dict, including
+        # per-tile export info (paths, bounds, CRS). Pass the merged spec so
+        # the metadata reflects the resolved bands the user actually ran with.
+        dataset_meta = adapter.build_dataset_meta(
+            merged_config,
+            meta_list=meta_list,
+            exported_paths=exported_paths,
+            lats=lats,
+            lons=lons,
+        )
 
     return tiles_root / dataset, dataset_meta
 
