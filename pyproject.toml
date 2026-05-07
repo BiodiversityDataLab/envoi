@@ -20,7 +20,7 @@ dependencies = [
     "pyyaml>=6.0.1",
     "pyarrow>=17.0.0",
     "tqdm>=4.65",
-    # "earthengine-api>=0.1.398",   # add when implementing GEE adapter
+    "earthengine-api>=0.1.398", 
 ]
 
 classifiers = [
@@ -40,9 +40,6 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5.0",
     "black>=24.3.0",
-]
-gee = [
-    "earthengine-api>=0.1.398",
 ]
 
 [project.urls]
