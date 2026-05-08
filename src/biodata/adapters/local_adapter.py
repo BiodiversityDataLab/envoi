@@ -663,9 +663,12 @@ class LocalRasterAdapter(BaseAdapter):
     ):
         """Crop and save a GeoTIFF window centred on each point.
 
-        If resample_m is set, the cropped window is resampled to
-        round(window_m / resample_m) × round(window_m / resample_m) pixels
-        so all tiles have identical dimensions regardless of native resolution.
+        If resample_m is set, the output tile is written at exactly resample_m
+        metres/pixel in the point's UTM zone, with the pixel grid snapped to the
+        nearest resample_m multiple — the same algorithm the GEE adapter uses.
+        This means local and GEE tiles for the same point at the same resample_m
+        are spatially aligned and directly comparable. Without resample_m, the
+        tile is written in the source raster's native CRS at native resolution.
 
         ``filename_suffix`` is inserted before the .tif extension so multi-
         window runs can place every window's tiles in the same folder
@@ -752,46 +755,63 @@ class LocalRasterAdapter(BaseAdapter):
                 tile_nodata = meta_nodata
 
             if n_pixels is not None:
-                # Reproject/resample to a fixed n_pixels × n_pixels grid.
-                # Preserve the source dtype rather than unconditionally
-                # promoting to float32, so integer rasters stay compact on
-                # disk. Bilinear resampling is appropriate for continuous
-                # data and acceptable for integer rasters when the user has
-                # opted into resampling explicitly.
-                if source_array.ndim == 3:
+                # Build the output grid in the point's UTM zone, snapped to the
+                # resample_m pixel boundary — matching GEE adapter behaviour exactly.
+                # Two things must agree with GEE for tiles to be spatially comparable:
+                #   1. Pixel size = resample_m (not native-span / n_pixels, which varies
+                #      per point because rio_mask snaps to native pixel boundaries).
+                #   2. Grid origin = center snapped to resample_m, then shifted by half
+                #      the window extent — the same formula GEE's _snap_to_grid uses.
+                utm_crs = self._get_utm_crs(lon, lat)
+                utm_transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+                cx_utm, cy_utm = utm_transformer.transform(lon, lat)
+                # Snap centre to nearest resample_m multiple (mirrors GEE's _snap_to_grid).
+                cx_snapped = round(cx_utm / resample_m) * resample_m
+                cy_snapped = round(cy_utm / resample_m) * resample_m
+                half_m = (n_pixels // 2) * resample_m
+                destination_transform = Affine(
+                    resample_m,
+                    0.0,
+                    cx_snapped - half_m,
+                    0.0,
+                    -resample_m,
+                    cy_snapped + half_m,
+                )
+                # Reproject directly from the open source dataset rather than from the
+                # polygon-masked window_array. The polygon mask sets edge pixels to NaN
+                # wherever the native pixel centre falls outside the 200 m polygon;
+                # bilinear interpolation at output cells near the window boundary then
+                # pulls from those NaN source pixels and propagates NaN into the output.
+                # Going straight to the source file gives the interpolation valid data
+                # everywhere, matching what GEE does when it exports a plain rectangle.
+                if self._is_multiband:
                     destination_array = np.empty((n_bands, n_pixels, n_pixels), dtype=tile_dtype)
-                    source_height, source_width = source_array.shape[1], source_array.shape[2]
+                    for band_idx, band_num in enumerate(self.band):
+                        reproject(
+                            source=rasterio.band(self.src, band_num),
+                            destination=destination_array[band_idx],
+                            dst_transform=destination_transform,
+                            dst_crs=utm_crs,
+                            resampling=Resampling.bilinear,
+                            dst_nodata=tile_nodata,
+                        )
                 else:
                     destination_array = np.empty((n_pixels, n_pixels), dtype=tile_dtype)
-                    source_height, source_width = source_array.shape
-                # Per-pixel resolution of the destination grid: total span / n_pixels.
-                # The y-resolution stays negative so the affine remains north-up.
-                destination_resolution_x = (source_transform.a * source_width) / n_pixels
-                destination_resolution_y = (source_transform.e * source_height) / n_pixels
-                destination_transform = Affine(
-                    destination_resolution_x,
-                    0.0,
-                    source_transform.c,
-                    0.0,
-                    destination_resolution_y,
-                    source_transform.f,
-                )
-                reproject(
-                    source=source_array.astype(tile_dtype, copy=False),
-                    destination=destination_array,
-                    src_transform=source_transform,
-                    src_crs=self.raster_crs,
-                    dst_transform=destination_transform,
-                    dst_crs=self.raster_crs,
-                    resampling=Resampling.bilinear,
-                    src_nodata=tile_nodata,
-                    dst_nodata=tile_nodata,
-                )
+                    reproject(
+                        source=rasterio.band(self.src, self.band[0]),
+                        destination=destination_array,
+                        dst_transform=destination_transform,
+                        dst_crs=utm_crs,
+                        resampling=Resampling.bilinear,
+                        dst_nodata=tile_nodata,
+                    )
                 output_array = destination_array
                 output_transform = destination_transform
+                output_crs = utm_crs
             else:
                 output_array = source_array
                 output_transform = source_transform
+                output_crs = self.raster_crs
 
             # Determine the height/width index depending on whether we have a
             # 2D (single-band) or 3D (multi-band) array.
@@ -806,7 +826,7 @@ class LocalRasterAdapter(BaseAdapter):
                 "width": profile_width,
                 "count": n_bands,
                 "dtype": str(output_array.dtype),
-                "crs": self.raster_crs,
+                "crs": output_crs,
                 "transform": output_transform,
                 "nodata": tile_nodata,
                 "compress": "LZW",
