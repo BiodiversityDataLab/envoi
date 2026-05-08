@@ -4,28 +4,13 @@ from dataclasses import dataclass
 import logging
 import pandas as pd
 
+# Date fields written into adapter meta dicts (GEE ImageCollections only).
+# Used exclusively by extract_date_columns below.
 _DATE_META_KEYS = (
     "date_clamped",
     "date_source",
     "image_time_start",
     "image_time_end",
-)
-
-# Substrings identifying QC columns in the final tabular output. QC columns
-# are produced by `attach_quality_control` with a "{dataset}_<name>_<suffix>"
-# shape, so each keyword is wrapped in underscores to avoid accidental matches
-# against stat columns. Keep this list in sync with the columns emitted by
-# `compute_qc_flags`, `extract_date_columns`, and `extract_crs_column`.
-_QC_COLUMN_KEYWORDS = (
-    "_in_extent_",
-    "_n_pixels_",
-    "_had_nodata_",
-    "_coverage_pct_",
-    "_image_time_start_",
-    "_image_time_end_",
-    "_date_clamped_",
-    "_date_source_",
-    "_region_crs_",
 )
 
 
@@ -43,20 +28,126 @@ class QualityControlBuildResult:
     quality_key : str
         Key used when storing the per-dataset coverage summary in metadata:
         "point" for point-only reducers, otherwise the window size as a string.
+    qc_column_names : list[str]
+        The exact column names present in quality_control_dataframe. Callers
+        use this to split stats vs. QC columns without relying on substring
+        matching against column names.
     """
 
     quality_control_dataframe: pd.DataFrame
     column_suffix: str
     quality_key: str
+    qc_column_names: list[str]
 
 
-def compute_qc_flags(meta_list, min_coverage_pct: int = 80) -> pd.DataFrame:
-    """meta_list: list of dicts returned by adapters for each row"""
+# ---------------------------------------------------------------------------
+# Atomic helpers — each extracts one category of fields from adapter meta dicts.
+# These are called by build_quality_control_dataframe below.
+# ---------------------------------------------------------------------------
+
+
+def compute_qc_flags(meta_list: list[dict], min_coverage_pct: int | float = 80) -> pd.DataFrame:
+    """Build core QC flags from adapter metadata dicts.
+
+    Extracts in_extent, n_pixels, had_nodata, and coverage_pct from each
+    meta dict, warns when any point falls below min_coverage_pct, and
+    returns a DataFrame with one row per input point.
+    """
+    if not meta_list:
+        return pd.DataFrame(columns=["in_extent", "n_pixels", "had_nodata", "coverage_pct"])
     df = pd.DataFrame(meta_list)
-    low = df["coverage_pct"] < float(min_coverage_pct)
-    if low.any():
-        logging.warning("Low coverage for %d sample(s) (<%s%%).", int(low.sum()), min_coverage_pct)
+    below_threshold_mask = df["coverage_pct"] < min_coverage_pct
+    if below_threshold_mask.any():
+        logging.warning(
+            "Low coverage for %d sample(s) (<%s%%).",
+            int(below_threshold_mask.sum()),
+            min_coverage_pct,
+        )
     return df[["in_extent", "n_pixels", "had_nodata", "coverage_pct"]]
+
+
+def extract_date_columns(meta_list: list[dict]) -> pd.DataFrame:
+    """Extract per-point date info from adapter meta dicts into a DataFrame.
+
+    Returns columns: image_time_start, image_time_end, date_clamped,
+    date_source. Returns an empty DataFrame if no date info is present in
+    the meta dicts. No GEE calls — reads only from the already-collected
+    meta dicts.
+    """
+    # Check all dicts, not just meta_list[0], because the first point may be a
+    # failure-path meta dict that doesn't carry date keys.
+    if not meta_list or not any(_DATE_META_KEYS[0] in m for m in meta_list):
+        return pd.DataFrame()
+    date_field_rows = [{k: m.get(k) for k in _DATE_META_KEYS} for m in meta_list]
+    return pd.DataFrame(date_field_rows)
+
+
+def extract_crs_column(meta_list: list[dict]) -> pd.DataFrame:
+    """Extract the per-point region CRS from adapter meta dicts into a DataFrame.
+
+    Returns a single-column DataFrame with column 'region_crs', or empty if
+    no CRS info is present. No GEE calls — reads from already-collected meta dicts.
+    """
+    # Check all dicts, not just meta_list[0], because the first point may be a
+    # failure-path meta dict that doesn't carry region_crs.
+    if not meta_list or not any("region_crs" in m for m in meta_list):
+        return pd.DataFrame()
+    return pd.DataFrame({"region_crs": [m.get("region_crs") for m in meta_list]})
+
+
+def extract_band_coverage_columns(meta_list: list[dict]) -> pd.DataFrame:
+    """Extract per-point, per-band coverage from adapter meta dicts into a DataFrame.
+
+    Each row in the result corresponds to one sample point. Columns are named
+    ``{band}_coverage_pct`` (e.g. ``bio01_coverage_pct``) so that after the
+    caller applies add_prefix/add_suffix the final column names follow the
+    ``{dataset}_{band}_coverage_pct_{window}m`` convention and are included
+    in the qc_column_names list returned by build_quality_control_dataframe.
+
+    Returns an empty DataFrame when no meta dict contains band_coverage_pct
+    (i.e. single-band datasets, point-only runs, or failure-path metas).
+    """
+    # Only emit columns when at least one point across the batch has non-empty
+    # band data. Failure-path metas carry band_coverage_pct: {} so this correctly
+    # skips datasets where every point failed.
+    first_band_data = next(
+        (m.get("band_coverage_pct") for m in meta_list if m.get("band_coverage_pct")),
+        None,
+    )
+    if not first_band_data:
+        return pd.DataFrame()
+
+    band_coverage_rows = [m.get("band_coverage_pct", {}) for m in meta_list]
+    band_coverage_dataframe = pd.DataFrame(band_coverage_rows)
+
+    # Cheap uniformity check: when all bands share the same pixel grid
+    # (e.g. a multi-band composite image like WorldClim) every band will
+    # have identical coverage at every point. The existing coverage_pct
+    # column already captures that value, so emitting 19 duplicate columns
+    # adds no information — skip the per-band breakdown in that case.
+    first_band_column = band_coverage_dataframe.iloc[:, 0]
+    if all(
+        band_coverage_dataframe[band_name].equals(first_band_column)
+        for band_name in band_coverage_dataframe.columns[1:]
+    ):
+        logging.debug(
+            "Skipping per-band coverage breakdown: all %d bands have identical coverage values.",
+            len(band_coverage_dataframe.columns),
+        )
+        return pd.DataFrame()
+
+    # Rename "bio01" → "bio01_coverage_pct" so the column name is self-describing
+    # after add_prefix/add_suffix assembles the full "{dataset}_{band}_coverage_pct_{window}m" form.
+    return band_coverage_dataframe.rename(
+        columns={
+            band_name: f"{band_name}_coverage_pct" for band_name in band_coverage_dataframe.columns
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Assemblers — combine the atomic helpers and attach QC data to the main DataFrame.
+# ---------------------------------------------------------------------------
 
 
 def build_quality_control_dataframe(
@@ -64,12 +155,15 @@ def build_quality_control_dataframe(
     dataset_name: str,
     reducer_names: list[str],
     window_size_m: int,
-    min_coverage_pct: int = 80,
+    min_coverage_pct: int | float = 80,
 ) -> QualityControlBuildResult:
     """Build dataset-prefixed QC columns from adapter metadata.
 
-    This function centralizes QC DataFrame construction so extract orchestration
-    code does not need to manage suffixing, date/crs joins, or merge mechanics.
+    Produces a prefixed/suffixed DataFrame covering core flags (in_extent,
+    n_pixels, had_nodata, coverage_pct) plus optional date, CRS, and per-band
+    coverage columns when present in the meta dicts. Centralizes QC DataFrame
+    construction so extract orchestration code does not need to manage
+    suffixing, date/crs joins, or merge mechanics.
     """
     # "point"-only requests keep the historical "_point" suffix. Any non-point
     # reducer means window-based statistics and therefore a "_{window}m" suffix.
@@ -86,7 +180,7 @@ def build_quality_control_dataframe(
         column_suffix
     )
 
-    # Date and CRS fields are optional, so we append only when they exist.
+    # Date, CRS, and per-band coverage fields are optional, so we append only when they exist.
     additional_quality_dataframes: list[pd.DataFrame] = []
 
     date_columns_dataframe = extract_date_columns(meta_list)
@@ -111,7 +205,10 @@ def build_quality_control_dataframe(
     if additional_quality_dataframes:
         quality_control_dataframe = pd.concat(
             [quality_control_dataframe.reset_index(drop=True)]
-            + [d.reset_index(drop=True) for d in additional_quality_dataframes],
+            + [
+                additional_df.reset_index(drop=True)
+                for additional_df in additional_quality_dataframes
+            ],
             axis=1,
         )
 
@@ -119,6 +216,7 @@ def build_quality_control_dataframe(
         quality_control_dataframe=quality_control_dataframe,
         column_suffix=column_suffix,
         quality_key=quality_key,
+        qc_column_names=quality_control_dataframe.columns.tolist(),
     )
 
 
@@ -141,7 +239,7 @@ def summarize_coverage(
     # so they fall into the n_zero bucket rather than being silently dropped.
     coverage_values = qc_df[coverage_column].fillna(0)
 
-    summary = {
+    coverage_summary = {
         "n_zero": int((coverage_values == 0).sum()),
         "n_partial": int(((coverage_values > 0) & (coverage_values < 100)).sum()),
         "n_full": int((coverage_values == 100).sum()),
@@ -155,10 +253,10 @@ def summarize_coverage(
         # Reset indexes so positional alignment between coverage_values and
         # ids is reliable regardless of either input's original index.
         ids_series = pd.Series(list(ids)).reset_index(drop=True)
-        zero_mask = coverage_values.reset_index(drop=True) == 0
-        summary["ids_no_data"] = ids_series[zero_mask].tolist()
+        zero_coverage_mask = coverage_values.reset_index(drop=True) == 0
+        coverage_summary["ids_no_data"] = ids_series[zero_coverage_mask].tolist()
 
-    return summary
+    return coverage_summary
 
 
 def attach_quality_control(
@@ -168,17 +266,18 @@ def attach_quality_control(
     dataset_name: str,
     reducer_names: list[str],
     window_size_m: int,
-    min_coverage_pct: int = 80,
-) -> tuple[pd.DataFrame, str, dict]:
-    """Append QC columns to df and return (df, quality_key, coverage_summary).
+    min_coverage_pct: int | float = 80,
+) -> tuple[pd.DataFrame, str, dict, list[str]]:
+    """Append QC columns to df and return (df, quality_key, coverage_summary, qc_column_names).
 
     Combines QC DataFrame construction, row-wise concatenation onto the caller's
     DataFrame, and the per-dataset coverage summary used in metadata — so the
     extract orchestrator does not need to manage suffixing, column naming, or
-    summary shape.
+    summary shape. The returned qc_column_names list lets the caller accumulate
+    exact QC column names across datasets for use with split_stats_and_qc.
     """
-    # Build the prefixed/suffixed QC DataFrame (core flags + optional date/crs).
-    result = build_quality_control_dataframe(
+    # Build the prefixed/suffixed QC DataFrame (core flags + optional date/crs/band_coverage).
+    qc_build_result = build_quality_control_dataframe(
         meta_list=meta_list,
         dataset_name=dataset_name,
         reducer_names=reducer_names,
@@ -189,107 +288,57 @@ def attach_quality_control(
     # Reset indexes before concat so row alignment is explicit and robust
     # regardless of whatever index the caller's DataFrame is carrying.
     df_with_qc = pd.concat(
-        [df.reset_index(drop=True), result.quality_control_dataframe.reset_index(drop=True)],
+        [
+            df.reset_index(drop=True),
+            qc_build_result.quality_control_dataframe.reset_index(drop=True),
+        ],
         axis=1,
     )
 
     # Reconstruct the fully-qualified coverage column name here so callers
     # never need to know the "{dataset}_coverage_pct{suffix}" convention.
-    coverage_column = f"{dataset_name}_coverage_pct{result.column_suffix}"
+    coverage_column = f"{dataset_name}_coverage_pct{qc_build_result.column_suffix}"
 
     # Pass the input ids (when present) so the coverage summary can include
     # the list of point ids that had no data for this dataset.
     ids = df["id"] if "id" in df.columns else None
     coverage_summary = summarize_coverage(
-        result.quality_control_dataframe, coverage_column, ids=ids
+        qc_build_result.quality_control_dataframe, coverage_column, ids=ids
     )
 
-    return df_with_qc, result.quality_key, coverage_summary
+    return (
+        df_with_qc,
+        qc_build_result.quality_key,
+        coverage_summary,
+        qc_build_result.qc_column_names,
+    )
 
 
 def split_stats_and_qc(
-    df: pd.DataFrame, core_columns: list[str]
+    df: pd.DataFrame,
+    core_columns: list[str],
+    qc_columns: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split a tabular output DataFrame into (stats_df, qc_df).
 
     Core columns (id, lat, lon, date) are preserved on both outputs so that
     each file is independently useful. QC columns are identified by the
-    `_QC_COLUMN_KEYWORDS` list above — kept here, next to the code that
-    produces them, so adding a new QC meta field only requires one edit.
+    explicit ``qc_columns`` list, which is built up from the column names
+    returned by ``attach_quality_control`` for each dataset — so there is no
+    fragile substring matching against column names.
     """
-    # A column is classified as QC if any of the known QC keyword fragments
-    # appears in its name (e.g. "dem_local_coverage_pct_200m").
-    qc_columns = [c for c in df.columns if any(kw in c for kw in _QC_COLUMN_KEYWORDS)]
-    stats_columns = [c for c in df.columns if c not in qc_columns]
+    # Convert to a set so membership checks are fast regardless of list length.
+    qc_column_set = set(qc_columns)
+    stats_columns = [column_name for column_name in df.columns if column_name not in qc_column_set]
 
     # Both outputs re-emit core columns first so they read naturally.
-    # The `c not in core_columns` filter prevents duplicating core columns
-    # if they somehow also match a QC keyword.
-    stats_df = df[core_columns + [c for c in stats_columns if c not in core_columns]].copy()
-    qc_df = df[core_columns + [c for c in qc_columns if c not in core_columns]].copy()
+    # The `column_name not in core_columns` filter prevents duplicating core columns.
+    stats_df = df[
+        core_columns
+        + [column_name for column_name in stats_columns if column_name not in core_columns]
+    ].copy()
+    qc_df = df[
+        core_columns
+        + [column_name for column_name in qc_columns if column_name not in core_columns]
+    ].copy()
     return stats_df, qc_df
-
-
-def extract_crs_column(meta_list: list[dict]) -> pd.DataFrame:
-    """Extract the per-point region CRS from adapter meta dicts into a DataFrame.
-
-    Returns a single-column DataFrame with column 'region_crs', or empty if
-    no CRS info is present. No GEE calls — reads from already-collected meta dicts.
-    """
-    if not meta_list or "region_crs" not in meta_list[0]:
-        return pd.DataFrame()
-    return pd.DataFrame({"region_crs": [m.get("region_crs") for m in meta_list]})
-
-
-def extract_band_coverage_columns(meta_list: list[dict]) -> pd.DataFrame:
-    """Extract per-point, per-band coverage from adapter meta dicts into a DataFrame.
-
-    Each row in the result corresponds to one sample point. Columns are named
-    ``{band}_coverage_pct`` (e.g. ``bio01_coverage_pct``) so that after the
-    caller applies add_prefix/add_suffix the final column names follow the
-    ``{dataset}_{band}_coverage_pct_{window}m`` convention — which already
-    matches the ``_coverage_pct_`` keyword in _QC_COLUMN_KEYWORDS and is
-    therefore automatically routed to the QC output file.
-
-    Returns an empty DataFrame when no meta dict contains band_coverage_pct
-    (i.e. single-band datasets, point-only runs, or failure-path metas).
-    """
-    # Only emit columns when at least the first point has non-empty band data.
-    # Failure-path metas carry band_coverage_pct: {} so this correctly skips
-    # datasets where every point failed.
-    first_band_data = next(
-        (m.get("band_coverage_pct") for m in meta_list if m.get("band_coverage_pct")),
-        None,
-    )
-    if not first_band_data:
-        return pd.DataFrame()
-
-    rows = [m.get("band_coverage_pct", {}) for m in meta_list]
-    band_df = pd.DataFrame(rows)
-
-    # Cheap uniformity check: when all bands share the same pixel grid
-    # (e.g. a multi-band composite image like WorldClim) every band will
-    # have identical coverage at every point. The existing coverage_pct
-    # column already captures that value, so emitting 19 duplicate columns
-    # adds no information — skip the per-band breakdown in that case.
-    first_column = band_df.iloc[:, 0]
-    if all(band_df[col].equals(first_column) for col in band_df.columns[1:]):
-        return pd.DataFrame()
-
-    # Rename "bio01" → "bio01_coverage_pct" so the column name survives
-    # add_prefix/add_suffix intact and still matches _QC_COLUMN_KEYWORDS.
-    return band_df.rename(columns={col: f"{col}_coverage_pct" for col in band_df.columns})
-
-
-def extract_date_columns(meta_list: list[dict]) -> pd.DataFrame:
-    """Extract per-point date info from adapter meta dicts into a DataFrame.
-
-    Returns columns: image_time_start, image_time_end, date_clamped,
-    date_source. Returns an empty DataFrame if no date info is present in
-    the meta dicts. No GEE calls — reads only from the already-collected
-    meta dicts.
-    """
-    if not meta_list or _DATE_META_KEYS[0] not in meta_list[0]:
-        return pd.DataFrame()
-    rows = [{k: m.get(k) for k in _DATE_META_KEYS} for m in meta_list]
-    return pd.DataFrame(rows)
