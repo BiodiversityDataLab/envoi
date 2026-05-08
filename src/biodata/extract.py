@@ -189,6 +189,10 @@ def extract(
         # layout so existing outputs are byte-for-byte unchanged.
         is_multi_window = len(window_sizes) > 1
 
+        # Accumulate QC column names across all datasets and window sizes so that
+        # split_stats_and_qc can use the explicit list rather than substring matching.
+        all_qc_columns: list[str] = []
+
         for dataset, band_overrides in datasets:
             # Look up the dataset's catalog entry once; both processing modes need it.
             dataset_config = catalog_datasets[dataset]
@@ -199,7 +203,7 @@ def extract(
                 # for one (dataset, window_size) pair.
 
                 if output_type == "tabular":
-                    df_copy, dataset_meta = _process_dataset_tabular(
+                    df_copy, dataset_meta, dataset_qc_columns = _process_dataset_tabular(
                         df_copy,
                         dataset,
                         dataset_config,
@@ -208,6 +212,7 @@ def extract(
                         window_size,
                         band_overrides=band_overrides,
                     )
+                    all_qc_columns.extend(dataset_qc_columns)
 
                 # In raster mode, the helper exports a folder of GeoTIFF tiles
                 # and returns the path plus the per-dataset metadata dict. With
@@ -281,7 +286,7 @@ def extract(
         if output_type == "tabular":
             # Keep id/lat/lon/date on both output files so each is self-contained.
             core_columns = [c for c in ("id", "lat", "lon", "date") if c in df_copy.columns]
-            stats_df, qc_df = split_stats_and_qc(df_copy, core_columns)
+            stats_df, qc_df = split_stats_and_qc(df_copy, core_columns, all_qc_columns)
 
             stats_df = _round_stat_columns(
                 stats_df, core_columns, defaults["stats_output_decimals"]
@@ -342,7 +347,7 @@ def _process_dataset_tabular(
     dates: list | None,
     window_size: int,
     band_overrides: Dict[str, Any] | None = None,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, dict, list[str]]:
     """Fetch stats and QC columns for one dataset/window pair in tabular mode.
 
     Owns adapter instantiation, statistic computation, QC column assembly,
@@ -399,7 +404,7 @@ def _process_dataset_tabular(
 
         # Attach per-row QC columns and capture the coverage summary used below
         # when assembling the per-dataset metadata dict.
-        df, quality_key, coverage_summary = attach_quality_control(
+        df, quality_key, coverage_summary, qc_column_names = attach_quality_control(
             df,
             meta_list=meta_list,
             dataset_name=dataset,
@@ -420,7 +425,7 @@ def _process_dataset_tabular(
             quality={quality_key: coverage_summary},
         )
 
-    return df, dataset_meta
+    return df, dataset_meta, qc_column_names
 
 
 def _process_dataset_raster(
