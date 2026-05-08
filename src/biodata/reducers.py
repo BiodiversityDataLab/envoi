@@ -9,80 +9,86 @@ logger = logging.getLogger(__name__)
 # ---------- helpers ----------
 
 
-def _to_array(vals: Iterable) -> np.ndarray:
+def _to_array(values: Iterable) -> np.ndarray:
     """Convert any iterable to a 1D float array."""
-    return np.asarray(list(vals), dtype=float).ravel()
+    return np.asarray(values, dtype=float).ravel()
 
 
-def _finite(vals: Iterable) -> np.ndarray:
+def _finite(values: Iterable) -> np.ndarray:
     """Return only finite values (drops NaN / inf)."""
-    arr = _to_array(vals)
-    return arr[np.isfinite(arr)]
+    finite_values = _to_array(values)
+    return finite_values[np.isfinite(finite_values)]
 
 
-def _nan_if_empty(arr: np.ndarray) -> float | None:
+def _nan_if_empty(finite_values: np.ndarray) -> float | None:
     """
     Return NaN if the array is empty, else None.
 
     Callers use:
-        maybe = _nan_if_empty(arr)
+        maybe = _nan_if_empty(finite_values)
         return maybe if maybe is not None else <real computation>
     """
-    return float("nan") if arr.size == 0 else None
+    return float("nan") if finite_values.size == 0 else None
 
 
 # ---------- basic reducers ----------
 
 
-def r_mean(vals: Iterable) -> float:
-    arr = _finite(vals)
-    maybe = _nan_if_empty(arr)
-    return maybe if maybe is not None else float(np.mean(arr))
+def r_mean(values: Iterable) -> float:
+    """Mean of finite values in the window."""
+    finite_values = _finite(values)
+    maybe = _nan_if_empty(finite_values)
+    return maybe if maybe is not None else float(np.mean(finite_values))
 
 
-def r_median(vals: Iterable) -> float:
-    arr = _finite(vals)
-    maybe = _nan_if_empty(arr)
-    return maybe if maybe is not None else float(np.median(arr))
+def r_median(values: Iterable) -> float:
+    """Median of finite values in the window."""
+    finite_values = _finite(values)
+    maybe = _nan_if_empty(finite_values)
+    return maybe if maybe is not None else float(np.median(finite_values))
 
 
-def r_min(vals: Iterable) -> float:
-    arr = _finite(vals)
-    maybe = _nan_if_empty(arr)
-    return maybe if maybe is not None else float(np.min(arr))
+def r_min(values: Iterable) -> float:
+    """Minimum of finite values in the window."""
+    finite_values = _finite(values)
+    maybe = _nan_if_empty(finite_values)
+    return maybe if maybe is not None else float(np.min(finite_values))
 
 
-def r_max(vals: Iterable) -> float:
-    arr = _finite(vals)
-    maybe = _nan_if_empty(arr)
-    return maybe if maybe is not None else float(np.max(arr))
+def r_max(values: Iterable) -> float:
+    """Maximum of finite values in the window."""
+    finite_values = _finite(values)
+    maybe = _nan_if_empty(finite_values)
+    return maybe if maybe is not None else float(np.max(finite_values))
 
 
-def r_sum(vals: Iterable) -> float:
+def r_sum(values: Iterable) -> float:
     """Sum of finite values."""
-    arr = _finite(vals)
-    maybe = _nan_if_empty(arr)
-    return maybe if maybe is not None else float(np.sum(arr))
+    finite_values = _finite(values)
+    maybe = _nan_if_empty(finite_values)
+    return maybe if maybe is not None else float(np.sum(finite_values))
 
 
-def r_std(vals: Iterable) -> float:
-    arr = _finite(vals)
-    maybe = _nan_if_empty(arr)
-    return maybe if maybe is not None else float(np.std(arr))
+def r_std(values: Iterable) -> float:
+    """Sample standard deviation of finite values in the window (ddof=1)."""
+    finite_values = _finite(values)
+    maybe = _nan_if_empty(finite_values)
+    return maybe if maybe is not None else float(np.std(finite_values, ddof=1))
 
 
-def r_var(vals: Iterable) -> float:
-    arr = _finite(vals)
-    maybe = _nan_if_empty(arr)
-    return maybe if maybe is not None else float(np.var(arr))
+def r_var(values: Iterable) -> float:
+    """Sample variance of finite values in the window (ddof=1)."""
+    finite_values = _finite(values)
+    maybe = _nan_if_empty(finite_values)
+    return maybe if maybe is not None else float(np.var(finite_values, ddof=1))
 
 
-def r_count(vals: Iterable) -> int:
+def r_count(values: Iterable) -> int:
     """Number of finite pixels in the window."""
-    return int(np.isfinite(_to_array(vals)).sum())
+    return int(np.isfinite(_to_array(values)).sum())
 
 
-def r_mode(vals: Iterable) -> float:
+def r_mode(values: Iterable) -> float:
     """Most frequent value in the window.
 
     For continuous data with no repeats, returns the smallest value
@@ -90,31 +96,33 @@ def r_mode(vals: Iterable) -> float:
     by returning the smallest. This matches the expected behaviour for
     integer-coded rasters (e.g. land cover classes).
     """
-    arr = _finite(vals)
-    maybe = _nan_if_empty(arr)
+    finite_values = _finite(values)
+    maybe = _nan_if_empty(finite_values)
     if maybe is not None:
         return maybe
-    values, counts = np.unique(arr, return_counts=True)
-    return float(values[np.argmax(counts)])
+    unique_values, counts = np.unique(finite_values, return_counts=True)
+    return float(unique_values[np.argmax(counts)])
 
 
 # ---------- quantiles ----------
 
 
-def make_quantile(q: float) -> Callable[[Iterable], float]:
+def make_quantile(quantile: float) -> Callable[[Iterable], float]:
     """
     Factory for quantile reducers.
 
-    q is in [0, 1] (e.g. 0.1 for 10th percentile).
+    quantile must be in [0, 1] (e.g. 0.1 for 10th percentile).
     The function name becomes r_qXX for debugging.
     """
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError(f"quantile must be in [0, 1], got {quantile}")
 
-    def _q(vals: Iterable) -> float:
-        arr = _finite(vals)
-        maybe = _nan_if_empty(arr)
-        return maybe if maybe is not None else float(np.percentile(arr, q * 100.0))
+    def _q(values: Iterable) -> float:
+        finite_values = _finite(values)
+        maybe = _nan_if_empty(finite_values)
+        return maybe if maybe is not None else float(np.percentile(finite_values, quantile * 100.0))
 
-    _q.__name__ = f"r_q{int(q * 100)}"
+    _q.__name__ = f"r_q{int(quantile * 100)}"
     return _q
 
 
@@ -151,28 +159,8 @@ _REGISTRY: Dict[str, Callable] = {
 SPECIAL_REDUCERS = frozenset({"point"})
 
 
-def get_reducer(name: str) -> Callable:
-    """
-    Look up a reducer by name (case-insensitive).
-
-    Example:
-        fn = get_reducer("mean")
-        value = fn(window_values)
-    """
-    lower = name.lower()
-    # Guard: "point" is handled by the adapter's fetch_stats_batch, not as a
-    # numpy reducer. If it ends up here, the extract pipeline routed incorrectly.
-    if lower in SPECIAL_REDUCERS:
-        raise ValueError(
-            f"'{lower}' is an adapter-level reducer; "
-            f"call adapter.fetch_stats_batch instead of get_reducer"
-        )
-    fn = _REGISTRY.get(lower)
-    if fn is None:
-        raise ValueError(f"Unknown reducer: {name}. Valid: {list(_REGISTRY)}")
-    return fn
-
-
+# Reducers that assume continuous data and are inappropriate for categorical data.
+# Used by validate_reducers() to warn users about incompatible reducer/data_type combinations.
 CONTINUOUS_ONLY_REDUCERS = {
     "mean",
     "median",
@@ -191,6 +179,31 @@ CONTINUOUS_ONLY_REDUCERS = {
 }
 
 
+# ---------- public API ----------
+
+
+def get_reducer(name: str) -> Callable:
+    """
+    Look up a reducer by name (case-insensitive).
+
+    Example:
+        reducer_fn = get_reducer("mean")
+        value = reducer_fn(window_values)
+    """
+    lower = name.lower()
+    # Guard: "point" is handled by the adapter's fetch_stats_batch, not as a
+    # numpy reducer. If it ends up here, the extract pipeline routed incorrectly.
+    if lower in SPECIAL_REDUCERS:
+        raise ValueError(
+            f"'{lower}' is an adapter-level reducer; "
+            f"call adapter.fetch_stats_batch instead of get_reducer"
+        )
+    reducer_fn = _REGISTRY.get(lower)
+    if reducer_fn is None:
+        raise ValueError(f"Unknown reducer: {name}. Valid: {list(_REGISTRY)}")
+    return reducer_fn
+
+
 def validate_reducers(
     reducer_names: list[str], data_type: str | None, dataset_name: str
 ) -> str | None:
@@ -201,10 +214,14 @@ def validate_reducers(
     """
     if data_type != "categorical":
         return None
-    bad = [r for r in reducer_names if r.lower() in CONTINUOUS_ONLY_REDUCERS]
-    if bad:
+    invalid_reducer_names = [
+        reducer_name
+        for reducer_name in reducer_names
+        if reducer_name.lower() in CONTINUOUS_ONLY_REDUCERS
+    ]
+    if invalid_reducer_names:
         msg = (
-            f"Dataset '{dataset_name}' is categorical but reducers {bad} assume "
+            f"Dataset '{dataset_name}' is categorical but reducers {invalid_reducer_names} assume "
             f"continuous data. Consider using 'point', 'mode' or 'count' instead."
         )
         logger.warning(msg)
@@ -212,9 +229,9 @@ def validate_reducers(
     return None
 
 
-__all__ = ["get_reducer", "_REGISTRY", "validate_reducers"]
-
-
 def list_reducers() -> list[str]:
     """Return sorted names of registered reducers."""
     return sorted(_REGISTRY.keys())
+
+
+__all__ = ["get_reducer", "validate_reducers", "list_reducers"]
