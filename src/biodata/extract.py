@@ -795,7 +795,7 @@ def _parse_run_config(
     )
 
 
-_VALID_STAT_TYPES = frozenset({"continuous", "categorical"})
+_VALID_STAT_TYPES = frozenset({"continuous", "categorical", "mixed"})
 _ALL_KNOWN_REDUCERS = frozenset(
     {
         "mean",

@@ -1,43 +1,45 @@
 datasets:
 
   # ── Example / reference entry ────────────────────────────────────────────
-  # Copy this block when adding a real dataset.
-  # All fields except source, path and data_type are optional.
-  dataset_name:  # provide a unique name for this dataset e.g. "sentinel_2_l2a"
-    data_source: earth_engine
-    path: path/to/dataset_on_earth_engine   # GEE asset ID; type (IMAGE / IMAGE_COLLECTION) is auto-detected
-    data_type: type                 # "continuous", "categorical" or "mixed" (for datasets with both continuous and categorical bands)
-
-    # Band selection - if omitted, all bands are loaded.
-    # The values set here are the dataset-wide DEFAULT and apply to every
-    # call to extract() that doesn't override them.
-    bands: [list, of, bands]                 # single string ("DEM") or list (["B4", "B8"])
-    derived_bands: [slope, aspect]           # compute and include derived bands (currently supported: slope, aspect — DEM-style datasets)
-    #
-    # The user can also override the bands list on a per-call basis by
-    # inlining a single-key dict in the `datasets` list passed to extract():
-    #   datasets:
-    #     - sentinel_2_l2a                       # use the catalog defaults
-    #     - {sentinel_2_l2a: [B4, B8]}           # shorthand: replace bands for this run only
-    #     - {dem_aster:     [DEM, slope]}        # mix source + derived names in one list
-    # Names recognised as derived (currently "slope", "aspect") are split out
-    # internally; the rest are used as source bands. The per-call override
-    # replaces the catalog's bands list entirely (no merging).
-
-    dataset_spec:
-      # Dataset-specific options
-      native_scale_m: 10            # native spatial resolution in meters (only needed for datasets that lack a native scale property in GEE metadata, e.g. composites stored in EPSG:4326)
-      use_utm_zone: true # true/false. for tiled collections, filter to the UTM zone of the point to avoid selecting the wrong tile.
-      collection_date_policy: contains # for interval-based collections (e.g. monthly aggregates), use the image whose time range satisfies start <= date < end, instead of nearest start date.
-
-    dataset_information:
-      # Optional free-form metadata fields, written to metadata JSON.
-      # These are not used by EDDP itself, but can be useful for users.
-      description: "A brief description of the dataset."
-      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/path_to_dataset"
-      source_url: "https://example.com/dataset-info"
-      citation: "Author et al. (Year). Title. Journal. DOI."
-      license: "CC-BY-4.0"
+  # Copy this block (uncommented) when adding a real dataset.
+  # Required keys for earth_engine datasets: data_source, path, data_type.
+  # All other fields are optional.
+  #
+  # dataset_name:  # provide a unique name for this dataset e.g. "sentinel_2_l2a"
+  #   data_source: earth_engine
+  #   path: path/to/dataset_on_earth_engine   # GEE asset ID; type (IMAGE / IMAGE_COLLECTION) is auto-detected
+  #   data_type: type                 # "continuous", "categorical" or "mixed" (for datasets with both continuous and categorical bands)
+  #
+  #   # Band selection - if omitted, all bands are loaded.
+  #   # The values set here are the dataset-wide DEFAULT and apply to every
+  #   # call to extract() that doesn't override them.
+  #   bands: [list, of, bands]                 # single string ("DEM") or list (["B4", "B8"])
+  #   derived_bands: [slope, aspect]           # compute and include derived bands (currently supported: slope, aspect — DEM-style datasets)
+  #
+  #   # The user can also override the bands list on a per-call basis by
+  #   # inlining a single-key dict in the `datasets` list passed to extract():
+  #   #   datasets:
+  #   #     - sentinel_2_l2a                       # use the catalog defaults
+  #   #     - {sentinel_2_l2a: [B4, B8]}           # shorthand: replace bands for this run only
+  #   #     - {dem_aster:     [DEM, slope]}        # mix source + derived names in one list
+  #   # Names recognised as derived (currently "slope", "aspect") are split out
+  #   # internally; the rest are used as source bands. The per-call override
+  #   # replaces the catalog's bands list entirely (no merging).
+  #
+  #   dataset_spec:
+  #     # Dataset-specific options
+  #     native_scale_m: 10            # native spatial resolution in meters (only needed for datasets that lack a native scale property in GEE metadata, e.g. composites stored in EPSG:4326)
+  #     use_utm_zone: true # true/false. for tiled collections, filter to the UTM zone of the point to avoid selecting the wrong tile.
+  #     collection_date_policy: contains # for interval-based collections (e.g. monthly aggregates), use the image whose time range satisfies start <= date < end, instead of nearest start date.
+  #
+  #   dataset_information:
+  #     # Optional free-form metadata fields, written to metadata JSON.
+  #     # These are not used by EDDP itself, but can be useful for users.
+  #     description: "A brief description of the dataset."
+  #     ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/path_to_dataset"
+  #     source_url: "https://example.com/dataset-info"
+  #     citation: "Author et al. (Year). Title. Journal. DOI."
+  #     license: "CC-BY-4.0"
   # ─────────────────────────────────────────────────────────────────────────
   
   
@@ -59,7 +61,7 @@ datasets:
       citation: "© DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved."
       license: "Copernicus Data License (free for most uses)"
 
-  bioclim:
+  climate_bioclim:
     data_source: earth_engine
     path: WORLDCLIM/V1/BIO
     data_type: continuous
@@ -70,7 +72,7 @@ datasets:
       citation: "Hijmans, R.J., Cameron, S.E., Parra, J.L., Jones, P.G., & Jarvis, A. (2005). Very high resolution interpolated climate surfaces for global land areas. International Journal of Climatology, 25, 1965-1978."
       license: "CC-BY-SA-4.0"
 
-  era5_monthly:
+  climate_era5_monthly:
     data_source: earth_engine
     path: ECMWF/ERA5/MONTHLY
     data_type: continuous
@@ -94,10 +96,10 @@ datasets:
       description: "Google Satellite Embeddings V1 - annual 64-dimensional embeddings for 2017-2025, 10m resolution."
       ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/GOOGLE_SATELLITE_EMBEDDING_V1_ANNUAL"
       source_url: "http://arxiv.org/abs/2507.22291"
-      citation: "Brown, C. F., Kazmierski, M. R., Pasquarella, V J., Rucklidge, W. J., Samsikova, M., Zhang, C., Shelhamer, E., Lahera, E., Wiles, O., Ilyushchenko, S., Gorelick, N., Zhang, L. L., Alj, S., Schechter, E., Askay, S., Guinan, O., Moore, R., Boukouvalas, A., & Kohli, P.(2025). AlphaEarth Foundations: An embedding field model for accurate and efficient global mapping from sparse label data. arXiv preprint arXiv.2507.22291. "
+      citation: "Brown, C. F., Kazmierski, M. R., Pasquarella, V. J., Rucklidge, W. J., Samsikova, M., Zhang, C., Shelhamer, E., Lahera, E., Wiles, O., Ilyushchenko, S., Gorelick, N., Zhang, L. L., Alj, S., Schechter, E., Askay, S., Guinan, O., Moore, R., Boukouvalas, A., & Kohli, P. (2025). AlphaEarth Foundations: An embedding field model for accurate and efficient global mapping from sparse label data. arXiv preprint arXiv:2507.22291."
       license: "CC-BY-4.0"
 
-  human_impact_index:
+  humanimpact_hii:
     data_source: earth_engine
     path: projects/HII/v1/hii
     data_type: continuous
@@ -108,7 +110,7 @@ datasets:
       citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
       license: "CC BY-NC-SA-3.0"
 
-  human_impact_index_drivers: # not working atm
+  humanimpact_hii_drivers: # not working atm
     data_source: earth_engine
     path: projects/HII/v1/driver/infrastructure
     data_type: continuous
@@ -119,7 +121,7 @@ datasets:
       citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
       license: "CC BY-NC-SA-3.0"
 
-  lulc_esa_worldcover_2021:
+  lulc_worldcover_2021:
     data_source: earth_engine
     path: ESA/WorldCover/v200
     data_type: categorical
@@ -130,7 +132,7 @@ datasets:
       citation: "Zanaga, D., Van De Kerchove, R., Daems, D., De Keersmaecker, W., Brockmann, C., Kirches, G., Wevers, J., Cartus, O., Santoro, M., Fritz, S., Lesiv, M., Herold, M., Tsendbazar, N.E., Xu, P., Ramoino, F., Arino, O., 2022. ESA WorldCover 10 m 2021 v200."
       license: "CC-BY-4.0"
 
-  lulc_cgls_lc100: # not working atm
+  lulc_cgls_lc100:
     data_source: earth_engine
     path: COPERNICUS/Landcover/100m/Proba-V-C3/Global
     data_type: categorical
@@ -141,7 +143,84 @@ datasets:
       citation: "Buchhorn, M., Smets, B., Bertels, L., Roo, B. D., Lesiv, M., Tsendbazar, N.-E., Herold, M., & Fritz, S. (2020). Copernicus Global Land Service: Land Cover 100m: collection 3: epoch 2019: Globe (Version V3.0.1) [Data set]. Zenodo."
       license: "Fully free and open to all users"
 
-  landsat_annual_ndvi:
+  lulc_dynamicworld:
+    data_source: earth_engine
+    path: GOOGLE/DYNAMICWORLD/V1
+    data_type: categorical
+    bands: [label]
+    dataset_spec:
+      use_utm_zone: true 
+    dataset_information:
+      description: "Dynamic World V1 - near real-time global 10m land cover at Sentinel-2 cadence, from 2015-06-27 to present. Exposes the `label` band (discrete class index 0-8: water, trees, grass, flooded_vegetation, crops, shrub_and_scrub, built, bare, snow_and_ice); the 9 per-class probability bands are also available via per-call band override."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/GOOGLE_DYNAMICWORLD_V1"
+      source_url: "https://www.nature.com/articles/s41597-022-01307-4"
+      citation: "Brown, C. F., Brumby, S. P., Guzder-Williams, B., Birch, T., Hyde, S. B., Mazzariello, J., Czerwinski, W., Pasquarella, V. J., Haertel, R., Ilyushchenko, S., Schwehr, K., Weisse, M., Stolle, F., Hanson, C., Guinan, O., Moore, R., & Tait, A. M. (2022). Dynamic World, Near real-time global 10 m land use land cover mapping. Scientific Data, 9, 251. https://doi.org/10.1038/s41597-022-01307-4"
+      license: "CC-BY-4.0"
+
+  lulc_naturallands_2020:
+    data_source: earth_engine
+    path: WRI/SBTN/naturalLands/v1_1/2020
+    data_type: categorical
+    dataset_information:
+      description: "SBTN Natural Lands Map v1.1 (2020) - global 30m map distinguishing natural from non-natural land cover, produced for the Science Based Targets Network."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/WRI_SBTN_naturalLands_v1_1_2020"
+      source_url: "https://github.com/wri/natural-lands-map/tree/main"
+      citation: "Mazur, E., Sims, M., Goldman, E., Schneider, M., Pirri, M. D., Beatty, C. R., Stolle, F., & Stevenson, M. (2025). SBTN Natural Lands Map v1.1: Technical Documentation. Science Based Targets Network."
+      license: "CC-BY-SA-4.0"
+
+  agb_esa_cci:
+    data_source: earth_engine
+    path: ESA/CCI/Above_Ground_Biomass/V6_0
+    data_type: continuous
+    dataset_information:
+      description: "ESA CCI Above-Ground Biomass v6.0 - global 100m forest above-ground biomass (Mg/ha) with per-pixel uncertainty, for selected years 2007, 2010 and 2015-2022."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/ESA_CCI_Above_Ground_Biomass_V6_0"
+      source_url: "https://climate.esa.int/en/projects/biomass/"
+      citation: "Santoro, M., & Cartus, O. (2025). ESA Biomass Climate Change Initiative (Biomass_cci): Global datasets of forest above-ground biomass for the years 2007, 2010, 2015, 2016, 2017, 2018, 2019, 2020, 2021 and 2022, v6.0. NERC EDS Centre for Environmental Data Analysis. https://doi.org/10.5285/95913ffb6467447ca72c4e9d8cf30501"
+      license: "ESA CCI Biomass License (free with citation)"
+
+  npp_modis:
+    data_source: earth_engine
+    path: MODIS/061/MOD17A3HGF
+    data_type: continuous
+    dataset_spec:
+      collection_date_policy: contains
+    dataset_information:
+      description: "MODIS Terra Net Primary Productivity (MOD17A3HGF v061) - annual NPP and GPP (kg C/m²) plus QC at 500m resolution, 2001-2024."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/MODIS_061_MOD17A3HGF"
+      source_url: "https://doi.org/10.5067/MODIS/MOD17A3HGF.061"
+      citation: "Running, S., & Zhao, M. (2021). MODIS/Terra Net Primary Production Gap-Filled Yearly L4 Global 500m SIN Grid V061 [Data set]. NASA Land Processes Distributed Active Archive Center. https://doi.org/10.5067/MODIS/MOD17A3HGF.061"
+      license: "Public Domain (no restrictions on use)"
+
+  ndvi_landsat_8day:
+    data_source: earth_engine
+    path: LANDSAT/COMPOSITES/C02/T1_L2_8DAY_NDVI
+    data_type: continuous
+    dataset_spec:
+      native_scale_m: 30
+      collection_date_policy: contains
+    dataset_information:
+      description: "Landsat 8-day NDVI - global 8-day composites of NDVI from 1984-present, 30m resolution."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/LANDSAT_COMPOSITES_C02_T1_L2_8DAY_NDVI"
+      source_url: "https://www.usgs.gov/landsat-missions/landsat-surface-reflectance-derived-spectral-indices"
+      citation: "Landsat NDVI products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center."
+      license: "Public Domain (free for all uses)"
+
+  ndvi_landsat_32day:
+    data_source: earth_engine
+    path: LANDSAT/COMPOSITES/C02/T1_L2_32DAY_NDVI
+    data_type: continuous
+    dataset_spec:
+      native_scale_m: 30
+      collection_date_policy: contains
+    dataset_information:
+      description: "Landsat 32-day NDVI - global 32-day composites of NDVI from 1984-present, 30m resolution."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/LANDSAT_COMPOSITES_C02_T1_L2_32DAY_NDVI"
+      source_url: "https://www.usgs.gov/landsat-missions/landsat-surface-reflectance-derived-spectral-indices"
+      citation: "Landsat NDVI products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center."
+      license: "Public Domain (free for all uses)"
+
+  ndvi_landsat_annual:
     data_source: earth_engine
     path: LANDSAT/COMPOSITES/C02/T1_L2_ANNUAL_NDVI
     data_type: continuous
