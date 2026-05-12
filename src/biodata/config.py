@@ -7,6 +7,10 @@ import logging
 import yaml
 
 REQUIRED_DATASET_KEYS = {"data_source", "path"}
+# Earth Engine datasets need a `data_type` so the right reducer set (continuous
+# vs categorical) gets picked. Local rasters can omit it — type is inferred at
+# read time from the raster file when needed.
+EE_REQUIRED_DATASET_KEYS = {"data_type"}
 
 # Module-level cache so each bundled YAML is only read once per process.
 _defaults_cache: Dict[str, Any] | None = None
@@ -119,6 +123,12 @@ def _validate_catalog(data: Dict[str, Any], source_label: str) -> Dict[str, Any]
         if not isinstance(spec["path"], str) or not spec["path"]:
             raise CatalogError(f"datasets.{name}.path must be a non-empty string")
 
+        # Earth Engine entries must declare `data_type` up front. Local rasters
+        # are allowed to omit it because their type can be inferred from the
+        # raster file when needed.
+        if spec["data_source"] == "earth_engine":
+            _require_keys(spec, EE_REQUIRED_DATASET_KEYS, f"datasets.{name}")
+
         _inspect_raster(name, spec)
 
     return data
@@ -184,6 +194,13 @@ def _load_catalog_any(src: Any) -> Dict[str, Any]:
                     f"datasets.{name}: missing required key 'path'.\n"
                     f"For GEE assets, this is the asset ID (e.g. 'COPERNICUS/S2_SR_HARMONIZED').\n"
                     f"For local rasters, this is the file path (e.g. 'data/dem.tif')."
+                )
+            # Earth Engine entries must declare `data_type` so we know which
+            # reducer set (continuous / categorical) to apply.
+            if spec.get("data_source") == "earth_engine" and not spec.get("data_type"):
+                raise CatalogError(
+                    f"datasets.{name}: missing required key 'data_type' for earth_engine dataset.\n"
+                    f"Valid values are: continuous, categorical, mixed."
                 )
         return d
 
