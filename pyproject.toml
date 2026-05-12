@@ -39,7 +39,7 @@ keywords = ["gis", "raster", "geospatial", "environment", "gee"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5.0",
-    "black>=24.3.0",
+    "black>=26.3.1",
 ]
 gee = [
     "earthengine-api>=0.1.398",
