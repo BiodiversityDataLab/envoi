@@ -12,7 +12,7 @@ batch_id: terrain                 # Batch identifier. Used for filenames (e.g. t
 
 datasets:                       # List of dataset names from catalog.yml
   - dem_aster
-  - bioclim
+  - climate_bioclim
 
 settings:
   output_type: tabular          # "tabular" or "raster"
