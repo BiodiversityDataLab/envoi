@@ -18,7 +18,6 @@ from tqdm.auto import tqdm
 import ee
 import geemap
 
-
 try:
     from . import register as _register
 except Exception:
