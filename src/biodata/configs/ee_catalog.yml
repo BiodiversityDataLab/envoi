@@ -99,7 +99,7 @@ datasets:
       citation: "Brown, C. F., Kazmierski, M. R., Pasquarella, V. J., Rucklidge, W. J., Samsikova, M., Zhang, C., Shelhamer, E., Lahera, E., Wiles, O., Ilyushchenko, S., Gorelick, N., Zhang, L. L., Alj, S., Schechter, E., Askay, S., Guinan, O., Moore, R., Boukouvalas, A., & Kohli, P. (2025). AlphaEarth Foundations: An embedding field model for accurate and efficient global mapping from sparse label data. arXiv preprint arXiv:2507.22291."
       license: "CC-BY-4.0"
 
-  humanimpact_hii:
+  hii_human_impact:
     data_source: earth_engine
     path: projects/HII/v1/hii
     data_type: continuous
@@ -110,16 +110,83 @@ datasets:
       citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
       license: "CC BY-NC-SA-3.0"
 
-  humanimpact_hii_drivers: # not working atm
+  hii_driver_infrastructure:
     data_source: earth_engine
     path: projects/HII/v1/driver/infrastructure
     data_type: continuous
     dataset_information:
-      description: "Human Impact Index - driver layers for HII (roads, railways, water etc.)."
+      description: "Human Impact Index driver - infrastructure."
       ee_source_url: "https://code.earthengine.google.com/f904097220e577cad2e0dc5379371c91"
       source_url: "https://wcshumanfootprint.org/"
       citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
       license: "CC BY-NC-SA-3.0"
+
+  hii_driver_land_use:
+    data_source: earth_engine
+    path: projects/HII/v1/driver/land_use
+    data_type: continuous
+    dataset_information:
+      description: "Human Impact Index driver - land use."
+      ee_source_url: "https://code.earthengine.google.com/f904097220e577cad2e0dc5379371c91"
+      source_url: "https://wcshumanfootprint.org/"
+      citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
+      license: "CC BY-NC-SA-3.0"
+
+  hii_driver_population_density:
+    data_source: earth_engine
+    path: projects/HII/v1/driver/population_density
+    data_type: continuous
+    dataset_information:
+      description: "Human Impact Index driver - population density."
+      ee_source_url: "https://code.earthengine.google.com/f904097220e577cad2e0dc5379371c91"
+      source_url: "https://wcshumanfootprint.org/"
+      citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
+      license: "CC BY-NC-SA-3.0"
+
+  hii_driver_power:
+    data_source: earth_engine
+    path: projects/HII/v1/driver/power
+    data_type: continuous
+    dataset_information:
+      description: "Human Impact Index driver - power."
+      ee_source_url: "https://code.earthengine.google.com/f904097220e577cad2e0dc5379371c91"
+      source_url: "https://wcshumanfootprint.org/"
+      citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
+      license: "CC BY-NC-SA-3.0"
+
+  hii_driver_railways:
+    data_source: earth_engine
+    path: projects/HII/v1/driver/railways
+    data_type: continuous
+    dataset_information:
+      description: "Human Impact Index driver - railways."
+      ee_source_url: "https://code.earthengine.google.com/f904097220e577cad2e0dc5379371c91"
+      source_url: "https://wcshumanfootprint.org/"
+      citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
+      license: "CC BY-NC-SA-3.0"
+
+  hii_driver_roads:
+    data_source: earth_engine
+    path: projects/HII/v1/driver/roads
+    data_type: continuous
+    dataset_information:
+      description: "Human Impact Index driver - roads."
+      ee_source_url: "https://code.earthengine.google.com/f904097220e577cad2e0dc5379371c91"
+      source_url: "https://wcshumanfootprint.org/"
+      citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
+      license: "CC BY-NC-SA-3.0"
+
+  hii_driver_water:
+    data_source: earth_engine
+    path: projects/HII/v1/driver/water
+    data_type: continuous
+    dataset_information:
+      description: "Human Impact Index driver - water."
+      ee_source_url: "https://code.earthengine.google.com/f904097220e577cad2e0dc5379371c91"
+      source_url: "https://wcshumanfootprint.org/"
+      citation: "Sanderson, E. W., Fisher, K., Robinson, N., Sampson, D., Duncan, A., & Royte, L. (2022). The march of the human footprint."
+      license: "CC BY-NC-SA-3.0"
+
 
   lulc_worldcover_2021:
     data_source: earth_engine
