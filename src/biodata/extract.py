@@ -67,7 +67,7 @@ def extract(
                 # "statistics": {"continuous": ["mean", "std"], "categorical": ["mode"]},
                 "window_size_m": 200,       # sampling window radius in metres
                 "output_file_format": "parquet",  # "parquet", "csv", or "dataframe" (tabular only)
-                "min_coverage_pct": 80,     # points below this coverage get a QC flag
+                "min_coverage_pct": 0,     # points below this coverage get a QC flag
                 "resample_m": 10,           # output pixel size in metres (raster only)
             },
         }
