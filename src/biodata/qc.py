@@ -46,7 +46,7 @@ class QualityControlBuildResult:
 # ---------------------------------------------------------------------------
 
 
-def compute_qc_flags(meta_list: list[dict], min_coverage_pct: int | float = 80) -> pd.DataFrame:
+def compute_qc_flags(meta_list: list[dict], min_coverage_pct: int | float) -> pd.DataFrame:
     """Build core QC flags from adapter metadata dicts.
 
     Extracts in_extent, n_pixels, had_nodata, and coverage_pct from each
@@ -155,7 +155,7 @@ def build_quality_control_dataframe(
     dataset_name: str,
     reducer_names: list[str],
     window_size_m: int,
-    min_coverage_pct: int | float = 80,
+    min_coverage_pct: int | float,
 ) -> QualityControlBuildResult:
     """Build dataset-prefixed QC columns from adapter metadata.
 
@@ -266,7 +266,7 @@ def attach_quality_control(
     dataset_name: str,
     reducer_names: list[str],
     window_size_m: int,
-    min_coverage_pct: int | float = 80,
+    min_coverage_pct: int | float,
 ) -> tuple[pd.DataFrame, str, dict, list[str]]:
     """Append QC columns to df and return (df, quality_key, coverage_summary, qc_column_names).
 

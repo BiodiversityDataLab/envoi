@@ -9,19 +9,21 @@
                              |
               +--------------+--------------+
               |                             |
-         config.py                     catalog.yml
-     load & validate catalog          dataset registry
-     auto-detect local raster         (data_source + path)
+         config.py                     configs/ee_catalog.yml
+     load + merge catalogs            built-in GEE dataset registry
+     update_catalog() / defaults      (data_source + path + ...)
+     auto-detect local raster
               |                             |
               +-------------+---------------+
                             |
+                    For each output config:
                     For each dataset:
                             |
               +-------------+-------------+
               |                           |
         adapters/__init__.py         reducers.py
         get_adapter(data_source)    get_reducer(name)
-        adapter registry            mean, std, q10, ...
+        adapter registry            mean, std, q05..q95, mode, ...
               |
      +--------+--------+
      |                  |
@@ -33,20 +35,21 @@
      |                  |
      +--------+---------+
               |
-              |  returns pixel values + QC metadata
+              |  returns stats + per-point QC metadata,
+              |  or writes GeoTIFF tiles
               |
      +--------+---------+-----------+
-     |                  |           |
-   qc.py           output.py   metadata.py
-  coverage       Parquet/CSV    sidecar JSON
-  flags          writer         (run/config/
-                                 datasets/quality)
+     |                              |
+   qc.py                       metadata.py
+  coverage flags,             sidecar JSON
+  per-band coverage,          (run / config /
+  date / CRS columns          datasets / warnings)
 ```
 
 ## Data flow
 
 ```
- Input DataFrame                    Config (dict or YAML)
+ Input DataFrame                    Config (dict, list, or YAML path)
  +------------------+               +-------------------------+
  | id | lat | lon   |               | batch_id: "terrain"     |
  |    | (date)      |               | datasets: [dem_aster]   |
@@ -57,38 +60,35 @@
  |    extract()      | <-------------+-------------------------+
  +--------+---------+
           |
-          |  1. Load catalog -> resolve adapter per dataset
-          |  2. For each dataset:
+          |  1. Validate/rename id/lat/lon/date columns; reproject to WGS84.
+          |  2. Parse dates (mixed-format aware) and warn on incomplete ones.
+          |  3. Load + merge catalogs (built-in EE + update_catalog() entries).
+          |  4. For each output run config, for each (dataset, window) pair:
           |
-          +---> [tabular + server stats]  GEE fast path
-          |     adapter.fetch_stats_batch()
-          |     -> server-side reduceRegion
-          |     -> {mean: 121.0, std: 4.2}
+          +---> [tabular]                  server stats (GEE) /
+          |     adapter.fetch_stats_batch()  python reducers (local)
+          |     -> {mean: 121.0, std: 4.2, ...} + QC meta
+          |     ("point" reducer adds an exact-pixel sample in the same call)
           |
-          +---> [tabular + local stats]   Python reducers
-          |     adapter.fetch_batch()
-          |     -> raw pixel arrays
-          |     -> reducers.py computes stats
-          |
-          +---> [tabular + point]         Single pixel
-          |     adapter.fetch_points_batch()
-          |     -> value at exact (lat, lon)
-          |
-          +---> [raster]                  GeoTIFF tiles
-          |     adapter.export_images()   (GEE via geemap)
-          |     adapter.export_windows()  (local via rasterio)
+          +---> [raster]                   GeoTIFF tiles
+                adapter.export_tiles()
+                -> per-point .tif files + per-tile meta
+                (GEE via geemap; local via rasterio.warp)
           |
           v
  +-----------------+  +------------------+  +---------------------+
- | stats.parquet   |  | stats_qc.parquet |  | metadata.json       |
- | (or .csv)       |  | coverage flags   |  | run / config /      |
- +-----------------+  +------------------+  | datasets / quality  |
-                                            +---------------------+
+ | stats.csv       |  | stats_qc.csv     |  | metadata.json       |
+ | (or .parquet)   |  | coverage flags,  |  | run / config /      |
+ +-----------------+  | date/CRS cols    |  | datasets / warnings |
+                     +------------------+  +---------------------+
     OR (raster mode):
  +------------------------------+
- | out/{name}/{dataset}/        |
+ | out/{batch_id}/{dataset}/    |
  |   A-dem_aster.tif            |
  |   B-dem_aster.tif            |
+ |   ...                        |
+ | out/{batch_id}/              |
+ |   {batch_id}_metadata.json   |
  +------------------------------+
 ```
 
@@ -96,16 +96,16 @@
 
 | Module | Role |
 |---|---|
-| `extract.py` | Orchestrator. Parses config, loops over datasets, dispatches to adapters, assembles outputs. |
-| `config.py` | Loads and validates `catalog.yml`. Auto-detects CRS/resolution for local rasters via rasterio. |
-| `adapters/__init__.py` | Adapter registry. Maps source names (`earth_engine`, `local`) to adapter classes. |
-| `gee_adapter.py` | GEE adapter. Handles asset type detection (IMAGE vs IMAGE_COLLECTION), image building (date filtering, cloud masking, mosaicking), server-side stats, point sampling, and raster export. Uses `filterBounds` for tiled collections and caches native projection. |
-| `local_adapter.py` | Local raster adapter. Reads GeoTIFF via rasterio, crops to UTM window per point, returns pixel arrays. Supports `resample_m` via rasterio `reproject`. |
-| `reducers.py` | Python-side reducer registry (mean, std, quantiles, etc.). Used for local rasters; GEE uses server-side reducers instead. |
-| `output.py` | Writes tabular results as Parquet or CSV. |
-| `qc.py` | Computes QC flags (in_extent, n_pixels, had_nodata, coverage_pct) from adapter metadata. |
-| `metadata.py` | Writes sidecar JSON with run info, config, per-dataset source details, and coverage quality summary. |
-| `auth.py` | Initializes GEE from a service account credentials JSON file. |
+| `extract.py` | Orchestrator. Validates inputs, parses each run config into `RunSettings`, loops over (dataset, window) pairs, dispatches to adapters, assembles stats/QC DataFrames and metadata. |
+| `config.py` | Loads and validates catalog YAMLs (built-in + user-registered via `update_catalog()`); auto-detects CRS/resolution/nodata/band count for local rasters via rasterio. |
+| `adapters/__init__.py` | Adapter registry. Maps `data_source` strings (`earth_engine`, `local`) to adapter classes via `register()` / `get_adapter()`. |
+| `adapters/base.py` | `BaseAdapter` with the shared context-manager lifecycle and method signatures (`fetch_values`, `fetch_batch`, `fetch_stats_batch`, `build_dataset_meta`). |
+| `gee_adapter.py` | GEE adapter. Auto-detects asset type (IMAGE vs IMAGE_COLLECTION) via `ee.data.getAsset()`, builds per-point images with date selection (nearest / contains policies) and optional UTM-zone filtering, computes server-side stats via combined `reduceRegion` reducers, exports tiles via geemap. Patches the urllib3 connection pool for parallel workers. |
+| `local_adapter.py` | Local raster adapter. Reads GeoTIFFs via rasterio, crops to a UTM-zone square per point, supports per-band nodata (including NaN), exports tiles either at native resolution or resampled+UTM-snapped via `rasterio.warp.reproject` for GEE parity. |
+| `reducers.py` | Python-side reducer registry (mean, std, var, min, max, sum, count, median, mode, q05..q95). Used by the local adapter; the GEE adapter uses server-side reducers instead. |
+| `qc.py` | Builds per-dataset QC columns from adapter meta dicts (core flags + optional date / region_crs / per-band coverage), and splits the merged DataFrame into stats vs QC files. |
+| `metadata.py` | Writes the sidecar JSON (`run` / `config` / `datasets` / optional `warnings`), and provides helpers used by adapters (date-info summary, UTM-zone collection, tile-export summary). |
+| `auth.py` | Initializes GEE from a service-account credentials JSON. |
 
 ## Adapter interface
 
@@ -113,10 +113,13 @@ Both adapters expose the same methods so `extract.py` can treat them uniformly:
 
 | Method | Mode | Returns |
 |---|---|---|
-| `fetch_batch(lats, lons, window_m)` | Raw pixels | List of `(values_array, meta_dict)` |
-| `fetch_stats_batch(lats, lons, window_m, reducers)` | Server stats (GEE only) | List of `(stats_dict, meta_dict)` |
-| `fetch_points_batch(lats, lons)` | Point sampling | List of `(values_dict, meta_dict)` |
-| `export_images(...)` / `export_windows(...)` | Raster tiles | List of output file paths |
+| `fetch_values(lat, lon, window_m, *, return_meta=False)` | Raw window pixels (one point) | `values_array` or `(values_array, meta_dict)` |
+| `fetch_batch(lats, lons, window_m, *, dates=None, return_meta=False)` | Raw window pixels (many points) | List of values (or `(values, meta)`) — default impl loops `fetch_values`; GEE overrides with parallelism |
+| `fetch_stats_batch(lats, lons, window_m, reducer_names, *, dates=None, progress_desc=None)` | Window stats + optional exact-pixel `"point"` sample | List of `(stats_dict, meta_dict)` — one per point |
+| `export_tiles(lats, lons, window_m, output_dir, *, ids=None, dates=None, dataset_name=..., resample_m=None, filename_suffix=None, progress_desc=None)` | GeoTIFF tiles | `(paths, meta_list)` — per-point output paths and per-tile meta |
+| `build_dataset_meta(spec, meta_list=None, exported_paths=None, quality=None, lats=None, lons=None)` | Per-dataset metadata for the sidecar | `dict` — source info, native CRS/resolution, band names, date-selection summary, quality stats |
+
+The `"point"` reducer is a special name handled inside `fetch_stats_batch`: it samples the exact pixel at each `(lat, lon)` and is merged into the same `stats_dict` as the window reducers (single round-trip in GEE, single read in local).
 
 ## GEE image building pipeline
 
@@ -130,14 +133,16 @@ ee.data.getAsset() -> IMAGE or IMAGE_COLLECTION?
     |
     +-- IMAGE_COLLECTION:
             |
-            +-- filterBounds(point)     <- spatial constraint
-            +-- filterDate(window)      <- if temporal_window_days set
-            +-- filter(cloud_pct)       <- if cloud_pct_max set
-            +-- map(cloud_mask)         <- if cloud_mask set
-            +-- reduce:
-            |     no dates  -> mosaic()
-            |     windowed  -> mean()
-            |     closest   -> first()
-            +-- select(band)            <- if specific band requested
-            +-- derived_band            <- NDVI, EVI, slope, aspect
+            +-- filterBounds(point)             <- when called per-point with coords
+            +-- filter(UTM_ZONE == zone)        <- when dataset_spec.use_utm_zone
+            +-- date selection:
+            |     no date     -> mosaic() (most recent non-masked pixel)
+            |     date given  -> filterDate(start, end).first(), with start/end
+            |                    resolved from cached system:time_start/time_end
+            |                    using collection_date_policy: "nearest" (default)
+            |                    or "contains"
+            +-- _apply_derived_bands             <- slope, aspect (from KNOWN_DERIVED_BANDS)
+            +-- select(source_bands + derived)   <- final output band list
 ```
+
+Cached on the adapter for the lifetime of one `extract()` call: native projection (`_native_proj`), native scale (`_cached_native_scale`), native CRS (`_cached_native_crs`), band name(s) and count (`_cached_band_name(s)`, `_cached_band_count`), and collection start/end timestamp indices (`_collection_time_starts/_ends`). The cache is populated lazily on first use and shared across all per-point worker threads.
