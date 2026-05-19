@@ -30,10 +30,19 @@ SAMPLE_DF = pd.DataFrame(
 )
 
 
-def _make_catalog(*datasets):
-    """Helper to build a catalog dict from (name, path) tuples."""
+def _make_catalog(*datasets, data_type="continuous"):
+    """Helper to build a catalog dict from (name, path) tuples.
+
+    `data_type` is required for earth_engine entries by the catalog validator,
+    so it gets stamped onto every entry here. Defaults to "continuous" since
+    that fits most ecological rasters; pass data_type="categorical" for land
+    cover etc.
+    """
     return {
-        "datasets": {name: {"data_source": "earth_engine", "path": path} for name, path in datasets}
+        "datasets": {
+            name: {"data_source": "earth_engine", "path": path, "data_type": data_type}
+            for name, path in datasets
+        }
     }
 
 
@@ -83,11 +92,11 @@ class TestStaticDatasets:
 
     def test_bioclim(self, tmp_path):
         # Bioclim has 19 bands — check first and last
-        cat = _make_catalog(("bioclim", "WORLDCLIM/V1/BIO"))
-        df = _run_stats(SAMPLE_DF, "bioclim", cat, tmp_path)
-        assert df["bioclim_bio01_mean_200m"].notna().all()
-        assert df["bioclim_bio19_mean_200m"].notna().all()
-        bioclim_cols = [c for c in df.columns if c.startswith("bioclim_bio")]
+        cat = _make_catalog(("climate_bioclim", "WORLDCLIM/V1/BIO"))
+        df = _run_stats(SAMPLE_DF, "climate_bioclim", cat, tmp_path)
+        assert df["climate_bioclim_bio01_mean_200m"].notna().all()
+        assert df["climate_bioclim_bio19_mean_200m"].notna().all()
+        bioclim_cols = [c for c in df.columns if c.startswith("climate_bioclim_bio")]
         assert len(bioclim_cols) == 19
 
     def test_human_impact_index(self, tmp_path):
@@ -101,6 +110,7 @@ class TestStaticDatasets:
                 "era5": {
                     "data_source": "earth_engine",
                     "path": "ECMWF/ERA5/MONTHLY",
+                    "data_type": "continuous",
                 }
             }
         }
@@ -116,6 +126,7 @@ class TestStaticDatasets:
                 "sat_emb": {
                     "data_source": "earth_engine",
                     "path": "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL",
+                    "data_type": "continuous",
                     "dataset_spec": {
                         "use_utm_zone": True,
                         "collection_date_policy": "contains",
@@ -137,12 +148,14 @@ class TestStaticDatasets:
 
 class TestLandCover:
     def test_esa_worldcover(self, tmp_path):
-        cat = _make_catalog(("lulc", "ESA/WorldCover/v200"))
+        cat = _make_catalog(("lulc", "ESA/WorldCover/v200"), data_type="categorical")
         df = _run_stats(SAMPLE_DF, "lulc", cat, tmp_path)
         assert df["lulc_mean_200m"].notna().all()
 
     def test_cgls_lc100(self, tmp_path):
-        cat = _make_catalog(("lc100", "COPERNICUS/Landcover/100m/Proba-V-C3/Global"))
+        cat = _make_catalog(
+            ("lc100", "COPERNICUS/Landcover/100m/Proba-V-C3/Global"), data_type="categorical"
+        )
         df = _run_stats(SAMPLE_DF, "lc100", cat, tmp_path)
         lc_cols = [c for c in df.columns if c.startswith("lc100_") and "_mean_" in c]
         assert len(lc_cols) > 0
@@ -191,6 +204,7 @@ class TestPointSampling:
                 "dem_glo30": {
                     "data_source": "earth_engine",
                     "path": "COPERNICUS/DEM/GLO30",
+                    "data_type": "continuous",
                     "bands": ["DEM"],
                     "derived_bands": ["slope", "aspect"],
                 }
@@ -220,7 +234,7 @@ class TestPointSampling:
             assert df[f"dem_glo30_{band}_point"].notna().all()
 
     def test_point_worldcover(self, tmp_path):
-        cat = _make_catalog(("lulc", "ESA/WorldCover/v200"))
+        cat = _make_catalog(("lulc", "ESA/WorldCover/v200"), data_type="categorical")
         update_catalog(cat)
         try:
             outputs = extract(
@@ -271,7 +285,7 @@ class TestRasterExport:
     def test_tiles_worldcover_resample(self, tmp_path):
         import rasterio
 
-        cat = _make_catalog(("lulc", "ESA/WorldCover/v200"))
+        cat = _make_catalog(("lulc", "ESA/WorldCover/v200"), data_type="categorical")
         update_catalog(cat)
         try:
             extract(
@@ -309,9 +323,9 @@ class TestAutoDateSelection:
                 "lon": [18.026823, 18.0309905],
             }
         )
-        cat = _make_catalog(("bioclim", "WORLDCLIM/V1/BIO"))
-        df = _run_stats(df_no_date, "bioclim", cat, tmp_path)
-        assert df["bioclim_bio01_mean_200m"].notna().all()
+        cat = _make_catalog(("climate_bioclim", "WORLDCLIM/V1/BIO"))
+        df = _run_stats(df_no_date, "climate_bioclim", cat, tmp_path)
+        assert df["climate_bioclim_bio01_mean_200m"].notna().all()
 
     def test_dem_glo30_no_date_column(self, tmp_path):
         """DEM collection without date column should still return values."""

@@ -22,6 +22,7 @@ CATALOG = {
         "dem_aster": {
             "data_source": "earth_engine",
             "path": "projects/sat-io/open-datasets/ASTER/GDEM",
+            "data_type": "continuous",
         },
     }
 }

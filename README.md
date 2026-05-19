@@ -83,7 +83,7 @@ When a run includes both continuous (e.g. elevation, climate) and categorical (e
 ```python
 outputs = extract(df, {
     "batch_id": "mixed",
-    "datasets": ["dem_glo30", "lulc_esa_worldcover_2021"],
+    "datasets": ["dem_glo30", "lulc_worldcover_2021"],
     "settings": {
         "output_type": "tabular",
         "statistics": {
