@@ -33,6 +33,34 @@ _gee_initialized = False
 # ---------------------------------------------------------------------------
 
 
+def _patch_ee_session_pool(pool_size: int) -> None:
+    """Raise the urllib3 connection-pool size on GEE's shared requests.Session.
+
+    All Earth Engine API calls (including ``getInfo()``) go through one shared
+    ``requests.Session`` stored at ``ee.data._get_state().requests_session``.
+    The default urllib3 pool size is 10, so when more than 10 worker threads
+    are active in parallel, the pool overflows and urllib3 logs:
+
+        WARNING:urllib3.connectionpool:Connection pool is full,
+        discarding connection: earthengine.googleapis.com
+
+    The warning itself is harmless (the request still succeeds), but each
+    overflowed thread pays the cost of a fresh TCP handshake. Mounting a
+    larger pool eliminates both the noise and the handshake overhead.
+
+    ``_get_state()`` is a private EE API — if the EE SDK ever moves this,
+    we silently skip the patch and the warnings reappear, but nothing breaks.
+    """
+    try:
+        from requests.adapters import HTTPAdapter
+
+        session = ee.data._get_state().requests_session
+        adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+        session.mount("https://", adapter)
+    except Exception:
+        logger.debug("Could not patch EE session pool size; warnings may persist")
+
+
 def _ensure_gee_init():
     """Initialize GEE once per process, skip if already active."""
     global _gee_initialized
@@ -46,6 +74,10 @@ def _ensure_gee_init():
 
         init_gee()
         _gee_initialized = True
+    # Size the connection pool generously so parallel workers don't overflow
+    # the urllib3 default of 10. Covers the default max_workers (20) and most
+    # user overrides without retuning. 50 idle TCP connections is trivial.
+    _patch_ee_session_pool(50)
 
 
 # ---------------------------------------------------------------------------
