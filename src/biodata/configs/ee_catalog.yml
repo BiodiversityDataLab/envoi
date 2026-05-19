@@ -57,6 +57,7 @@ datasets:
     path: COPERNICUS/DEM/GLO30
     data_type: continuous
     bands: [DEM]
+    # derived_bands: [slope, aspect] # fixa så att det checkas mot derive_bands
     dataset_information:
       description: "Copernicus DEM GLO-30 - global digital surface model derived from TanDEM-X radar data."
       spatial_resolution: 30 meters
