@@ -31,8 +31,8 @@ outputs = extract(df, {
     },
 }, output_dir="out")
 
-print(outputs["terrain"])      # -> out/terrain.parquet
-print(outputs["terrain_qc"])   # -> out/terrain_qc.parquet
+print(outputs["terrain"])      # -> out/terrain.csv
+# QC: out/terrain_qc.csv
 # Metadata: out/terrain_metadata.json
 ```
 
@@ -120,7 +120,7 @@ A one-element list (`{"sentinel2": ["B4"]}`) keeps the multi-band column naming 
 ## Output kinds
 
 ### Tabular (`output_type: "tabular"`)
-Produces Parquet (default) or CSV with reducer columns and a separate QC file.
+Produces Parquet or CSV (default) with reducer columns and a separate QC file.
 
 Available reducers: `mean`, `median`, `std`, `var`, `min`, `max`, `q10`, `q90`, `count`, `sum`, `point`
 
@@ -133,9 +133,9 @@ Option: `resample_m` resamples all tiles to a consistent resolution (e.g. for CN
 
 ## Output columns
 
-**Stats file**: `dem_aster_mean_b200`, `dem_aster_std_b200`, ...
+**Stats file**: `dem_aster_mean_200m`, `dem_aster_std_200m`, ...
 
-**QC file**: `dem_aster_in_extent_b200`, `dem_aster_n_pixels_b200`, `dem_aster_had_nodata_b200`, `dem_aster_coverage_pct_b200`
+**QC file**: `dem_aster_in_extent_200m`, `dem_aster_n_pixels_200m`, `dem_aster_had_nodata_200m`, `dem_aster_coverage_pct_200m`
 
 ## Notes
 
