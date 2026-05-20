@@ -77,3 +77,11 @@ line-length = 100
 [tool.black]
 line-length = 100
 target-version = ["py310"]
+
+[tool.pytest.ini_options]
+# Custom markers. Run "pytest -m gee" to exercise only the live Earth Engine
+# tests, or "pytest -m 'not gee'" to skip them (e.g. on a machine without
+# GEE credentials, or for fast inner-loop development).
+markers = [
+    "gee: tests that require live Google Earth Engine authentication (network + service account credentials)",
+]
