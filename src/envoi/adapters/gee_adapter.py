@@ -112,16 +112,49 @@ def _snap_to_grid(coord: float, scale: float) -> float:
 
 def _get_collection_time_bounds(
     collection_id: str,
+    *,
+    bounds_geometry: ee.Geometry | None = None,
+    date_range: tuple[pd.Timestamp, pd.Timestamp] | None = None,
 ) -> tuple[pd.DatetimeIndex | None, pd.DatetimeIndex | None]:
     """Fetch start/end timestamps for a GEE ImageCollection.
 
     Returns (start_times, end_times) as sorted DatetimeIndex objects.
     Returns (start_times, None) when end times are unavailable (e.g. user-uploaded
     assets that omit system:time_end). Returns (None, None) only on total failure.
-    One getInfo() round-trip, done once per dataset during __post_init__.
+    One getInfo() round-trip, done once per dataset.
+
+    Parameters
+    ----------
+    bounds_geometry : ee.Geometry, optional
+        Restrict the timestamp index to images whose footprint intersects this
+        geometry. Critical for per-tile per-pass collections (e.g. DynamicWorld
+        has ~10 million images globally — without a spatial filter, aggregating
+        every system:time_start exceeds GEE's compute budget and times out).
+        Passing a ``MultiPoint`` of the batch's sample coordinates narrows the
+        result to just the tiles we actually care about.
+    date_range : (start, end) tuple of pd.Timestamp, optional
+        Additional pre-filter on the collection's time interval. Combined with
+        ``bounds_geometry`` so even busy collections (Sentinel-2 over a few
+        tiles for many years) stay well within budget.
     """
     try:
         image_collection = ee.ImageCollection(collection_id)
+        # Narrow the collection BEFORE aggregating timestamps. Order matters
+        # only for clarity: GEE optimises filter chains internally, but doing
+        # the cheaper spatial filter first keeps the chain readable. Without
+        # these filters, ``aggregate_array`` materialises every image's
+        # timestamp — fine for ~1k-image collections, fatal for the per-pass
+        # ones (DynamicWorld, raw Sentinel-2, …) which contain millions.
+        if bounds_geometry is not None:
+            image_collection = image_collection.filterBounds(bounds_geometry)
+        if date_range is not None:
+            range_start, range_end = date_range
+            # filterDate is half-open; add a day on the end so an exact
+            # match at range_end is still included.
+            image_collection = image_collection.filterDate(
+                range_start.strftime("%Y-%m-%d"),
+                (range_end + pd.DateOffset(days=1)).strftime("%Y-%m-%d"),
+            )
         # Fetch both arrays in a single round-trip by wrapping in ee.Dictionary.
         raw = ee.Dictionary(
             {
@@ -719,8 +752,15 @@ class GeeRasterAdapter(BaseAdapter):
         self._dataset_spec = dataset_spec
 
         is_collection = "collection" in dataset_spec
+        self._is_collection = is_collection
         self._collection_time_starts = None
         self._collection_time_ends = None
+        # Lazy-init flag for the collection timestamp index. The fetch is
+        # deferred to the first ``fetch_stats_batch`` / ``export_tiles`` call
+        # so it can be filtered by the actual batch's bounds and date range —
+        # without that filter, per-tile per-pass collections (DynamicWorld
+        # and similar) hit GEE's compute budget and time out.
+        self._timestamps_loaded = False
 
         # Cache the native projection from the source — composite images
         # (mosaic, mean, etc.) lose per-band projection info, so we grab it
@@ -729,17 +769,10 @@ class GeeRasterAdapter(BaseAdapter):
             self._native_proj = (
                 ee.ImageCollection(dataset_spec["collection"]).first().select(0).projection()
             )
-            # Fetch available timestamps for automatic date selection.
-            start_times, end_times = _get_collection_time_bounds(dataset_spec["collection"])
-            self._collection_time_starts = start_times
-            self._collection_time_ends = end_times
-            # Collections with timestamps use per-point date selection;
-            # the static image is built lazily in _get_image when no date
-            # is provided (most-recent fallback).
-            self._needs_per_point_date = self._collection_time_starts is not None
-            if not self._needs_per_point_date:
-                # Timestamp fetch failed — fall back to static mosaic
-                self._static_image = _build_image(dataset_spec)
+            # Optimistically assume timestamps are fetchable; the lazy fetch
+            # flips this to False (and builds a static-mosaic fallback) if
+            # GEE refuses to materialise the timestamp index.
+            self._needs_per_point_date = True
         elif "image" in dataset_spec:
             self._native_proj = ee.Image(dataset_spec["image"]).select(0).projection()
             self._static_image = _build_image(dataset_spec)
@@ -754,6 +787,75 @@ class GeeRasterAdapter(BaseAdapter):
         # rather than silently producing 100 km tiles.
         if self.scale is None and self._native_proj is not None:
             self._validate_auto_detected_scale()
+
+    def _ensure_collection_timestamps(
+        self,
+        lats: Sequence[float] | None = None,
+        lons: Sequence[float] | None = None,
+        dates: Sequence | None = None,  # kept for API symmetry; see body for why unused.
+    ) -> None:
+        """Fetch the collection's start/end timestamps on first use.
+
+        Called by the public batch methods (``fetch_stats_batch``,
+        ``export_tiles``) before any per-point work. Idempotent — subsequent
+        calls return immediately once the index is cached or has been proved
+        unfetchable.
+
+        Filters the collection by the batch's bounding geometry BEFORE the
+        ``aggregate_array`` call so per-tile per-pass collections (e.g.
+        DynamicWorld with ~10M images globally) return a tractable few-
+        thousand-image index instead of timing out server-side. The ``dates``
+        argument is accepted but intentionally NOT used as a filter — see
+        the comment below.
+        """
+        # Non-collections (single IMAGE assets) have no timestamp axis, and
+        # repeat calls after a successful (or proven-failed) fetch are no-ops.
+        if not self._is_collection or self._timestamps_loaded:
+            return
+
+        # Build a MultiPoint geometry from the batch's sample coordinates.
+        # GEE's filterBounds keeps any image whose footprint intersects at
+        # least one of the points, so for tiled collections this is the
+        # difference between scanning millions of images and scanning the
+        # handful of tiles we actually care about. Skipped (no spatial
+        # filter) when the caller didn't pass coordinates — falls back to
+        # the unfiltered behaviour the adapter used to have.
+        bounds_geometry = None
+        if lats is not None and lons is not None and len(lats) > 0:
+            point_pairs = [[float(lon), float(lat)] for lat, lon in zip(lats, lons)]
+            bounds_geometry = ee.Geometry.MultiPoint(point_pairs)
+
+        # NOTE on date_range: we deliberately do NOT pre-filter by the
+        # batch's input dates here. Two reasons:
+        #   1. Many collections expose `system:time_start` values that have
+        #      nothing to do with the input sample date (e.g. GLO30 reports
+        #      2006-01-01 for every tile while users typically query with
+        #      modern dates). A naive ``[date-1y, date+1y]`` filter excludes
+        #      every tile and breaks the per-point fetch.
+        #   2. Out-of-range date tests (date = 2099) deliberately exercise
+        #      the clamping path — but a date filter built from that date
+        #      would itself produce an empty collection, defeating the test.
+        # filterBounds alone is enough for every catalog entry we ship: it
+        # already bounds DynamicWorld to a few thousand timestamps for a
+        # typical batch, which fits comfortably inside GEE's compute budget.
+        # If a future per-pass collection ever turns out to need date
+        # narrowing too, ``_get_collection_time_bounds`` accepts ``date_range``
+        # for the caller to pass in explicitly.
+        collection_id = self._dataset_spec["collection"]
+        start_times, end_times = _get_collection_time_bounds(
+            collection_id,
+            bounds_geometry=bounds_geometry,
+        )
+        self._collection_time_starts = start_times
+        self._collection_time_ends = end_times
+        # If the filtered fetch still failed, flip back to the static-mosaic
+        # fallback so per-point work doesn't crash trying to read a None
+        # timestamp index. This mirrors the eager-fetch fallback the adapter
+        # used to do in __post_init__ before timestamps went lazy.
+        self._needs_per_point_date = start_times is not None
+        if not self._needs_per_point_date:
+            self._static_image = _build_image(self._dataset_spec)
+        self._timestamps_loaded = True
 
     def _validate_auto_detected_scale(self) -> None:
         """Raise if GEE auto-detection returned the EPSG:4326 default scale.
@@ -1358,6 +1460,12 @@ class GeeRasterAdapter(BaseAdapter):
         lons = list(lons)
         date_list = list(dates) if dates is not None else [None] * n
 
+        # Fetch the collection's timestamp index now that we know the
+        # batch's spatial extent and date range — without this the fetch
+        # would happen unfiltered in __post_init__ and time out for very
+        # large per-tile per-pass collections.
+        self._ensure_collection_timestamps(lats, lons, date_list)
+
         # Build the window reducer once when window stats are requested;
         # leave it None for point-only runs.
         if window_reducers:
@@ -1497,9 +1605,16 @@ class GeeRasterAdapter(BaseAdapter):
         output_dir.mkdir(parents=True, exist_ok=True)
 
         n = len(lats)
+        lats = list(lats)
+        lons = list(lons)
         date_list = list(dates) if dates is not None else [None] * n
         id_list = list(ids) if ids is not None else [str(i) for i in range(n)]
         results: list = [None] * n
+
+        # Fetch the collection's timestamp index now that we know the
+        # batch's spatial extent and date range — see fetch_stats_batch
+        # for why this is deferred from __post_init__ to here.
+        self._ensure_collection_timestamps(lats, lons, date_list)
 
         # Warm the band-name cache so build_dataset_meta can read it later.
         try:
