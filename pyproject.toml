@@ -64,9 +64,9 @@ dev = [
 
 [project.urls]
 Homepage = "https://biodiversity.se/"
-Repository = "https://github.com/BiodiversityLab/envoi"
-Issues = "https://github.com/BiodiversityLab/envoi/issues"
-Documentation = "https://github.com/BiodiversityLab/envoi#readme"
+Repository = "https://github.com/BiodiversityDataLab/envoi"
+Issues = "https://github.com/BiodiversityDataLab/envoi/issues"
+Documentation = "https://github.com/BiodiversityDataLab/envoi#readme"
 
 [tool.setuptools.package-data]
 envoi = ["configs/*.yml"]
