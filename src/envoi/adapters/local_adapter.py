@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 
 from .base import BaseAdapter
 from ..reducers import get_reducer
-from ..metadata import summarize_tile_export
+from ..metadata import get_utm_crs, summarize_tile_export
 
 try:
     from . import register as _register
@@ -229,22 +229,13 @@ class LocalRasterAdapter(BaseAdapter):
 
     # ------------------------------------------------------------------
     # Geometry / CRS
+    # UTM helpers live in ``..metadata`` so both adapters share one impl.
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _get_utm_crs(lon: float, lat: float) -> str:
-        """Return the EPSG code for the UTM zone covering (lon, lat)."""
-        zone_number = int((lon + 180) / 6) + 1
-        # The naive formula gives 61 at exactly lon == 180; UTM only defines
-        # zones 1-60, so clamp to keep the EPSG code valid.
-        zone_number = max(1, min(zone_number, 60))
-        base_epsg = 32600 if lat >= 0 else 32700
-        return f"EPSG:{base_epsg + zone_number}"
 
     def _project_meter_square_to_raster_geom(self, lat: float, lon: float, window_m: int):
         # Determine a metric CRS for building the square:
         # use the point's UTM zone for global flexibility
-        metric_crs = self._get_utm_crs(lon, lat)
+        metric_crs = get_utm_crs(lon, lat)
         wgs84_to_metric = Transformer.from_crs("EPSG:4326", metric_crs, always_xy=True)
         center_x, center_y = wgs84_to_metric.transform(lon, lat)
         # Build a square in metres around the centre.
@@ -762,7 +753,7 @@ class LocalRasterAdapter(BaseAdapter):
                 #      per point because rio_mask snaps to native pixel boundaries).
                 #   2. Grid origin = center snapped to resample_m, then shifted by half
                 #      the window extent — the same formula GEE's _snap_to_grid uses.
-                utm_crs = self._get_utm_crs(lon, lat)
+                utm_crs = get_utm_crs(lon, lat)
                 utm_transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
                 cx_utm, cy_utm = utm_transformer.transform(lon, lat)
                 # Snap centre to nearest resample_m multiple (mirrors GEE's _snap_to_grid).

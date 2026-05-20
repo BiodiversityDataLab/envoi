@@ -5,7 +5,7 @@
 ```
                           User code
                              |
-                     extract(df, config)              <- src/biodata/extract.py
+                     extract(df, config)              <- src/envoi/extract.py
                              |
               +--------------+--------------+
               |                             |

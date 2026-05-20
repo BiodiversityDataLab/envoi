@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "envoi"
-version = "0.9.0"
+version = "0.2.0"
 description = "Automated feature extraction from environmental datasets for ecological and spatial analysis."
 authors = [
     { name = "Adrian Baggström", email = "adrian.baggstrom@ebc.uu.se" },
     { name = "Jakob Nyström", email = "jakob.nystrom@ebc.uu.se" },
 ]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "pandas>=2.1",
@@ -28,12 +28,13 @@ dependencies = [
 ]
 
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
   "License :: OSI Approved :: MIT License",
   "Natural Language :: English",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -75,4 +76,4 @@ line-length = 100
 
 [tool.black]
 line-length = 100
-target-version = ["py311"]
+target-version = ["py310"]
