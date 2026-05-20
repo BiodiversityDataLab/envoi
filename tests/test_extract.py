@@ -10,8 +10,8 @@ import pytest
 import rasterio
 from rasterio.transform import from_bounds
 
-from biodata.extract import extract
-from biodata import update_catalog, reset_catalog
+from envoi.extract import extract
+from envoi import update_catalog, reset_catalog
 
 DATA_DIR = Path("data/for_testing")
 SAMPLE_CSV = DATA_DIR / "adrian_example.csv"
@@ -85,7 +85,8 @@ class TestTabular:
         )
 
         stats_df = pd.read_csv(outputs["dem_100m"])
-        qc_df = pd.read_csv(outputs["dem_100m_qc"])
+        # QC file is written alongside the stats file but not included in the return dict.
+        qc_df = pd.read_csv(tmp_path / "dem_100m_qc.csv")
 
         assert len(stats_df) == len(sample_df)
         assert len(qc_df) == len(sample_df)
@@ -135,7 +136,7 @@ class TestTabular:
         )
 
         assert outputs["csv_test"].suffix == ".csv"
-        assert outputs["csv_test_qc"].suffix == ".csv"
+        assert (tmp_path / "csv_test_qc.csv").exists()
         result = pd.read_csv(outputs["csv_test"])
         assert len(result) == len(sample_df)
 
@@ -498,7 +499,7 @@ class TestResolveTileDtype:
 
     def test_uniform_list_returns_first_dtype(self):
         """Multi-band with all bands sharing a dtype returns that dtype."""
-        from biodata.adapters.local_adapter import LocalRasterAdapter
+        from envoi.adapters.local_adapter import LocalRasterAdapter
 
         result = LocalRasterAdapter._resolve_tile_dtype(
             ["uint8", "uint8", "uint8"], np.dtype("float32")
@@ -507,7 +508,7 @@ class TestResolveTileDtype:
 
     def test_mixed_list_promotes_and_warns(self):
         """Multi-band with mixed dtypes promotes via np.result_type and warns."""
-        from biodata.adapters.local_adapter import LocalRasterAdapter
+        from envoi.adapters.local_adapter import LocalRasterAdapter
 
         with pytest.warns(UserWarning, match="heterogeneous band dtypes"):
             result = LocalRasterAdapter._resolve_tile_dtype(["uint8", "float32"], np.dtype("uint8"))
@@ -516,14 +517,14 @@ class TestResolveTileDtype:
 
     def test_scalar_string_returns_dtype(self):
         """Single-band passes a str — helper resolves it via np.dtype."""
-        from biodata.adapters.local_adapter import LocalRasterAdapter
+        from envoi.adapters.local_adapter import LocalRasterAdapter
 
         result = LocalRasterAdapter._resolve_tile_dtype("int16", np.dtype("float64"))
         assert result == np.dtype("int16")
 
     def test_none_falls_back(self):
         """No meta dtype recorded → fall back to the in-memory window dtype."""
-        from biodata.adapters.local_adapter import LocalRasterAdapter
+        from envoi.adapters.local_adapter import LocalRasterAdapter
 
         result = LocalRasterAdapter._resolve_tile_dtype(None, np.dtype("uint16"))
         assert result == np.dtype("uint16")
@@ -922,7 +923,7 @@ class TestTypedStatistics:
 class TestLocalRasterAdapterLifecycle:
     def test_context_manager_closes_dataset(self):
         """`with` block releases the rasterio dataset when it exits."""
-        from biodata.adapters.local_adapter import LocalRasterAdapter
+        from envoi.adapters.local_adapter import LocalRasterAdapter
 
         spec = {"data_source": "local", "path": str(DEM_TIF), "bands": 1}
         with LocalRasterAdapter(spec) as adapter:
@@ -936,7 +937,7 @@ class TestLocalRasterAdapterLifecycle:
 
     def test_close_is_idempotent(self):
         """Calling close() twice (e.g. via with + manual close) is a no-op."""
-        from biodata.adapters.local_adapter import LocalRasterAdapter
+        from envoi.adapters.local_adapter import LocalRasterAdapter
 
         spec = {"data_source": "local", "path": str(DEM_TIF), "bands": 1}
         adapter = LocalRasterAdapter(spec)
@@ -947,7 +948,7 @@ class TestLocalRasterAdapterLifecycle:
 
     def test_get_utm_crs_clamps_at_antimeridian(self):
         """lon == 180 must produce a valid UTM zone (1-60), not zone 61."""
-        from biodata.adapters.local_adapter import LocalRasterAdapter
+        from envoi.adapters.local_adapter import LocalRasterAdapter
 
         # Northern hemisphere: zones 32601..32660. Southern: 32701..32760.
         # The naive `(lon + 180) / 6 + 1` formula gives 61 at lon == 180,

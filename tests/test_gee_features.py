@@ -6,11 +6,11 @@ Add a new test class or method here whenever a new GEE dataset is added to the c
 
 import pandas as pd
 import pytest
-from biodata.extract import extract
-from biodata import update_catalog, reset_catalog
+from envoi.extract import extract
+from envoi import update_catalog, reset_catalog
 
 try:
-    from biodata.auth import init_gee
+    from envoi.auth import init_gee
 
     init_gee()
     GEE_AVAILABLE = True

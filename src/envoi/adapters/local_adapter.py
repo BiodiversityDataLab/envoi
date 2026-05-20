@@ -1,4 +1,4 @@
-# src/biodata/adapters/local_adapter.py
+# src/envoi/adapters/local_adapter.py
 from __future__ import annotations
 import warnings
 from dataclasses import dataclass
