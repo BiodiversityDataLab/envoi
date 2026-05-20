@@ -1,5 +1,6 @@
 # src/envoi/extract.py
 from __future__ import annotations
+import warnings
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple
 from pathlib import Path
@@ -523,7 +524,7 @@ def _parse_and_validate_dates(
 
     if "date" not in df.columns:
         message = "No 'date' column found in input DataFrame; proceeding without dates."
-        print(message)
+        warnings.warn(message, stacklevel=2)
         date_warnings.append(message)
         return df, None, date_warnings
 
@@ -537,7 +538,7 @@ def _parse_and_validate_dates(
             f"Skipping {len(null_ids)} row(s) with missing dates "
             f"(ids: {null_ids}). Provide a date for every row to include them."
         )
-        print(message)
+        warnings.warn(message, stacklevel=2)
         date_warnings.append(message)
         df = df.loc[~null_date_mask].copy()
 
@@ -563,7 +564,7 @@ def _parse_and_validate_dates(
                 f"Date '{raw_date_str}' interpreted as {parsed_date.strftime('%Y-%m-%d')}. "
                 f"Provide a full YYYY-MM-DD date if you want a specific day."
             )
-            print(message)
+            warnings.warn(message, stacklevel=2)
             date_warnings.append(message)
 
     return df, parsed_dates.strftime("%Y-%m-%d").tolist(), date_warnings
@@ -796,7 +797,7 @@ def _parse_run_config(
     )
 
 
-_VALID_STAT_TYPES = frozenset({"continuous", "categorical", "mixed"})
+_VALID_STAT_TYPES = frozenset({"continuous", "categorical"})
 _ALL_KNOWN_REDUCERS = frozenset(
     {
         "mean",
@@ -1088,7 +1089,7 @@ def _validate_and_reproject_crs(
         input_crs_upper = input_crs.upper()
         if input_crs_upper != "EPSG:4326" and input_crs_upper != "WGS84":
             message = f"Reprojecting coordinates from {input_crs} to EPSG:4326 (WGS84)."
-            print(message)
+            warnings.warn(message, stacklevel=2)
             crs_warnings.append(message)
             transformer = Transformer.from_crs(input_crs, "EPSG:4326", always_xy=True)
             lons, lats = transformer.transform(df["lon"].values, df["lat"].values)

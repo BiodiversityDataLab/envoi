@@ -1,4 +1,8 @@
-"""Tests for the extract() pipeline using local raster data."""
+"""Tests for the extract() pipeline using local raster data.
+
+The synthetic DEM and ``sample_df`` fixtures are provided by ``conftest.py``,
+so this module no longer references any on-disk fixture paths.
+"""
 
 from pathlib import Path
 import json
@@ -13,53 +17,49 @@ from rasterio.transform import from_bounds
 from envoi.extract import extract
 from envoi import update_catalog, reset_catalog
 
-DATA_DIR = Path("data/for_testing")
-SAMPLE_CSV = DATA_DIR / "adrian_example.csv"
-DEM_TIF = DATA_DIR / "dem/TG4NHB-dem.tif"
-
-CATALOG = {
-    "datasets": {
-        "dem_local": {
-            "data_source": "local",
-            "path": str(DEM_TIF),
-            "bands": 1,
-        },
-        "slope_local": {
-            "data_source": "local",
-            "path": str(DEM_TIF),
-            "bands": 2,
-        },
-        # Multi-band local entry used by the per-call band override tests.
-        # The DEM TIFF has 3 bands; this registration exposes all of them
-        # so the tests can shrink the band list at call time.
-        "multi_band_local": {
-            "data_source": "local",
-            "path": str(DEM_TIF),
-            "bands": [1, 2, 3],
-        },
-        # Categorical entry — same underlying file, tagged so the typed-stats
-        # tests can exercise the data_type dispatch without a real categorical raster.
-        "dem_local_categorical": {
-            "data_source": "local",
-            "path": str(DEM_TIF),
-            "bands": 1,
-            "data_type": "categorical",
-        },
-    }
-}
-
 
 @pytest.fixture(autouse=True)
-def register_test_catalog():
-    """Register the local test datasets before each test and clean up after."""
-    update_catalog(CATALOG)
+def register_test_catalog(dem_tif):
+    """Register the local test datasets before each test and clean up after.
+
+    The catalog is built per-test (rather than at module load time) because
+    the synthetic DEM path is a session-scoped tmp file — its location isn't
+    known until the ``dem_tif`` fixture runs.
+    """
+    dem_path = str(dem_tif)
+    catalog = {
+        "datasets": {
+            "dem_local": {
+                "data_source": "local",
+                "path": dem_path,
+                "bands": 1,
+            },
+            "slope_local": {
+                "data_source": "local",
+                "path": dem_path,
+                "bands": 2,
+            },
+            # Multi-band local entry used by the per-call band override tests.
+            # The synthetic DEM has 3 bands; this registration exposes all of
+            # them so the tests can shrink the band list at call time.
+            "multi_band_local": {
+                "data_source": "local",
+                "path": dem_path,
+                "bands": [1, 2, 3],
+            },
+            # Categorical entry — same underlying file, tagged so the typed-stats
+            # tests can exercise the data_type dispatch without a real categorical raster.
+            "dem_local_categorical": {
+                "data_source": "local",
+                "path": dem_path,
+                "bands": 1,
+                "data_type": "categorical",
+            },
+        }
+    }
+    update_catalog(catalog)
     yield
     reset_catalog()
-
-
-@pytest.fixture
-def sample_df():
-    return pd.read_csv(SAMPLE_CSV)
 
 
 # ------------------------------------------------------------------
@@ -921,11 +921,11 @@ class TestTypedStatistics:
 
 
 class TestLocalRasterAdapterLifecycle:
-    def test_context_manager_closes_dataset(self):
+    def test_context_manager_closes_dataset(self, dem_tif):
         """`with` block releases the rasterio dataset when it exits."""
         from envoi.adapters.local_adapter import LocalRasterAdapter
 
-        spec = {"data_source": "local", "path": str(DEM_TIF), "bands": 1}
+        spec = {"data_source": "local", "path": str(dem_tif), "bands": 1}
         with LocalRasterAdapter(spec) as adapter:
             # Inside the block the underlying dataset is open and usable.
             assert adapter.src.closed is False
@@ -935,11 +935,11 @@ class TestLocalRasterAdapterLifecycle:
         # leaking file descriptors when many datasets are processed.
         assert handle.closed is True
 
-    def test_close_is_idempotent(self):
+    def test_close_is_idempotent(self, dem_tif):
         """Calling close() twice (e.g. via with + manual close) is a no-op."""
         from envoi.adapters.local_adapter import LocalRasterAdapter
 
-        spec = {"data_source": "local", "path": str(DEM_TIF), "bands": 1}
+        spec = {"data_source": "local", "path": str(dem_tif), "bands": 1}
         adapter = LocalRasterAdapter(spec)
         adapter.close()
         # Second call must not raise even though the dataset is already closed.
@@ -948,12 +948,12 @@ class TestLocalRasterAdapterLifecycle:
 
     def test_get_utm_crs_clamps_at_antimeridian(self):
         """lon == 180 must produce a valid UTM zone (1-60), not zone 61."""
-        from envoi.adapters.local_adapter import LocalRasterAdapter
+        from envoi.metadata import get_utm_crs
 
         # Northern hemisphere: zones 32601..32660. Southern: 32701..32760.
         # The naive `(lon + 180) / 6 + 1` formula gives 61 at lon == 180,
         # which would yield EPSG:32661 — outside the UTM range.
-        assert LocalRasterAdapter._get_utm_crs(180.0, 0.0) == "EPSG:32660"
-        assert LocalRasterAdapter._get_utm_crs(180.0, -1.0) == "EPSG:32760"
+        assert get_utm_crs(180.0, 0.0) == "EPSG:32660"
+        assert get_utm_crs(180.0, -1.0) == "EPSG:32760"
         # Spot-check that an ordinary longitude still resolves correctly.
-        assert LocalRasterAdapter._get_utm_crs(0.0, 0.0) == "EPSG:32631"
+        assert get_utm_crs(0.0, 0.0) == "EPSG:32631"
