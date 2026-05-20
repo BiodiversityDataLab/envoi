@@ -200,7 +200,7 @@ def _load_catalog_any(src: Any) -> Dict[str, Any]:
             if spec.get("data_source") == "earth_engine" and not spec.get("data_type"):
                 raise CatalogError(
                     f"datasets.{name}: missing required key 'data_type' for earth_engine dataset.\n"
-                    f"Valid values are: continuous, categorical, mixed."
+                    f"Valid values are: continuous, categorical."
                 )
         return d
 

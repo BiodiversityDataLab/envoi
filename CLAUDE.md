@@ -82,14 +82,14 @@ To add custom datasets (local rasters or GEE assets not in the built-in catalog)
 call `update_catalog()` once before extracting:
 
 ```python
-from biodata import update_catalog
+from envoi import update_catalog
 update_catalog("my_catalog.yml")          # from a YAML file
 update_catalog({"datasets": {...}})       # or a dict
 ```
 
 ## Catalog design
 
-The built-in catalog (`src/biodata/configs/ee_catalog.yml`) is bundled with the
+The built-in catalog (`src/envoi/configs/ee_catalog.yml`) is bundled with the
 package and loaded automatically. Only `data_source` and `path` are required —
 everything else is auto-detected or optional.
 
@@ -106,17 +106,29 @@ datasets:
 **Local auto-detection:** CRS, resolution, nodata, and band count are read from the
 file via rasterio (`_inspect_raster()`).
 
-**`feature_spec` block** (optional, GEE only): for advanced config like
-cloud masking, collection reducer, and derived bands:
+**`dataset_spec` block** (optional, GEE only): per-dataset overrides that
+the GEE adapter consults when the default behaviour is wrong. The keys
+currently honoured are:
+
+- `native_scale_m` — manual override when GEE's `nominalScale()` returns
+  the EPSG:4326 default (~111 km) for assets whose native projection
+  metadata is missing (e.g. some Landsat composites).
+- `use_utm_zone` — when `True`, the adapter filters the collection by
+  `UTM_ZONE` so a per-point query picks the tile covering that point.
+  Used for tiled global collections like the GLO-30 DEM.
+- `collection_date_policy` — `"nearest"` (default) or `"contains"`.
+  Controls how an ImageCollection's per-point image is selected from a
+  sample date.
 
 ```yaml
-sen2_ndvi:
+dem_glo30:
   data_source: earth_engine
-  path: COPERNICUS/S2_SR_HARMONIZED
-  feature_spec:
-    cloud_pct_max: 20
-    cloud_mask: s2
-    derived_band: NDVI
+  path: COPERNICUS/DEM/GLO30
+  data_type: continuous
+  bands: ["DEM"]
+  dataset_spec:
+    native_scale_m: 30
+    use_utm_zone: true
 ```
 
 **Automatic date handling for ImageCollections:** when the input DataFrame
@@ -130,7 +142,7 @@ most recent image is used. Date decisions are recorded in the output metadata.
 ## Files overview
 
 ```
-src/biodata/
+src/envoi/
     extract.py           ← main entry point
     config.py            ← catalog loading, update_catalog(), local raster auto-detection
     metadata.py          ← per-feature metadata + sidecar JSON writer
@@ -140,7 +152,6 @@ src/biodata/
     qc.py                ← coverage QC flags
     configs/
         ee_catalog.yml   ← built-in GEE dataset registry (bundled with package)
-        local_catalog.yml← template for user-defined local datasets
         defaults.yml     ← project-wide setting defaults
     adapters/
         base.py          ← BaseAdapter

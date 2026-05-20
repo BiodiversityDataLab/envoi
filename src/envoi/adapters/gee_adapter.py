@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from ..config import load_defaults
-from ..metadata import build_tile_crs_zones, summarize_date_info, summarize_tile_export
+from ..metadata import (
+    build_tile_crs_zones,
+    get_utm_crs,
+    get_utm_zone_label,
+    summarize_date_info,
+    summarize_tile_export,
+)
 from .base import BaseAdapter
 
 import numpy as np
@@ -81,24 +87,10 @@ def _ensure_gee_init():
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers  (UTM zones, pixel-grid snapping)
+# Geometry helpers  (pixel-grid snapping)
+# UTM helpers live in ``metadata.get_utm_crs`` / ``metadata.get_utm_zone_label``
+# so both adapters share one implementation.
 # ---------------------------------------------------------------------------
-
-
-def _get_utm_crs(lon: float, lat: float) -> str:
-    """Return the EPSG code for the UTM zone covering (lon, lat)."""
-    if not (-180 <= lon <= 180 and -90 <= lat <= 90):
-        raise ValueError(f"Invalid WGS84 coordinates: ({lon}, {lat})")
-    zone_number = int((lon + 180) / 6) + 1
-    base_epsg = 32600 if lat >= 0 else 32700
-    return f"EPSG:{base_epsg + zone_number}"
-
-
-def _get_utm_zone_label(lon: float, lat: float) -> str:
-    """Return the UTM zone label like "33N" or "34S" for a lon/lat point."""
-    zone_number = int((lon + 180) / 6) + 1
-    hemisphere = "N" if lat >= 0 else "S"
-    return f"{zone_number}{hemisphere}"
 
 
 def _snap_to_grid(coord: float, scale: float) -> float:
@@ -358,7 +350,7 @@ def _build_image(
         # Some tiled collections (e.g. satellite embeddings) need UTM-zone
         # filtering to avoid selecting the wrong tile for a point.
         if dataset_spec.get("use_utm_zone") and lat is not None and lon is not None:
-            utm_zone = _get_utm_zone_label(lon, lat)
+            utm_zone = get_utm_zone_label(lon, lat)
             image_collection = image_collection.filter(ee.Filter.eq("UTM_ZONE", utm_zone))
 
         # --- Date-based image selection ---
@@ -973,7 +965,7 @@ class GeeRasterAdapter(BaseAdapter):
         point = ee.Geometry.Point([lon, lat])
         if window_m == 0:
             return point
-        utm = _get_utm_crs(lon, lat)
+        utm = get_utm_crs(lon, lat)
         return point.buffer(window_m / 2, proj=ee.Projection(utm)).bounds(maxError=1)
 
     def _src_label(self) -> str:
@@ -1189,7 +1181,7 @@ class GeeRasterAdapter(BaseAdapter):
         img = self._get_image(date, lat=lat, lon=lon)
         region = self._make_region(lat, lon, window_m)
 
-        utm_crs = _get_utm_crs(lon, lat)
+        utm_crs = get_utm_crs(lon, lat)
         native_m = self._get_scale_value(img)
 
         # If the window is smaller than the native pixel size, expand the
@@ -1439,7 +1431,7 @@ class GeeRasterAdapter(BaseAdapter):
         img = self._get_image(date, lat=lat, lon=lon)
         # Use resample_m as the export scale when provided; fall back to native.
         scale_m = float(resample_m) if resample_m is not None else self._get_scale_value(img)
-        utm = _get_utm_crs(lon, lat)
+        utm = get_utm_crs(lon, lat)
 
         # Project to UTM, snap to pixel grid, compute window corners
         from pyproj import Transformer

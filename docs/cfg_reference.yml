@@ -1,5 +1,5 @@
 # ============================================================
-# biodata-enricher: config reference
+# envoi: config reference
 # ============================================================
 # Pass as a dict (single output) or list of dicts (multiple)
 # to extract(df, config, catalog=..., output_dir=...)
