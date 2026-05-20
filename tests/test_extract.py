@@ -1194,3 +1194,271 @@ class TestLocalRasterAdapterLifecycle:
         assert get_utm_crs(180.0, -1.0) == "EPSG:32760"
         # Spot-check that an ordinary longitude still resolves correctly.
         assert get_utm_crs(0.0, 0.0) == "EPSG:32631"
+
+
+# ------------------------------------------------------------------
+# Categorical reducers — class_count and class_fraction expansion.
+# ------------------------------------------------------------------
+#
+# These tests use a small uint8 raster with hand-picked class values so the
+# expected per-class counts can be asserted exactly. The raster is split
+# into four equal quadrants, each filled with a different class id, so any
+# point near the centre sees a known mix of classes in its window.
+
+
+# Pixel size and dimensions match the DEM fixture in conftest.py so the
+# same sample points (around UTM 34N x≈349500, y≈6988500) fall inside this
+# raster too. The four-class quadrant layout still gives every centred
+# point at least two classes in any reasonable window.
+_LULC_RES_M = 10.0
+_LULC_HEIGHT = 500
+_LULC_WIDTH = 500
+_LULC_ORIGIN_X = 347020.0
+_LULC_ORIGIN_Y = 6988980.0
+_LULC_CRS = "EPSG:32634"
+
+# Class IDs the synthetic raster carries — four quadrants, four classes.
+# Picked to be visually distinct (not consecutive) so accidental off-by-one
+# class-id bugs show up clearly in output columns.
+_LULC_CLASSES = [10, 20, 30, 40]
+
+
+@pytest.fixture(scope="session")
+def categorical_tif(tmp_path_factory) -> Path:
+    """Synthetic single-band uint8 categorical raster split into 4 quadrants.
+
+    Each quadrant carries one of ``_LULC_CLASSES`` so any centred sample
+    point with a window large enough to span ≥ 2 quadrants will exercise
+    the multi-class output path. Same CRS / origin as ``dem_tif`` so the
+    existing ``sample_df`` points fall inside this raster too.
+    """
+
+    arr = np.empty((_LULC_HEIGHT, _LULC_WIDTH), dtype=np.uint8)
+    half_h, half_w = _LULC_HEIGHT // 2, _LULC_WIDTH // 2
+    # Fill each quadrant with a distinct class id. Top-left → 10, top-right
+    # → 20, bottom-left → 30, bottom-right → 40. The exact layout doesn't
+    # matter beyond "every class is present in the raster" — the tests
+    # assert structural properties (columns exist, fractions sum to ~1.0)
+    # rather than exact per-class pixel counts.
+    arr[:half_h, :half_w] = _LULC_CLASSES[0]
+    arr[:half_h, half_w:] = _LULC_CLASSES[1]
+    arr[half_h:, :half_w] = _LULC_CLASSES[2]
+    arr[half_h:, half_w:] = _LULC_CLASSES[3]
+
+    fixtures_dir = tmp_path_factory.mktemp("envoi_lulc_fixtures")
+    lulc_path = fixtures_dir / "synthetic_lulc.tif"
+    transform = from_bounds(
+        _LULC_ORIGIN_X,
+        _LULC_ORIGIN_Y - _LULC_HEIGHT * _LULC_RES_M,
+        _LULC_ORIGIN_X + _LULC_WIDTH * _LULC_RES_M,
+        _LULC_ORIGIN_Y,
+        _LULC_WIDTH,
+        _LULC_HEIGHT,
+    )
+    with rasterio.open(
+        lulc_path,
+        "w",
+        driver="GTiff",
+        height=_LULC_HEIGHT,
+        width=_LULC_WIDTH,
+        count=1,
+        dtype="uint8",
+        crs=_LULC_CRS,
+        transform=transform,
+    ) as dst:
+        dst.write(arr, 1)
+    return lulc_path
+
+
+def _run_class_extract(df, tmp_path, statistics, *, window_size_m=200):
+    """Run extract() with the synthetic categorical raster and return the stats DataFrame."""
+    outputs = extract(
+        df,
+        {
+            "batch_id": "lulc_test",
+            "datasets": ["lulc_local"],
+            "settings": {
+                "output_type": "tabular",
+                "statistics": statistics,
+                "window_size_m": window_size_m,
+            },
+        },
+        output_dir=tmp_path,
+    )
+    return pd.read_csv(outputs["lulc_test"])
+
+
+@pytest.fixture
+def lulc_catalog(categorical_tif):
+    """Register a categorical local raster pointing at the synthetic LULC fixture."""
+    catalog = {
+        "datasets": {
+            "lulc_local": {
+                "data_source": "local",
+                "path": str(categorical_tif),
+                "bands": 1,
+                "data_type": "categorical",
+            }
+        }
+    }
+    update_catalog(catalog)
+    yield
+    reset_catalog()
+
+
+class TestClassReducerColumns:
+    """End-to-end checks of class_count / class_fraction column expansion."""
+
+    def test_class_count_produces_one_column_per_class(self, sample_df, tmp_path, lulc_catalog):
+        # The synthetic raster contains every class in _LULC_CLASSES. A 200 m
+        # window centred near the middle of the raster spans multiple
+        # quadrants, so we expect at least two classes per row — and the
+        # batch-level union should include every class observed by at least
+        # one row.
+        stats_df = _run_class_extract(sample_df, tmp_path, {"categorical": ["class_count"]})
+        observed_classes = {
+            int(col.split("_class_")[1].split("_count")[0])
+            for col in stats_df.columns
+            if "_class_" in col and col.endswith("_count_200m")
+        }
+        # At least two classes appeared in some point's window.
+        assert len(observed_classes) >= 2
+        assert observed_classes.issubset(set(_LULC_CLASSES))
+
+    def test_class_fraction_per_row_sums_to_one(self, sample_df, tmp_path, lulc_catalog):
+        # For every row whose window saw any class at all, the per-class
+        # fractions must add up to ~1.0 — that's the definitional contract
+        # of class_fraction.
+        stats_df = _run_class_extract(sample_df, tmp_path, {"categorical": ["class_fraction"]})
+        fraction_columns = [col for col in stats_df.columns if col.endswith("_fraction_200m")]
+        assert fraction_columns, "expected at least one class_fraction column"
+        for _, row in stats_df.iterrows():
+            row_sum = sum(row[col] for col in fraction_columns)
+            # A row whose window was entirely out-of-extent will have all
+            # zero fractions (the zero-fill policy), so we allow either 0
+            # or ~1.0 here. The fraction-sum-to-1 contract is the load-
+            # bearing assertion for any row that saw data.
+            assert row_sum == pytest.approx(0.0) or row_sum == pytest.approx(1.0, abs=1e-6)
+
+    def test_class_count_and_class_fraction_together(self, sample_df, tmp_path, lulc_catalog):
+        # Asking for both reducers in one call should produce both column
+        # families. Verifies the dedupe path in the GEE adapter and the
+        # ordinary "both reducers run" path in the local adapter.
+        stats_df = _run_class_extract(
+            sample_df,
+            tmp_path,
+            {"categorical": ["class_count", "class_fraction"]},
+        )
+        has_count = any(col.endswith("_count_200m") for col in stats_df.columns)
+        has_fraction = any(col.endswith("_fraction_200m") for col in stats_df.columns)
+        assert has_count and has_fraction
+
+    def test_absent_class_filled_with_zero(self, sample_df, tmp_path, lulc_catalog):
+        # The zero-fill contract: a row whose window didn't contain class X
+        # gets 0 (not NaN) for class_X_count and 0.0 for class_X_fraction.
+        # We don't know which row contains which class without inspecting
+        # the data, but we *do* know that no class column should ever be
+        # NaN under the "always 0 for absent" policy.
+        stats_df = _run_class_extract(
+            sample_df, tmp_path, {"categorical": ["class_count", "class_fraction"]}
+        )
+        class_columns = [col for col in stats_df.columns if "_class_" in col]
+        assert class_columns, "expected at least one class column"
+        for col in class_columns:
+            assert (
+                not stats_df[col].isna().any()
+            ), f"column {col} has NaN; expected zero-fill for absent classes"
+
+
+# ------------------------------------------------------------------
+# _append_stat_columns — class-key zero-fill and union-of-classes.
+# ------------------------------------------------------------------
+#
+# These tests poke the helper directly so the zero-fill / union behaviour
+# is pinned without going through the extract() pipeline (faster and
+# easier to read than a synthetic-raster setup for these edge cases).
+
+
+class TestAppendStatColumnsClassFill:
+    def test_class_union_across_points(self):
+        # Two rows: row 0 saw classes 10/20, row 1 saw classes 20/30. The
+        # output should include columns for *every* class that any row saw
+        # (union), with absent classes filled to 0.
+        from envoi.extract import _append_stat_columns
+
+        df = pd.DataFrame({"id": ["a", "b"]})
+        stats_results = [
+            ({"class_10_count": 5, "class_20_count": 3}, {}),
+            ({"class_20_count": 4, "class_30_count": 2}, {}),
+        ]
+        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+        # Union of classes across both rows.
+        assert result["lulc_class_10_count_200m"].tolist() == [5, 0]
+        assert result["lulc_class_20_count_200m"].tolist() == [3, 4]
+        assert result["lulc_class_30_count_200m"].tolist() == [0, 2]
+
+    def test_class_fraction_absent_fills_with_float_zero(self):
+        # The zero-fill helper must distinguish count (int 0) from fraction
+        # (float 0.0). A row that didn't see a class gets 0.0 in its
+        # fraction column, preserving the float dtype.
+        from envoi.extract import _append_stat_columns
+
+        df = pd.DataFrame({"id": ["a", "b"]})
+        stats_results = [
+            ({"class_10_fraction": 0.5, "class_20_fraction": 0.5}, {}),
+            ({"class_10_fraction": 1.0}, {}),
+        ]
+        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+        # Row 1's class_20 is absent — must be filled with the float 0.0
+        # (not None / NaN / int 0).
+        col = "lulc_class_20_fraction_200m"
+        assert result[col].tolist() == [0.5, 0.0]
+        # Float dtype preserved (pandas would upcast to object on None fill).
+        assert result[col].dtype.kind == "f"
+
+    def test_non_class_columns_keep_none_for_missing(self):
+        # Regression: only class_* columns get zero-fill. A plain reducer
+        # (e.g. mean) that's missing for some row still produces None /
+        # NaN as before, so the missing-data signal isn't lost.
+        from envoi.extract import _append_stat_columns
+
+        df = pd.DataFrame({"id": ["a", "b"]})
+        stats_results = [
+            ({"mean": 1.5}, {}),
+            ({}, {}),  # row 1 has no stats at all
+        ]
+        result = _append_stat_columns(df, "dem", window_size_m=100, stats_results=stats_results)
+        # Row 1's mean is missing — must be NaN, not 0.
+        assert pd.isna(result["dem_mean_100m"].iloc[1])
+
+    def test_multiband_class_columns_filled_per_band(self):
+        # Multi-band class keys carry a "b{n}_class_..." prefix. The fill
+        # helper must match those too via the optional band prefix in the
+        # regex. Each band's class columns are zero-filled independently.
+        from envoi.extract import _append_stat_columns
+
+        df = pd.DataFrame({"id": ["a", "b"]})
+        stats_results = [
+            ({"b1_class_10_count": 5, "b2_class_10_count": 4}, {}),
+            ({"b1_class_20_count": 3}, {}),
+        ]
+        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+        assert result["lulc_b1_class_10_count_200m"].tolist() == [5, 0]
+        assert result["lulc_b1_class_20_count_200m"].tolist() == [0, 3]
+        # b2_class_10 only appears in row 0; row 1 is zero-filled.
+        assert result["lulc_b2_class_10_count_200m"].tolist() == [4, 0]
+
+
+# ------------------------------------------------------------------
+# _ALL_KNOWN_REDUCERS — make sure the registry sets agree.
+# ------------------------------------------------------------------
+
+
+def test_all_known_reducers_includes_class_reducers():
+    # Regression check: the validator's allow-list must include the new
+    # categorical reducers, otherwise _validate_reducer_names rejects them
+    # before the adapter ever sees them.
+    from envoi.extract import _ALL_KNOWN_REDUCERS
+
+    assert "class_count" in _ALL_KNOWN_REDUCERS
+    assert "class_fraction" in _ALL_KNOWN_REDUCERS

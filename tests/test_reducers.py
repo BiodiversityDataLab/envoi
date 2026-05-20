@@ -12,11 +12,14 @@ import math
 import pytest
 
 from envoi.reducers import (
+    CATEGORICAL_ONLY_REDUCERS,
     CONTINUOUS_ONLY_REDUCERS,
     SPECIAL_REDUCERS,
     get_reducer,
     list_reducers,
     make_quantile,
+    r_class_count,
+    r_class_fraction,
     r_count,
     r_max,
     r_mean,
@@ -256,6 +259,107 @@ class TestValidateReducers:
         # real registered reducer — catches typos in the constant.
         registry_names = set(list_reducers())
         assert CONTINUOUS_ONLY_REDUCERS <= registry_names
+
+    def test_categorical_only_set_matches_registry(self):
+        # Same sanity check for the categorical-only set — every name in
+        # CATEGORICAL_ONLY_REDUCERS must be registered, otherwise the warning
+        # message can reference reducers users can't actually request.
+        registry_names = set(list_reducers())
+        assert CATEGORICAL_ONLY_REDUCERS <= registry_names
+
+    def test_continuous_dataset_with_categorical_only_reducer_returns_warning(self):
+        # class_count on a DEM is virtually always a user mistake — every
+        # floating-point pixel value would become its own "class". Warn so
+        # the user notices, but don't hard-fail.
+        warning_message = validate_reducers(
+            ["class_count"], data_type="continuous", dataset_name="dem"
+        )
+        assert warning_message is not None
+        # The message should name the categorical-only reducer so the user
+        # can identify the offending entry without reading the source.
+        assert "class_count" in warning_message
+        assert "categorical" in warning_message
+
+    def test_none_data_type_with_categorical_only_reducer_returns_warning(self):
+        # Local rasters often omit data_type — we treat unknown as continuous
+        # for the categorical-only warning so the user still gets the safety
+        # net when class_count is asked of an untagged raster.
+        warning_message = validate_reducers(
+            ["class_fraction"], data_type=None, dataset_name="some_local_raster"
+        )
+        assert warning_message is not None
+        assert "class_fraction" in warning_message
+
+
+# ------------------------------------------------------------------
+# Categorical reducers — dict-valued, one entry per class.
+# ------------------------------------------------------------------
+
+
+class TestClassReducers:
+    """class_count and class_fraction return dicts mapping class -> stat.
+
+    They're the only reducers in the registry whose return shape is non-scalar;
+    adapter code is expected to detect the dict and expand it into per-class
+    stat keys downstream.
+    """
+
+    def test_class_count_basic(self):
+        # Three class IDs with known counts — checks the unique/return_counts pairing.
+        result = r_class_count([10.0, 10.0, 20.0, 20.0, 20.0, 30.0])
+        assert result == {10: 2, 20: 3, 30: 1}
+
+    def test_class_count_returns_int_values(self):
+        # Counts must be Python ints (not numpy ints) so JSON / CSV
+        # serialisation downstream is unambiguous and the column dtype
+        # is stable.
+        result = r_class_count([10.0, 10.0])
+        assert isinstance(next(iter(result.values())), int)
+
+    def test_class_count_returns_int_keys(self):
+        # Class IDs are cast to int so column names like "class_10_count"
+        # don't include a trailing ".0" from the float-typed input array.
+        result = r_class_count([10.0, 20.0])
+        assert all(isinstance(k, int) for k in result.keys())
+
+    def test_class_count_empty_window(self):
+        # Empty input must not raise — must return an empty dict so the
+        # adapter emits no class keys for the failing point.
+        assert r_class_count([]) == {}
+
+    def test_class_count_drops_non_finite(self):
+        # NaN and +/-inf are filtered by _finite() before np.unique runs,
+        # same contract as every other reducer.
+        result = r_class_count([10.0, 10.0, float("nan"), float("inf"), 20.0])
+        assert result == {10: 2, 20: 1}
+
+    def test_class_fraction_basic(self):
+        # Same array as class_count_basic — fractions must sum to 1.0.
+        result = r_class_fraction([10.0, 10.0, 20.0, 20.0, 20.0, 30.0])
+        assert result[10] == pytest.approx(2 / 6)
+        assert result[20] == pytest.approx(3 / 6)
+        assert result[30] == pytest.approx(1 / 6)
+        assert sum(result.values()) == pytest.approx(1.0)
+
+    def test_class_fraction_single_class(self):
+        # A window with one class gets the full fraction 1.0.
+        result = r_class_fraction([10.0, 10.0, 10.0])
+        assert result == {10: 1.0}
+
+    def test_class_fraction_empty_window(self):
+        # Mirror class_count's empty-window behaviour: empty dict, no error.
+        assert r_class_fraction([]) == {}
+
+    def test_class_count_via_registry(self):
+        # The registry should expose class_count by name, so adapter code
+        # can call get_reducer("class_count") and receive r_class_count.
+        reducer_fn = get_reducer("class_count")
+        assert reducer_fn is r_class_count
+
+    def test_class_fraction_via_registry(self):
+        # Same registry lookup contract for class_fraction.
+        reducer_fn = get_reducer("class_fraction")
+        assert reducer_fn is r_class_fraction
 
 
 # ------------------------------------------------------------------

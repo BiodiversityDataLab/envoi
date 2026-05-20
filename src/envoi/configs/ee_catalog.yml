@@ -134,6 +134,7 @@ datasets:
     data_source: earth_engine
     path: COPERNICUS/Landcover/100m/Proba-V-C3/Global
     data_type: categorical
+    bands: [discrete_classification]
     dataset_information:
       description: "Copernicus Global Land Service Land Cover 100m - global land cover maps from PROBA-V."
       spatial_resolution: 100 meters
