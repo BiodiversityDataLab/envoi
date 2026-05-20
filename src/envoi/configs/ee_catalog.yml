@@ -8,7 +8,7 @@ datasets:
   # dataset_name:  # provide a unique name for this dataset e.g. "sentinel_2_l2a"
   #   data_source: earth_engine
   #   path: path/to/dataset_on_earth_engine   # GEE asset ID; type (IMAGE / IMAGE_COLLECTION) is auto-detected
-  #   data_type: type                 # "continuous", "categorical" or "mixed" (for datasets with both continuous and categorical bands)
+  #   data_type: type                 # "continuous" or "categorical"
   #
   #   # Band selection - if omitted, all bands are loaded.
   #   # The values set here are the dataset-wide DEFAULT and apply to every

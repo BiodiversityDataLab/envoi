@@ -1,5 +1,5 @@
 # ============================================================
-# biodata-enricher: project-wide defaults
+# envoi: project-wide defaults
 # ============================================================
 # These values are used by extract() when not explicitly set
 # in the run config dict or as keyword arguments to the call.

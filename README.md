@@ -1,4 +1,4 @@
-# biodata-enricher
+# envoi
 
 Enrich a Pandas DataFrame of sample points (`id`, `lat`, `lon`, optional `date`) with environmental data from Google Earth Engine or local GeoTIFFs.
 
@@ -9,14 +9,28 @@ Outputs **tabular** data (Parquet/CSV) with summary statistics and QC columns, o
 ## Install
 
 ```bash
-pip install biodata-enricher
+pip install envoi
 ```
+
+## Earth Engine setup
+
+Datasets that come from Google Earth Engine (most of the built-in catalog — `dem_aster`, `dem_glo30`, `sen2_ndvi`, etc.) need a service account key from Google. If you only plan to use your own local rasters you can skip this section.
+
+**Step 1 — get the key file.** In the [Google Cloud Console](https://console.cloud.google.com/iam-admin/serviceaccounts), create a service account that has Earth Engine access and download its JSON key. You'll end up with a file like `my-project-1234-abcdef.json`. See the [official guide](https://developers.google.com/earth-engine/guides/service_account) for the full walkthrough.
+
+**Step 2 — put the file somewhere `envoi` can find it.** Pick whichever of these is easiest:
+
+- **In your project folder:** save it as `credentials/ee_credentials.json` next to your script or notebook. This is the simplest option if you only use Earth Engine for one project.
+- **In your user folder:** save it as `~/.config/envoi/ee_credentials.json` (you may need to create the folder). Useful if you want the same key available to every project on your computer.
+- **Anywhere else:** pass the path explicitly in your code with `init_gee(credentials_path="/path/to/key.json")` before calling `extract()`.
+
+> **Advanced:** if you're running `envoi` in CI or a Docker container, set the `ENVOI_EE_CREDENTIALS` environment variable to the path of the JSON file. This is checked before the two folders above.
 
 ## Quick start
 
 ```python
 import pandas as pd
-from biodata import extract
+from envoi import extract
 
 df = pd.read_csv("data/points_sample.csv")
 
@@ -60,7 +74,7 @@ outputs = extract(df, [
 Datasets not in the built-in catalog can be registered once with `update_catalog()` and are then available in all subsequent `extract()` calls:
 
 ```python
-from biodata import extract, update_catalog
+from envoi import extract, update_catalog
 
 # Register a local raster
 update_catalog({"datasets": {
@@ -116,6 +130,8 @@ outputs = extract(df, {
 Names recognised as derived bands (currently `slope` and `aspect`, computed from the dataset's first band) are split out automatically — you don't need a separate key for them. Derived bands are only supported for Earth Engine datasets; supplying one for a local raster raises a `ValueError`.
 
 A one-element list (`{"sentinel2": ["B4"]}`) keeps the multi-band column naming (`sentinel2_B4_mean_<window>m`); use the catalog if you want the bare single-band form (`sentinel2_mean_<window>m`).
+
+> **Note on band identifiers:** Earth Engine datasets identify bands by *string* names (`"B4"`, `"DEM"`, `"slope"`) because GEE exposes named bands. Local GeoTIFFs identify bands by *integer* index (`1`, `2`, `[1, 2, 3]`) because rasterio reads bands positionally. So a GEE catalog entry might set `bands: ["DEM"]` and a local one `bands: 1`, and a per-call override follows the same convention as the dataset it targets. This mirrors what the underlying libraries use and is enforced by the adapter on registration.
 
 ## Output kinds
 
