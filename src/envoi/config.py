@@ -1,4 +1,4 @@
-# src/biodata/config.py
+# src/envoi/config.py
 from __future__ import annotations
 import importlib.resources as importlib_resources
 from pathlib import Path
@@ -24,12 +24,12 @@ logger = logging.getLogger(__name__)
 
 
 def _read_builtin_yaml(filename: str) -> Dict[str, Any]:
-    """Read a YAML file bundled inside the biodata package under configs/.
+    """Read a YAML file bundled inside the envoi package under configs/.
 
     Uses importlib.resources so the file is found correctly whether the
     package is installed via pip or run directly from source.
     """
-    ref = importlib_resources.files("biodata").joinpath("configs").joinpath(filename)
+    ref = importlib_resources.files("envoi").joinpath("configs").joinpath(filename)
     text = ref.read_text(encoding="utf-8")
     return yaml.safe_load(text) or {}
 
@@ -200,7 +200,7 @@ def _load_catalog_any(src: Any) -> Dict[str, Any]:
             if spec.get("data_source") == "earth_engine" and not spec.get("data_type"):
                 raise CatalogError(
                     f"datasets.{name}: missing required key 'data_type' for earth_engine dataset.\n"
-                    f"Valid values are: continuous, categorical, mixed."
+                    f"Valid values are: continuous, categorical."
                 )
         return d
 
