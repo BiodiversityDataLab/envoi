@@ -1,5 +1,6 @@
 # src/envoi/extract.py
 from __future__ import annotations
+import re
 import warnings
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple
@@ -810,6 +811,9 @@ _ALL_KNOWN_REDUCERS = frozenset(
         "count",
         "mode",
         "point",
+        # categorical (expand to one column per class value at output time)
+        "class_count",
+        "class_fraction",
         "q05",
         "q10",
         "q25",
@@ -819,6 +823,12 @@ _ALL_KNOWN_REDUCERS = frozenset(
         "q95",
     }
 )
+
+# Matches the per-class stat keys produced by the categorical reducers, in
+# either single-band form ("class_10_count") or multi-band form
+# ("b2_class_10_fraction"). Used to zero-fill rows that didn't see a class
+# observed by some other row in the same batch.
+_CLASS_COLUMN_RE = re.compile(r"^(?:b\d+_)?class_-?\d+_(count|fraction)$")
 
 
 def _parse_statistics(
@@ -1008,6 +1018,14 @@ def _append_stat_columns(
     - point,  multi-band:  "{band}_point"   -> column "{dataset}_{band}_point"
 
     Point keys intentionally skip the buffer suffix to preserve the historical schema.
+
+    Categorical reducers (``class_count`` / ``class_fraction``) produce
+    per-class stat keys like ``class_10_count`` or ``b2_class_20_fraction``.
+    Each class value found in *any* row's stat dict becomes an output column;
+    rows whose dict didn't see that class are filled with 0 (the design
+    decision is that "class not observed" = 0, regardless of whether the
+    window itself was valid; the QC sidecar records extent/coverage
+    separately).
     """
     # Collect keys in first-seen order so output columns stay stable across runs.
     stat_keys = dict.fromkeys(key for stat_dict, _ in stats_results for key in stat_dict)
@@ -1023,8 +1041,21 @@ def _append_stat_columns(
         else:
             column_name = f"{dataset_name}_{stat_key}_{window_size_m}m"
 
-        # Pull one value per sample row, defaulting to None if that key is absent.
-        column_values = [stat_dict.get(stat_key) for stat_dict, _ in stats_results]
+        # Decide the fill value for missing entries:
+        # - class_*_count   -> 0   (absent class = zero pixels)
+        # - class_*_fraction -> 0.0 (absent class = 0 % of window)
+        # - everything else -> None (existing behaviour for missing stats)
+        class_match = _CLASS_COLUMN_RE.match(stat_key)
+        if class_match is not None:
+            missing_fill = 0 if class_match.group(1) == "count" else 0.0
+        else:
+            missing_fill = None
+
+        # Pull one value per sample row, using the chosen fill for absent keys.
+        column_values = [
+            stat_dict[stat_key] if stat_key in stat_dict else missing_fill
+            for stat_dict, _ in stats_results
+        ]
 
         # Overwrite existing columns (keeps schema stable across windows).
         if column_name in existing_columns:

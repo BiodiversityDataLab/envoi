@@ -225,6 +225,59 @@ class TestLandCover:
         ]
         assert lc100_mean_columns
 
+    def test_worldcover_class_count_and_fraction(self, tmp_path):
+        """End-to-end check of the categorical reducers against ESA WorldCover.
+
+        The two sample points sit in northern Sweden where the WorldCover
+        v200 map contains at least two classes (tree cover + grassland or
+        water) within a 500 m window. We verify three properties:
+
+          * At least one ``class_*_count_*`` and one ``class_*_fraction_*``
+            column comes back populated.
+          * Per-row fractions sum to ~1.0 (or 0.0 for an out-of-extent row
+            — none expected here, but the contract allows both).
+          * Absent classes are filled with 0 (never NaN) so downstream
+            consumers can do arithmetic on the column directly.
+        """
+        catalog = _make_catalog(
+            ("worldcover", "ESA/WorldCover/v200"),
+            data_type="categorical",
+        )
+        result = _run_stats(
+            SWEDEN_SAMPLE_DF,
+            "worldcover",
+            catalog,
+            tmp_path,
+            reducers=["class_count", "class_fraction"],
+        )
+
+        # Per-class columns must exist for both reducers.
+        count_columns = [
+            column
+            for column in result.columns
+            if "_class_" in column and column.endswith("_count_200m")
+        ]
+        fraction_columns = [
+            column
+            for column in result.columns
+            if "_class_" in column and column.endswith("_fraction_200m")
+        ]
+        assert count_columns, "expected at least one class_*_count column"
+        assert fraction_columns, "expected at least one class_*_fraction column"
+
+        # Sum of fractions per row must be ~1.0 (a valid GEE call on land)
+        # or ~0.0 (out-of-extent — not expected here but allowed). Anything
+        # in between would indicate the frequencyHistogram-to-fraction
+        # post-process is using the wrong denominator.
+        for _, row in result.iterrows():
+            row_sum = sum(row[column] for column in fraction_columns)
+            assert row_sum == pytest.approx(0.0) or row_sum == pytest.approx(1.0, abs=1e-3)
+
+        # No NaN in any class column — the "always 0 for absent" fill must
+        # have run over the unioned column set.
+        for column in count_columns + fraction_columns:
+            assert not result[column].isna().any(), f"column {column} has NaN"
+
 
 # ------------------------------------------------------------------
 # Point sampling across dataset types.
