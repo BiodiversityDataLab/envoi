@@ -5,7 +5,7 @@ from .reducers import list_reducers
 from .config import update_catalog, reset_catalog
 
 try:
-    __version__ = version("biodata-enricher")
+    __version__ = version("envoi")
 except PackageNotFoundError:  # local editable install
     __version__ = "0.0.0+local"
 
