@@ -1,4 +1,4 @@
-# biodata-enricher
+# envoi
 
 Enrich a Pandas DataFrame of sample points (`id`, `lat`, `lon`, optional `date`) with environmental data from Google Earth Engine or local GeoTIFFs.
 
@@ -9,14 +9,14 @@ Outputs **tabular** data (Parquet/CSV) with summary statistics and QC columns, o
 ## Install
 
 ```bash
-pip install biodata-enricher
+pip install envoi
 ```
 
 ## Quick start
 
 ```python
 import pandas as pd
-from biodata import extract
+from envoi import extract
 
 df = pd.read_csv("data/points_sample.csv")
 
@@ -60,7 +60,7 @@ outputs = extract(df, [
 Datasets not in the built-in catalog can be registered once with `update_catalog()` and are then available in all subsequent `extract()` calls:
 
 ```python
-from biodata import extract, update_catalog
+from envoi import extract, update_catalog
 
 # Register a local raster
 update_catalog({"datasets": {

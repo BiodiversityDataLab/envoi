@@ -1,4 +1,4 @@
-# src/biodata/extract.py
+# src/envoi/extract.py
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple
@@ -122,19 +122,20 @@ def extract(
         simply skipped — the extractor never errors on a missing date column.
         The output tables will use the same name.
     write_metadata : bool, optional
-        Whether to write a JSON metadata sidecar alongside the output files.
-        Defaults to ``True``. Set to ``False`` to suppress the sidecar, for
-        example when running interactively and the output will not be kept on
-        disk.
+        Whether to write the auxiliary files alongside the main output(s).
+        When ``True`` (the default), the JSON metadata sidecar is written for
+        every output and, in tabular mode, the per-point QC table is also
+        written to disk. Set to ``False`` to suppress both — useful when
+        running interactively and the output will not be kept on disk.
 
     Returns
     -------
     dict[str, Path | pd.DataFrame]
-        Mapping of output key to the result. For tabular outputs the keys are
-        ``"<batch_id>"`` (stats table) and ``"<batch_id>_qc"`` (QC table);
-        for raster outputs the key is ``"<batch_id>:<dataset>"`` pointing to
-        the tiles folder. When ``output_file_format`` is ``"dataframe"``, the
-        values are pandas DataFrames rather than file paths.
+        Mapping of output key to the result. For tabular outputs the key is
+        ``"<batch_id>"`` pointing to the stats table. For raster outputs the key is
+        ``"<batch_id>:<dataset>"`` pointing to the tiles folder. When
+        ``output_file_format`` is ``"dataframe"``, the stats value is a pandas
+        DataFrame rather than a file path.
     """
     output_paths: Dict[str, Path | pd.DataFrame] = {}
 

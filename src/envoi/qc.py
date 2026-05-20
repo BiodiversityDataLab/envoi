@@ -1,4 +1,4 @@
-# src/biodata/qc.py
+# src/envoi/qc.py
 from __future__ import annotations
 from dataclasses import dataclass
 import logging

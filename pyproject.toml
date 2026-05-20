@@ -3,12 +3,15 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "biodata-enricher"
-version = "0.1.2"
-description = "Enrich points with environmental datasets from local/remote sources (MVP)."
-authors = [{ name = "Team Biodata", email = "team@example.com" }]
+name = "envoi"
+version = "0.9.0"
+description = "Automated feature extraction from environmental datasets for ecological and spatial analysis."
+authors = [
+    { name = "Adrian Baggström", email = "adrian.baggstrom@ebc.uu.se" },
+    { name = "Jakob Nyström", email = "jakob.nystrom@ebc.uu.se" },
+]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "pandas>=2.1",
@@ -20,37 +23,56 @@ dependencies = [
     "pyyaml>=6.0.1",
     "pyarrow>=17.0.0",
     "tqdm>=4.65",
-    "earthengine-api>=0.1.398", 
+    "earthengine-api>=1.7",
+    "geemap>=0.36",
 ]
 
 classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
-  "License :: OSI Approved :: MIT License",
-  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: GIS",
+  "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 
-keywords = ["gis", "raster", "geospatial", "environment", "gee"]
+keywords = [
+  "gis",
+  "raster",
+  "geospatial",
+  "earth-engine",
+  "remote-sensing",
+  "feature-extraction",
+  "environmental-data",
+  "ecology",
+]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5.0",
-    "black>=26.3.1",
+    "black>=24.3.0",
+    "build>=1.0.0",
+    "twine>=4.0.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/AppleShay/biodata-enricher"
+Homepage = "https://biodiversity.se/"
+Repository = "https://github.com/BiodiversityLab/envoi"
+Issues = "https://github.com/BiodiversityLab/envoi/issues"
+Documentation = "https://github.com/BiodiversityLab/envoi#readme"
 
 [tool.setuptools.package-data]
-biodata = ["configs/*.yml"]
+envoi = ["configs/*.yml"]
 
 [tool.ruff]
 line-length = 100
 
 [tool.black]
 line-length = 100
-target-version = ["py310"]
+target-version = ["py311"]

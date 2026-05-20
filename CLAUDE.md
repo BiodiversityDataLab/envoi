@@ -1,4 +1,4 @@
-# CLAUDE.md — EDDP / biodata-enricher
+# CLAUDE.md — envoi / envoi
 
 This file gives you context on the project vision, architecture, and decisions.
 Update it as the project evolves.
@@ -18,7 +18,7 @@ Update it as the project evolves.
 
 ## What this project is
 
-**biodata-enricher (EDDP)** is a Python package that enriches geographic point data
+**envoi (envoi)** is a Python package that enriches geographic point data
 with environmental datasets. The input is a table of sample points (`id`, `lat`, `lon`,
 optionally `date`); the output is either that same table with appended environmental columns 
 or images of environmental datasets, ready for spatial ecological modeling or similar analyses.

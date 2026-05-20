@@ -1,4 +1,4 @@
-# src/biodata/adapters/__init__.py
+# src/envoi/adapters/__init__.py
 
 _REG: dict[str, type] = {}
 
