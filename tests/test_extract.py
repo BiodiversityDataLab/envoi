@@ -912,6 +912,243 @@ class TestTypedStatistics:
 
 
 # ------------------------------------------------------------------
+# Output file formats — parquet and in-memory DataFrame
+# ------------------------------------------------------------------
+#
+# The "csv" format is exercised by every other test in this file. These
+# tests cover the other two values of `output_file_format`:
+#   * "parquet" — same on-disk shape as csv, just a different writer.
+#   * "dataframe" — stats are returned in memory instead of written to disk.
+
+
+class TestOutputFormats:
+    def test_parquet_output_writes_parquet_file(self, sample_df, tmp_path):
+        """output_file_format='parquet' writes a .parquet file readable by pandas."""
+        outputs = extract(
+            sample_df,
+            {
+                "batch_id": "parquet_test",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                    "output_file_format": "parquet",
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        # Returned path must be a .parquet file (not .csv).
+        stats_path = outputs["parquet_test"]
+        assert stats_path.suffix == ".parquet", f"expected .parquet, got {stats_path.suffix}"
+        assert stats_path.exists()
+
+        # Read the file back so we know the writer produced a valid parquet
+        # file — not just a renamed CSV.
+        stats_df = pd.read_parquet(stats_path)
+        assert len(stats_df) == len(sample_df)
+        assert "dem_local_mean_100m" in stats_df.columns
+
+        # The QC sidecar is written in the same format alongside the stats.
+        qc_path = tmp_path / "parquet_test_qc.parquet"
+        assert qc_path.exists()
+        qc_df = pd.read_parquet(qc_path)
+        assert len(qc_df) == len(sample_df)
+
+    def test_dataframe_format_returns_in_memory_dataframe(self, sample_df, tmp_path):
+        """output_file_format='dataframe' returns the stats DataFrame instead of a Path."""
+        outputs = extract(
+            sample_df,
+            {
+                "batch_id": "df_test",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                    "output_file_format": "dataframe",
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        # Sanity: the value in the outputs dict is a DataFrame, not a Path.
+        # This is the whole point of the "dataframe" mode — skip disk I/O for
+        # the stats output when the caller wants the result in-memory.
+        result = outputs["df_test"]
+        assert isinstance(
+            result, pd.DataFrame
+        ), f"expected DataFrame return, got {type(result).__name__}"
+        assert len(result) == len(sample_df)
+        assert "dem_local_mean_100m" in result.columns
+        # Core columns (id/lat/lon) are preserved on the stats output so the
+        # returned DataFrame is independently useful.
+        assert "id" in result.columns
+        assert list(result["id"]) == list(sample_df["id"])
+
+    def test_unknown_output_format_raises(self, sample_df, tmp_path):
+        """An unrecognised output_file_format value raises ValueError."""
+        # Guards against typos like "parquette" / "df" silently being treated
+        # as csv (the historical fallthrough behaviour).
+        with pytest.raises(ValueError, match="output_file_format"):
+            extract(
+                sample_df,
+                {
+                    "batch_id": "bad_fmt",
+                    "datasets": ["dem_local"],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["mean"],
+                        "window_size_m": 100,
+                        "output_file_format": "parquette",
+                    },
+                },
+                output_dir=tmp_path,
+            )
+
+
+# ------------------------------------------------------------------
+# Numerical correctness — does the pipeline actually compute the right number?
+# ------------------------------------------------------------------
+#
+# Every other test in this file checks schema, column names, or NaN-ness.
+# These tests use a constant-valued raster (every pixel = constant_dem_value)
+# so the expected mean/std/min/max are known analytically. If the reducer
+# wiring breaks numerically — e.g. nodata sentinels leak into the math, or
+# windows pick up neighbouring tiles — these are the assertions that catch it.
+
+
+class TestNumericalCorrectness:
+    def test_mean_over_constant_raster_equals_constant(
+        self, sample_df, constant_dem_tif, constant_dem_value, tmp_path
+    ):
+        """A constant raster's window mean must equal the constant value."""
+        # Register the constant raster as a one-off dataset. The autouse
+        # register_test_catalog fixture's reset_catalog() teardown cleans it
+        # up at the end of the test, so we don't pollute later tests.
+        update_catalog(
+            {
+                "datasets": {
+                    "dem_constant": {
+                        "data_source": "local",
+                        "path": str(constant_dem_tif),
+                        "bands": 1,
+                    }
+                }
+            }
+        )
+
+        outputs = extract(
+            sample_df,
+            {
+                "batch_id": "numerical_test",
+                "datasets": ["dem_constant"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean", "min", "max", "std"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        stats_df = pd.read_csv(outputs["numerical_test"])
+
+        # Every pixel is `constant_dem_value`, so the window aggregate must be
+        # exactly that constant for every reducer-that-sees-data. Using
+        # pytest.approx with a small absolute tolerance to absorb the
+        # stats_output_decimals rounding the pipeline applies on write.
+        assert stats_df["dem_constant_mean_100m"].iloc[0] == pytest.approx(constant_dem_value)
+        assert stats_df["dem_constant_min_100m"].iloc[0] == pytest.approx(constant_dem_value)
+        assert stats_df["dem_constant_max_100m"].iloc[0] == pytest.approx(constant_dem_value)
+        # Standard deviation of a single repeated value is exactly 0 (the
+        # sample-std denominator (n-1) cancels with the zero numerator).
+        assert stats_df["dem_constant_std_100m"].iloc[0] == pytest.approx(0.0)
+
+    def test_mean_constant_across_all_points(
+        self, sample_df, constant_dem_tif, constant_dem_value, tmp_path
+    ):
+        """Every sample point on a constant raster gets the same mean — no per-point drift."""
+        # Catches a class of bugs where one point's window accidentally picks
+        # up neighbour data, returns NaN, or falls through to a different
+        # code path than the others.
+        update_catalog(
+            {
+                "datasets": {
+                    "dem_constant": {
+                        "data_source": "local",
+                        "path": str(constant_dem_tif),
+                        "bands": 1,
+                    }
+                }
+            }
+        )
+
+        outputs = extract(
+            sample_df,
+            {
+                "batch_id": "uniform_test",
+                "datasets": ["dem_constant"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 200,
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        stats_df = pd.read_csv(outputs["uniform_test"])
+        # All N points must report exactly the constant value — no NaN, no drift.
+        np.testing.assert_allclose(
+            stats_df["dem_constant_mean_200m"].to_numpy(),
+            np.full(len(sample_df), constant_dem_value),
+        )
+
+    def test_point_sampling_returns_exact_pixel_value(
+        self, sample_df, constant_dem_tif, constant_dem_value, tmp_path
+    ):
+        """The 'point' reducer samples the underlying pixel value exactly."""
+        # On a constant raster every pixel has the same value, so wherever the
+        # point lands the sampled value must equal that constant. If the
+        # adapter is doing any unexpected resampling / interpolation, this is
+        # where it would show up.
+        update_catalog(
+            {
+                "datasets": {
+                    "dem_constant": {
+                        "data_source": "local",
+                        "path": str(constant_dem_tif),
+                        "bands": 1,
+                    }
+                }
+            }
+        )
+
+        outputs = extract(
+            sample_df,
+            {
+                "batch_id": "point_numeric",
+                "datasets": ["dem_constant"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["point"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        stats_df = pd.read_csv(outputs["point_numeric"])
+        # Every sampled point must read exactly the constant value.
+        np.testing.assert_allclose(
+            stats_df["dem_constant_point"].to_numpy(),
+            np.full(len(sample_df), constant_dem_value),
+        )
+
+
+# ------------------------------------------------------------------
 # LocalRasterAdapter unit tests
 # ------------------------------------------------------------------
 #

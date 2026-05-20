@@ -105,3 +105,58 @@ def dem_tif(tmp_path_factory) -> Path:
         dst.write(aspect_band, 3)
 
     return dem_path
+
+
+# Constant value (in metres) baked into every pixel of the constant-valued DEM.
+# Picked to be:
+#   * non-zero (so accidental zeros from a default fill would be obvious),
+#   * non-integer-friendly (50.0 not 1.0) so mean/min/max look distinct in output,
+#   * inside the realistic elevation range so the typed-stats validator doesn't warn.
+_CONSTANT_DEM_VALUE = 50.0
+
+
+@pytest.fixture(scope="session")
+def constant_dem_tif(tmp_path_factory) -> Path:
+    """Single-band float32 DEM where every pixel equals _CONSTANT_DEM_VALUE.
+
+    Used by the numerical-correctness tests: when every pixel inside a window
+    is the same value, mean / min / max must equal that value and std must be
+    zero. No randomness, no rounding tolerance needed — exact equality checks.
+
+    Spatial parameters (CRS, origin, resolution, size) match ``dem_tif`` so the
+    same sample points fall inside both rasters.
+    """
+    # Same CRS/transform/dimensions as the random DEM above — keeps the
+    # synthetic-fixture layout uniform so tests using either fixture share
+    # the same sample-point coverage.
+    constant_band = np.full((_DEM_HEIGHT, _DEM_WIDTH), _CONSTANT_DEM_VALUE, dtype=np.float32)
+
+    fixtures_dir = tmp_path_factory.mktemp("envoi_const_fixtures")
+    constant_dem_path = fixtures_dir / "constant_dem.tif"
+
+    transform = from_origin(_DEM_ORIGIN_X, _DEM_ORIGIN_Y, _DEM_RES_M, _DEM_RES_M)
+    with rasterio.open(
+        constant_dem_path,
+        "w",
+        driver="GTiff",
+        height=_DEM_HEIGHT,
+        width=_DEM_WIDTH,
+        count=1,
+        dtype="float32",
+        crs=_DEM_CRS,
+        transform=transform,
+    ) as dst:
+        dst.write(constant_band, 1)
+
+    return constant_dem_path
+
+
+@pytest.fixture(scope="session")
+def constant_dem_value() -> float:
+    """The exact value stored in every pixel of the ``constant_dem_tif`` fixture.
+
+    Exposed as a fixture so tests don't have to import the private
+    ``_CONSTANT_DEM_VALUE`` constant — they pull both the file and the value
+    via the public fixture API.
+    """
+    return _CONSTANT_DEM_VALUE

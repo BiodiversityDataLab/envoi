@@ -144,22 +144,21 @@ datasets:
       citation: "Buchhorn, M., Smets, B., Bertels, L., Roo, B. D., Lesiv, M., Tsendbazar, N.-E., Herold, M., & Fritz, S. (2020). Copernicus Global Land Service: Land Cover 100m: collection 3: epoch 2019: Globe (Version V3.0.1) [Data set]. Zenodo."
       license: "Fully free and open to all users"
 
-  lulc_dynamicworld_v1:
-    data_source: earth_engine
-    path: GOOGLE/DYNAMICWORLD/V1
-    data_type: categorical
-    bands: [label]
-    dataset_spec:
-      use_utm_zone: true
-    dataset_information:
-      description: "Dynamic World V1 - near real-time global land cover. Exposes the `label` band (discrete class index 0-8: water, trees, grass, flooded_vegetation, crops, shrub_and_scrub, built, bare, snow_and_ice); the 9 per-class probability bands are also available via per-call band override."
-      spatial_resolution: 10 meters
-      temporal_resolution: 2-5 days (Sentinel-2 cadence)
-      temporal_range: 2015-06-27 to present
-      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/GOOGLE_DYNAMICWORLD_V1"
-      source_url: "https://www.nature.com/articles/s41597-022-01307-4"
-      citation: "Brown, C. F., Brumby, S. P., Guzder-Williams, B., Birch, T., Hyde, S. B., Mazzariello, J., Czerwinski, W., Pasquarella, V. J., Haertel, R., Ilyushchenko, S., Schwehr, K., Weisse, M., Stolle, F., Hanson, C., Guinan, O., Moore, R., & Tait, A. M. (2022). Dynamic World, Near real-time global 10 m land use land cover mapping. Scientific Data, 9, 251. https://doi.org/10.1038/s41597-022-01307-4"
-      license: "CC-BY-4.0"
+  # Too much issues with this dataset - commented out for now, can add back later if needed.
+  # lulc_dynamicworld_v1:
+  #   data_source: earth_engine
+  #   path: GOOGLE/DYNAMICWORLD/V1
+  #   data_type: categorical
+  #   bands: [label]
+  #   dataset_information:
+  #     description: "Dynamic World V1 - near real-time global land cover. Exposes the `label` band (discrete class index 0-8: water, trees, grass, flooded_vegetation, crops, shrub_and_scrub, built, bare, snow_and_ice); the 9 per-class probability bands are also available via per-call band override."
+  #     spatial_resolution: 10 meters
+  #     temporal_resolution: 2-5 days (Sentinel-2 cadence)
+  #     temporal_range: 2015-06-27 to present
+  #     ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/GOOGLE_DYNAMICWORLD_V1"
+  #     source_url: "https://www.nature.com/articles/s41597-022-01307-4"
+  #     citation: "Brown, C. F., Brumby, S. P., Guzder-Williams, B., Birch, T., Hyde, S. B., Mazzariello, J., Czerwinski, W., Pasquarella, V. J., Haertel, R., Ilyushchenko, S., Schwehr, K., Weisse, M., Stolle, F., Hanson, C., Guinan, O., Moore, R., & Tait, A. M. (2022). Dynamic World, Near real-time global 10 m land use land cover mapping. Scientific Data, 9, 251. https://doi.org/10.1038/s41597-022-01307-4"
+  #     license: "CC-BY-4.0"
 
   lulc_naturallands_2020:
     data_source: earth_engine
