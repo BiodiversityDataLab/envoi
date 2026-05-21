@@ -14,7 +14,8 @@ datasets:
   #   # The values set here are the dataset-wide DEFAULT and apply to every
   #   # call to extract() that doesn't override them.
   #   bands: [list, of, bands]                 # single string ("DEM") or list (["B4", "B8"])
-  #   derived_bands: [slope, aspect]           # compute and include derived bands (currently supported: slope, aspect — DEM-style datasets)
+  #   derived_bands: [slope, aspect]           # compute and include derived bands by default (must be a subset of supported_derived_bands)
+  #   supported_derived_bands: [slope, aspect] # whitelist of derived bands this dataset is allowed to produce (slope/aspect only apply to DEM-style datasets). Required for any dataset that should accept derived bands either as a catalog default or as a per-call override.
   #
   #   # The user can also override the bands list on a per-call basis by
   #   # inlining a single-key dict in the `datasets` list passed to extract():
@@ -24,7 +25,9 @@ datasets:
   #   #     - {dem_aster:     [DEM, slope]}        # mix source + derived names in one list
   #   # Names recognised as derived (currently "slope", "aspect") are split out
   #   # internally; the rest are used as source bands. The per-call override
-  #   # replaces the catalog's bands list entirely (no merging).
+  #   # replaces the catalog's bands list entirely (no merging). Any derived
+  #   # band requested at call site must appear in `supported_derived_bands`
+  #   # for the dataset, otherwise the call is rejected up front.
   #
   #   dataset_spec:
   #     # Dataset-specific options
@@ -47,6 +50,7 @@ datasets:
     data_source: earth_engine
     path: projects/sat-io/open-datasets/ASTER/GDEM
     data_type: continuous
+    supported_derived_bands: [slope, aspect]
     dataset_information:
       spatial_resolution: 30 meters
       temporal_resolution: static
@@ -57,7 +61,7 @@ datasets:
     path: COPERNICUS/DEM/GLO30
     data_type: continuous
     bands: [DEM]
-    # derived_bands: [slope, aspect] # fixa så att det checkas mot derive_bands
+    supported_derived_bands: [slope, aspect]
     dataset_information:
       description: "Copernicus DEM GLO-30 - global digital surface model derived from TanDEM-X radar data."
       spatial_resolution: 30 meters
