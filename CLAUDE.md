@@ -19,9 +19,12 @@ Update it as the project evolves.
 ## What this project is
 
 **envoi (envoi)** is a Python package that enriches geographic point data
-with environmental datasets. The input is a table of sample points (`id`, `lat`, `lon`,
-optionally `date`); the output is either that same table with appended environmental columns 
-or images of environmental datasets, ready for spatial ecological modeling or similar analyses.
+with environmental datasets. The input is a table of sample points
+(`gbifID`, `decimalLatitude`, `decimalLongitude`, optionally `eventDate` —
+following the GBIF / Darwin Core convention); the output is either that same
+table with appended environmental columns or images of environmental datasets,
+ready for spatial ecological modeling or similar analyses. The input column
+names can be overridden via the `*_column` parameters on `extract()`.
 
 The primary use case is ecological research where you have field sample
 locations and want to attach climate, terrain, vegetation, or other environmental
@@ -132,10 +135,11 @@ dem_glo30:
 ```
 
 **Automatic date handling for ImageCollections:** when the input DataFrame
-has a `date` column, the adapter fetches the collection's available timestamps
-and selects the single nearest image to each point's date. Out-of-range dates
-are clamped to the closest boundary. When no `date` column is provided, the
-most recent image is used. Date decisions are recorded in the output metadata.
+has an `eventDate` column, the adapter fetches the collection's available
+timestamps and selects the single nearest image to each point's date.
+Out-of-range dates are clamped to the closest boundary. When no `eventDate`
+column is provided, the most recent image is used. Date decisions are
+recorded in the output metadata.
 
 ---
 
