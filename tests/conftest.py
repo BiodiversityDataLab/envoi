@@ -20,6 +20,26 @@ import pytest
 import rasterio
 from rasterio.transform import from_origin
 
+from envoi import reset_catalog
+
+
+@pytest.fixture(autouse=True)
+def _reset_user_catalog():
+    """Clear the session-wide user catalog around every test.
+
+    ``envoi.update_catalog()`` stores registered datasets in a module-level
+    dict that persists for the lifetime of the Python process. Without this
+    fixture, a test that forgets to call ``reset_catalog()`` in a teardown
+    block leaks its datasets into the next test, producing order-dependent
+    failures. Running ``reset_catalog()`` both before and after each test
+    guarantees a clean slate regardless of how the test exits (pass, fail,
+    or interrupted mid-body).
+    """
+    reset_catalog()
+    yield
+    reset_catalog()
+
+
 # Spatial parameters copied from the original DEM fixture so the synthetic
 # data covers the same area the sample points fall inside. The points are
 # around (lat 62.97-62.98N, lon 18.02-18.03E) — i.e. UTM 34N — and the

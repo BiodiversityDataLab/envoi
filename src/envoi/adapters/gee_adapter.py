@@ -348,20 +348,30 @@ def _resolve_date_filter_range(
 # Derived bands  (slope, aspect, …)
 # ---------------------------------------------------------------------------
 
+# Dispatch table for derived bands. Maps the user-facing derived-band name to
+# the GEE function that computes it from a source image. Add a new derived
+# band by inserting one entry here — KNOWN_DERIVED_BANDS and the runtime
+# dispatch inside `_apply_derived_bands` both read from this dict, so no
+# further edits are needed.
+_DERIVED_BAND_DISPATCH = {
+    "slope": ee.Terrain.slope,
+    "aspect": ee.Terrain.aspect,
+}
+
 # Names that are recognised as *derived* bands. When the user passes a unified
 # bands list at the call site (via extract()), names appearing in this set are
 # split out and forwarded to the adapter as `derived_bands` rather than `bands`.
-# Keep this in sync with the if/elif dispatch inside `_apply_derived_bands`
-# below — adding a new derived-band name requires updating both places.
-KNOWN_DERIVED_BANDS = frozenset({"slope", "aspect"})
+# Derived directly from the dispatch table so the two can never drift apart.
+KNOWN_DERIVED_BANDS = frozenset(_DERIVED_BAND_DISPATCH)
 
 
 def _apply_derived_bands(image, derived):
     """Compute derived bands and add them alongside the existing bands of `image`.
 
     `derived` may be either a single band name (e.g. "slope") or a list of names
-    (e.g. ["slope", "aspect"]). Each derived band is computed from `image` and
-    added to the output via `addBands()`, so the source bands are preserved.
+    (e.g. ["slope", "aspect"]). Each derived band is computed from `image` via
+    the dispatch table above and added to the output via `addBands()`, so the
+    source bands are preserved.
 
     Raises ValueError if an unknown derived band name is given — silent fallback
     was previously a trap that produced confusing "missing output" bugs.
@@ -373,15 +383,15 @@ def _apply_derived_bands(image, derived):
         derived_names = list(derived)
 
     for derived_band_name in derived_names:
-        if derived_band_name == "slope":
-            image = image.addBands(ee.Terrain.slope(image))
-        elif derived_band_name == "aspect":
-            image = image.addBands(ee.Terrain.aspect(image))
-        else:
+        # Look up the compute function once per name; an unknown name short-
+        # circuits with a clear error before any GEE-side work is done.
+        compute = _DERIVED_BAND_DISPATCH.get(derived_band_name)
+        if compute is None:
             raise ValueError(
                 f"Unknown derived band '{derived_band_name}'. "
                 f"Supported: {', '.join(sorted(KNOWN_DERIVED_BANDS))}."
             )
+        image = image.addBands(compute(image))
 
     return image
 
