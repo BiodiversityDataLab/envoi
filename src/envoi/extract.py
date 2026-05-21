@@ -34,10 +34,10 @@ def extract(
     config: str | Path | dict | list,
     output_dir: str | Path = "outputs",
     input_crs: str | None = None,
-    id_column: str = "id",
-    latitude_column: str = "lat",
-    longitude_column: str = "lon",
-    date_column: str = "date",
+    id_column: str = "gbifID",
+    latitude_column: str = "decimalLatitude",
+    longitude_column: str = "decimalLongitude",
+    date_column: str = "eventDate",
     write_metadata: bool = True,
 ) -> Dict[str, Path | pd.DataFrame]:
     """Extract environmental data for a set of geographic sample points.
@@ -94,10 +94,11 @@ def extract(
     ----------
     df : pd.DataFrame
         Input table of sample points. Must contain identifier and coordinate
-        columns (named ``id``, ``lat``, ``lon`` by default — override the names
-        with the ``*_column`` parameters below). An optional date column
-        (YYYY-MM-DD strings) enables nearest-date image selection for
-        time-varying datasets.
+        columns (named ``gbifID``, ``decimalLatitude``, ``decimalLongitude``
+        by default, following the GBIF / Darwin Core convention — override the
+        names with the ``*_column`` parameters below). An optional date column
+        (``eventDate``, YYYY-MM-DD strings) enables nearest-date image selection
+        for time-varying datasets.
     config : str, Path, dict, or list
         Output specification — see above. A path string or ``Path`` is loaded as
         YAML before processing.
@@ -111,18 +112,22 @@ def extract(
         omitted, coordinates are assumed to already be in WGS84.
     id_column : str, optional
         Name of the input column containing each row's identifier.
-        Defaults to ``"id"``. The output tables will use the same name.
+        Defaults to ``"gbifID"`` (GBIF / Darwin Core). The output
+        tables will use the same name.
     latitude_column : str, optional
         Name of the input column containing latitude values. Defaults
-        to ``"lat"``. The output tables will use the same name.
+        to ``"decimalLatitude"`` (GBIF / Darwin Core). The output tables
+        will use the same name.
     longitude_column : str, optional
         Name of the input column containing longitude values. Defaults
-        to ``"lon"``. The output tables will use the same name.
+        to ``"decimalLongitude"`` (GBIF / Darwin Core). The output tables
+        will use the same name.
     date_column : str, optional
         Name of the optional input column containing per-row dates.
-        Defaults to ``"date"``. If absent from ``df`` the date branch is
-        simply skipped — the extractor never errors on a missing date column.
-        The output tables will use the same name.
+        Defaults to ``"eventDate"`` (GBIF / Darwin Core). If absent from
+        ``df`` the date branch is simply skipped — the extractor never
+        errors on a missing date column. The output tables will use the
+        same name.
     write_metadata : bool, optional
         Whether to write the auxiliary files alongside the main output(s).
         When ``True`` (the default), the JSON metadata sidecar is written for
@@ -544,24 +549,65 @@ def _parse_and_validate_dates(
 
     raw_dates = df["date"].tolist()
 
+    # GBIF / Darwin Core ``eventDate`` follows ISO 8601 and is allowed to be
+    # an interval like ``"2026-05-12T13:00/2026-05-12T15:45"`` (start/end), a
+    # datetime with a time-of-day component, and may carry a timezone suffix
+    # (``Z``, ``+02:00``). Nearest-image lookup downstream only uses day
+    # precision, so collapse each entry to its date portion *before* handing
+    # it to pandas: take the start of any interval, drop the ``T...`` time
+    # component. This also avoids pandas's "mixed time zones" parsing path,
+    # which returns an object-dtype Index rather than a DatetimeIndex.
+    preprocessed_dates: list[str] = []
+    interval_truncation_count = 0
+    time_truncation_count = 0
+    for raw_date in raw_dates:
+        raw_date_str = str(raw_date).strip()
+        # Split on the first "/" to keep the start half of an interval.
+        if "/" in raw_date_str:
+            interval_truncation_count += 1
+            raw_date_str = raw_date_str.split("/", 1)[0]
+        # Then split on "T" to drop any time-of-day and timezone suffix.
+        if "T" in raw_date_str:
+            time_truncation_count += 1
+            raw_date_str = raw_date_str.split("T", 1)[0]
+        preprocessed_dates.append(raw_date_str)
+
+    # One aggregated warning per kind of truncation, not one per row — GBIF
+    # downloads routinely carry these formats and a per-row warning floods the
+    # console for no extra information.
+    if interval_truncation_count:
+        message = (
+            f"Truncated {interval_truncation_count} ISO 8601 date interval(s) "
+            f"('start/end') to their start day; nearest-image lookup only uses "
+            f"day precision."
+        )
+        warnings.warn(message, stacklevel=2)
+        date_warnings.append(message)
+    if time_truncation_count:
+        message = (
+            f"Dropped time-of-day from {time_truncation_count} date value(s); "
+            f"nearest-image lookup only uses day precision."
+        )
+        warnings.warn(message, stacklevel=2)
+        date_warnings.append(message)
+
     # format="mixed" lets pandas infer the format per-element, which is needed
     # to accept a mix of full ("2021-06-15"), year-month ("2021-06"), and
     # year-only ("2021") dates in the same column. Without this, pandas locks
     # onto the first element's format and raises on any entry that doesn't match.
     try:
-        parsed_dates = pd.to_datetime(raw_dates, format="mixed")
+        parsed_dates = pd.to_datetime(preprocessed_dates, format="mixed")
     except Exception as e:
         raise ValueError(f"Error parsing 'date' column: {e}. Expected dates in YYYY-MM-DD format.")
 
-    # Detect incomplete dates (year-only "2002" or year-month "2002-02") by splitting
-    # on "-". A complete date has 3 parts (YYYY-MM-DD); year-only has 1, year-month
-    # has 2. This correctly handles single-digit months/days like "2002-1-1"
-    # (still 3 parts → complete)
-    for raw_date, parsed_date in zip(raw_dates, parsed_dates):
-        raw_date_str = str(raw_date).strip()
-        if len(raw_date_str.split("-")) < 3:
+    # Detect incomplete dates (year-only "2002" or year-month "2002-02") by
+    # splitting on "-". A complete date has 3 parts (YYYY-MM-DD); year-only
+    # has 1, year-month has 2. This correctly handles single-digit months/days
+    # like "2002-1-1" (still 3 parts → complete).
+    for preprocessed_date, parsed_date in zip(preprocessed_dates, parsed_dates):
+        if len(preprocessed_date.split("-")) < 3:
             message = (
-                f"Date '{raw_date_str}' interpreted as {parsed_date.strftime('%Y-%m-%d')}. "
+                f"Date '{preprocessed_date}' interpreted as {parsed_date.strftime('%Y-%m-%d')}. "
                 f"Provide a full YYYY-MM-DD date if you want a specific day."
             )
             warnings.warn(message, stacklevel=2)
