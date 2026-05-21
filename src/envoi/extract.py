@@ -811,7 +811,6 @@ _ALL_KNOWN_REDUCERS = frozenset(
         "count",
         "mode",
         "point",
-        # categorical (expand to one column per class value at output time)
         "class_count",
         "class_fraction",
         "q05",
