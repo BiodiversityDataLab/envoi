@@ -327,6 +327,7 @@ class TestPointSampling:
                     "data_type": "continuous",
                     "bands": ["DEM"],
                     "derived_bands": ["slope", "aspect"],
+                    "supported_derived_bands": ["slope", "aspect"],
                 }
             }
         }
