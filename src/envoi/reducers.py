@@ -104,6 +104,52 @@ def r_mode(values: Iterable) -> float:
     return float(unique_values[np.argmax(counts)])
 
 
+# ---------- categorical reducers (dict-valued) ----------
+#
+# Unlike every other reducer in this module, the two below return a dict
+# mapping class value -> count or fraction. They expand into one output
+# column per class downstream (see _append_stat_columns in extract.py).
+# Adapters must detect the dict return shape and unpack it into per-class
+# stat keys; do NOT treat the return value as a scalar.
+
+
+def r_class_count(values: Iterable) -> Dict[int, int]:
+    """Return ``{class_value: pixel_count}`` for a categorical window.
+
+    Non-finite values (NaN, +/-inf) are filtered out the same way every
+    other reducer does. An empty window returns ``{}`` — the caller is
+    responsible for filling missing classes with 0 downstream.
+    """
+    finite_values = _finite(values)
+    if finite_values.size == 0:
+        return {}
+    # np.unique returns the sorted unique values and their counts; pair them up.
+    unique_values, counts = np.unique(finite_values, return_counts=True)
+    # Cast the class id to int so column names like "class_10_count" are clean.
+    # Float class codes (rare) are coerced; non-integral floats would still
+    # collapse here, but every categorical raster we ship uses integer codes.
+    return {int(value): int(count) for value, count in zip(unique_values, counts)}
+
+
+def r_class_fraction(values: Iterable) -> Dict[int, float]:
+    """Return ``{class_value: fraction_in_[0, 1]}`` for a categorical window.
+
+    The denominator is the total number of finite pixels in the window, so
+    the per-class fractions sum to 1.0 across the classes that are actually
+    present in the window. An empty window returns ``{}``; the caller fills
+    absent classes with 0.0 downstream.
+    """
+    finite_values = _finite(values)
+    if finite_values.size == 0:
+        return {}
+    unique_values, counts = np.unique(finite_values, return_counts=True)
+    # Total = number of valid pixels in the window. Used as the denominator
+    # so fractions are normalised within the observed (finite) pixels only,
+    # not against the geometric window size.
+    total_pixels = finite_values.size
+    return {int(value): float(count) / total_pixels for value, count in zip(unique_values, counts)}
+
+
 # ---------- quantiles ----------
 
 
@@ -141,6 +187,9 @@ _REGISTRY: Dict[str, Callable] = {
     "var": r_var,
     "count": r_count,
     "mode": r_mode,
+    # categorical (dict-valued — expanded per-class downstream)
+    "class_count": r_class_count,
+    "class_fraction": r_class_fraction,
     # quantiles (rich but still lightweight)
     "q05": make_quantile(0.05),
     "q10": make_quantile(0.10),
@@ -179,6 +228,17 @@ CONTINUOUS_ONLY_REDUCERS = {
 }
 
 
+# Reducers that assume categorical data (discrete class IDs). Computing a
+# per-class histogram of a continuous raster is technically possible but
+# almost always a mistake (e.g. floating-point DEM values would each produce
+# their own "class"). validate_reducers() warns when these are requested on
+# continuous datasets.
+CATEGORICAL_ONLY_REDUCERS = {
+    "class_count",
+    "class_fraction",
+}
+
+
 # ---------- public API ----------
 
 
@@ -211,18 +271,49 @@ def validate_reducers(
 
     Returns the warning message string if a warning was raised, else None.
     The caller can collect these for inclusion in the run metadata.
+
+    Two directions are checked:
+      * categorical dataset + continuous-only reducer (e.g. ``mean`` on land
+        cover) — meaningless because class IDs aren't ordinal.
+      * continuous dataset + categorical-only reducer (e.g. ``class_count``
+        on a DEM) — would treat each floating-point pixel value as its own
+        "class" and produce a useless explosion of columns.
+
+    When ``data_type`` is None (common for local rasters where the type
+    isn't declared in the catalog), we conservatively treat the dataset as
+    continuous so the categorical-only warning still fires; the continuous-
+    only side stays silent because most rasters genuinely are continuous.
     """
-    if data_type != "categorical":
+    # ---- categorical dataset: warn about continuous-only reducers ----
+    if data_type == "categorical":
+        invalid_reducer_names = [
+            reducer_name
+            for reducer_name in reducer_names
+            if reducer_name.lower() in CONTINUOUS_ONLY_REDUCERS
+        ]
+        if invalid_reducer_names:
+            msg = (
+                f"Dataset '{dataset_name}' is categorical but reducers {invalid_reducer_names} "
+                f"assume continuous data. Consider using 'point', 'mode', 'count', "
+                f"'class_count', or 'class_fraction' instead."
+            )
+            logger.warning(msg)
+            return msg
         return None
+
+    # ---- continuous (or unknown) dataset: warn about categorical-only reducers ----
+    # We treat unknown/None as continuous for this direction — class_count on
+    # a DEM is virtually always a user mistake worth flagging.
     invalid_reducer_names = [
         reducer_name
         for reducer_name in reducer_names
-        if reducer_name.lower() in CONTINUOUS_ONLY_REDUCERS
+        if reducer_name.lower() in CATEGORICAL_ONLY_REDUCERS
     ]
     if invalid_reducer_names:
         msg = (
-            f"Dataset '{dataset_name}' is categorical but reducers {invalid_reducer_names} assume "
-            f"continuous data. Consider using 'point', 'mode' or 'count' instead."
+            f"Dataset '{dataset_name}' has data_type='{data_type}' (treated as continuous) "
+            f"but reducers {invalid_reducer_names} assume categorical (discrete-class) data. "
+            f"Set data_type: categorical in the catalog if this dataset really is categorical."
         )
         logger.warning(msg)
         return msg
