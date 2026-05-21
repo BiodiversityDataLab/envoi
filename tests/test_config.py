@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from envoi import reset_catalog, update_catalog
+from envoi import list_datasets, reset_catalog, update_catalog
 from envoi.config import (
     BUILTIN_EE_CATALOG,
     CatalogError,
@@ -243,3 +243,95 @@ class TestLoadCatalogsMerge:
         # and parsed.
         merged = load_catalogs(BUILTIN_EE_CATALOG)
         assert merged["datasets"], "builtin EE catalog should not be empty"
+
+
+# ------------------------------------------------------------------
+# list_datasets — verbosity levels, merged-catalog view, error handling.
+# ------------------------------------------------------------------
+
+
+class TestListDatasets:
+    """list_datasets() surfaces the merged catalog at three verbosity levels.
+
+    These tests use capsys to assert both the printed output and the returned
+    object — list_datasets() is documented to do both, so each test checks
+    that both halves of the contract hold.
+    """
+
+    def test_names_returns_sorted_list_of_strings(self, capsys):
+        # Default verbosity is "names" — should return a sorted list of
+        # dataset keys and print one key per line.
+        result = list_datasets()
+        captured = capsys.readouterr()
+        assert isinstance(result, list)
+        assert all(isinstance(name, str) for name in result)
+        # Sorted is part of the contract so output is deterministic.
+        assert result == sorted(result)
+        # Every returned name should also appear in the printed output.
+        printed_lines = captured.out.strip().splitlines()
+        assert set(result) == set(printed_lines)
+
+    def test_names_includes_a_known_builtin_dataset(self, capsys):
+        # Smoke check that the merged view actually exposes built-in
+        # datasets (not just an empty list). dem_aster is a stable entry
+        # in the bundled catalog used elsewhere in the README/tests.
+        result = list_datasets("names")
+        capsys.readouterr()  # discard printed output
+        assert "dem_aster" in result
+
+    def test_info_returns_records_with_expected_fields(self, capsys):
+        # "info" verbosity returns a list of dicts with the human-readable
+        # metadata fields. Missing fields are stored as None so callers can
+        # filter consistently without KeyError surprises.
+        records = list_datasets("info")
+        capsys.readouterr()  # discard printed output
+        assert isinstance(records, list)
+        assert all(isinstance(r, dict) for r in records)
+        expected_fields = {
+            "name",
+            "data_source",
+            "data_type",
+            "description",
+            "citation",
+            "ee_source_url",
+            "source_url",
+        }
+        # Every record must expose the full info-level field set, even if
+        # some values are None — the shape is part of the contract.
+        for record in records:
+            assert expected_fields <= set(record.keys())
+
+    def test_full_returns_complete_entries(self, capsys):
+        # "full" verbosity returns the entire catalog entry plus a "name"
+        # field. For at least one known dataset we expect to see the
+        # top-level keys present in the YAML (path, data_source, etc.).
+        records = list_datasets("full")
+        capsys.readouterr()  # discard printed output
+        by_name = {r["name"]: r for r in records}
+        dem_aster = by_name["dem_aster"]
+        assert dem_aster["data_source"] == "earth_engine"
+        assert "path" in dem_aster
+
+    def test_includes_user_registered_datasets(self, capsys):
+        # User-registered datasets should show up alongside built-ins —
+        # this matches what extract() sees, so the listing is honest.
+        update_catalog(
+            {
+                "datasets": {
+                    "my_test_dataset": {
+                        "data_source": "local",
+                        "path": "/tmp/nonexistent.tif",
+                    }
+                }
+            }
+        )
+        names = list_datasets("names")
+        capsys.readouterr()  # discard printed output
+        assert "my_test_dataset" in names
+
+    def test_invalid_verbosity_raises_value_error(self):
+        # A typo in verbosity should fail loudly, not silently default —
+        # the error message must surface the supported levels so the
+        # caller can fix the typo without reading the source.
+        with pytest.raises(ValueError, match="verbosity must be one of"):
+            list_datasets("verbose")
