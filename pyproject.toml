@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "envoi"
 version = "0.2.0"
-description = "Automated feature extraction from environmental datasets for ecological and spatial analysis."
+description = "Automated feature extraction from environmental data sources for ecological and spatial analysis."
 authors = [
     { name = "Adrian Baggström", email = "adrian.baggstrom@ebc.uu.se" },
     { name = "Jakob Nyström", email = "jakob.nystrom@ebc.uu.se" },
@@ -24,7 +24,7 @@ dependencies = [
     "pyarrow>=17.0.0",
     "tqdm>=4.65",
     "earthengine-api>=1.7",
-    "geemap>=0.36",
+    "requests>=2.31",
 ]
 
 classifiers = [
