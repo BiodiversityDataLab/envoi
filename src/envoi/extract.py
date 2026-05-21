@@ -229,7 +229,6 @@ def extract(
                 # and returns the path plus the per-dataset metadata dict. With
                 # multiple windows the filename suffix keeps each window's
                 # tiles distinct inside the same dataset folder.
-                # TODO: QC for raster mode is not yet implemented. Needed?
                 elif output_type == "raster":
                     tiles_root = Path(output_dir) / batch_id
                     suffix = f"{window_size}m" if is_multi_window else None
@@ -626,6 +625,16 @@ def _normalize_dataset_entry(
             raise ValueError(f"Output '{batch_id}': dataset name cannot be empty.")
         if entry not in catalog_datasets:
             raise KeyError(f"Output '{batch_id}': dataset(s) ['{entry}'] not found in catalog.")
+        # Even with no per-call override, the catalog default `derived_bands`
+        # still becomes the effective list. Validate it against the dataset's
+        # applicability whitelist so a misconfigured catalog entry surfaces
+        # up front instead of silently producing nonsense bands.
+        _validate_effective_derived_bands(
+            override_derived=[],
+            dataset_name=entry,
+            dataset_config=catalog_datasets[entry],
+            batch_id=batch_id,
+        )
         return entry, {}
 
     # ---- shapes 2 & 3: single-key dict ----
@@ -694,7 +703,8 @@ def _normalize_dataset_entry(
     # Local rasters cannot have derived bands (no slope/aspect computation
     # path exists in LocalRasterAdapter). Surface this clearly so the user
     # knows the catalog is the right place for that.
-    data_source = catalog_datasets[name].get("data_source")
+    dataset_config = catalog_datasets[name]
+    data_source = dataset_config.get("data_source")
     if derived_bands and data_source != "earth_engine":
         raise ValueError(
             f"Output '{batch_id}': dataset '{name}' is a {data_source!r} raster — "
@@ -702,12 +712,76 @@ def _normalize_dataset_entry(
             f"earth_engine datasets."
         )
 
+    # Enforce the catalog's per-dataset applicability whitelist. A derived
+    # band (e.g. slope) only makes physical sense for some datasets (e.g.
+    # DEMs), so the catalog declares `supported_derived_bands` to mark which
+    # derived bands are valid here. The check runs against the EFFECTIVE
+    # derived bands — the call-site override if present, otherwise the
+    # catalog's `derived_bands` default — so a misconfigured catalog entry
+    # surfaces even when the user supplies no override.
+    _validate_effective_derived_bands(
+        override_derived=derived_bands,
+        dataset_name=name,
+        dataset_config=dataset_config,
+        batch_id=batch_id,
+    )
+
     band_overrides: Dict[str, Any] = {}
     if source_bands:
         band_overrides["bands"] = source_bands
     if derived_bands:
         band_overrides["derived_bands"] = derived_bands
     return name, band_overrides
+
+
+def _validate_effective_derived_bands(
+    *,
+    override_derived: list,
+    dataset_name: str,
+    dataset_config: dict,
+    batch_id: str,
+) -> None:
+    """Raise ValueError if the effective derived bands violate the whitelist.
+
+    The effective list is the call-site override when provided; otherwise it
+    falls back to the catalog's own `derived_bands` default. The list is then
+    validated against the dataset's `supported_derived_bands` whitelist — a
+    missing or empty whitelist means the dataset declines derived bands
+    entirely.
+    """
+    # When the user passed any derived bands at the call site, those win and
+    # we ignore the catalog default. Otherwise the catalog default IS the
+    # effective list and must also satisfy the whitelist.
+    if override_derived:
+        effective = list(override_derived)
+    else:
+        catalog_default = dataset_config.get("derived_bands")
+        if isinstance(catalog_default, str):
+            effective = [catalog_default]
+        elif catalog_default:
+            effective = list(catalog_default)
+        else:
+            effective = []
+
+    if not effective:
+        return
+
+    supported = dataset_config.get("supported_derived_bands") or []
+    unsupported = [b for b in effective if b not in supported]
+    if not unsupported:
+        return
+
+    if supported:
+        supported_msg = f"Supported for this dataset: {sorted(supported)}."
+    else:
+        supported_msg = (
+            "This dataset does not declare `supported_derived_bands` in the catalog, "
+            "so no derived bands are allowed for it."
+        )
+    raise ValueError(
+        f"Output '{batch_id}': dataset '{dataset_name}' does not support derived "
+        f"band(s) {sorted(set(unsupported))}. {supported_msg}"
+    )
 
 
 def _parse_run_config(
@@ -770,7 +844,7 @@ def _parse_run_config(
     else:
         stats, user_stats = {}, None
 
-    # window_size_m can be either a single positive number or a list of them.
+    # window_size_m can be either a single positive integer or a list of them.
     # When the user supplies a list, statistics (or tiles) are produced for
     # each window size and the column / filename suffix disambiguates them.
     user_window_size = settings.get("window_size_m", defaults["window_size_m"])
@@ -781,8 +855,16 @@ def _parse_run_config(
     else:
         window_sizes = [user_window_size]
     for window_size in window_sizes:
-        if not isinstance(window_size, (int, float)) or window_size <= 0:
-            raise ValueError(f"Invalid window_size_m: {window_size}. Must be a positive number.")
+        # Reject non-integers explicitly. window_size feeds f-string column
+        # names like "{dataset}_mean_{window_size_m}m", and a float would
+        # silently yield columns like "dem_mean_200.0m" — breaking schema
+        # expectations downstream. ``bool`` is a subclass of ``int`` in
+        # Python, so we filter it out first to avoid accepting True/False.
+        if isinstance(window_size, bool) or not isinstance(window_size, int) or window_size <= 0:
+            raise ValueError(
+                f"Output '{batch_id}': invalid window_size_m: {window_size!r}. "
+                f"Must be a positive integer (or a list of positive integers)."
+            )
 
     return RunSettings(
         batch_id=batch_id,
