@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "envoi"
-version = "0.2.0"
+version = "0.1.0"
 description = "Automated feature extraction from environmental data sources for ecological and spatial analysis."
 authors = [
     { name = "Adrian Baggström", email = "adrian.baggstrom@ebc.uu.se" },
