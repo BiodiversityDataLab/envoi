@@ -342,3 +342,8 @@ The source, including descriptions, citations, and URLs for every entry, is [src
 - **Contributing** — [CONTRIBUTORS.md](CONTRIBUTORS.md)
 - **Issues / bug reports** — [github.com/BiodiversityDataLab/envoi/issues](https://github.com/BiodiversityDataLab/envoi/issues)
 - **Repository** — [github.com/BiodiversityDataLab/envoi](https://github.com/BiodiversityDataLab/envoi)
+
+---
+
+*Take these points: cross sky and stone;  
+return them clothed, no longer alone.*
