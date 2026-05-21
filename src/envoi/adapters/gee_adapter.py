@@ -23,7 +23,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 import ee
-import geemap
+import requests
 
 try:
     from . import register as _register
@@ -33,6 +33,63 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 _gee_initialized = False
+
+# GEE's synchronous getDownloadURL endpoint refuses responses larger than
+# about 32 MB (the documented limit; some empirical reports place it closer
+# to 48–50 MB). We pre-check against the conservative number so users get an
+# actionable error from us rather than an opaque 400 from GEE.
+GEE_SYNC_LIMIT_BYTES = 32 * 1024 * 1024
+
+# How long to wait for a single tile download before giving up. Tiles are at
+# most a few tens of MB and GEE usually answers in seconds, but the request
+# also covers GEE's server-side image assembly, which can take longer for
+# heavy ImageCollection composites.
+_TILE_DOWNLOAD_TIMEOUT_S = 120
+
+# Number of times we retry transient HTTP failures (429 / 5xx) with
+# exponential backoff. Three attempts means waits of roughly 1s, 2s, 4s
+# between tries — enough to ride out brief GEE hiccups without making a
+# failed batch crawl.
+_TILE_DOWNLOAD_MAX_RETRIES = 3
+
+
+def _check_tile_size(
+    *,
+    window_m: float,
+    scale_m: float,
+    band_count: int,
+    dataset_name: str,
+) -> None:
+    """Raise ValueError if a sync download would exceed GEE's response limit.
+
+    Pure-Python size estimate — no GEE calls — so it can be unit-tested
+    without credentials and lifted out of :meth:`GeeRasterAdapter._guard_tile_size`.
+
+    The error message names every knob the user can turn so they can fix
+    the problem without reading our source.
+    """
+    # window_m is the tile side length in metres and scale_m is the pixel
+    # size, so (window_m / scale_m) is the pixel count per side.
+    # max(1, ...) mirrors the pixel floor used when building the export
+    # region — a sub-pixel window still produces a 1×1 raster, not zero.
+    pixels_per_side = max(1, round(window_m / scale_m))
+    total_pixels = pixels_per_side * pixels_per_side
+
+    # Assume float32 (4 bytes/pixel) as a conservative upper bound. GEE's
+    # actual response is often smaller (int16 + compression), but
+    # overshooting here is safer than letting an oversized request through.
+    estimated_bytes = total_pixels * max(1, band_count) * 4
+    if estimated_bytes <= GEE_SYNC_LIMIT_BYTES:
+        return
+
+    raise ValueError(
+        f"Requested tile is too large for GEE's synchronous download "
+        f"endpoint (estimated {estimated_bytes / 1e6:.1f} MB > "
+        f"{GEE_SYNC_LIMIT_BYTES / 1e6:.0f} MB limit). "
+        f"Reduce window_size_m (currently {window_m}), "
+        f"increase resample_m (currently {scale_m}), or select fewer "
+        f"bands for dataset '{dataset_name}'."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -770,7 +827,8 @@ class GeeRasterAdapter(BaseAdapter):
        When ``"point"`` is included in the requested reducers, an exact-pixel
        sample at each ``(lat, lon)`` is added as a second server-side branch
        and resolved in the same round-trip.
-    2. **export_tiles** — download full GeoTIFF tiles via ``geemap``.
+    2. **export_tiles** — download full GeoTIFF tiles via
+       ``ee.Image.getDownloadURL`` + ``requests`` (no ``geemap`` dependency).
 
     For ImageCollections, the adapter selects an image per point based
     on the catalog's ``collection_date_policy``: ``"nearest"`` (default)
@@ -1668,7 +1726,7 @@ class GeeRasterAdapter(BaseAdapter):
         return results
 
     # ------------------------------------------------------------------
-    # Mode 2: Image export  (geemap → GeoTIFF)
+    # Mode 2: Image export  (ee.Image.getDownloadURL → GeoTIFF)
     # ------------------------------------------------------------------
 
     def _export_single(
@@ -1715,18 +1773,121 @@ class GeeRasterAdapter(BaseAdapter):
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # verbose=False suppresses geemap's per-tile "Downloading data from..."
-        # and "Data downloaded to..." prints, which otherwise interleave with
-        # and disrupt the tqdm progress bar in export_tiles.
-        geemap.ee_export_image(
-            img,
-            filename=str(output_path),
-            scale=scale_m,
-            region=region,
-            crs=utm,
-            verbose=False,
+        # output_path is laid out as <root>/<batch_id>/<dataset_name>/<file>.tif
+        # by export_tiles, so the parent directory's name is the dataset name —
+        # used purely for the error message in _guard_tile_size.
+        dataset_name = output_path.parent.name
+
+        # Fail fast (with actionable guidance) before asking GEE for a URL,
+        # so oversized tiles surface as a clean ValueError instead of an
+        # opaque HTTP 400 from getDownloadURL.
+        self._guard_tile_size(img, window_m=window_m, scale_m=scale_m, dataset_name=dataset_name)
+
+        self._download_tile_via_url(
+            img, region=region, scale_m=scale_m, crs=utm, output_path=output_path
         )
         return output_path
+
+    # ------------------------------------------------------------------
+    # Mode 2 helpers: pre-flight size check + URL-based tile download
+    # ------------------------------------------------------------------
+
+    def _guard_tile_size(
+        self,
+        img: ee.Image,
+        *,
+        window_m: float,
+        scale_m: float,
+        dataset_name: str,
+    ) -> None:
+        """Raise ValueError if the requested tile would exceed GEE's sync limit.
+
+        Thin wrapper around :func:`_check_tile_size` — it only exists to
+        fetch the band count off the GEE image (which requires a live
+        adapter), then hands the pure-Python size check to the module-level
+        function so the latter stays unit-testable without GEE creds.
+        """
+        # _get_band_name populates _cached_band_count as a side effect. It
+        # may already be warm (export_tiles primes it in line ~1773), but we
+        # call it here so the size guard is self-contained and works even
+        # for callers that didn't go through export_tiles.
+        self._get_band_name(img)
+        band_count = getattr(self, "_cached_band_count", 1) or 1
+
+        _check_tile_size(
+            window_m=window_m,
+            scale_m=scale_m,
+            band_count=band_count,
+            dataset_name=dataset_name,
+        )
+
+    def _download_tile_via_url(
+        self,
+        img: ee.Image,
+        *,
+        region: ee.Geometry,
+        scale_m: float,
+        crs: str,
+        output_path: Path,
+    ) -> None:
+        """Download one tile via ``ee.Image.getDownloadURL`` + ``requests``.
+
+        Asks GEE for a single multi-band GeoTIFF (``format='GEO_TIFF'``
+        with ``filePerBand=False``) so we get a TIFF in the response body
+        directly — no zip wrapping, no per-band extraction step. Streams
+        the response straight to ``output_path`` with retries for
+        transient HTTP errors.
+        """
+        # GEE's getDownloadURL is server-side: it builds the URL synchronously
+        # but the URL itself points to a streamed export, so the actual image
+        # generation happens during the GET below.
+        url = img.getDownloadURL(
+            {
+                "scale": scale_m,
+                "region": region,
+                "crs": crs,
+                "format": "GEO_TIFF",
+                "filePerBand": False,
+            }
+        )
+
+        # Retry loop for transient errors (429 = rate-limited, 5xx = GEE-side
+        # blip). Permanent errors (4xx other than 429) raise immediately so
+        # we don't waste time retrying a bad request.
+        import time
+
+        last_error: Exception | None = None
+        for attempt in range(_TILE_DOWNLOAD_MAX_RETRIES):
+            try:
+                response = requests.get(url, stream=True, timeout=_TILE_DOWNLOAD_TIMEOUT_S)
+                status_code = response.status_code
+                if status_code == 429 or 500 <= status_code < 600:
+                    # Drain the connection and back off before retrying.
+                    response.close()
+                    last_error = RuntimeError(
+                        f"GEE tile download returned HTTP {status_code} on attempt {attempt + 1}"
+                    )
+                    time.sleep(2**attempt)
+                    continue
+                response.raise_for_status()
+
+                # Stream to disk in 1 MiB chunks so peak memory stays bounded
+                # even for the largest allowed tiles (~32 MB).
+                with output_path.open("wb") as output_file:
+                    for chunk in response.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            output_file.write(chunk)
+                return
+            except requests.RequestException as request_error:
+                # Connection errors / timeouts also get the backoff treatment.
+                last_error = request_error
+                time.sleep(2**attempt)
+
+        # Exhausted retries — surface the last error so export_tiles can
+        # log it per-point and mark the result slot as None.
+        raise RuntimeError(
+            f"Failed to download GEE tile after {_TILE_DOWNLOAD_MAX_RETRIES} attempts: {last_error}"
+        )
 
     def export_tiles(
         self,

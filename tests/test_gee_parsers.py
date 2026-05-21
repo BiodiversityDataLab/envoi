@@ -13,7 +13,11 @@ most cases here verify that path.
 from __future__ import annotations
 
 
+import pytest
+
 from envoi.adapters.gee_adapter import (
+    GEE_SYNC_LIMIT_BYTES,
+    _check_tile_size,
     _dedupe_categorical_for_ee,
     _parse_multiband_result,
     _parse_reduce_result,
@@ -198,3 +202,50 @@ class TestParseMultibandResultClassCount:
             suffixes=["_histogram"],
         )
         assert parsed == {"B1_class_10_count": 4}
+
+
+# ------------------------------------------------------------------
+# _check_tile_size — pure-Python sync-download size guard.
+# ------------------------------------------------------------------
+
+
+class TestCheckTileSize:
+    def test_small_request_passes(self):
+        # 500 m window at 10 m resolution = 50×50 = 2500 pixels × 4 bytes ×
+        # 1 band = 10 KB. Well under the 32 MB limit, so no exception.
+        _check_tile_size(
+            window_m=500,
+            scale_m=10,
+            band_count=1,
+            dataset_name="dem_aster",
+        )
+
+    def test_oversized_request_raises_with_actionable_message(self):
+        # 100 km window at 1 m resolution = 10^10 pixels × 4 bytes ~ 40 GB.
+        # Comfortably over the limit; the message must name every knob the
+        # user can turn so they don't have to read our source to fix it.
+        with pytest.raises(ValueError) as excinfo:
+            _check_tile_size(
+                window_m=100_000,
+                scale_m=1,
+                band_count=1,
+                dataset_name="dem_glo30",
+            )
+        message = str(excinfo.value)
+        assert "window_size_m" in message
+        assert "resample_m" in message
+        assert "dem_glo30" in message
+        # Sanity-check the reported limit comes from the constant, not a
+        # magic number — keeps the assertion honest if we ever raise the cap.
+        assert f"{GEE_SYNC_LIMIT_BYTES / 1e6:.0f} MB" in message
+
+    def test_band_count_inflates_estimate(self):
+        # A multi-band request that's under the limit at 1 band must trip
+        # the guard at 20 bands. Confirms the band_count factor is actually
+        # used in the estimate rather than ignored.
+        kwargs = {"window_m": 3000, "scale_m": 10, "dataset_name": "multi_band"}
+        # 300×300×4 = 360 KB at 1 band → safe.
+        _check_tile_size(band_count=1, **kwargs)
+        # × 200 bands ~ 72 MB → must raise.
+        with pytest.raises(ValueError):
+            _check_tile_size(band_count=200, **kwargs)
