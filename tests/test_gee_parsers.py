@@ -19,7 +19,6 @@ from envoi.adapters.gee_adapter import (
     _parse_reduce_result,
 )
 
-
 # ------------------------------------------------------------------
 # _dedupe_categorical_for_ee — both class_* names map to one EE call.
 # ------------------------------------------------------------------
