@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -448,7 +449,46 @@ _EE_REDUCER_MAP = {
     "max": ("max", "_max"),
     "count": ("count", "_count"),
     "sum": ("sum", "_sum"),
+    # Categorical: frequencyHistogram returns a {class_value: count} dict
+    # under the "{band}_histogram" key. The parsing helpers unpack that dict
+    # into one stat key per class (e.g. class_10_count).
+    # class_fraction is intentionally NOT registered here — it shares the
+    # same EE reducer as class_count and is derived in Python from the
+    # histogram + the per-band valid-pixel count.
+    "class_count": ("frequencyHistogram", "_histogram"),
 }
+
+
+# Matches stat-dict keys produced by the histogram unpack step:
+#   single-band: "class_10_count"
+#   multi-band:  "<band>_class_10_count" (e.g. "Map_class_10_count")
+# Used by the fraction post-process and by the "strip counts if the user
+# didn't ask for class_count" cleanup in _fetch_stats_single.
+_CLASS_COUNT_KEY_RE = re.compile(r"^(?P<prefix>.*?)class_(?P<value>-?\d+)_count$")
+
+
+def _dedupe_categorical_for_ee(reducer_names: Sequence[str]) -> list[str]:
+    """Collapse ``class_count`` + ``class_fraction`` to a single EE call.
+
+    Both reducers rely on the same server-side ``ee.Reducer.frequencyHistogram``;
+    duplicating it in the combined reducer would either error (duplicate
+    output name) or waste a server-side pass. The function returns a list
+    where ``class_fraction`` has been replaced/removed so only one
+    ``class_count`` entry remains. The original list (with ``class_fraction``)
+    is preserved by the caller and used later to decide whether the fraction
+    keys need to be derived in Python.
+    """
+    deduped: list[str] = []
+    histogram_already_added = False
+    for reducer_name in reducer_names:
+        if reducer_name in ("class_count", "class_fraction"):
+            if not histogram_already_added:
+                deduped.append("class_count")
+                histogram_already_added = True
+            # else: drop the duplicate quietly — histogram already in the call.
+        else:
+            deduped.append(reducer_name)
+    return deduped
 
 
 def _get_ee_reducer(reducer_name: str) -> tuple[ee.Reducer, str]:
@@ -506,12 +546,35 @@ def _parse_reduce_result(
     GEE keys the output as ``{band}{suffix}`` — e.g. ``elevation_mean``.
     For a single reducer with no combination, GEE may omit the suffix and
     use just the band name.
+
+    Special case: when ``reducer_name == "class_count"`` the GEE value at
+    ``{band}_histogram`` is itself a ``dict[str, number]`` (class id → count).
+    We expand it into one stat key per class instead of storing the dict
+    under a single ``class_count`` key, so downstream column-naming code
+    sees ordinary scalar entries.
     """
     result_dict: dict[str, float | None] = {}
     if not result:
-        return {r: None for r in reducer_names}
+        # class_count produces *zero* keys when the window had no data, so the
+        # row's stat dict simply lacks any class entries (downstream will
+        # zero-fill). Every other reducer gets an explicit None placeholder.
+        return {r: None for r in reducer_names if r != "class_count"}
 
     for reducer_name, suffix in zip(reducer_names, suffixes):
+        if reducer_name == "class_count":
+            # Histogram lives under "{band}_histogram"; for a lone reducer GEE
+            # may omit the suffix, so fall back to the bare band key as well.
+            output_key = f"{band_name}{suffix}"
+            histogram = result.get(output_key)
+            if histogram is None and len(reducer_names) == 1:
+                histogram = result.get(band_name)
+            if histogram:
+                # Class ids come back as JSON strings (e.g. "10"); float→int
+                # tolerates legitimate float codes that round to an int.
+                for class_str, count_value in histogram.items():
+                    result_dict[f"class_{int(float(class_str))}_count"] = int(count_value)
+            continue
+
         # Try with suffix first, then bare band name (single-reducer case)
         output_key = f"{band_name}{suffix}"
         value = result.get(output_key)
@@ -538,6 +601,10 @@ def _parse_multiband_result(
     request. Either way the result is a combined-form dict, so GEE emits
     ``{band}{gee_suffix}`` keys (e.g. ``"bio01_mean"``) and we always use
     suffix-based parsing here.
+
+    Special case: ``class_count`` returns a histogram-dict at
+    ``{band}_histogram`` instead of a scalar. Each band's dict is unpacked
+    into ``{band}_class_{value}_count`` keys.
     """
     if not result:
         return {}
@@ -545,6 +612,20 @@ def _parse_multiband_result(
     result_dict: dict[str, float | None] = {}
 
     for reducer_name, suffix in zip(reducer_names, suffixes):
+        if reducer_name == "class_count":
+            # For each band's histogram entry, unpack the inner dict into
+            # one stat key per class. Empty / None histograms (no data for
+            # that band's window) simply produce no keys.
+            for output_key, histogram in result.items():
+                if not output_key.endswith(suffix):
+                    continue
+                band = output_key[: -len(suffix)]
+                if not histogram:
+                    continue
+                for class_str, count_value in histogram.items():
+                    result_dict[f"{band}_class_{int(float(class_str))}_count"] = int(count_value)
+            continue
+
         # Find every key that ends with this reducer's suffix (e.g. "_mean").
         # Count keys (added by the caller for QC) are skipped here unless
         # the user actually asked for a "count" reducer themselves.
@@ -1221,7 +1302,13 @@ class GeeRasterAdapter(BaseAdapter):
         multiband = not isinstance(spec_band, str) and band_count > 1
 
         # Window-side: one None value per requested non-point reducer.
-        stats: dict[str, float | None] = {r: None for r in reducer_names}
+        # Categorical class reducers are intentionally skipped — they produce
+        # *per-class* keys (e.g. "class_10_count") on success, so on failure
+        # we emit no class keys and let _append_stat_columns zero-fill the
+        # corresponding columns alongside any successful rows in the batch.
+        stats: dict[str, float | None] = {
+            r: None for r in reducer_names if r not in ("class_count", "class_fraction")
+        }
 
         # Point-side: mirror the success-path shape — multi-band emits one
         # "{band}_point" key per band; single-band emits a bare "point" key.
@@ -1261,6 +1348,7 @@ class GeeRasterAdapter(BaseAdapter):
         *,
         want_point: bool = False,
         date=None,
+        original_reducer_names: Sequence[str] | None = None,
     ):
         """Compute server-side stats for a single point via reduceRegion.
 
@@ -1279,7 +1367,17 @@ class GeeRasterAdapter(BaseAdapter):
         ``(stats_dict, meta_dict)`` tuple with merged keys:
         - window keys: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
         - point  keys: ``"point"``  (single band) or ``{band}_point``     (multi-band)
+
+        ``original_reducer_names`` carries the *un-deduped* user request
+        (i.e. with ``class_fraction`` still present if asked for). It is
+        used only by the categorical post-process: ``class_fraction`` is
+        derived from the histogram counts after parsing, and the count
+        keys are stripped if the user only asked for fractions.
         """
+        # Fall back to the deduped list when the caller didn't pass the
+        # original — preserves the old single-reducer test entry points.
+        if original_reducer_names is None:
+            original_reducer_names = reducer_names
         img = self._get_image(date, lat=lat, lon=lon)
         region = self._make_region(lat, lon, window_m)
 
@@ -1363,6 +1461,51 @@ class GeeRasterAdapter(BaseAdapter):
             else:
                 window_stats = _parse_reduce_result(window_raw, band_name, reducer_names, suffixes)
             valid_count = _extract_count_from_reduce_result(window_raw, band_name, multiband)
+
+            # ---- categorical post-process ----
+            # We always ask GEE for `class_count` (frequencyHistogram) when
+            # the user wants either class_count or class_fraction; fractions
+            # are derived locally from the histogram's own per-band pixel
+            # total. (Using the histogram's own sum — rather than a parallel
+            # ee.Reducer.count() result — guarantees fractions sum to 1.0
+            # per row by construction. The two can disagree on some GEE
+            # datasets because the masks they honour aren't always identical.)
+            user_wants_fraction = "class_fraction" in original_reducer_names
+            user_wants_count = "class_count" in original_reducer_names
+            if user_wants_fraction:
+                # Group the just-parsed class_*_count entries by their prefix
+                # (single-band → "", multi-band → "<band>_") and sum each
+                # group to get the denominator for that band's fractions.
+                class_totals_by_prefix: dict[str, int] = {}
+                for stat_key, count_value in window_stats.items():
+                    match = _CLASS_COUNT_KEY_RE.match(stat_key)
+                    if match is None or count_value is None:
+                        continue
+                    prefix = match.group("prefix")
+                    class_totals_by_prefix[prefix] = (
+                        class_totals_by_prefix.get(prefix, 0) + count_value
+                    )
+
+                # Iterate a snapshot so adding fraction keys mid-loop is safe.
+                for stat_key in list(window_stats):
+                    match = _CLASS_COUNT_KEY_RE.match(stat_key)
+                    if match is None:
+                        continue
+                    prefix = match.group("prefix")
+                    class_value = match.group("value")
+                    count_value = window_stats[stat_key]
+                    if count_value is None:
+                        continue
+                    total = class_totals_by_prefix.get(prefix, 0)
+                    if total > 0:
+                        window_stats[f"{prefix}class_{class_value}_fraction"] = count_value / total
+
+            # If the user asked only for class_fraction, drop the
+            # class_*_count keys we generated internally to derive fractions.
+            if not user_wants_count and user_wants_fraction:
+                for stat_key in list(window_stats):
+                    if _CLASS_COUNT_KEY_RE.match(stat_key) is not None:
+                        del window_stats[stat_key]
 
         # ---- parse point branch ----
         point_stats: dict[str, float | None] = {}
@@ -1453,7 +1596,13 @@ class GeeRasterAdapter(BaseAdapter):
         # combined window reducer; it gets its own server-side branch.
         reducer_names = list(reducer_names)
         want_point = "point" in reducer_names
-        window_reducers = [r for r in reducer_names if r != "point"]
+        # `original_window_reducers` keeps the user-requested list (incl. any
+        # class_fraction) so _fetch_stats_single can decide what to derive
+        # locally. `ee_window_reducers` is the deduped list fed to the
+        # server-side combined reducer — class_fraction is merged into
+        # class_count because they share frequencyHistogram in EE.
+        original_window_reducers = [r for r in reducer_names if r != "point"]
+        ee_window_reducers = _dedupe_categorical_for_ee(original_window_reducers)
 
         n = len(lats)
         lats = list(lats)
@@ -1468,8 +1617,8 @@ class GeeRasterAdapter(BaseAdapter):
 
         # Build the window reducer once when window stats are requested;
         # leave it None for point-only runs.
-        if window_reducers:
-            combined_reducer, suffixes = _build_combined_reducer(window_reducers)
+        if ee_window_reducers:
+            combined_reducer, suffixes = _build_combined_reducer(ee_window_reducers)
         else:
             combined_reducer, suffixes = None, []
 
@@ -1493,10 +1642,11 @@ class GeeRasterAdapter(BaseAdapter):
                     lon,
                     window_m,
                     combined_reducer,
-                    window_reducers,
+                    ee_window_reducers,
                     suffixes,
                     want_point=want_point,
                     date=date,
+                    original_reducer_names=original_window_reducers,
                 ): i
                 for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
             }
@@ -1507,8 +1657,11 @@ class GeeRasterAdapter(BaseAdapter):
                         results[idx] = future.result()
                     except Exception as e:
                         logger.warning("GEE stats fetch failed for point %d: %s", idx, e)
+                        # Use the original reducer list so the failure stub
+                        # mirrors what the user asked for (class reducers are
+                        # filtered inside _empty_stats_result).
                         results[idx] = self._empty_stats_result(
-                            window_m, window_reducers, want_point=want_point
+                            window_m, original_window_reducers, want_point=want_point
                         )
                     pbar.update(1)
 

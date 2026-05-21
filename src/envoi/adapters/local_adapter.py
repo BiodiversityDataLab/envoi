@@ -541,12 +541,41 @@ class LocalRasterAdapter(BaseAdapter):
                 for band_index, band_num in enumerate(band_nums):
                     band_values = window_values[band_index]
                     for reducer_name, reducer in window_reducer_fns:
-                        stats[f"b{band_num}_{reducer_name}"] = (
-                            reducer(band_values) if band_values.size else None
-                        )
+                        is_class_reducer = reducer_name in ("class_count", "class_fraction")
+                        if not band_values.size:
+                            # Empty window: scalar reducers get a None placeholder
+                            # (preserves the missing-data signal). Class reducers
+                            # get no key at all — _append_stat_columns zero-fills
+                            # them against other rows' class observations.
+                            if not is_class_reducer:
+                                stats[f"b{band_num}_{reducer_name}"] = None
+                            continue
+                        result = reducer(band_values)
+                        # Categorical reducers (class_count, class_fraction)
+                        # return a dict {class_value: scalar}. Expand into
+                        # per-class stat keys so the output column naming
+                        # matches the single-stat-key convention everywhere
+                        # else in the pipeline.
+                        if isinstance(result, dict):
+                            suffix = "count" if reducer_name == "class_count" else "fraction"
+                            for class_value, scalar in result.items():
+                                stats[f"b{band_num}_class_{class_value}_{suffix}"] = scalar
+                        else:
+                            stats[f"b{band_num}_{reducer_name}"] = result
             else:
                 for reducer_name, reducer in window_reducer_fns:
-                    stats[reducer_name] = reducer(window_values) if window_values.size else None
+                    is_class_reducer = reducer_name in ("class_count", "class_fraction")
+                    if not window_values.size:
+                        if not is_class_reducer:
+                            stats[reducer_name] = None
+                        continue
+                    result = reducer(window_values)
+                    if isinstance(result, dict):
+                        suffix = "count" if reducer_name == "class_count" else "fraction"
+                        for class_value, scalar in result.items():
+                            stats[f"class_{class_value}_{suffix}"] = scalar
+                    else:
+                        stats[reducer_name] = result
 
         # ---- point branch ----
         if want_point:
