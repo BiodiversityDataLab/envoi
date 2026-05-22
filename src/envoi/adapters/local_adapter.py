@@ -16,7 +16,8 @@ from tqdm.auto import tqdm
 
 from .base import BaseAdapter
 from ..reducers import get_reducer
-from ..metadata import get_utm_crs, summarize_tile_export
+from ..geo import get_utm_crs
+from ..metadata import summarize_tile_export
 
 try:
     from . import register as _register
