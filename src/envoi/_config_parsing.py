@@ -113,16 +113,15 @@ def _normalize_dataset_entry(
                           `_ALLOWED_OVERRIDE_KEYS`. Reserved for future
                           per-call band_overrides; today only `bands` is allowed.
 
-    Raises ValueError for any malformed entry and KeyError for an unknown
-    dataset name (matching the existing error message used elsewhere in the
-    pipeline so the user sees a consistent failure mode).
+    Raises ValueError for any malformed entry or unknown dataset name, so a
+    single ``except ValueError`` covers every config-shape failure mode.
     """
     # ---- shape 1: plain string ----
     if isinstance(entry, str):
         if not entry:
             raise ValueError(f"Output '{batch_id}': dataset name cannot be empty.")
         if entry not in catalog_datasets:
-            raise KeyError(f"Output '{batch_id}': dataset(s) ['{entry}'] not found in catalog.")
+            raise ValueError(f"Output '{batch_id}': dataset(s) ['{entry}'] not found in catalog.")
         # Even with no per-call override, the catalog default `derived_bands`
         # still becomes the effective list. Validate it against the dataset's
         # applicability whitelist so a misconfigured catalog entry surfaces
@@ -156,7 +155,7 @@ def _normalize_dataset_entry(
             f"Output '{batch_id}': dataset key must be a non-empty string, got {name!r}."
         )
     if name not in catalog_datasets:
-        raise KeyError(f"Output '{batch_id}': dataset(s) ['{name}'] not found in catalog.")
+        raise ValueError(f"Output '{batch_id}': dataset(s) ['{name}'] not found in catalog.")
 
     # Normalize the value into a unified bands list. Both the shorthand and
     # the full form ultimately produce the same list, which we then split

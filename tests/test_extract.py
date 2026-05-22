@@ -840,8 +840,8 @@ class TestErrors:
             )
 
     def test_unknown_dataset(self, sample_df, tmp_path):
-        """Raises KeyError for a dataset not in catalog."""
-        with pytest.raises(KeyError, match="nonexistent"):
+        """Raises ValueError for a dataset not in catalog."""
+        with pytest.raises(ValueError, match="nonexistent"):
             extract(
                 sample_df,
                 {
@@ -974,8 +974,8 @@ class TestPerCallBandOverrides:
             _run_with_datasets(sample_df, [{"dem_local": []}], tmp_path)
 
     def test_unknown_dataset_name_raises(self, sample_df, tmp_path):
-        """Override on an unknown dataset name raises KeyError, same as for plain strings."""
-        with pytest.raises(KeyError, match="not_a_dataset"):
+        """Override on an unknown dataset name raises ValueError, same as for plain strings."""
+        with pytest.raises(ValueError, match="not_a_dataset"):
             _run_with_datasets(sample_df, [{"not_a_dataset": [1]}], tmp_path)
 
     def test_metadata_records_resolved_overrides(self, sample_df, tmp_path):
