@@ -11,7 +11,7 @@ batch_id: terrain                 # Batch identifier. Used for filenames (e.g. t
                                 # Default: "output1", "output2", ...
 
 datasets:                       # List of dataset names from catalog.yml
-  - dem_aster
+  - dem_copernicus_glo30
   - climate_bioclim
 
 settings:
@@ -41,12 +41,12 @@ Pass a list:
 extract(df, [
     {
         "batch_id": "terrain_stats",
-        "datasets": ["dem_aster"],
+        "datasets": ["dem_copernicus_glo30"],
         "settings": {"output_type": "tabular", "statistics": ["mean", "std"], "window_size_m": 200},
     },
     {
         "batch_id": "terrain_tiles",
-        "datasets": ["dem_aster"],
+        "datasets": ["dem_copernicus_glo30"],
         "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 10},
     },
 ])
@@ -59,9 +59,9 @@ Each dataset in the catalog requires source + path.
 Everything else is auto-detected or optional.
 
 datasets:
-  dem_aster:
+  dem_copernicus_glo30:
     data_source: earth_engine                # "earth_engine" or "local"
-    path: projects/sat-io/open-datasets/ASTER/GDEM  # GEE asset ID or local file path
+    path: COPERNICUS/DEM/GLO30                # GEE asset ID or local file path
     data_type: continuous               # "continuous" or "categorical"
                                         # Affects default reducer (mean vs point) and
                                         # warns if inappropriate reducers are requested.
@@ -104,7 +104,7 @@ df = pd.DataFrame({
 Output files
 ============================================================
 Tabular:
-  out/{batch_id}.parquet          Stats (e.g. dem_aster_mean_b200)
+  out/{batch_id}.parquet          Stats (e.g. dem_copernicus_glo30_mean_b200)
   out/{batch_id}_qc.parquet       QC flags (in_extent, n_pixels, had_nodata, coverage_pct)
   out/{batch_id}_metadata.json    Sidecar metadata
 

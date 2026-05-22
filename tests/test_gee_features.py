@@ -23,7 +23,7 @@ import pytest
 import rasterio
 
 from envoi import reset_catalog, update_catalog
-from envoi.config import BUILTIN_EE_CATALOG, load_catalogs
+from envoi.catalog import BUILTIN_EE_CATALOG, load_catalogs
 from envoi.extract import extract
 
 from _gee_helpers import SWEDEN_SAMPLE_DF, gee_credentials_available
@@ -484,10 +484,10 @@ class TestAutoDateSelection:
         # nearest-image selection must pick different timestamps for each.
         in_range_df = pd.DataFrame(
             {
-                "id": ["A_2010", "B_2020"],
-                "lat": [62.97, 62.98],
-                "lon": [18.02, 18.03],
-                "date": ["2010-06-01", "2020-06-01"],
+                "gbifID": ["A_2010", "B_2020"],
+                "decimalLatitude": [62.97, 62.98],
+                "decimalLongitude": [18.02, 18.03],
+                "eventDate": ["2010-06-01", "2020-06-01"],
             }
         )
         update_catalog(_make_catalog(("era5", "ECMWF/ERA5/MONTHLY")))
@@ -529,10 +529,10 @@ class TestAutoDateSelection:
         """A future date should clamp to the latest available image."""
         future_df = pd.DataFrame(
             {
-                "id": ["future"],
-                "lat": [62.97],
-                "lon": [18.02],
-                "date": ["2099-12-31"],
+                "gbifID": ["future"],
+                "decimalLatitude": [62.97],
+                "decimalLongitude": [18.02],
+                "eventDate": ["2099-12-31"],
             }
         )
         update_catalog(_make_catalog(("era5", "ECMWF/ERA5/MONTHLY")))
@@ -564,9 +564,9 @@ class TestAutoDateSelection:
         """DataFrame without a date column should use the most recent image."""
         no_date_df = pd.DataFrame(
             {
-                "id": ["A", "B"],
-                "lat": [62.9768783, 62.9812956],
-                "lon": [18.026823, 18.0309905],
+                "gbifID": ["A", "B"],
+                "decimalLatitude": [62.9768783, 62.9812956],
+                "decimalLongitude": [18.026823, 18.0309905],
             }
         )
         update_catalog(_make_catalog(("era5", "ECMWF/ERA5/MONTHLY")))
@@ -618,7 +618,7 @@ class TestBuiltinCatalog:
             SWEDEN_SAMPLE_DF,
             {
                 "batch_id": "builtin",
-                "datasets": ["dem_aster"],
+                "datasets": ["dem_copernicus_glo30"],
                 "settings": {
                     "output_type": "tabular",
                     "statistics": ["mean"],
@@ -630,7 +630,9 @@ class TestBuiltinCatalog:
         result = pd.read_csv(outputs["builtin"])
         # At least one mean column must exist and have non-null values for
         # both sample points — the minimum "did extract work" signal.
-        mean_columns = [c for c in result.columns if c.startswith("dem_aster") and "mean" in c]
+        mean_columns = [
+            c for c in result.columns if c.startswith("dem_copernicus_glo30") and "mean" in c
+        ]
         assert mean_columns
         assert result[mean_columns[0]].notna().all()
 
@@ -687,9 +689,9 @@ class TestCatalogWalk:
         ("dataset_name", "dataset_spec"),
         _parametrize_builtin_catalog(),
         # IDs are baked into each pytest.param above (via ``id=dataset_name``)
-        # so the test output reads "test_smoke[dem_aster]" rather than
-        # "test_smoke[0]" — also makes the xfail marker attach to the right
-        # dataset by name rather than parametrize position.
+        # so the test output reads "test_smoke[dem_copernicus_glo30]" rather
+        # than "test_smoke[0]" — also makes the xfail marker attach to the
+        # right dataset by name rather than parametrize position.
     )
     def test_smoke(self, dataset_name, dataset_spec, tmp_path):
         # Pick a reducer that matches the dataset's declared type so the
@@ -768,10 +770,10 @@ class TestGeeNumericalCorrectness:
         """
         bonneville_df = pd.DataFrame(
             {
-                "id": ["bonneville"],
-                "lat": [40.7500],
-                "lon": [-113.8500],
-                "date": ["2020-01-01"],
+                "gbifID": ["bonneville"],
+                "decimalLatitude": [40.7500],
+                "decimalLongitude": [-113.8500],
+                "eventDate": ["2020-01-01"],
             }
         )
         update_catalog(_make_catalog(("dem_aster", "projects/sat-io/open-datasets/ASTER/GDEM")))

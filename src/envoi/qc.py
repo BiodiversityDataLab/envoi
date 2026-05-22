@@ -2,7 +2,14 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import logging
+import warnings
+
 import pandas as pd
+
+# Module logger so callers can route/silence envoi.qc messages independently
+# of the root logger (matches the convention used in catalog.py, reducers.py,
+# and the adapters).
+logger = logging.getLogger(__name__)
 
 # Date fields written into adapter meta dicts (GEE ImageCollections only).
 # Used exclusively by extract_date_columns below.
@@ -58,10 +65,14 @@ def compute_qc_flags(meta_list: list[dict], min_coverage_pct: int | float) -> pd
     df = pd.DataFrame(meta_list)
     below_threshold_mask = df["coverage_pct"] < min_coverage_pct
     if below_threshold_mask.any():
-        logging.warning(
-            "Low coverage for %d sample(s) (<%s%%).",
-            int(below_threshold_mask.sum()),
-            min_coverage_pct,
+        # Emit via the Python warnings system (rather than logging) so that
+        # this user-facing notice flows through the same channel as the
+        # date / CRS warnings in _input_validation.py. stacklevel=2 points
+        # the warning at the caller (extract.py) rather than this helper.
+        warnings.warn(
+            f"Low coverage for {int(below_threshold_mask.sum())} sample(s) "
+            f"(<{min_coverage_pct}%).",
+            stacklevel=2,
         )
     return df[["in_extent", "n_pixels", "had_nodata", "coverage_pct"]]
 
@@ -130,7 +141,7 @@ def extract_band_coverage_columns(meta_list: list[dict]) -> pd.DataFrame:
         band_coverage_dataframe[band_name].equals(first_band_column)
         for band_name in band_coverage_dataframe.columns[1:]
     ):
-        logging.debug(
+        logger.debug(
             "Skipping per-band coverage breakdown: all %d bands have identical coverage values.",
             len(band_coverage_dataframe.columns),
         )
