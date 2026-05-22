@@ -16,7 +16,7 @@ Add contributors here as they make contributions. Format:
 - **Name** ([@github-handle](https://github.com/handle)) — brief description of contributions
 -->
 
-- **Miguel Redondo** at [NBIS](https://nbis.se) — For support during the start up phases of *envoi*.
+- **Miguel Redondo** at [NBIS](https://nbis.se) — For development during the start up phases of *envoi*.
 
 The initial codebase of *envoi* was developed with the help of the Uppsala University Data Science MSc students:
 
@@ -27,13 +27,11 @@ The initial codebase of *envoi* was developed with the help of the Uppsala Unive
 
 ## Acknowledgements
 
-<!--
-- **Tobias Andermann** —
--->
+- **Tobias Andermann** — PhD supervisor, Biodiversity Data Lab, Uppsala University.
 
 *envoi* is developed at the [Biodiversity Data Lab](https://biodiversity.se/) at Uppsala University.
 
-We are grateful to the open-source community and the maintainers of the libraries that envoi builds on, including:
+We are grateful to the open-source community and the maintainers of the libraries that *envoi* builds on, including:
 - [Google Earth Engine Python API](https://github.com/google/earthengine-api)
 - [rasterio](https://github.com/rasterio/rasterio)
 - [geopandas](https://geopandas.org/)
