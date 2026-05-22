@@ -1,10 +1,8 @@
 from __future__ import annotations
 from typing import Iterable, Callable, Dict
-import logging
+import warnings
+
 import numpy as np
-
-logger = logging.getLogger(__name__)
-
 
 # ---------- helpers ----------
 
@@ -297,7 +295,10 @@ def validate_reducers(
                 f"assume continuous data. Consider using 'point', 'mode', 'count', "
                 f"'class_count', or 'class_fraction' instead."
             )
-            logger.warning(msg)
+            # Emit via warnings.warn (not logger.warning) for consistency with
+            # the date/CRS/QC warning channels — the caller also records the
+            # returned message in the run's metadata sidecar.
+            warnings.warn(msg, stacklevel=2)
             return msg
         return None
 
@@ -315,7 +316,10 @@ def validate_reducers(
             f"but reducers {invalid_reducer_names} assume categorical (discrete-class) data. "
             f"Set data_type: categorical in the catalog if this dataset really is categorical."
         )
-        logger.warning(msg)
+        # Emit via warnings.warn (not logger.warning) for consistency with
+        # the date/CRS/QC warning channels — the caller also records the
+        # returned message in the run's metadata sidecar.
+        warnings.warn(msg, stacklevel=2)
         return msg
     return None
 
