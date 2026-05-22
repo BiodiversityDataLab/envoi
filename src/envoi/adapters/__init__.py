@@ -21,4 +21,4 @@ def get_adapter(name):
 
 # --- import built-in adapters so they self-register on import ---
 from . import local_adapter  # noqa: E402,F401
-from . import gee_adapter  # noqa: E402,F401
+from . import earth_engine  # noqa: E402,F401
