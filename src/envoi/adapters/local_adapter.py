@@ -62,13 +62,22 @@ class LocalRasterAdapter(BaseAdapter):
             raise FileNotFoundError(f"Raster not found: {self.path}")
 
         self.src = rasterio.open(self.path)
-        self.raster_crs = self.src.crs
+        # Guard the remaining setup so a failure (e.g. an invalid `bands` spec)
+        # closes the rasterio handle we just opened. Without this, the caller
+        # never sees a usable adapter — so the `with` block's __exit__ doesn't
+        # run — and the file descriptor would leak for the lifetime of the
+        # interpreter. Re-raise so the original error reaches the caller.
+        try:
+            self.raster_crs = self.src.crs
 
-        # Determine which bands to read. If the user specifies "bands" in the
-        # catalog (a single int or list of ints), use that. Otherwise default
-        # to all bands in the file so no data is silently dropped. The actual
-        # branching lives in _normalize_bands_spec to keep this method short.
-        self._normalize_bands_spec(self.spec.get("bands"))
+            # Determine which bands to read. If the user specifies "bands" in the
+            # catalog (a single int or list of ints), use that. Otherwise default
+            # to all bands in the file so no data is silently dropped. The actual
+            # branching lives in _normalize_bands_spec to keep this method short.
+            self._normalize_bands_spec(self.spec.get("bands"))
+        except BaseException:
+            self.close()
+            raise
 
     def _normalize_bands_spec(self, bands_spec) -> None:
         """Resolve ``self.band`` (list[int]) and ``self._is_multiband`` from spec.
