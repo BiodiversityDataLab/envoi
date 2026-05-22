@@ -69,7 +69,7 @@ or list of dicts (multiple outputs):
 ```python
 extract(df, {
     "batch_id": "terrain",
-    "datasets": ["dem_aster"],
+    "datasets": ["dem_copernicus_glo30"],
     "settings": {
         "output_type": "tabular",          # "tabular" or "raster"
         "statistics": ["mean", "std"],
@@ -98,9 +98,9 @@ everything else is auto-detected or optional.
 
 ```yaml
 datasets:
-  dem_aster:
+  dem_copernicus_glo30:
     data_source: earth_engine
-    path: projects/sat-io/open-datasets/ASTER/GDEM   # asset type auto-detected via ee.data.getAsset()
+    path: COPERNICUS/DEM/GLO30   # asset type auto-detected via ee.data.getAsset()
 ```
 
 **GEE auto-detection:** asset type (IMAGE vs IMAGE_COLLECTION) is resolved via

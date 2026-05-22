@@ -346,7 +346,7 @@ class TestGbifEventDateParsing:
         # Verbatim form seen in real GBIF downloads — both halves of the
         # interval include a time component. The downstream date list must
         # contain the start day, with no time.
-        from envoi.extract import _parse_and_validate_dates
+        from envoi._input_validation import _parse_and_validate_dates
 
         df = pd.DataFrame(
             {
@@ -370,7 +370,7 @@ class TestGbifEventDateParsing:
         # ``2026-05-12T13:00:00Z`` and similar — the strip-on-"T" path turns
         # these into pure date strings before pandas sees them. They were
         # rejected by the original strict YYYY-MM-DD parser.
-        from envoi.extract import _parse_and_validate_dates
+        from envoi._input_validation import _parse_and_validate_dates
 
         df = pd.DataFrame(
             {
@@ -389,7 +389,7 @@ class TestGbifEventDateParsing:
         # pandas would return an object-dtype Index and the downstream
         # ``.strftime`` call blew up with AttributeError. Pin this so that
         # regression can't sneak back in.
-        from envoi.extract import _parse_and_validate_dates
+        from envoi._input_validation import _parse_and_validate_dates
 
         df = pd.DataFrame(
             {
@@ -410,7 +410,7 @@ class TestGbifEventDateParsing:
         # truncation warnings are aggregated. Two aggregated warnings (one
         # for intervals, one for time-of-day) are acceptable; per-row spam
         # is what we're guarding against.
-        from envoi.extract import _parse_and_validate_dates
+        from envoi._input_validation import _parse_and_validate_dates
 
         n_rows = 60
         df = pd.DataFrame(
@@ -432,7 +432,7 @@ class TestGbifEventDateParsing:
     def test_plain_yyyy_mm_dd_unchanged(self):
         # Regression guard: the pre-existing happy path must still work
         # exactly the same and emit no warnings.
-        from envoi.extract import _parse_and_validate_dates
+        from envoi._input_validation import _parse_and_validate_dates
 
         df = pd.DataFrame(
             {
@@ -452,7 +452,7 @@ class TestGbifEventDateParsing:
         # Year-only dates should still warn about incomplete precision, and
         # the warning's quoted date must be the preprocessed string (not the
         # raw value with any interval suffix).
-        from envoi.extract import _parse_and_validate_dates
+        from envoi._input_validation import _parse_and_validate_dates
 
         df = pd.DataFrame(
             {
@@ -1395,7 +1395,7 @@ class TestLocalRasterAdapterLifecycle:
 
     def test_get_utm_crs_clamps_at_antimeridian(self):
         """lon == 180 must produce a valid UTM zone (1-60), not zone 61."""
-        from envoi.metadata import get_utm_crs
+        from envoi.geo import get_utm_crs
 
         # Northern hemisphere: zones 32601..32660. Southern: 32701..32760.
         # The naive `(lon + 180) / 6 + 1` formula gives 61 at lon == 180,
@@ -1594,7 +1594,7 @@ class TestAppendStatColumnsClassFill:
         # Two rows: row 0 saw classes 10/20, row 1 saw classes 20/30. The
         # output should include columns for *every* class that any row saw
         # (union), with absent classes filled to 0.
-        from envoi.extract import _append_stat_columns
+        from envoi._output_assembly import _append_stat_columns
 
         df = pd.DataFrame({"id": ["a", "b"]})
         stats_results = [
@@ -1611,7 +1611,7 @@ class TestAppendStatColumnsClassFill:
         # The zero-fill helper must distinguish count (int 0) from fraction
         # (float 0.0). A row that didn't see a class gets 0.0 in its
         # fraction column, preserving the float dtype.
-        from envoi.extract import _append_stat_columns
+        from envoi._output_assembly import _append_stat_columns
 
         df = pd.DataFrame({"id": ["a", "b"]})
         stats_results = [
@@ -1630,7 +1630,7 @@ class TestAppendStatColumnsClassFill:
         # Regression: only class_* columns get zero-fill. A plain reducer
         # (e.g. mean) that's missing for some row still produces None /
         # NaN as before, so the missing-data signal isn't lost.
-        from envoi.extract import _append_stat_columns
+        from envoi._output_assembly import _append_stat_columns
 
         df = pd.DataFrame({"id": ["a", "b"]})
         stats_results = [
@@ -1645,7 +1645,7 @@ class TestAppendStatColumnsClassFill:
         # Multi-band class keys carry a "b{n}_class_..." prefix. The fill
         # helper must match those too via the optional band prefix in the
         # regex. Each band's class columns are zero-filled independently.
-        from envoi.extract import _append_stat_columns
+        from envoi._output_assembly import _append_stat_columns
 
         df = pd.DataFrame({"id": ["a", "b"]})
         stats_results = [
@@ -1668,7 +1668,7 @@ def test_all_known_reducers_includes_class_reducers():
     # Regression check: the validator's allow-list must include the new
     # categorical reducers, otherwise _validate_reducer_names rejects them
     # before the adapter ever sees them.
-    from envoi.extract import _ALL_KNOWN_REDUCERS
+    from envoi._config_parsing import _ALL_KNOWN_REDUCERS
 
     assert "class_count" in _ALL_KNOWN_REDUCERS
     assert "class_fraction" in _ALL_KNOWN_REDUCERS

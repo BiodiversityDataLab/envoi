@@ -8,6 +8,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # PyPI Trusted Publishing (OIDC) requires the workflow to be able to
+    # request a short-lived id token from GitHub; without this permission
+    # the pypa/gh-action-pypi-publish step fails with "OIDC token not found".
+    permissions:
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
