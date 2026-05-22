@@ -103,8 +103,8 @@ outputs = extract(sample_points, {
 })
 
 # Files land in outputs/ by default:
-#   outputs/terrain.parquet           ← reducer columns
-#   outputs/terrain_qc.parquet        ← per-point coverage / nodata flags
+#   outputs/terrain.csv               ← reducer columns
+#   outputs/terrain_qc.csv            ← per-point coverage / nodata flags
 #   outputs/terrain_metadata.json     ← per-run dataset metadata
 ```
 
@@ -140,8 +140,8 @@ list_reducers()
 
 | Value         | Result                                                   |
 | ------------- | -------------------------------------------------------- |
-| `"parquet"`   | `outputs/<batch_id>.parquet` (default)                   |
-| `"csv"`       | `outputs/<batch_id>.csv`                                 |
+| `"csv"`       | `outputs/<batch_id>.csv` (default)                       |
+| `"parquet"`   | `outputs/<batch_id>.parquet`                             |
 | `"dataframe"` | Returns the DataFrame in-memory, skips writing to disk.  |
 
 ```python
