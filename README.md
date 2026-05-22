@@ -76,15 +76,19 @@ Datasets that come from Google Earth Engine (most of the built-in catalog — `d
 import pandas as pd
 from envoi import extract
 
-# Input: any DataFrame with id, lat, lon. Coordinates are assumed to be in
-# WGS84 (EPSG:4326). If yours are in a different CRS, pass `input_crs=...`
-# to extract() (e.g. `input_crs="EPSG:32634"`) and envoi will reproject them
-# to WGS84 internally. A `date` column is optional — see "Date-aware
-# extraction" below for how envoi uses it when present.
+# Input: any DataFrame with gbifID, decimalLatitude, decimalLongitude
+# (the GBIF / Darwin Core convention). Coordinates are assumed to be in WGS84
+# (EPSG:4326). If yours are in a different CRS, pass `input_crs=...` to
+# extract() (e.g. `input_crs="EPSG:32634"`) and envoi will reproject them
+# to WGS84 internally. An `eventDate` column is optional — see "Date-aware
+# extraction" below for how envoi uses it when present. If your DataFrame
+# uses different names (e.g. `id`/`lat`/`lon`), pass them through
+# `id_column=...`, `latitude_column=...`, `longitude_column=...`,
+# `date_column=...`.
 sample_points = pd.DataFrame({
-    "id":  ["a", "b", "c"],
-    "lat": [59.85, 59.86, 59.87],
-    "lon": [17.63, 17.64, 17.65],
+    "gbifID":     ["a", "b", "c"],
+    "decimalLatitude":  [59.85, 59.86, 59.87],
+    "decimalLongitude": [17.63, 17.64, 17.65],
 })
 
 # Single output: mean and std of elevation in a 200 m window around each point.
@@ -208,14 +212,14 @@ outputs = extract(sample_points, [
 
 ### Date-aware extraction
 
-If your DataFrame has a `date` column, envoi uses it when querying time-varying Earth Engine ImageCollections:
+If your DataFrame has an `eventDate` column, envoi uses it when querying time-varying Earth Engine ImageCollections:
 
 ```python
 sample_points = pd.DataFrame({
-    "id":   ["a", "b"],
-    "lat":  [59.85, 59.86],
-    "lon":  [17.63, 17.64],
-    "date": ["2022-06-15", "2023-08-01"],
+    "gbifID":     ["a", "b"],
+    "decimalLatitude":  [59.85, 59.86],
+    "decimalLongitude": [17.63, 17.64],
+    "eventDate":        ["2022-06-15", "2023-08-01"],
 })
 
 extract(sample_points, {
@@ -232,7 +236,7 @@ For each point, envoi selects a single image from the collection. How that image
 
 Dates outside the collection's range are silently clamped to the nearest boundary and recorded in the metadata sidecar — they do not raise.
 
-Without a `date` column, envoi falls back to the most recent image in each collection and emits a warning so you know it happened.
+Without an `eventDate` column, envoi falls back to the most recent image in each collection and emits a warning so you know it happened.
 
 ### Mixing categorical and continuous datasets
 

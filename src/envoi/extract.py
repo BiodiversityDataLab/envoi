@@ -1,26 +1,33 @@
 # src/envoi/extract.py
 from __future__ import annotations
-import re
-import warnings
-from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple
+from typing import Dict, Any
 from pathlib import Path
 
 import pandas as pd
-import yaml
-from pyproj import Transformer
 
 from .adapters import get_adapter
-from .adapters.gee_adapter import KNOWN_DERIVED_BANDS
-from .config import load_catalogs, load_defaults, BUILTIN_EE_CATALOG
+from .catalog import load_catalogs, load_defaults, BUILTIN_EE_CATALOG
 from .qc import attach_quality_control, split_stats_and_qc
+from .reducers import validate_reducers
 from .metadata import write_metadata_sidecar
-
-# Keys allowed inside the full-form dict value
-# (e.g. {"sen2": {"bands": [...]}}). Adding more per-call band_overrides in the
-# future means extending this set and validating each new key inside the
-# entry-normalization helper below.
-_ALLOWED_OVERRIDE_KEYS = frozenset({"bands"})
+from ._config_parsing import (
+    RunSettings,
+    _as_config_list,
+    _parse_run_config,
+    _resolve_stats_for_dataset,
+)
+from ._input_validation import (
+    _parse_and_validate_dates,
+    _validate_and_reproject_crs,
+    _validate_required_columns,
+)
+from ._output_assembly import (
+    _append_stat_columns,
+    _resolve_dataset_metadata,
+    _restore_user_column_names,
+    _round_stat_columns,
+    _write_tabular,
+)
 
 # Default catalog tuple used when the caller does not supply one.
 # The sentinels tell load_catalogs() to load the YAML files that are
@@ -34,10 +41,10 @@ def extract(
     config: str | Path | dict | list,
     output_dir: str | Path = "outputs",
     input_crs: str | None = None,
-    id_column: str = "id",
-    latitude_column: str = "lat",
-    longitude_column: str = "lon",
-    date_column: str = "date",
+    id_column: str = "gbifID",
+    latitude_column: str = "decimalLatitude",
+    longitude_column: str = "decimalLongitude",
+    date_column: str = "eventDate",
     write_metadata: bool = True,
 ) -> Dict[str, Path | pd.DataFrame]:
     """Extract environmental data for a set of geographic sample points.
@@ -61,7 +68,7 @@ def extract(
 
         {
             "batch_id": "terrain",          # used as the output file stem
-            "datasets": ["dem_aster"],      # one or more dataset names from the catalog
+            "datasets": ["dem_copernicus_glo30"],  # one or more dataset names from the catalog
             "settings": {
                 "output_type": "tabular",   # "tabular" or "raster"
                 "statistics": ["mean"],     # list (all datasets) or typed dict (see below)
@@ -94,10 +101,11 @@ def extract(
     ----------
     df : pd.DataFrame
         Input table of sample points. Must contain identifier and coordinate
-        columns (named ``id``, ``lat``, ``lon`` by default — override the names
-        with the ``*_column`` parameters below). An optional date column
-        (YYYY-MM-DD strings) enables nearest-date image selection for
-        time-varying datasets.
+        columns (named ``gbifID``, ``decimalLatitude``, ``decimalLongitude``
+        by default, following the GBIF / Darwin Core convention — override the
+        names with the ``*_column`` parameters below). An optional date column
+        (``eventDate``, YYYY-MM-DD strings) enables nearest-date image selection
+        for time-varying datasets.
     config : str, Path, dict, or list
         Output specification — see above. A path string or ``Path`` is loaded as
         YAML before processing.
@@ -111,18 +119,22 @@ def extract(
         omitted, coordinates are assumed to already be in WGS84.
     id_column : str, optional
         Name of the input column containing each row's identifier.
-        Defaults to ``"id"``. The output tables will use the same name.
+        Defaults to ``"gbifID"`` (GBIF / Darwin Core). The output
+        tables will use the same name.
     latitude_column : str, optional
         Name of the input column containing latitude values. Defaults
-        to ``"lat"``. The output tables will use the same name.
+        to ``"decimalLatitude"`` (GBIF / Darwin Core). The output tables
+        will use the same name.
     longitude_column : str, optional
         Name of the input column containing longitude values. Defaults
-        to ``"lon"``. The output tables will use the same name.
+        to ``"decimalLongitude"`` (GBIF / Darwin Core). The output tables
+        will use the same name.
     date_column : str, optional
         Name of the optional input column containing per-row dates.
-        Defaults to ``"date"``. If absent from ``df`` the date branch is
-        simply skipped — the extractor never errors on a missing date column.
-        The output tables will use the same name.
+        Defaults to ``"eventDate"`` (GBIF / Darwin Core). If absent from
+        ``df`` the date branch is simply skipped — the extractor never
+        errors on a missing date column. The output tables will use the
+        same name.
     write_metadata : bool, optional
         Whether to write the auxiliary files alongside the main output(s).
         When ``True`` (the default), the JSON metadata sidecar is written for
@@ -214,7 +226,12 @@ def extract(
                 # for one (dataset, window_size) pair.
 
                 if output_type == "tabular":
-                    df_copy, dataset_meta, dataset_qc_columns = _process_dataset_tabular(
+                    (
+                        df_copy,
+                        dataset_meta,
+                        dataset_qc_columns,
+                        reducer_warning,
+                    ) = _process_dataset_tabular(
                         df_copy,
                         dataset,
                         dataset_config,
@@ -224,6 +241,12 @@ def extract(
                         band_overrides=band_overrides,
                     )
                     all_qc_columns.extend(dataset_qc_columns)
+                    # Record the reducer/data_type mismatch (if any) in the
+                    # per-dataset warnings backlog. The message is identical
+                    # across windows for the same dataset, so a dict
+                    # assignment naturally deduplicates repeat windows.
+                    if reducer_warning:
+                        warnings_backlog[f"reducer_{dataset}"] = reducer_warning
 
                 # In raster mode, the helper exports a folder of GeoTIFF tiles
                 # and returns the path plus the per-dataset metadata dict. With
@@ -365,7 +388,7 @@ def _process_dataset_tabular(
     dates: list | None,
     window_size: int,
     band_overrides: Dict[str, Any] | None = None,
-) -> tuple[pd.DataFrame, dict, list[str]]:
+) -> tuple[pd.DataFrame, dict, list[str], str | None]:
     """Fetch stats and QC columns for one dataset/window pair in tabular mode.
 
     Owns adapter instantiation, statistic computation, QC column assembly,
@@ -377,6 +400,12 @@ def _process_dataset_tabular(
     `derived_bands`) that replace the catalog values before adapter
     instantiation. The catalog dict itself is never mutated — the override
     is shallow-merged into a fresh dict per call.
+
+    Returns ``(df, dataset_meta, qc_column_names, reducer_warning)`` where
+    ``reducer_warning`` is the message from :func:`validate_reducers` when
+    the requested stats don't match the dataset's data_type (e.g. ``mean``
+    on a categorical raster) — or ``None`` when everything is fine. The
+    caller threads this into the metadata sidecar's ``warnings`` section.
     """
     # Build a fresh shallow-merged config so per-call band_overrides replace the
     # catalog values for this run only. The catalog dict itself is not
@@ -399,6 +428,13 @@ def _process_dataset_tabular(
         resolved_stats = _resolve_stats_for_dataset(
             data_type, run_settings.stats, dataset, run_settings.batch_id
         )
+
+        # Flag reducer/data_type mismatches (e.g. `mean` on a categorical
+        # raster, or `class_count` on a continuous one). The message is
+        # emitted via warnings.warn inside validate_reducers and also
+        # returned here so the caller can persist it in the metadata
+        # sidecar alongside the date / CRS warnings.
+        reducer_warning = validate_reducers(resolved_stats, data_type, dataset)
 
         # Ask the adapter to compute all requested statistics for every sample.
         # Returns a list of (stats_dict, meta_dict) — one tuple per row in df.
@@ -443,7 +479,7 @@ def _process_dataset_tabular(
             quality={quality_key: coverage_summary},
         )
 
-    return df, dataset_meta, qc_column_names
+    return df, dataset_meta, qc_column_names, reducer_warning
 
 
 def _process_dataset_raster(
@@ -508,720 +544,3 @@ def _process_dataset_raster(
         )
 
     return tiles_root / dataset, dataset_meta
-
-
-def _parse_and_validate_dates(
-    df: pd.DataFrame,
-) -> tuple[pd.DataFrame, list | None, list[str]]:
-    """Parse and validate the 'date' column from the input DataFrame.
-
-    Returns a tuple of (df, dates, date_warnings) where df has rows with missing
-    dates removed, dates is a list of YYYY-MM-DD strings (or None if no 'date'
-    column is present), and date_warnings is a list of messages the caller can
-    print and record in the output metadata.
-    """
-    date_warnings: list[str] = []
-
-    if "date" not in df.columns:
-        message = "No 'date' column found in input DataFrame; proceeding without dates."
-        warnings.warn(message, stacklevel=2)
-        date_warnings.append(message)
-        return df, None, date_warnings
-
-    # Drop rows with missing dates rather than raising, so the user still gets
-    # results for the valid rows. The dropped ids are recorded in the warnings
-    # so the user can see exactly which points were skipped.
-    null_date_mask = df["date"].isna()
-    if null_date_mask.any():
-        null_ids = df.loc[null_date_mask, "id"].tolist()
-        message = (
-            f"Skipping {len(null_ids)} row(s) with missing dates "
-            f"(ids: {null_ids}). Provide a date for every row to include them."
-        )
-        warnings.warn(message, stacklevel=2)
-        date_warnings.append(message)
-        df = df.loc[~null_date_mask].copy()
-
-    raw_dates = df["date"].tolist()
-
-    # format="mixed" lets pandas infer the format per-element, which is needed
-    # to accept a mix of full ("2021-06-15"), year-month ("2021-06"), and
-    # year-only ("2021") dates in the same column. Without this, pandas locks
-    # onto the first element's format and raises on any entry that doesn't match.
-    try:
-        parsed_dates = pd.to_datetime(raw_dates, format="mixed")
-    except Exception as e:
-        raise ValueError(f"Error parsing 'date' column: {e}. Expected dates in YYYY-MM-DD format.")
-
-    # Detect incomplete dates (year-only "2002" or year-month "2002-02") by splitting
-    # on "-". A complete date has 3 parts (YYYY-MM-DD); year-only has 1, year-month
-    # has 2. This correctly handles single-digit months/days like "2002-1-1"
-    # (still 3 parts → complete)
-    for raw_date, parsed_date in zip(raw_dates, parsed_dates):
-        raw_date_str = str(raw_date).strip()
-        if len(raw_date_str.split("-")) < 3:
-            message = (
-                f"Date '{raw_date_str}' interpreted as {parsed_date.strftime('%Y-%m-%d')}. "
-                f"Provide a full YYYY-MM-DD date if you want a specific day."
-            )
-            warnings.warn(message, stacklevel=2)
-            date_warnings.append(message)
-
-    return df, parsed_dates.strftime("%Y-%m-%d").tolist(), date_warnings
-
-
-@dataclass
-class RunSettings:
-    """Validated and parsed settings for a single output run."""
-
-    batch_id: str
-    # Each entry is a (dataset_name, band_overrides) pair. `band_overrides` is an empty
-    # dict for plain-string entries in the user's `datasets` list, and contains
-    # `bands` and/or `derived_bands` keys when the user supplied a per-call
-    # override (e.g. {"sen2": ["B4", "B8"]} or {"sen2": {"bands": ["B4"]}}).
-    datasets: List[Tuple[str, Dict[str, Any]]]
-    output_type: str  # "tabular" or "raster"
-    output_file_format: str  # "csv", "parquet", or "dataframe"
-    window_sizes: List[int]  # one or more square-sampling-window sizes in metres
-    min_coverage: float  # 0–100 — threshold for low-coverage QC flag
-    # Normalized stats dict: {"continuous": [...], "categorical": [...]}.
-    # A flat list from the user is normalized to identical lists on both keys.
-    # Downstream code calls _resolve_stats_for_dataset() to pick the right list
-    # per dataset rather than reading this dict directly.
-    stats: Dict[str, List[str]]
-    # Original user-supplied form (flat list or typed dict), stored verbatim
-    # so the metadata sidecar round-trips it without normalizing it away.
-    user_stats: list | Dict[str, List[str]]
-    resample_m: float | None  # target pixel size in metres (raster mode only)
-    user_window_size: int | List[int]  # original input form, preserved for metadata
-
-
-def _normalize_dataset_entry(
-    entry: Any,
-    batch_id: str,
-    catalog_datasets: dict,
-) -> Tuple[str, Dict[str, Any]]:
-    """Normalize one item from the user's `datasets` list into (name, band_overrides).
-
-    Three accepted shapes:
-      * A plain string  -> ("name", {})
-      * Shorthand dict  -> {"name": [bands...]}
-                          where the list is a unified band list (source +
-                          derived bands mixed). Names recognised as derived
-                          (KNOWN_DERIVED_BANDS) are split into the
-                          `derived_bands` override; the rest go to `bands`.
-      * Full-form dict  -> {"name": {"bands": [...]}}
-                          where the inner dict accepts the keys listed in
-                          `_ALLOWED_OVERRIDE_KEYS`. Reserved for future
-                          per-call band_overrides; today only `bands` is allowed.
-
-    Raises ValueError for any malformed entry and KeyError for an unknown
-    dataset name (matching the existing error message used elsewhere in the
-    pipeline so the user sees a consistent failure mode).
-    """
-    # ---- shape 1: plain string ----
-    if isinstance(entry, str):
-        if not entry:
-            raise ValueError(f"Output '{batch_id}': dataset name cannot be empty.")
-        if entry not in catalog_datasets:
-            raise KeyError(f"Output '{batch_id}': dataset(s) ['{entry}'] not found in catalog.")
-        # Even with no per-call override, the catalog default `derived_bands`
-        # still becomes the effective list. Validate it against the dataset's
-        # applicability whitelist so a misconfigured catalog entry surfaces
-        # up front instead of silently producing nonsense bands.
-        _validate_effective_derived_bands(
-            override_derived=[],
-            dataset_name=entry,
-            dataset_config=catalog_datasets[entry],
-            batch_id=batch_id,
-        )
-        return entry, {}
-
-    # ---- shapes 2 & 3: single-key dict ----
-    if not isinstance(entry, dict):
-        raise ValueError(
-            f"Output '{batch_id}': each dataset entry must be a string or a single-key "
-            f"dict, got {type(entry).__name__}: {entry!r}."
-        )
-    if len(entry) != 1:
-        raise ValueError(
-            f"Output '{batch_id}': each dataset dict must have exactly one key "
-            f"(the dataset name), got {len(entry)} keys: {sorted(entry.keys())}."
-        )
-
-    # Pull out the single (name, value) pair. The value is either a list
-    # (shorthand) or a dict (full form); anything else is rejected below.
-    name, value = next(iter(entry.items()))
-
-    if not isinstance(name, str) or not name:
-        raise ValueError(
-            f"Output '{batch_id}': dataset key must be a non-empty string, got {name!r}."
-        )
-    if name not in catalog_datasets:
-        raise KeyError(f"Output '{batch_id}': dataset(s) ['{name}'] not found in catalog.")
-
-    # Normalize the value into a unified bands list. Both the shorthand and
-    # the full form ultimately produce the same list, which we then split
-    # into source bands and derived bands below.
-    if isinstance(value, list):
-        # Shorthand: the list IS the unified band list.
-        unified_bands = value
-    elif isinstance(value, dict):
-        # Full form: validate keys, then read `bands` out of the inner dict.
-        unknown_keys = set(value.keys()) - _ALLOWED_OVERRIDE_KEYS
-        if unknown_keys:
-            raise ValueError(
-                f"Output '{batch_id}': unknown override key(s) {sorted(unknown_keys)} for "
-                f"dataset '{name}'. Allowed: {sorted(_ALLOWED_OVERRIDE_KEYS)}."
-            )
-        unified_bands = value.get("bands")
-        if unified_bands is None:
-            # Empty full-form dict — treat as no band_overrides at all.
-            return name, {}
-        if not isinstance(unified_bands, list):
-            raise ValueError(
-                f"Output '{batch_id}': 'bands' for dataset '{name}' must be a list, "
-                f"got {type(unified_bands).__name__}."
-            )
-    else:
-        raise ValueError(
-            f"Output '{batch_id}': override for dataset '{name}' must be a list (shorthand) "
-            f"or a dict (full form), got {type(value).__name__}: {value!r}."
-        )
-
-    if not unified_bands:
-        raise ValueError(
-            f"Output '{batch_id}': band list for dataset '{name}' must contain at least one band."
-        )
-
-    # Split the unified list into source bands and derived bands. Order is
-    # preserved within each side so the resulting output band order matches
-    # what the user wrote.
-    derived_bands = [b for b in unified_bands if b in KNOWN_DERIVED_BANDS]
-    source_bands = [b for b in unified_bands if b not in KNOWN_DERIVED_BANDS]
-
-    # Local rasters cannot have derived bands (no slope/aspect computation
-    # path exists in LocalRasterAdapter). Surface this clearly so the user
-    # knows the catalog is the right place for that.
-    dataset_config = catalog_datasets[name]
-    data_source = dataset_config.get("data_source")
-    if derived_bands and data_source != "earth_engine":
-        raise ValueError(
-            f"Output '{batch_id}': dataset '{name}' is a {data_source!r} raster — "
-            f"derived bands {sorted(set(derived_bands))} are only supported for "
-            f"earth_engine datasets."
-        )
-
-    # Enforce the catalog's per-dataset applicability whitelist. A derived
-    # band (e.g. slope) only makes physical sense for some datasets (e.g.
-    # DEMs), so the catalog declares `supported_derived_bands` to mark which
-    # derived bands are valid here. The check runs against the EFFECTIVE
-    # derived bands — the call-site override if present, otherwise the
-    # catalog's `derived_bands` default — so a misconfigured catalog entry
-    # surfaces even when the user supplies no override.
-    _validate_effective_derived_bands(
-        override_derived=derived_bands,
-        dataset_name=name,
-        dataset_config=dataset_config,
-        batch_id=batch_id,
-    )
-
-    band_overrides: Dict[str, Any] = {}
-    if source_bands:
-        band_overrides["bands"] = source_bands
-    if derived_bands:
-        band_overrides["derived_bands"] = derived_bands
-    return name, band_overrides
-
-
-def _validate_effective_derived_bands(
-    *,
-    override_derived: list,
-    dataset_name: str,
-    dataset_config: dict,
-    batch_id: str,
-) -> None:
-    """Raise ValueError if the effective derived bands violate the whitelist.
-
-    The effective list is the call-site override when provided; otherwise it
-    falls back to the catalog's own `derived_bands` default. The list is then
-    validated against the dataset's `supported_derived_bands` whitelist — a
-    missing or empty whitelist means the dataset declines derived bands
-    entirely.
-    """
-    # When the user passed any derived bands at the call site, those win and
-    # we ignore the catalog default. Otherwise the catalog default IS the
-    # effective list and must also satisfy the whitelist.
-    if override_derived:
-        effective = list(override_derived)
-    else:
-        catalog_default = dataset_config.get("derived_bands")
-        if isinstance(catalog_default, str):
-            effective = [catalog_default]
-        elif catalog_default:
-            effective = list(catalog_default)
-        else:
-            effective = []
-
-    if not effective:
-        return
-
-    supported = dataset_config.get("supported_derived_bands") or []
-    unsupported = [b for b in effective if b not in supported]
-    if not unsupported:
-        return
-
-    if supported:
-        supported_msg = f"Supported for this dataset: {sorted(supported)}."
-    else:
-        supported_msg = (
-            "This dataset does not declare `supported_derived_bands` in the catalog, "
-            "so no derived bands are allowed for it."
-        )
-    raise ValueError(
-        f"Output '{batch_id}': dataset '{dataset_name}' does not support derived "
-        f"band(s) {sorted(set(unsupported))}. {supported_msg}"
-    )
-
-
-def _parse_run_config(
-    run_config: dict,
-    defaults: dict,
-    index: int,
-    catalog_datasets: dict,
-) -> RunSettings:
-    """Parse and validate a single output run config dict into a RunSettings instance.
-
-    Raises ValueError for any invalid or missing setting so callers don't need
-    to do any further validation on the returned object.
-    """
-    # Use a numbered fallback batch_id when the user didn't provide one.
-    batch_id = run_config.get("batch_id", f"output{index + 1}")
-
-    # datasets is required — must be a non-empty list. Each entry is normalized
-    # into a (name, band_overrides) tuple by the helper, which also handles all
-    # validation (catalog existence, malformed dicts, derived-on-local, ...).
-    raw_datasets = run_config.get("datasets", [])
-    if not raw_datasets:
-        raise ValueError(f"Output '{batch_id}': missing required 'datasets' list")
-    datasets = [_normalize_dataset_entry(e, batch_id, catalog_datasets) for e in raw_datasets]
-
-    # settings is required — must be a non-empty dict.
-    settings = run_config.get("settings", {}) or {}
-    if not settings:
-        raise ValueError(f"Output '{batch_id}': missing required 'settings' dict")
-
-    # output_type controls the entire processing path (stats vs tile export).
-    output_type = settings.get("output_type")
-    if output_type not in ("tabular", "raster"):
-        raise ValueError(f"Unknown or missing output_type: {output_type}")
-
-    # resample_m is only meaningful for raster output.
-    resample_m = settings.get("resample_m")
-    if output_type == "raster" and resample_m is not None and resample_m <= 0:
-        raise ValueError(f"Invalid resample_m: {resample_m}. Must be a positive number.")
-    if output_type == "tabular" and resample_m is not None:
-        raise ValueError("resample_m is not applicable when output_type is 'tabular'.")
-
-    # output_file_format applies to tabular output only.
-    output_file_format = settings.get("output_file_format", defaults["output_file_format"])
-    if output_file_format not in ("csv", "parquet", "dataframe"):
-        raise ValueError(f"Unknown output_file_format: {output_file_format}")
-
-    # min_coverage_pct is a percentage — must be in [0, 100].
-    min_coverage = settings.get("min_coverage_pct", defaults["min_coverage_pct"])
-    if min_coverage < 0 or min_coverage > 100:
-        raise ValueError(f"Invalid min_coverage_pct: {min_coverage}. Must be between 0 and 100.")
-
-    # statistics — required for tabular, forbidden for raster.
-    # Accepts either a flat list (applied to all datasets) or a typed dict
-    # {"continuous": [...], "categorical": [...]} for mixed-type runs.
-    raw_stats = settings.get("statistics")
-    if output_type == "raster" and raw_stats:
-        raise ValueError("Statistics cannot be computed when output_type is 'raster'.")
-    if output_type == "tabular":
-        stats, user_stats = _parse_statistics(raw_stats, batch_id)
-    else:
-        stats, user_stats = {}, None
-
-    # window_size_m can be either a single positive integer or a list of them.
-    # When the user supplies a list, statistics (or tiles) are produced for
-    # each window size and the column / filename suffix disambiguates them.
-    user_window_size = settings.get("window_size_m", defaults["window_size_m"])
-    if isinstance(user_window_size, (list, tuple)):
-        window_sizes = list(user_window_size)
-        if not window_sizes:
-            raise ValueError(f"Output '{batch_id}': window_size_m list must not be empty.")
-    else:
-        window_sizes = [user_window_size]
-    for window_size in window_sizes:
-        # Reject non-integers explicitly. window_size feeds f-string column
-        # names like "{dataset}_mean_{window_size_m}m", and a float would
-        # silently yield columns like "dem_mean_200.0m" — breaking schema
-        # expectations downstream. ``bool`` is a subclass of ``int`` in
-        # Python, so we filter it out first to avoid accepting True/False.
-        if isinstance(window_size, bool) or not isinstance(window_size, int) or window_size <= 0:
-            raise ValueError(
-                f"Output '{batch_id}': invalid window_size_m: {window_size!r}. "
-                f"Must be a positive integer (or a list of positive integers)."
-            )
-
-    return RunSettings(
-        batch_id=batch_id,
-        datasets=datasets,
-        output_type=output_type,
-        output_file_format=output_file_format,
-        window_sizes=window_sizes,
-        min_coverage=min_coverage,
-        stats=stats,
-        user_stats=user_stats,
-        resample_m=resample_m,
-        user_window_size=user_window_size,
-    )
-
-
-_VALID_STAT_TYPES = frozenset({"continuous", "categorical"})
-_ALL_KNOWN_REDUCERS = frozenset(
-    {
-        "mean",
-        "median",
-        "min",
-        "max",
-        "sum",
-        "std",
-        "var",
-        "count",
-        "mode",
-        "point",
-        "class_count",
-        "class_fraction",
-        "q05",
-        "q10",
-        "q25",
-        "q50",
-        "q75",
-        "q90",
-        "q95",
-    }
-)
-
-# Matches the per-class stat keys produced by the categorical reducers, in
-# either single-band form ("class_10_count") or multi-band form
-# ("b2_class_10_fraction"). Used to zero-fill rows that didn't see a class
-# observed by some other row in the same batch.
-_CLASS_COLUMN_RE = re.compile(r"^(?:b\d+_)?class_-?\d+_(count|fraction)$")
-
-
-def _parse_statistics(
-    raw: Any,
-    batch_id: str,
-) -> tuple[Dict[str, List[str]], Any]:
-    """Parse and validate the user's `statistics` setting.
-
-    Accepts two forms:
-      * A flat list of reducer names — applied to all datasets regardless of
-        type. Normalized internally to {"continuous": list, "categorical": list}.
-      * A typed dict {"continuous": [...], "categorical": [...]} — each key is
-        optional, but at least one must be present and non-empty.
-
-    Returns (normalized_dict, user_stats) where user_stats is the original
-    user-supplied value, preserved verbatim for the metadata sidecar.
-    Raises ValueError for any invalid input.
-    """
-    if not raw:
-        raise ValueError(
-            f"Output '{batch_id}': 'statistics' must be a non-empty list or "
-            f"a dict with 'continuous' and/or 'categorical' keys."
-        )
-
-    # ---- flat list (backward-compat) ----
-    if isinstance(raw, list):
-        if len(raw) == 0:
-            raise ValueError(f"Output '{batch_id}': 'statistics' list must not be empty.")
-        _validate_reducer_names(raw, batch_id, context="statistics")
-        normalized = {"continuous": raw, "categorical": raw}
-        return normalized, raw
-
-    # ---- typed dict ----
-    if isinstance(raw, dict):
-        unknown_keys = set(raw.keys()) - _VALID_STAT_TYPES
-        if unknown_keys:
-            raise ValueError(
-                f"Output '{batch_id}': unknown 'statistics' key(s) {sorted(unknown_keys)}. "
-                f"Allowed: {sorted(_VALID_STAT_TYPES)}."
-            )
-        if not raw:
-            raise ValueError(
-                f"Output '{batch_id}': 'statistics' dict must contain at least one of "
-                f"{sorted(_VALID_STAT_TYPES)}."
-            )
-        normalized: Dict[str, List[str]] = {}
-        for key, reducers in raw.items():
-            if not isinstance(reducers, list) or not reducers:
-                raise ValueError(
-                    f"Output '{batch_id}': 'statistics.{key}' must be a non-empty list."
-                )
-            _validate_reducer_names(reducers, batch_id, context=f"statistics.{key}")
-            normalized[key] = reducers
-        return normalized, raw
-
-    raise ValueError(
-        f"Output '{batch_id}': 'statistics' must be a list or dict, " f"got {type(raw).__name__}."
-    )
-
-
-def _validate_reducer_names(reducers: list, batch_id: str, context: str) -> None:
-    """Raise ValueError if any reducer name is not in the known set."""
-    unknown = [r for r in reducers if r not in _ALL_KNOWN_REDUCERS]
-    if unknown:
-        raise ValueError(
-            f"Output '{batch_id}': unknown reducer(s) {unknown} in '{context}'. "
-            f"Valid reducers: {sorted(_ALL_KNOWN_REDUCERS)}."
-        )
-
-
-def _resolve_stats_for_dataset(
-    data_type: str | None,
-    stats: Dict[str, List[str]],
-    dataset_name: str,
-    batch_id: str,
-) -> List[str]:
-    """Return the reducer list to use for one dataset based on its data_type.
-
-    Falls back to 'continuous' when data_type is None or unrecognised, since
-    most ecological rasters are continuous and users often omit data_type for
-    local datasets. Raises ValueError when the resolved list would be empty
-    so the user gets a clear message rather than a run with no output columns.
-    """
-    resolved_type = data_type if data_type in _VALID_STAT_TYPES else "continuous"
-    reducers = stats.get(resolved_type)
-    if not reducers:
-        raise ValueError(
-            f"Dataset '{dataset_name}' has data_type='{data_type}' but the "
-            f"'{resolved_type}' statistics list is missing or empty. "
-            f"Add a '{resolved_type}' key to the 'statistics' dict in the run config "
-            f"for output '{batch_id}'."
-        )
-    return reducers
-
-
-def _round_stat_columns(
-    stats_df: pd.DataFrame,
-    core_columns: list[str],
-    decimals: int,
-) -> pd.DataFrame:
-    """Round all non-core stat columns to the given number of decimal places.
-
-    Core columns (id, lat, lon, date) are excluded so coordinate precision
-    is preserved exactly as the user supplied it.
-    """
-    stat_columns = [c for c in stats_df.columns if c not in core_columns]
-    stats_df[stat_columns] = stats_df[stat_columns].round(decimals)
-    return stats_df
-
-
-def _restore_user_column_names(
-    stats_df: pd.DataFrame,
-    qc_df: pd.DataFrame,
-    column_name_map: Dict[str, str],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Rename canonical core columns back to the user's original names.
-
-    `column_name_map` maps user names → canonical names (e.g. "sample_id" →
-    "id"). We invert it to rename the output back so the user's chosen names
-    round-trip through extract().
-    """
-    output_rename = {
-        canonical: user for user, canonical in column_name_map.items() if user != canonical
-    }
-    if output_rename:
-        stats_df = stats_df.rename(columns=output_rename)
-        qc_df = qc_df.rename(columns=output_rename)
-    return stats_df, qc_df
-
-
-def _resolve_dataset_metadata(
-    datasets: List[Tuple[str, Dict[str, Any]]],
-    catalog_datasets: dict,
-) -> List[Dict[str, Any]]:
-    """Build the resolved per-dataset list stored in the metadata sidecar.
-
-    For each (name, band_overrides) pair, records the bands and derived_bands
-    that were actually used — the per-call override when supplied, otherwise
-    the catalog's value, otherwise None. Storing this alongside the run config
-    makes a run reproducible without having to consult the catalog separately.
-    """
-    resolved = []
-    for dataset, band_overrides in datasets:
-        dataset_config = catalog_datasets[dataset]
-        resolved.append(
-            {
-                "name": dataset,
-                "bands": band_overrides.get("bands", dataset_config.get("bands")),
-                "derived_bands": band_overrides.get(
-                    "derived_bands", dataset_config.get("derived_bands")
-                ),
-            }
-        )
-    return resolved
-
-
-def _load_yaml(path_or_dict):
-    """Load a YAML file if given a path, or return the dict/list if already loaded."""
-    if isinstance(path_or_dict, (dict, list)):
-        return path_or_dict
-    with open(path_or_dict) as f:
-        return yaml.safe_load(f)
-
-
-def _as_config_list(config) -> list[dict]:
-    """Load and normalize config into a list of output config dicts."""
-    raw = _load_yaml(config)
-    if isinstance(raw, dict):
-        return [raw]
-    if isinstance(raw, list):
-        return raw
-    raise ValueError("config must be a dict, list, or path to a YAML file.")
-
-
-def _append_stat_columns(
-    df: pd.DataFrame,
-    dataset_name: str,
-    window_size_m: int,
-    stats_results: list[tuple[dict, dict]],
-) -> pd.DataFrame:
-    """Append adapter statistics columns to the output dataframe.
-
-    Expected stat keys from adapters:
-    - window, single-band: "{reducer}"      -> column "{dataset}_{reducer}_{buf}m"
-    - window, multi-band:  "b{n}_{reducer}" -> column "{dataset}_b{n}_{reducer}_{buf}m"
-    - point,  single-band: "point"          -> column "{dataset}_point"
-    - point,  multi-band:  "{band}_point"   -> column "{dataset}_{band}_point"
-
-    Point keys intentionally skip the buffer suffix to preserve the historical schema.
-
-    Categorical reducers (``class_count`` / ``class_fraction``) produce
-    per-class stat keys like ``class_10_count`` or ``b2_class_20_fraction``.
-    Each class value found in *any* row's stat dict becomes an output column;
-    rows whose dict didn't see that class are filled with 0 (the design
-    decision is that "class not observed" = 0, regardless of whether the
-    window itself was valid; the QC sidecar records extent/coverage
-    separately).
-    """
-    # Collect keys in first-seen order so output columns stay stable across runs.
-    stat_keys = dict.fromkeys(key for stat_dict, _ in stats_results for key in stat_dict)
-
-    # Build a batch of new columns so we can add them in one concat.
-    # Columns that already exist should be overwritten (not duplicated),
-    # which can happen for point stats when multiple window sizes are run.
-    new_columns: dict[str, list] = {}
-    existing_columns = set(df.columns)
-    for stat_key in stat_keys:
-        if stat_key == "point" or stat_key.endswith("_point"):
-            column_name = f"{dataset_name}_{stat_key}"
-        else:
-            column_name = f"{dataset_name}_{stat_key}_{window_size_m}m"
-
-        # Decide the fill value for missing entries:
-        # - class_*_count   -> 0   (absent class = zero pixels)
-        # - class_*_fraction -> 0.0 (absent class = 0 % of window)
-        # - everything else -> None (existing behaviour for missing stats)
-        class_match = _CLASS_COLUMN_RE.match(stat_key)
-        if class_match is not None:
-            missing_fill = 0 if class_match.group(1) == "count" else 0.0
-        else:
-            missing_fill = None
-
-        # Pull one value per sample row, using the chosen fill for absent keys.
-        column_values = [
-            stat_dict[stat_key] if stat_key in stat_dict else missing_fill
-            for stat_dict, _ in stats_results
-        ]
-
-        # Overwrite existing columns (keeps schema stable across windows).
-        if column_name in existing_columns:
-            df[column_name] = column_values
-        else:
-            new_columns[column_name] = column_values
-
-    # Add all new columns at once to avoid DataFrame fragmentation warnings.
-    if new_columns:
-        df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
-
-    return df
-
-
-def _write_tabular(df: pd.DataFrame, name: str, output_dir: Path, output_file_format: str) -> Path:
-    """Write a DataFrame to a CSV or Parquet file and return the path written."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if output_file_format == "parquet":
-        path = output_dir / f"{name}.parquet"
-        df.to_parquet(path, index=False)
-    else:
-        path = output_dir / f"{name}.csv"
-        df.to_csv(path, index=False)
-    return path
-
-
-def _validate_required_columns(
-    df: pd.DataFrame,
-    id_column: str,
-    latitude_column: str,
-    longitude_column: str,
-) -> None:
-    """Raise ValueError if df is missing any of the required id/lat/lon columns.
-
-    Uses the user-supplied column names so the error message points at the
-    columns the caller is actually expecting to find — not the canonical
-    internal names.
-    """
-    required_columns = {id_column, latitude_column, longitude_column}
-    if not required_columns.issubset(df.columns):
-        missing_columns = required_columns - set(df.columns)
-        raise ValueError(
-            f"Input DataFrame is missing required column(s): {sorted(missing_columns)}.\n"
-            f"Expected columns: {id_column}, {latitude_column}, {longitude_column} "
-            f"(and optionally a date column).\n"
-            f"Found columns: {sorted(df.columns.tolist())}"
-        )
-
-
-def _validate_and_reproject_crs(
-    df: pd.DataFrame, input_crs: str | None
-) -> tuple[pd.DataFrame, list[str]]:
-    """Reproject coordinates to WGS84 if needed, and raise if any lat/lon are out of range.
-
-    Returns a tuple of (df, crs_warnings) where crs_warnings is a list of messages
-    about CRS handling (e.g. a reprojection notice) that the caller can record in
-    the output metadata alongside the warnings_backlog.
-    """
-    crs_warnings: list[str] = []
-
-    if input_crs is not None:
-        input_crs_upper = input_crs.upper()
-        if input_crs_upper != "EPSG:4326" and input_crs_upper != "WGS84":
-            message = f"Reprojecting coordinates from {input_crs} to EPSG:4326 (WGS84)."
-            warnings.warn(message, stacklevel=2)
-            crs_warnings.append(message)
-            transformer = Transformer.from_crs(input_crs, "EPSG:4326", always_xy=True)
-            lons, lats = transformer.transform(df["lon"].values, df["lat"].values)
-            df["lon"] = lons
-            df["lat"] = lats
-
-    bad_lat_mask = df["lat"].abs() > 90
-    bad_lon_mask = df["lon"].abs() > 180
-    bad_mask = bad_lat_mask | bad_lon_mask
-    if bad_mask.any():
-        bad_rows = df.loc[bad_mask, ["id", "lat", "lon"]]
-        problems = []
-        if bad_lat_mask.any():
-            problems.append("latitude values outside ±90°")
-        if bad_lon_mask.any():
-            problems.append("longitude values outside ±180°")
-        raise ValueError(
-            f"Coordinates appear to not be in WGS84 (EPSG:4326): {'; '.join(problems)}.\n"
-            f"Rows with invalid coordinates:\n{bad_rows.to_string(index=False)}\n"
-            f"If your coordinates are in a different CRS, pass input_crs='EPSG:XXXX'"
-        )
-
-    return df, crs_warnings

@@ -1,4 +1,4 @@
-"""Unit tests for envoi.adapters.gee_adapter internal helpers.
+"""Unit tests for envoi.adapters.earth_engine internal helpers.
 
 These exercise the pure-Python parsing functions that translate raw
 ``reduceRegion`` output into stat dicts. They do not hit Earth Engine —
@@ -15,13 +15,12 @@ from __future__ import annotations
 
 import pytest
 
-from envoi.adapters.gee_adapter import (
-    GEE_SYNC_LIMIT_BYTES,
-    _check_tile_size,
+from envoi.adapters.earth_engine._reducers import (
     _dedupe_categorical_for_ee,
     _parse_multiband_result,
     _parse_reduce_result,
 )
+from envoi.adapters.earth_engine._tiles import GEE_SYNC_LIMIT_BYTES, _check_tile_size
 
 # ------------------------------------------------------------------
 # _dedupe_categorical_for_ee — both class_* names map to one EE call.

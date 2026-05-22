@@ -52,7 +52,7 @@
  Input DataFrame                    Config (dict, list, or YAML path)
  +------------------+               +-------------------------+
  | id | lat | lon   |               | batch_id: "terrain"     |
- |    | (date)      |               | datasets: [dem_aster]   |
+ |    | (date)      |               | datasets: [dem_glo30]   |
  +--------+---------+               | settings:               |
           |                          |   output_type: tabular  |
           v                          |   statistics: [mean,std]|
@@ -84,8 +84,8 @@
     OR (raster mode):
  +------------------------------+
  | out/{batch_id}/{dataset}/    |
- |   A-dem_aster.tif            |
- |   B-dem_aster.tif            |
+ |   A-dem_glo30.tif            |
+ |   B-dem_glo30.tif            |
  |   ...                        |
  | out/{batch_id}/              |
  |   {batch_id}_metadata.json   |

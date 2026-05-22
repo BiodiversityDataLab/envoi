@@ -7,6 +7,7 @@ so this module no longer references any on-disk fixture paths.
 from pathlib import Path
 import json
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -117,7 +118,7 @@ class TestTabular:
         )
 
         result = pd.read_csv(outputs["test"])
-        assert list(result["id"]) == list(sample_df["id"])
+        assert list(result["gbifID"]) == list(sample_df["gbifID"])
 
     def test_csv_format(self, sample_df, tmp_path):
         """Default format is csv; parquet can be requested explicitly."""
@@ -217,7 +218,15 @@ class TestTabular:
         # northern-Sweden raster used by the sample fixtures). This guarantees
         # at least one row hits the rio_mask exception path.
         out_of_extent_row = pd.DataFrame(
-            [{"id": "OOB", "n_otu": 0, "lat": 0.0, "lon": 0.0, "date": "2025-01-01"}]
+            [
+                {
+                    "gbifID": "OOB",
+                    "n_otu": 0,
+                    "decimalLatitude": 0.0,
+                    "decimalLongitude": 0.0,
+                    "eventDate": "2025-01-01",
+                }
+            ]
         )
         df_with_oob = pd.concat([sample_df, out_of_extent_row], ignore_index=True)
 
@@ -253,13 +262,209 @@ class TestTabular:
         ), f"flat-named columns leaked into multi-band output: {leaked_columns}"
 
         # The out-of-extent row should have NaN in every per-band stat column.
-        oob_row = stats_df.loc[stats_df["id"] == "OOB"].iloc[0]
+        oob_row = stats_df.loc[stats_df["gbifID"] == "OOB"].iloc[0]
         for band_index in (1, 2, 3):
             for reducer_name in ("mean", "std"):
                 value = oob_row[f"multi_band_local_b{band_index}_{reducer_name}_100m"]
                 assert pd.isna(
                     value
                 ), f"expected NaN at b{band_index}_{reducer_name} for OOB point, got {value}"
+
+
+# ------------------------------------------------------------------
+# Custom input column names
+# ------------------------------------------------------------------
+
+
+class TestCustomColumnNames:
+    """The default input column names follow the GBIF / Darwin Core convention
+    (``gbifID``, ``decimalLatitude``, ``decimalLongitude``, ``eventDate``),
+    but callers can override every name via the ``*_column`` parameters. These
+    tests pin the override path so a future change to the canonical-name
+    rename layer can't silently break user-supplied names.
+    """
+
+    def test_legacy_short_column_names_via_overrides(self, sample_df, tmp_path):
+        """Old-style short column names (``id``/``lat``/``lon``/``date``) still
+        work when the user passes them through the ``*_column`` overrides —
+        this is the documented migration path for callers that were on the
+        pre-GBIF defaults.
+        """
+        # Rename the GBIF-default fixture columns back to the historical short
+        # names so we can exercise the override path with realistic input.
+        legacy_df = sample_df.rename(
+            columns={
+                "gbifID": "id",
+                "decimalLatitude": "lat",
+                "decimalLongitude": "lon",
+                "eventDate": "date",
+            }
+        )
+
+        outputs = extract(
+            legacy_df,
+            {
+                "batch_id": "legacy_names",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                    "output_file_format": "dataframe",
+                },
+            },
+            output_dir=tmp_path,
+            id_column="id",
+            latitude_column="lat",
+            longitude_column="lon",
+            date_column="date",
+        )
+
+        result = outputs["legacy_names"]
+        # The output must round-trip the user's chosen names — not the new GBIF
+        # defaults, and not the internal canonical names.
+        assert "id" in result.columns
+        assert "gbifID" not in result.columns
+        assert list(result["id"]) == list(legacy_df["id"])
+        # And the actual extraction still ran end-to-end.
+        assert "dem_local_mean_100m" in result.columns
+
+
+# ------------------------------------------------------------------
+# GBIF / Darwin Core eventDate parsing
+# ------------------------------------------------------------------
+
+
+class TestGbifEventDateParsing:
+    """``eventDate`` from a GBIF download follows ISO 8601 and is allowed to
+    be an interval (``start/end``) or a datetime with a time component. The
+    pipeline only uses day precision downstream, so the parser must collapse
+    these to a YYYY-MM-DD start without erroring.
+    """
+
+    def test_iso_interval_truncates_to_start(self):
+        # Verbatim form seen in real GBIF downloads — both halves of the
+        # interval include a time component. The downstream date list must
+        # contain the start day, with no time.
+        from envoi._input_validation import _parse_and_validate_dates
+
+        df = pd.DataFrame(
+            {
+                "id": ["a"],
+                "lat": [62.97],
+                "lon": [18.02],
+                "date": ["2026-05-12T13:00/2026-05-12T15:45"],
+            }
+        )
+        # Two aggregated warnings: one for the interval truncation, one for
+        # the time-of-day truncation. Both reference a count of 1.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _, dates, _ = _parse_and_validate_dates(df)
+        messages = [str(w.message) for w in caught]
+        assert any("Truncated 1 ISO 8601 date interval" in m for m in messages)
+        assert any("Dropped time-of-day from 1 date value" in m for m in messages)
+        assert dates == ["2026-05-12"]
+
+    def test_iso_datetime_with_time_parses_to_day(self):
+        # ``2026-05-12T13:00:00Z`` and similar — the strip-on-"T" path turns
+        # these into pure date strings before pandas sees them. They were
+        # rejected by the original strict YYYY-MM-DD parser.
+        from envoi._input_validation import _parse_and_validate_dates
+
+        df = pd.DataFrame(
+            {
+                "id": ["a"],
+                "lat": [62.97],
+                "lon": [18.02],
+                "date": ["2026-05-12T13:00:00Z"],
+            }
+        )
+        _, dates, _ = _parse_and_validate_dates(df)
+        assert dates == ["2026-05-12"]
+
+    def test_mixed_timezones_do_not_break_parsing(self):
+        # Real GBIF rows can mix tz-aware (``Z``-suffixed) and tz-naive
+        # datetimes in the same column. Before stripping the time component,
+        # pandas would return an object-dtype Index and the downstream
+        # ``.strftime`` call blew up with AttributeError. Pin this so that
+        # regression can't sneak back in.
+        from envoi._input_validation import _parse_and_validate_dates
+
+        df = pd.DataFrame(
+            {
+                "id": ["a", "b"],
+                "lat": [62.97, 62.98],
+                "lon": [18.02, 18.03],
+                "date": [
+                    "2026-02-11T15:01Z/2026-02-11T16:03Z",  # tz-aware interval
+                    "2026-05-12T13:00/2026-05-12T15:45",  # tz-naive interval
+                ],
+            }
+        )
+        _, dates, _ = _parse_and_validate_dates(df)
+        assert dates == ["2026-02-11", "2026-05-12"]
+
+    def test_per_row_warning_is_not_emitted_for_many_intervals(self):
+        # A 60-row GBIF download mustn't produce 60 per-row warnings — the
+        # truncation warnings are aggregated. Two aggregated warnings (one
+        # for intervals, one for time-of-day) are acceptable; per-row spam
+        # is what we're guarding against.
+        from envoi._input_validation import _parse_and_validate_dates
+
+        n_rows = 60
+        df = pd.DataFrame(
+            {
+                "id": [str(i) for i in range(n_rows)],
+                "lat": [62.97] * n_rows,
+                "lon": [18.02] * n_rows,
+                "date": ["2026-05-12T13:00/2026-05-12T15:45"] * n_rows,
+            }
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _parse_and_validate_dates(df)
+        assert len(caught) == 2, (
+            f"expected 2 aggregated warnings for {n_rows} interval rows, "
+            f"got {len(caught)} — per-row spam regressed"
+        )
+
+    def test_plain_yyyy_mm_dd_unchanged(self):
+        # Regression guard: the pre-existing happy path must still work
+        # exactly the same and emit no warnings.
+        from envoi._input_validation import _parse_and_validate_dates
+
+        df = pd.DataFrame(
+            {
+                "id": ["a", "b"],
+                "lat": [62.97, 62.98],
+                "lon": [18.02, 18.03],
+                "date": ["2020-06-01", "2021-07-15"],
+            }
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning would fail the test
+            _, dates, date_warnings = _parse_and_validate_dates(df)
+        assert dates == ["2020-06-01", "2021-07-15"]
+        assert date_warnings == []
+
+    def test_year_only_still_warns_on_preprocessed_string(self):
+        # Year-only dates should still warn about incomplete precision, and
+        # the warning's quoted date must be the preprocessed string (not the
+        # raw value with any interval suffix).
+        from envoi._input_validation import _parse_and_validate_dates
+
+        df = pd.DataFrame(
+            {
+                "id": ["a"],
+                "lat": [62.97],
+                "lon": [18.02],
+                "date": ["2026"],
+            }
+        )
+        with pytest.warns(UserWarning, match="interpreted as 2026-01-01"):
+            _, dates, _ = _parse_and_validate_dates(df)
+        assert dates == ["2026-01-01"]
 
 
 # ------------------------------------------------------------------
@@ -385,7 +590,9 @@ class TestRaster:
         # is built in UTM and reprojected to the raster's EPSG:4326 CRS, so it
         # ends up as a non-axis-aligned quadrilateral — corner pixels of the
         # cropped bounding box fall outside the polygon and get masked.
-        df = pd.DataFrame({"id": ["centre"], "lat": [62.98], "lon": [18.025]})
+        df = pd.DataFrame(
+            {"gbifID": ["centre"], "decimalLatitude": [62.98], "decimalLongitude": [18.025]}
+        )
         extract(
             df,
             {
@@ -422,7 +629,9 @@ class TestRaster:
             {"datasets": {"float32_test": {"data_source": "local", "path": str(raster_path)}}}
         )
 
-        df = pd.DataFrame({"id": ["centre"], "lat": [62.98], "lon": [18.025]})
+        df = pd.DataFrame(
+            {"gbifID": ["centre"], "decimalLatitude": [62.98], "decimalLongitude": [18.025]}
+        )
         extract(
             df,
             {
@@ -982,10 +1191,11 @@ class TestOutputFormats:
         ), f"expected DataFrame return, got {type(result).__name__}"
         assert len(result) == len(sample_df)
         assert "dem_local_mean_100m" in result.columns
-        # Core columns (id/lat/lon) are preserved on the stats output so the
-        # returned DataFrame is independently useful.
-        assert "id" in result.columns
-        assert list(result["id"]) == list(sample_df["id"])
+        # Core columns (gbifID/decimalLatitude/decimalLongitude) are
+        # preserved on the stats output so the returned DataFrame is
+        # independently useful.
+        assert "gbifID" in result.columns
+        assert list(result["gbifID"]) == list(sample_df["gbifID"])
 
     def test_unknown_output_format_raises(self, sample_df, tmp_path):
         """An unrecognised output_file_format value raises ValueError."""
@@ -1185,7 +1395,7 @@ class TestLocalRasterAdapterLifecycle:
 
     def test_get_utm_crs_clamps_at_antimeridian(self):
         """lon == 180 must produce a valid UTM zone (1-60), not zone 61."""
-        from envoi.metadata import get_utm_crs
+        from envoi.geo import get_utm_crs
 
         # Northern hemisphere: zones 32601..32660. Southern: 32701..32760.
         # The naive `(lon + 180) / 6 + 1` formula gives 61 at lon == 180,
@@ -1384,7 +1594,7 @@ class TestAppendStatColumnsClassFill:
         # Two rows: row 0 saw classes 10/20, row 1 saw classes 20/30. The
         # output should include columns for *every* class that any row saw
         # (union), with absent classes filled to 0.
-        from envoi.extract import _append_stat_columns
+        from envoi._output_assembly import _append_stat_columns
 
         df = pd.DataFrame({"id": ["a", "b"]})
         stats_results = [
@@ -1401,7 +1611,7 @@ class TestAppendStatColumnsClassFill:
         # The zero-fill helper must distinguish count (int 0) from fraction
         # (float 0.0). A row that didn't see a class gets 0.0 in its
         # fraction column, preserving the float dtype.
-        from envoi.extract import _append_stat_columns
+        from envoi._output_assembly import _append_stat_columns
 
         df = pd.DataFrame({"id": ["a", "b"]})
         stats_results = [
@@ -1420,7 +1630,7 @@ class TestAppendStatColumnsClassFill:
         # Regression: only class_* columns get zero-fill. A plain reducer
         # (e.g. mean) that's missing for some row still produces None /
         # NaN as before, so the missing-data signal isn't lost.
-        from envoi.extract import _append_stat_columns
+        from envoi._output_assembly import _append_stat_columns
 
         df = pd.DataFrame({"id": ["a", "b"]})
         stats_results = [
@@ -1435,7 +1645,7 @@ class TestAppendStatColumnsClassFill:
         # Multi-band class keys carry a "b{n}_class_..." prefix. The fill
         # helper must match those too via the optional band prefix in the
         # regex. Each band's class columns are zero-filled independently.
-        from envoi.extract import _append_stat_columns
+        from envoi._output_assembly import _append_stat_columns
 
         df = pd.DataFrame({"id": ["a", "b"]})
         stats_results = [
@@ -1458,7 +1668,7 @@ def test_all_known_reducers_includes_class_reducers():
     # Regression check: the validator's allow-list must include the new
     # categorical reducers, otherwise _validate_reducer_names rejects them
     # before the adapter ever sees them.
-    from envoi.extract import _ALL_KNOWN_REDUCERS
+    from envoi._config_parsing import _ALL_KNOWN_REDUCERS
 
     assert "class_count" in _ALL_KNOWN_REDUCERS
     assert "class_fraction" in _ALL_KNOWN_REDUCERS

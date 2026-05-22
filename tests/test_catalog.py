@@ -1,4 +1,4 @@
-"""Unit tests for envoi.config — catalog validation and user-catalog state.
+"""Unit tests for envoi.catalog — catalog validation and user-catalog state.
 
 These cover the error paths that turn invalid YAML / dicts into a clear
 CatalogError, plus the accumulate/reset semantics of update_catalog() and
@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from envoi import list_datasets, reset_catalog, update_catalog
-from envoi.config import (
+from envoi.catalog import (
     BUILTIN_EE_CATALOG,
     CatalogError,
     _load_catalog_any,
@@ -273,11 +273,12 @@ class TestListDatasets:
 
     def test_names_includes_a_known_builtin_dataset(self, capsys):
         # Smoke check that the merged view actually exposes built-in
-        # datasets (not just an empty list). dem_aster is a stable entry
-        # in the bundled catalog used elsewhere in the README/tests.
+        # datasets (not just an empty list). dem_copernicus_glo30 is a
+        # stable entry in the bundled catalog used elsewhere in the
+        # README/tests.
         result = list_datasets("names")
         capsys.readouterr()  # discard printed output
-        assert "dem_aster" in result
+        assert "dem_copernicus_glo30" in result
 
     def test_info_returns_records_with_expected_fields(self, capsys):
         # "info" verbosity returns a list of dicts with the human-readable
@@ -308,9 +309,9 @@ class TestListDatasets:
         records = list_datasets("full")
         capsys.readouterr()  # discard printed output
         by_name = {r["name"]: r for r in records}
-        dem_aster = by_name["dem_aster"]
-        assert dem_aster["data_source"] == "earth_engine"
-        assert "path" in dem_aster
+        dem_entry = by_name["dem_copernicus_glo30"]
+        assert dem_entry["data_source"] == "earth_engine"
+        assert "path" in dem_entry
 
     def test_includes_user_registered_datasets(self, capsys):
         # User-registered datasets should show up alongside built-ins —

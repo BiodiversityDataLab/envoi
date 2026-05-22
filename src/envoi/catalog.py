@@ -1,4 +1,4 @@
-# src/envoi/config.py
+# src/envoi/catalog.py
 from __future__ import annotations
 import importlib.resources as importlib_resources
 from pathlib import Path

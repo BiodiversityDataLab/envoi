@@ -2,7 +2,7 @@ from importlib.metadata import version, PackageNotFoundError
 
 from .extract import extract
 from .reducers import list_reducers
-from .config import update_catalog, reset_catalog, list_datasets, CatalogError
+from .catalog import update_catalog, reset_catalog, list_datasets, CatalogError
 from .auth import init_gee
 
 try:
