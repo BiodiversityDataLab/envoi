@@ -22,7 +22,7 @@ datasets:
   #   #   datasets:
   #   #     - sentinel_2_l2a                       # use the catalog defaults
   #   #     - {sentinel_2_l2a: [B4, B8]}           # shorthand: replace bands for this run only
-  #   #     - {dem_aster:     [DEM, slope]}        # mix source + derived names in one list
+  #   #     - {dem_copernicus_glo30: [DEM, slope]} # mix source + derived names in one list
   #   # Names recognised as derived (currently "slope", "aspect") are split out
   #   # internally; the rest are used as source bands. The per-call override
   #   # replaces the catalog's bands list entirely (no merging). Any derived
@@ -46,16 +46,6 @@ datasets:
   
   
   # ── Terrain ──────────────────────────────────────────────────────────────
-  dem_aster: # testing purpose only - remove later
-    data_source: earth_engine
-    path: projects/sat-io/open-datasets/ASTER/GDEM
-    data_type: continuous
-    supported_derived_bands: [slope, aspect]
-    dataset_information:
-      spatial_resolution: 30 meters
-      temporal_resolution: static
-      temporal_range: n/a
-
   dem_copernicus_glo30:
     data_source: earth_engine
     path: COPERNICUS/DEM/GLO30
