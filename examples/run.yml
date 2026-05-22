@@ -1,7 +1,68 @@
-# Example: tabular stats for local DEM
+# ===========================================================================
+# envoi: example run configuration
+# ---------------------------------------------------------------------------
+# Pass this file as the second argument to extract(). It is the YAML form of
+# the dict/list-of-dicts you would otherwise build in Python:
+#
+#   from envoi import extract
+#   import pandas as pd
+#
+#   points = pd.DataFrame({
+#       "gbifID":           ["a", "b"],
+#       "decimalLatitude":  [59.85, 59.86],
+#       "decimalLongitude": [17.63, 17.64],
+#   })
+#   extract(points, "examples/run.yml")
+#
+# The top-level structure is a list of "batches". Each batch produces one
+# output file (or one folder of raster tiles) under outputs/. Run all of
+# them in a single extract() call, or delete the ones you do not need.
+#
+# Every dataset referenced below ships in envoi's built-in catalog
+# (src/envoi/configs/ee_catalog.yml), so no update_catalog() call is needed
+# to run this example.
+# ===========================================================================
+
+
+# ── Batch 1 ─ Terrain statistics around each point ─────────────────────────
+# Computes mean, std, and the 10th / 90th elevation percentiles inside a
+# square 200 m window centered on every point. Result: one row per point,
+# one column per reducer (e.g. dem_copernicus_glo30_mean_200m).
 - batch_id: terrain_stats
-  datasets: [dem_local]
+  datasets: [dem_copernicus_glo30]
+  settings:
+    output_type: tabular              # "tabular" (stats per point) or "raster" (GeoTIFF tiles)
+    statistics: [mean, std, q10, q90] # any reducer from envoi.list_reducers()
+    window_size_m: 200                # side length of the square window in metres
+    output_file_format: csv           # "csv" (default), "parquet", or "dataframe"
+
+
+# ── Batch 2 ─ Terrain GeoTIFF tiles (one per point) ────────────────────────
+# Crops the same 200 m window around each point and resamples every tile to
+# 10 m/pixel in the point's UTM zone. With `resample_m` set, all tiles share
+# the same dimensions and pixel grid — convenient as CNN input.
+- batch_id: terrain_tiles
+  datasets: [dem_copernicus_glo30]
+  settings:
+    output_type: raster
+    window_size_m: 200
+    resample_m: 10                    # omit to keep the source raster's native resolution
+
+
+# ── Batch 3 ─ Mixed continuous + categorical extraction ────────────────────
+# Combines elevation (continuous) with ESA WorldCover land cover (categorical)
+# in a single output. The `statistics` block is a *dict* keyed by data_type,
+# so each dataset gets reducers appropriate to its kind:
+#   - continuous datasets (DEM)  → mean, std
+#   - categorical datasets (LULC) → mode, class_fraction (one column per class)
+- batch_id: terrain_and_landcover
+  datasets:
+    - dem_copernicus_glo30
+    - lulc_worldcover_2021
   settings:
     output_type: tabular
-    statistics: [mean, std, q10, q90]
-    window_size_m: 200
+    window_size_m: 500
+    min_coverage_pct: 80              # flag rows where fewer than 80% of pixels are valid
+    statistics:
+      continuous:  [mean, std]
+      categorical: [mode, class_fraction]
