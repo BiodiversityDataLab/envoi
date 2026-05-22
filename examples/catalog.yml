@@ -1,0 +1,81 @@
+# ===========================================================================
+# envoi: example custom catalog
+# ---------------------------------------------------------------------------
+# Register these datasets with update_catalog() once at the start of your
+# session. Every later extract() call can then reference them by name, just
+# like the built-in entries:
+#
+#   from envoi import update_catalog, extract
+#
+#   update_catalog("examples/catalog.yml")   # load this file
+#   extract(points, {
+#       "batch_id": "my_run",
+#       "datasets": ["my_dem", "sentinel_2_sr_harmonized"],
+#       "settings": {"output_type": "tabular",
+#                    "statistics": ["mean"],
+#                    "window_size_m": 200},
+#   })
+#
+# User-registered datasets override any built-in entry with the same name,
+# so this file is also the right place to tweak a shipped dataset (e.g.
+# change its default bands) without editing the envoi package itself.
+#
+# Required keys per entry:
+#   - data_source: "local" or "earth_engine"
+#   - path:        file path (local) or GEE asset ID (earth_engine)
+#   - data_type:   "continuous" or "categorical"
+#                  Required for earth_engine entries; optional for local
+#                  rasters, which default to "continuous" otherwise.
+#
+# Everything else is optional. For local rasters envoi auto-detects CRS,
+# pixel size, nodata, and band count by opening the file with rasterio
+# the first time the catalog is loaded.
+#
+# For the full set of optional fields (bands, derived bands, dataset_spec,
+# dataset_information) see the commented reference block at the top of
+# src/envoi/configs/ee_catalog.yml — it is a copy-paste starting point.
+# ===========================================================================
+
+datasets:
+
+  # ── Local raster: minimal example ────────────────────────────────────────
+  # A GeoTIFF on disk. CRS, pixel size, nodata, and band count are detected
+  # from the file automatically — no need to declare them here.
+  my_dem:
+    data_source: local
+    path: data/my_dem.tif
+    
+  # ── Local raster: categorical, with metadata ─────────────────────────────
+  # Local datasets identify bands by INTEGER index (1-based, rasterio style),
+  # unlike GEE entries which use string names. data_type must be set
+  # explicitly here because local rasters default to "continuous".
+  my_landcover:
+    data_source: local
+    path: data/landcover.tif
+    data_type: categorical
+    bands: 1
+    dataset_information:
+      description: "Local 10 m land cover raster, classes 1-9."
+      citation: "Smith et al. 2024"
+      license: "internal"
+
+  # ── Earth Engine asset not in the built-in catalog ───────────────────────
+  # Sentinel-2 Level-2A surface reflectance (harmonized collection).
+  # collection_date_policy: contains is the right choice for interval-based
+  # ImageCollections — the per-point image is selected by date range rather
+  # than nearest timestamp.
+  sentinel_2_sr_harmonized:
+    data_source: earth_engine
+    path: COPERNICUS/S2_SR_HARMONIZED
+    data_type: continuous
+    bands: [B4, B8]
+    dataset_spec:
+      collection_date_policy: contains
+    dataset_information:
+      spatial_resolution: 10-60 m
+      temporal_resolution: 5 days
+      temporal_range: 2017-03-28 to present
+      description: "Sentinel-2 Level-2A surface reflectance (harmonized)."
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_S2_SR_HARMONIZED"
+      citation: "Copernicus Sentinel data, processed by ESA."
+      license: "Free and open (Copernicus license)"
