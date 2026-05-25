@@ -1,54 +1,21 @@
-# ===========================================================================
-# envoi: example custom catalog
-# ---------------------------------------------------------------------------
-# Register these datasets with update_catalog() once at the start of your
-# session. Every later extract() call can then reference them by name, just
-# like the built-in entries:
+# envoi: example custom catalog (template)
 #
-#   from envoi import update_catalog, extract
+# Register with `update_catalog("examples/catalog.yml")` before calling
+# extract(). Entries registered here override built-ins with the same name.
 #
-#   update_catalog("examples/catalog.yml")   # load this file
-#   extract(points, {
-#       "batch_id": "my_run",
-#       "datasets": ["my_dem", "sentinel_2_sr_harmonized"],
-#       "settings": {"output_type": "tabular",
-#                    "statistics": ["mean"],
-#                    "window_size_m": 200},
-#   })
-#
-# User-registered datasets override any built-in entry with the same name,
-# so this file is also the right place to tweak a shipped dataset (e.g.
-# change its default bands) without editing the envoi package itself.
-#
-# Required keys per entry:
-#   - data_source: "local" or "earth_engine"
-#   - path:        file path (local) or GEE asset ID (earth_engine)
-#   - data_type:   "continuous" or "categorical"
-#                  Required for earth_engine entries; optional for local
-#                  rasters, which default to "continuous" otherwise.
-#
-# Everything else is optional. For local rasters envoi auto-detects CRS,
-# pixel size, nodata, and band count by opening the file with rasterio
-# the first time the catalog is loaded.
-#
-# For the full set of optional fields (bands, derived bands, dataset_spec,
-# dataset_information) see the commented reference block at the top of
-# src/envoi/configs/ee_catalog.yml — it is a copy-paste starting point.
-# ===========================================================================
+# Required keys: data_source, path (and data_type for earth_engine entries).
+# Full schema reference: src/envoi/configs/ee_catalog.yml.
 
 datasets:
 
-  # ── Local raster: minimal example ────────────────────────────────────────
-  # A GeoTIFF on disk. CRS, pixel size, nodata, and band count are detected
-  # from the file automatically — no need to declare them here.
+  # Local GeoTIFF — CRS, pixel size, nodata and band count are auto-detected.
   my_dem:
     data_source: local
     path: data/my_dem.tif
-    
-  # ── Local raster: categorical, with metadata ─────────────────────────────
-  # Local datasets identify bands by INTEGER index (1-based, rasterio style),
-  # unlike GEE entries which use string names. data_type must be set
-  # explicitly here because local rasters default to "continuous".
+
+  # Local categorical raster — bands are addressed by integer index
+  # (1-based, rasterio style). data_type must be set explicitly; local
+  # entries default to "continuous" otherwise.
   my_landcover:
     data_source: local
     path: data/landcover.tif
@@ -59,23 +26,13 @@ datasets:
       citation: "Smith et al. 2024"
       license: "internal"
 
-  # ── Earth Engine asset not in the built-in catalog ───────────────────────
-  # Sentinel-2 Level-2A surface reflectance (harmonized collection).
-  # collection_date_policy: contains is the right choice for interval-based
-  # ImageCollections — the per-point image is selected by date range rather
-  # than nearest timestamp.
+  # Earth Engine asset not in the built-in catalog.
   sentinel_2_sr_harmonized:
     data_source: earth_engine
     path: COPERNICUS/S2_SR_HARMONIZED
     data_type: continuous
     bands: [B4, B8]
     dataset_spec:
+      # Interval-based collection: pick the image whose time range contains
+      # the point's date, rather than the nearest start timestamp.
       collection_date_policy: contains
-    dataset_information:
-      spatial_resolution: 10-60 m
-      temporal_resolution: 5 days
-      temporal_range: 2017-03-28 to present
-      description: "Sentinel-2 Level-2A surface reflectance (harmonized)."
-      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_S2_SR_HARMONIZED"
-      citation: "Copernicus Sentinel data, processed by ESA."
-      license: "Free and open (Copernicus license)"
