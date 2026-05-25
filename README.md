@@ -4,37 +4,36 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/envoi)](https://pypi.org/project/envoi/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Enrich a pandas DataFrame of sample points with environmental data from Google Earth Engine and/or local GeoTIFFs — one unified interface, identical output shape across data sources.
+Automated feature extraction from environmental data sources for ecological and spatial analysis.
 
 ---
 
 ## Table of contents
 
-- [Why envoi?](#why-envoi)
+- [envoi - ENvironmental Variables for Observational Instances](#why-envoi)
 - [Install](#install)
 - [Earth Engine setup](#earth-engine-setup)
 - [Quick start](#quick-start)
 - [Outputs](#outputs)
   - [Tabular](#tabular)
   - [Raster](#raster)
-- [Advanced](#advanced)
-  - [Multiple outputs in one call](#multiple-outputs-in-one-call)
-  - [Date-aware extraction](#date-aware-extraction)
-  - [Mixing categorical and continuous datasets](#mixing-categorical-and-continuous-datasets)
-  - [Selecting bands per call](#selecting-bands-per-call)
-  - [Custom datasets](#custom-datasets)
+- [Advanced](docs/advanced.md)
 - [Reference](#reference)
   - [Built-in datasets](#built-in-datasets)
   - [Notes](#notes)
+- [How to cite](#how-to-cite)
+- [Contributors](#contributors)
 - [Project links](#project-links)
 
 ---
 
-## envoi - Environmental variables for observational instances
+## envoi - ENvironmental Variables for Observational Instances
 
 Ecological and spatial models need environmental variables attached to field sample points — climate, terrain, land cover, vegetation indices. The usual workflow involves stitching together one-off scripts for each data source (Earth Engine for satellite data, rasterio for local files, ad-hoc projections to get distances right), and the outputs rarely line up.
 
 envoi exposes a single `extract(df, config)` call that runs against both Google Earth Engine and local GeoTIFFs and returns the same shape of output. No pre-downloading, sensible defaults for users who'd rather not think about CRS or UTM zones, and the same reducers and QC columns across data sources so results are directly comparable.
+
+envoi is developed at the [Biodiversity Data Lab](https://biodiversity.se/) at Uppsala University.
 
 ---
 
@@ -110,6 +109,8 @@ outputs = extract(sample_points, {
 
 Override the output location with `extract(df, config, output_dir="my_dir")`.
 
+The same config can also live in a YAML file — see [examples/run.yml](examples/run.yml) for a runnable template.
+
 ---
 
 ## Outputs
@@ -183,123 +184,7 @@ Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`.
 
 ## Advanced
 
-### Multiple outputs in one call
-
-Pass a list of configs to produce several outputs from one `extract()` call:
-
-```python
-outputs = extract(sample_points, [
-    {
-        "batch_id": "terrain_stats",
-        "datasets": ["dem_copernicus_glo30"],
-        "settings": {
-            "output_type": "tabular",
-            "statistics": ["mean", "std"],
-            "window_size_m": 200,
-        },
-    },
-    {
-        "batch_id": "terrain_tiles",
-        "datasets": ["dem_copernicus_glo30"],
-        "settings": {
-            "output_type": "raster",
-            "window_size_m": 200,
-            "resample_m": 10,
-        },
-    },
-])
-```
-
-### Date-aware extraction
-
-If your DataFrame has an `eventDate` column, envoi uses it when querying time-varying Earth Engine ImageCollections:
-
-```python
-sample_points = pd.DataFrame({
-    "gbifID":     ["a", "b"],
-    "decimalLatitude":  [59.85, 59.86],
-    "decimalLongitude": [17.63, 17.64],
-    "eventDate":        ["2022-06-15", "2023-08-01"],
-})
-
-extract(sample_points, {
-    "batch_id": "ndvi",
-    "datasets": ["ndvi_landsat_annual"],
-    "settings": {"output_type": "tabular", "statistics": ["mean"], "window_size_m": 200},
-})
-```
-
-For each point, envoi selects a single image from the collection. How that image is chosen is controlled per-dataset by `collection_date_policy` in the catalog:
-
-- `"nearest"` (default) — the image whose start timestamp is closest to the point's date.
-- `"contains"` — the image whose time range contains the point's date. Use this for interval-based collections (e.g. monthly aggregates) where "contains" is more meaningful than "nearest".
-
-Dates outside the collection's range are silently clamped to the nearest boundary and recorded in the metadata sidecar — they do not raise.
-
-Without an `eventDate` column, envoi falls back to the most recent image in each collection and emits a warning so you know it happened.
-
-### Mixing categorical and continuous datasets
-
-When a run combines continuous datasets (e.g. elevation, climate) with categorical ones (e.g. land cover), pass a typed dict for `statistics` so each type gets the appropriate reducers:
-
-```python
-extract(sample_points, {
-    "batch_id": "mixed",
-    "datasets": ["dem_copernicus_glo30", "lulc_worldcover_2021"],
-    "settings": {
-        "output_type": "tabular",
-        "statistics": {
-            "continuous":  ["mean", "std", "q10", "q90"],
-            "categorical": ["mode", "class_fraction"],
-        },
-        "window_size_m": 200,
-    },
-})
-```
-
-Each dataset's `data_type` in the catalog (`continuous` or `categorical`) decides which list applies. A reducer valid for both types (e.g. `mode`) can appear in both lists. Datasets without an explicit `data_type` default to `continuous`. A flat list (the original form) still works and applies to every dataset.
-
-### Selecting bands per call
-
-The catalog defines each dataset's default bands. To override them for a single call without re-registering the catalog, replace a string entry in `datasets` with a single-key dict whose value is the band list:
-
-```python
-extract(sample_points, {
-    "batch_id": "satellite",
-    "datasets": [
-        "dem_copernicus_glo30",                # catalog defaults
-        {"sr_landsat_annual": ["B4", "B5"]},   # narrow bands for this run only
-        {"dem_copernicus_glo30": ["DEM", "slope"]},       # mix source + derived names
-    ],
-    "settings": {"output_type": "tabular", "statistics": ["mean"], "window_size_m": 200},
-})
-```
-
-Names recognised as derived bands (currently `slope` and `aspect`, computed from the first band of the dataset) are split out automatically — no separate key needed. Derived bands are only supported for Earth Engine datasets; supplying one for a local raster raises `ValueError`.
-
-A one-element list (`{"sr_landsat_annual": ["B4"]}`) keeps the multi-band column naming (`sr_landsat_annual_B4_mean_200m`); use the catalog default if you want the bare single-band form.
-
-> **Band identifiers.** Earth Engine datasets identify bands by *string* names (`"B4"`, `"DEM"`, `"slope"`) because GEE exposes named bands. Local GeoTIFFs identify bands by *integer* index (`1`, `2`, `[1, 2, 3]`) because rasterio reads bands positionally. So a GEE catalog entry might set `bands: ["DEM"]` and a local one `bands: 1`, and a per-call override follows the same convention as the dataset it targets.
-
-### Custom datasets
-
-Datasets not in the built-in catalog can be registered once with `update_catalog()`. Registered datasets are then available in every subsequent `extract()` call:
-
-```python
-from envoi import update_catalog
-
-# From a dict — quick for one-off local rasters.
-update_catalog({
-    "datasets": {
-        "my_dem": {"data_source": "local", "path": "data/dem.tif"},
-    },
-})
-
-# From a YAML file — better for multi-dataset projects under version control.
-update_catalog("my_catalog.yml")
-```
-
-For the full catalog schema, see the commented reference block at the top of [src/envoi/configs/ee_catalog.yml](src/envoi/configs/ee_catalog.yml) — it's a copy-paste starting point for adding a new entry.
+Multiple outputs in one call, date-aware extraction, mixing categorical and continuous datasets, per-call band selection, and custom dataset registration are covered in [docs/advanced_guide.md](docs/advanced_guide.md). A starter custom catalog (local raster and Earth Engine entries) lives at [examples/catalog.yml](examples/catalog.yml).
 
 ---
 
@@ -337,6 +222,27 @@ The source, including descriptions, citations, and URLs for every entry, is [src
 - **Window units.** `window_size_m` is in meters. Each window is projected into the point's local UTM zone so distances are correct globally.
 - **Data source CRS and resolution.** Both are detected automatically from each dataset — no manual configuration needed.
 - **QC, not failure.** Low pixel coverage is flagged in QC columns rather than raising. Filter on `<dataset>_coverage_pct_<window>m` to drop unreliable rows downstream.
+
+---
+
+## How to cite
+
+A paper describing envoi is currently in preparation. In the meantime, please cite the software directly:
+
+> Baggström, A., Nyström, J., & Andermann, T. (*in prep.*). envoi: automated environmental feature extraction for ecological analysis. Retrieved from https://github.com/BiodiversityDataLab/envoi
+
+This entry will be updated with a DOI and full citation when the paper is published.
+
+---
+
+## Contributors
+
+**Primary authors and maintainers** — Adrian Baggström, Jakob Nyström.
+
+**Past contributors** — Miguel Redondo at [NBIS](https://nbis.se); Shaheryar, Thant Zin Bo, and Per Vincent Ankarbåge (Uppsala University Data Science MSc students).
+
+**Acknowledgements** — Tobias Andermann (Conceptualization and PhD supervision for A.B. and T.N.). A.B., J.N., and T.A. received financial support from the SciLifeLab & Wallenberg Data Driven Life Science Program (grant: KAW 2020.0239) and from the Swedish Research Council (2023-05366). We are grateful to the maintainers of Google Earth Engine, rasterio, geopandas, and pyproj.
+
 
 ---
 

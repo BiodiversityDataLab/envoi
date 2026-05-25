@@ -2,45 +2,40 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .venv/
-.env
+
+# Build / packaging
 dist/
 build/
 *.egg-info/
 
-# Data
-data/*.tif
-data/*.tiff
-data/*.nc
-data/*.zip
-data/*.parquet
-data/*.gpkg
-data/*.geojson
-data/raw/
-out/
+# Testing & QC
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data & runtime outputs
+data/
 outputs/
 .cache/
-.cache/**
 
-# OS/editor
+# Credentials
+credentials/
+.env
+
+# OS / editor
 .DS_Store
 .vscode/
 .idea/
-data/*.hgt
-.venv/
-*.pyc
-configs/examples/
-
-# Secrets
-credentials/
 
 # Personal / scratch
-adrians/
-testing_deleteme.py
-tests/output/
-data/us_temp_annual.tif
-data/us_points.csv
-data/points_5.csv
-testing.ipynb
-adde_test.py
-vj_data.py
+CLAUDE.md
+.claude/
