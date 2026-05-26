@@ -66,7 +66,7 @@ Live GEE tests are marked with `@pytest.mark.gee` and need network access plus c
 - `tests/` — pytest suite, including the `gee`-marked live Earth Engine tests and shared fixtures in `conftest.py`.
 - `examples/` — minimal example `run.yml` and `catalog.yml` showing the config schema.
 - `demo/` — `getting_started.ipynb`, an interactive walkthrough of the main features.
-- `docs/` — design notes (`architecture.md`) and extended usage (`advanced.md`).
+- `docs/` — design notes (`architecture.md`) and extended usage (`advanced_usage.md`).
 - `.github/workflows/` — CI (`ci.yml`) and PyPI release (`release.yml`) pipelines.
 
 ---

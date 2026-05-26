@@ -39,3 +39,4 @@ credentials/
 # Personal / scratch
 CLAUDE.md
 .claude/
+examples/walkthrough_output/

@@ -14,10 +14,11 @@ Automated feature extraction from environmental data sources for ecological and 
 - [Install](#install)
 - [Earth Engine setup](#earth-engine-setup)
 - [Quick start](#quick-start)
+- [Walkthrough notebook](examples/walkthrough.ipynb)
 - [Outputs](#outputs)
   - [Tabular](#tabular)
   - [Raster](#raster)
-- [Advanced](docs/advanced.md)
+- [Advanced](docs/advanced_usage.md)
 - [Reference](#reference)
   - [Built-in datasets](#built-in-datasets)
   - [Notes](#notes)
@@ -111,6 +112,10 @@ Override the output location with `extract(df, config, output_dir="my_dir")`.
 
 The same config can also live in a YAML file — see [examples/run.yml](examples/run.yml) for a runnable template.
 
+### Walkthrough
+
+For a guided end-to-end tutorial — tabular and raster extraction, local rasters, multi-dataset runs, date-aware extraction, and catalog discovery — see the [walkthrough notebook](examples/walkthrough.ipynb).
+
 ---
 
 ## Outputs
@@ -184,7 +189,7 @@ Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`.
 
 ## Advanced
 
-Multiple outputs in one call, date-aware extraction, mixing categorical and continuous datasets, per-call band selection, and custom dataset registration are covered in [docs/advanced_guide.md](docs/advanced_guide.md). A starter custom catalog (local raster and Earth Engine entries) lives at [examples/catalog.yml](examples/catalog.yml).
+Multiple outputs in one call, date-aware extraction, mixing categorical and continuous datasets, per-call band selection, multiple window sizes, and custom dataset registration are covered in [docs/advanced_usage.md](docs/advanced_usage.md). A starter custom catalog (local raster and Earth Engine entries) lives at [examples/catalog.yml](examples/catalog.yml).
 
 ---
 
