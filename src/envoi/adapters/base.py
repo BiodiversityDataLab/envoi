@@ -38,6 +38,7 @@ class BaseAdapter:
         *,
         dates: Sequence | None = None,
         progress_desc: str | None = None,
+        disable_progress: bool = False,
     ) -> List[tuple[dict, dict]]:
         raise NotImplementedError
 

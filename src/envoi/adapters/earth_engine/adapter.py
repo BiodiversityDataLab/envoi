@@ -881,6 +881,7 @@ class GeeRasterAdapter(BaseAdapter):
         *,
         dates: Sequence | None = None,
         progress_desc: str | None = None,
+        disable_progress: bool = False,
     ) -> list[tuple[dict[str, float | None], dict]]:
         """Compute server-side statistics for many points in parallel (Mode 1).
 
@@ -956,7 +957,12 @@ class GeeRasterAdapter(BaseAdapter):
                 ): i
                 for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list))
             }
-            with tqdm(total=n, desc=progress_desc or "GEE stats", unit="pt") as pbar:
+            with tqdm(
+                total=n,
+                desc=progress_desc or "GEE stats",
+                unit="pt",
+                disable=disable_progress,
+            ) as pbar:
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
                     try:
@@ -1082,6 +1088,7 @@ class GeeRasterAdapter(BaseAdapter):
         resample_m: float | None = None,
         filename_suffix: str | None = None,
         progress_desc: str | None = None,
+        disable_progress: bool = False,
     ) -> tuple[list[Path | None], list[dict]]:
         """Export GeoTIFF tiles for many points in parallel (Mode 2).
 
@@ -1134,7 +1141,12 @@ class GeeRasterAdapter(BaseAdapter):
                 future_to_idx[future] = i
 
             # Progress bar advances as each tile finishes downloading from GEE.
-            with tqdm(total=n, desc=progress_desc or "GEE tiles", unit="tile") as pbar:
+            with tqdm(
+                total=n,
+                desc=progress_desc or "GEE tiles",
+                unit="tile",
+                disable=disable_progress,
+            ) as pbar:
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
                     try:
