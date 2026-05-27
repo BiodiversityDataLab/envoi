@@ -1,5 +1,6 @@
 # src/envoi/auth.py
 import os
+import sys
 from pathlib import Path
 
 import ee
@@ -9,10 +10,18 @@ import ee
 # inject credentials without touching the filesystem layout.
 ENV_VAR = "ENVOI_EE_CREDENTIALS"
 
-# User-level config location, following the XDG-style convention used by
-# many cross-platform Python tools. Works the same on Linux, macOS, and
-# Windows (Path.home() resolves correctly on all three).
-USER_CONFIG_PATH = Path.home() / ".config" / "envoi" / "ee_credentials.json"
+# User-level config location, resolved per-platform so each OS gets its
+# conventional path:
+#   * Windows: %APPDATA%\envoi\ee_credentials.json
+#     (typically C:\Users\<you>\AppData\Roaming\envoi\...)
+#   * macOS / Linux: ~/.config/envoi/ee_credentials.json (XDG-style)
+# Falls back to the standard Roaming subpath on Windows when %APPDATA% is
+# unset (rare — usually only in stripped-down containers).
+if sys.platform == "win32":
+    _windows_appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    USER_CONFIG_PATH = Path(_windows_appdata) / "envoi" / "ee_credentials.json"
+else:
+    USER_CONFIG_PATH = Path.home() / ".config" / "envoi" / "ee_credentials.json"
 
 # Project-local fallback. Lets the dev workflow keep working without any
 # env-var setup: drop the key at <project>/credentials/ee_credentials.json
@@ -25,7 +34,8 @@ def _default_credentials_path() -> Path | None:
 
     Lookup order:
       1. ``$ENVOI_EE_CREDENTIALS`` environment variable
-      2. ``~/.config/envoi/ee_credentials.json``
+      2. user config dir (``~/.config/envoi/ee_credentials.json`` on
+         macOS/Linux, ``%APPDATA%\\envoi\\ee_credentials.json`` on Windows)
       3. ``./credentials/ee_credentials.json`` (relative to current working dir)
 
     Returns the matching :class:`Path`, or ``None`` when nothing is found.
@@ -54,9 +64,10 @@ def init_gee(credentials_path: str | Path | None = None) -> None:
     Args:
         credentials_path: Path to the service account JSON. When omitted,
             looks for the file in (1) ``$ENVOI_EE_CREDENTIALS``,
-            (2) ``~/.config/envoi/ee_credentials.json``, then
-            (3) ``./credentials/ee_credentials.json``. Pass an explicit
-            path to bypass the lookup.
+            (2) the user config dir — ``~/.config/envoi/ee_credentials.json``
+            on macOS/Linux or ``%APPDATA%\\envoi\\ee_credentials.json`` on
+            Windows, then (3) ``./credentials/ee_credentials.json``. Pass
+            an explicit path to bypass the lookup.
 
     Raises:
         FileNotFoundError: when no credentials file is found in any of the
