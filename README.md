@@ -10,15 +10,14 @@ Automated feature extraction from environmental data sources for ecological and 
 
 ## Table of contents
 
-- [envoi - ENvironmental Variables for Observational Instances](#envoi---environmental-variables-for-observational-instances)
 - [Install](#install)
 - [Earth Engine setup](#earth-engine-setup)
 - [Quick start](#quick-start)
-- [Walkthrough notebook](examples/walkthrough.ipynb)
+  - [Walkthrough](#walkthrough)
 - [Outputs](#outputs)
   - [Tabular](#tabular)
   - [Raster](#raster)
-- [Advanced usage](docs/advanced_usage.md)
+- [Advanced usage](#advanced-usage)
 - [Reference](#reference)
   - [Built-in datasets](#built-in-datasets)
   - [Notes](#notes)
@@ -71,19 +70,12 @@ Datasets that come from Google Earth Engine (most of the built-in catalog — `d
 
 ## Quick start
 
+Pass any DataFrame with an identifier column and a latitude/longitude pair. By default envoi expects the GBIF / Darwin Core names `gbifID`, `decimalLatitude`, `decimalLongitude` and treats coordinates as WGS84 (EPSG:4326). If yours differ, override on the call with `id_column=`, `latitude_column=`, `longitude_column=`, and `input_crs=` (e.g. `"EPSG:32634"`) — envoi reprojects to WGS84 internally. An optional `eventDate` column (or any column passed via `date_column=`) enables [date-aware extraction](docs/advanced_usage.md#date-aware-extraction).
+
 ```python
 import pandas as pd
 from envoi import extract
 
-# Input: any DataFrame with gbifID, decimalLatitude, decimalLongitude
-# (the GBIF / Darwin Core convention). Coordinates are assumed to be in WGS84
-# (EPSG:4326). If yours are in a different CRS, pass `input_crs=...` to
-# extract() (e.g. `input_crs="EPSG:32634"`) and envoi will reproject them
-# to WGS84 internally. An `eventDate` column is optional — see "Date-aware
-# extraction" below for how envoi uses it when present. If your DataFrame
-# uses different names (e.g. `id`/`lat`/`lon`), pass them through
-# `id_column=...`, `latitude_column=...`, `longitude_column=...`,
-# `date_column=...`.
 sample_points = pd.DataFrame({
     "gbifID":     ["a", "b", "c"],
     "decimalLatitude":  [59.85, 59.86, 59.87],
@@ -182,7 +174,7 @@ Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`.
 
 **Without `resample_m`,** tiles are written in the source raster's native CRS at native resolution. The tile boundary snaps to the source pixel grid, so the actual extent is `window_size_m` rounded to whole pixels — any pixel touched by the requested window is included, and tile dimensions can vary slightly across points (especially for global datasets where pixel size depends on latitude).
 
-**With `resample_m`,** every tile is reprojected to the point's UTM zone at exactly `resample_m` metres per pixel, on a grid snapped to that resolution. All tiles end up the same size (`round(window_size_m / resample_m)` pixels per side) and are spatially aligned across data sources — useful when feeding tiles to a CNN that expects a fixed input size or when comparing GEE and local rasters pixel-for-pixel.
+**With `resample_m`,** every tile is reprojected to the point's UTM zone at exactly `resample_m` meters per pixel, on a grid snapped to that resolution. All tiles end up the same size (`round(window_size_m / resample_m)` pixels per side) and are spatially aligned across data sources — useful when feeding tiles to a CNN that expects a fixed input size or when comparing GEE and local rasters pixel-for-pixel.
 
 ---
 
@@ -206,7 +198,7 @@ list_datasets("info")    # name + description, citation, source URLs
 list_datasets("full")    # the complete catalog entry for each dataset
 ```
 
-`list_datasets()` both prints the listing and returns the same data as a list (of strings for `"names"`, of dicts for `"info"` / `"full"`), so you can keep using it programmatically.
+`list_datasets()` both prints the listing and returns the same data as a list (of strings for the default call, of dicts for `"info"` / `"full"`), so you can keep using it programmatically.
 
 A representative subset of the built-in catalog:
 
@@ -245,7 +237,7 @@ This entry will be updated with a DOI and full citation when the paper is publis
 
 **Past contributors** — Miguel Redondo at [NBIS](https://nbis.se); Shaheryar, Thant Zin Bo, and Per Vincent Ankarbåge (Uppsala University Data Science MSc students).
 
-**Acknowledgements** — Tobias Andermann (Conceptualization and PhD supervision for A.B. and T.N.). A.B., J.N., and T.A. received financial support from the SciLifeLab & Wallenberg Data Driven Life Science Program (grant: KAW 2020.0239) and from the Swedish Research Council (2023-05366). We are grateful to the maintainers of Google Earth Engine, rasterio, geopandas, and pyproj.
+**Acknowledgements** — Tobias Andermann (Conceptualization and PhD supervision for A.B. and J.N.). A.B., J.N., and T.A. received financial support from the SciLifeLab & Wallenberg Data Driven Life Science Program (grant: KAW 2020.0239) and from the Swedish Research Council (2023-05366). We are grateful to the maintainers of Google Earth Engine, rasterio, geopandas, and pyproj.
 
 
 ---
