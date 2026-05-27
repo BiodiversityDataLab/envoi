@@ -15,6 +15,10 @@ EE_REQUIRED_DATASET_KEYS = {"data_type"}
 # Module-level cache so each bundled YAML is only read once per process.
 _defaults_cache: Dict[str, Any] | None = None
 
+# Cached set of built-in dataset names, used by update_catalog() to detect
+# when a user-registered entry shadows a built-in. Lazy-loaded on first use.
+_builtin_dataset_names_cache: frozenset[str] | None = None
+
 # Datasets registered by the user via update_catalog(). Persists for the
 # duration of the Python session. Applied as the final merge layer in
 # load_catalogs() so user entries always override built-in ones.
@@ -46,6 +50,20 @@ def load_defaults() -> Dict[str, Any]:
 
     _defaults_cache = _read_builtin_yaml("defaults.yml")
     return _defaults_cache
+
+
+def _get_builtin_dataset_names() -> frozenset[str]:
+    """Return the set of names defined in the bundled built-in EE catalog.
+
+    Cached on first call so the YAML is only parsed once per process.
+    """
+    global _builtin_dataset_names_cache
+    if _builtin_dataset_names_cache is not None:
+        return _builtin_dataset_names_cache
+
+    builtin = _read_builtin_yaml("ee_catalog.yml")
+    _builtin_dataset_names_cache = frozenset(builtin.get("datasets", {}).keys())
+    return _builtin_dataset_names_cache
 
 
 class CatalogError(ValueError):
@@ -256,7 +274,23 @@ def update_catalog(source: str | Path | dict) -> None:
     """
     global _user_catalog_datasets
     cat = _load_catalog_any(source)
-    _user_catalog_datasets.update(cat.get("datasets", {}))
+    new_datasets = cat.get("datasets", {})
+
+    # Log when a registered name shadows a built-in catalog entry. Done at
+    # info level (not warn) because shadowing is documented and often
+    # intentional — users sometimes register their own version of a
+    # built-in dataset (e.g. a local DEM that replaces the GEE one). But
+    # it's also a common typo source, so surfacing it once per call helps
+    # the user spot accidental collisions.
+    builtin_names = _get_builtin_dataset_names()
+    for name in new_datasets:
+        if name in builtin_names:
+            logger.info(
+                "update_catalog: '%s' shadows the built-in catalog entry of the same name",
+                name,
+            )
+
+    _user_catalog_datasets.update(new_datasets)
 
 
 def reset_catalog() -> None:

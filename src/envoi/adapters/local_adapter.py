@@ -625,6 +625,7 @@ class LocalRasterAdapter(BaseAdapter):
             Sequence | None
         ) = None,  # noqa: ARG002 — accepted only for API parity with GeeRasterAdapter; local rasters have no time dimension.
         progress_desc: str | None = None,
+        disable_progress: bool = False,
     ) -> List[tuple[dict, dict]]:
         """Unified stats fetch: dispatches window reducers and the "point" reducer.
 
@@ -665,6 +666,7 @@ class LocalRasterAdapter(BaseAdapter):
             total=total_points,
             desc=progress_desc or "Local stats",
             unit="pt",
+            disable=disable_progress,
         ):
             results.append(
                 self._fetch_stats_single(
@@ -690,6 +692,7 @@ class LocalRasterAdapter(BaseAdapter):
         resample_m: float | None = None,
         filename_suffix: str | None = None,
         progress_desc: str | None = None,
+        disable_progress: bool = False,
     ):
         """Crop and save a GeoTIFF window centred on each point.
 
@@ -742,6 +745,7 @@ class LocalRasterAdapter(BaseAdapter):
             total=len(id_list),
             desc=progress_desc or "Local tiles",
             unit="tile",
+            disable=disable_progress,
         ):
             output_path = output_dir / f"{sample_id}-{dataset_name}{suffix_part}.tif"
             _, meta = self.fetch_values(lat, lon, window_m, return_meta=True)

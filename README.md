@@ -10,14 +10,14 @@ Automated feature extraction from environmental data sources for ecological and 
 
 ## Table of contents
 
-- [envoi - ENvironmental Variables for Observational Instances](#why-envoi)
+- [envoi - ENvironmental Variables for Observational Instances](#envoi---environmental-variables-for-observational-instances)
 - [Install](#install)
 - [Earth Engine setup](#earth-engine-setup)
 - [Quick start](#quick-start)
 - [Outputs](#outputs)
   - [Tabular](#tabular)
   - [Raster](#raster)
-- [Advanced](docs/advanced.md)
+- [Advanced guide](docs/advanced_guide.md)
 - [Reference](#reference)
   - [Built-in datasets](#built-in-datasets)
   - [Notes](#notes)
@@ -56,7 +56,8 @@ Datasets that come from Google Earth Engine (most of the built-in catalog — `d
 **Step 2 — put the file somewhere envoi can find it.** Pick whichever of these is easiest:
 
 - **In your project folder:** save it as `credentials/ee_credentials.json` next to your script or notebook. This is the simplest option if you only use Earth Engine for one project.
-- **In your user folder:** save it as `~/.config/envoi/ee_credentials.json` (you may need to create the folder). Useful if you want the same key available to every project on your computer.
+- **In your user folder:** save it as `~/.config/envoi/ee_credentials.json` (macOS/Linux) or `%APPDATA%\envoi\ee_credentials.json` (Windows). You may need to create the folder. Useful if you want the same key available to every project on your computer.
+- **At a custom path via environment variable:** set `ENVOI_EE_CREDENTIALS` to the file's path. envoi checks this before the two folders above, so it's the right choice when the key lives outside the defaults, when you swap between several credential files, or in CI / Docker.
 - **Anywhere else:** pass the path explicitly in your code before calling `extract()`:
 
   ```python
@@ -64,8 +65,6 @@ Datasets that come from Google Earth Engine (most of the built-in catalog — `d
 
   init_gee(credentials_path="/path/to/my-project-1234-abcdef.json")
   ```
-
-> **Advanced:** if you're running envoi in CI or a Docker container, set the `ENVOI_EE_CREDENTIALS` environment variable to the path of the JSON file. This is checked before the two folders above.
 
 ---
 
@@ -182,7 +181,7 @@ Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`.
 
 ---
 
-## Advanced
+## Advanced guide
 
 Multiple outputs in one call, date-aware extraction, mixing categorical and continuous datasets, per-call band selection, and custom dataset registration are covered in [docs/advanced_guide.md](docs/advanced_guide.md). A starter custom catalog (local raster and Earth Engine entries) lives at [examples/catalog.yml](examples/catalog.yml).
 
@@ -249,7 +248,7 @@ This entry will be updated with a DOI and full citation when the paper is publis
 ## Project links
 
 - **License** — [MIT](LICENSE)
-- **Contributing** — [CONTRIBUTORS.md](CONTRIBUTORS.md)
+- **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Issues / bug reports** — [github.com/BiodiversityDataLab/envoi/issues](https://github.com/BiodiversityDataLab/envoi/issues)
 - **Repository** — [github.com/BiodiversityDataLab/envoi](https://github.com/BiodiversityDataLab/envoi)
 
