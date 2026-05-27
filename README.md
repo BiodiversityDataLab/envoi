@@ -1,7 +1,7 @@
 # envoi
 
-[![PyPI version](https://img.shields.io/pypi/v/envoi)](https://pypi.org/project/envoi/)
-[![Python versions](https://img.shields.io/pypi/pyversions/envoi)](https://pypi.org/project/envoi/)
+[![PyPI version](https://img.shields.io/pypi/v/envoi-geospatial)](https://pypi.org/project/envoi-geospatial/)
+[![Python versions](https://img.shields.io/pypi/pyversions/envoi-geospatial)](https://pypi.org/project/envoi-geospatial/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Automated feature extraction from environmental data sources for ecological and spatial analysis.
@@ -40,7 +40,7 @@ envoi is developed at the [Biodiversity Data Lab](https://biodiversity.se/) at U
 ## Install
 
 ```bash
-pip install envoi
+pip install envoi-geospatial
 ```
 
 Requires Python 3.10 or newer.
