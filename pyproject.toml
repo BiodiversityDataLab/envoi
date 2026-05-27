@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "envoi"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Automated feature extraction from environmental data sources for ecological and spatial analysis."
 authors = [
     { name = "Adrian Baggström", email = "adrian.baggstrom@ebc.uu.se" },
@@ -39,7 +39,6 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: GIS",
-  "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 
 keywords = [
@@ -68,8 +67,11 @@ Repository = "https://github.com/BiodiversityDataLab/envoi"
 Issues = "https://github.com/BiodiversityDataLab/envoi/issues"
 Documentation = "https://github.com/BiodiversityDataLab/envoi#readme"
 
+[tool.setuptools.dynamic]
+version = { attr = "envoi._version.__version__" }
+
 [tool.setuptools.package-data]
-envoi = ["configs/*.yml"]
+envoi = ["configs/*.yml", "py.typed"]
 
 [tool.ruff]
 line-length = 100
