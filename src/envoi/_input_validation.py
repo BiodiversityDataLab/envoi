@@ -51,6 +51,7 @@ def _validate_required_columns(
 
 def _parse_and_validate_dates(
     df: pd.DataFrame,
+    date_column_name: str = "eventDate",
 ) -> tuple[pd.DataFrame, list | None, list[str]]:
     """Parse and validate the 'date' column from the input DataFrame.
 
@@ -58,11 +59,19 @@ def _parse_and_validate_dates(
     dates removed, dates is a list of YYYY-MM-DD strings (or None if no 'date'
     column is present), and date_warnings is a list of messages the caller can
     print and record in the output metadata.
+
+    ``date_column_name`` is the user-facing column name used purely for
+    diagnostic messages — by the time this function runs the column has
+    already been renamed to the canonical ``"date"``, so look-ups inside
+    use the canonical name regardless.
     """
     date_warnings: list[str] = []
 
     if "date" not in df.columns:
-        message = "No 'date' column found in input DataFrame; proceeding without dates."
+        message = (
+            f"No '{date_column_name}' column found in input DataFrame; "
+            f"proceeding without dates."
+        )
         warnings.warn(message, stacklevel=2)
         date_warnings.append(message)
         return df, None, date_warnings
@@ -132,7 +141,10 @@ def _parse_and_validate_dates(
     try:
         parsed_dates = pd.to_datetime(preprocessed_dates, format="mixed")
     except Exception as e:
-        raise ValueError(f"Error parsing 'date' column: {e}. Expected dates in YYYY-MM-DD format.")
+        raise ValueError(
+            f"Error parsing '{date_column_name}' column: {e}. "
+            f"Expected dates in YYYY-MM-DD format."
+        )
 
     # Detect incomplete dates (year-only "2002" or year-month "2002-02") by
     # splitting on "-". A complete date has 3 parts (YYYY-MM-DD); year-only
