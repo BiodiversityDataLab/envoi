@@ -1,6 +1,6 @@
 # Advanced usage
 
-The README's quick-start covers the common case — one DataFrame, one dataset, one output. The patterns below build on that for runs that involve more than one output, time-varying datasets, mixed continuous and categorical inputs, per-call band selection, multiple window sizes, and your own dataset catalog. Everything documented here is configured through the second argument to `extract()` (a Python dict, a list of dicts, or a path to a YAML file) — nothing requires changes to envoi itself.
+The [README's quick-start](../README.md#quick-start) covers the common case — one DataFrame, one dataset, one output. The patterns below build on that for runs that involve more than one output, time-varying datasets, mixed continuous and categorical inputs, per-call band selection, multiple window sizes, and your own dataset catalog. Everything documented here is configured through the second argument to `extract()` (a Python dict, a list of dicts, or a path to a YAML file) — nothing requires changes to envoi itself.
 
 ## Multiple outputs in one call
 
