@@ -50,6 +50,8 @@ keywords = [
   "feature-extraction",
   "environmental-data",
   "ecology",
+  "biodiversity",
+  "gbif",
 ]
 
 [project.optional-dependencies]
