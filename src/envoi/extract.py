@@ -46,6 +46,7 @@ def extract(
     longitude_column: str = "decimalLongitude",
     date_column: str = "eventDate",
     write_metadata: bool = True,
+    quiet: bool = False,
 ) -> Dict[str, Path | pd.DataFrame]:
     """Extract environmental data for a set of geographic sample points.
 
@@ -141,6 +142,11 @@ def extract(
         every output and, in tabular mode, the per-point QC table is also
         written to disk. Set to ``False`` to suppress both — useful when
         running interactively and the output will not be kept on disk.
+    quiet : bool, optional
+        When ``True``, suppresses the per-point ``tqdm`` progress bars
+        emitted by both adapters. Useful when calling ``extract()`` from a
+        script or notebook where the progress output is just noise.
+        Defaults to ``False`` (progress bars on).
 
     Returns
     -------
@@ -175,8 +181,10 @@ def extract(
     # in the run config or as keyword arguments to this function.
     defaults = load_defaults()
 
-    # Validate inputs
-    df, dates, date_warnings = _parse_and_validate_dates(df)
+    # Validate inputs. Pass the user-supplied date_column so warnings about a
+    # missing or unparseable date column quote the name the caller actually
+    # has in their DataFrame, not the canonical internal "date".
+    df, dates, date_warnings = _parse_and_validate_dates(df, date_column_name=date_column)
     df, crs_warnings = _validate_and_reproject_crs(df, input_crs)
 
     # Merge the built-in catalogs with any datasets registered via update_catalog().
@@ -239,6 +247,7 @@ def extract(
                         dates,
                         window_size,
                         band_overrides=band_overrides,
+                        quiet=quiet,
                     )
                     all_qc_columns.extend(dataset_qc_columns)
                     # Record the reducer/data_type mismatch (if any) in the
@@ -267,6 +276,7 @@ def extract(
                         tiles_root=tiles_root,
                         filename_suffix=suffix,
                         band_overrides=band_overrides,
+                        quiet=quiet,
                     )
                     # Single-window: same key as before. Multi-window: append
                     # the window so callers can locate each window's tiles.
@@ -388,6 +398,7 @@ def _process_dataset_tabular(
     dates: list | None,
     window_size: int,
     band_overrides: Dict[str, Any] | None = None,
+    quiet: bool = False,
 ) -> tuple[pd.DataFrame, dict, list[str], str | None]:
     """Fetch stats and QC columns for one dataset/window pair in tabular mode.
 
@@ -447,6 +458,7 @@ def _process_dataset_tabular(
             resolved_stats,
             dates=dates,
             progress_desc=f"{dataset} | {window_size}m | tabular",
+            disable_progress=quiet,
         )
 
         # Append stat columns to the output DataFrame based on the keys in
@@ -495,6 +507,7 @@ def _process_dataset_raster(
     tiles_root: Path,
     filename_suffix: str | None = None,
     band_overrides: Dict[str, Any] | None = None,
+    quiet: bool = False,
 ) -> tuple[Path, dict]:
     """Export GeoTIFF tiles for one dataset/window pair in raster mode.
 
@@ -530,6 +543,7 @@ def _process_dataset_raster(
             resample_m=run_settings.resample_m,
             filename_suffix=filename_suffix,
             progress_desc=f"{dataset} | {window_size}m | raster",
+            disable_progress=quiet,
         )
 
         # Adapter assembles the full per-dataset metadata dict, including
