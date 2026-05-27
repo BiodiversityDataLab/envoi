@@ -38,5 +38,6 @@ credentials/
 
 # Personal / scratch
 CLAUDE.md
+CLAUDE.local.md
 .claude/
 examples/walkthrough_output/
