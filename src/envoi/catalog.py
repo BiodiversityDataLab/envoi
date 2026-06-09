@@ -314,8 +314,7 @@ def list_datasets(verbosity: str = "names") -> list:
 
     Combines the built-in EE catalog with any datasets the user has added
     via ``update_catalog()`` — i.e. exactly what ``extract()`` would see.
-    The result is both printed to stdout (for interactive / notebook use)
-    and returned (so callers can keep processing it programmatically).
+    Returns the requested dataset information.
 
     Args:
         verbosity: How much detail to include for each dataset.
@@ -346,17 +345,13 @@ def list_datasets(verbosity: str = "names") -> list:
         )
 
     # Load the merged catalog (built-in EE + any user-registered datasets).
-    # This is the same view extract() uses, so what we print matches what
-    # the user can actually pass to extract().
+    # This is the same view extract() uses, so the listing is honest.
     catalog = load_catalogs(BUILTIN_EE_CATALOG)
     datasets = catalog.get("datasets", {})
     sorted_names = sorted(datasets.keys())
 
     # ----- "names" -------------------------------------------------------
-    # Just dump the keys, one per line. Cheap, scannable, and easy to grep.
     if verbosity == "names":
-        for name in sorted_names:
-            print(name)
         return sorted_names
 
     # ----- "info" --------------------------------------------------------
@@ -380,39 +375,11 @@ def list_datasets(verbosity: str = "names") -> list:
                 }
             )
 
-        # Pretty print each record as a small block. We intentionally skip
-        # missing fields so the output stays compact for sparse entries.
-        for record in info_records:
-            header_type = record["data_type"] or "unspecified type"
-            print(f"{record['name']} ({record['data_source']}, {header_type})")
-            if record["description"]:
-                print(f"  description: {record['description']}")
-            if record["ee_source_url"]:
-                print(f"  ee_source_url: {record['ee_source_url']}")
-            if record["source_url"]:
-                print(f"  source_url: {record['source_url']}")
-            if record["citation"]:
-                print(f"  citation: {record['citation']}")
-            # Trailing blank line separates entries so the block is readable.
-            print()
         return info_records
 
     # ----- "full" --------------------------------------------------------
-    # Return the entire catalog entry. We use yaml.dump for printing because
-    # entries can be deeply nested (bands, dataset_spec, dataset_information)
-    # and Python's default repr is unreadable for nested dicts.
     full_records: list[dict] = []
     for name in sorted_names:
         entry = datasets[name]
         full_records.append({"name": name, **entry})
-
-    for record in full_records:
-        # Print as a single YAML block per dataset so nested fields render
-        # cleanly instead of as one-line Python repr.
-        yaml_text = yaml.dump(
-            {record["name"]: {k: v for k, v in record.items() if k != "name"}},
-            sort_keys=False,
-            default_flow_style=False,
-        )
-        print(yaml_text)
     return full_records
