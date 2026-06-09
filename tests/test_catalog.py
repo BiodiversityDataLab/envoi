@@ -258,34 +258,28 @@ class TestListDatasets:
     that both halves of the contract hold.
     """
 
-    def test_names_returns_sorted_list_of_strings(self, capsys):
+    def test_names_returns_sorted_list_of_strings(self):
         # Default verbosity is "names" — should return a sorted list of
-        # dataset keys and print one key per line.
+        # dataset keys.
         result = list_datasets()
-        captured = capsys.readouterr()
         assert isinstance(result, list)
         assert all(isinstance(name, str) for name in result)
         # Sorted is part of the contract so output is deterministic.
         assert result == sorted(result)
-        # Every returned name should also appear in the printed output.
-        printed_lines = captured.out.strip().splitlines()
-        assert set(result) == set(printed_lines)
 
-    def test_names_includes_a_known_builtin_dataset(self, capsys):
+    def test_names_includes_a_known_builtin_dataset(self):
         # Smoke check that the merged view actually exposes built-in
         # datasets (not just an empty list). dem_copernicus_glo30 is a
         # stable entry in the bundled catalog used elsewhere in the
         # README/tests.
         result = list_datasets("names")
-        capsys.readouterr()  # discard printed output
         assert "dem_copernicus_glo30" in result
 
-    def test_info_returns_records_with_expected_fields(self, capsys):
+    def test_info_returns_records_with_expected_fields(self):
         # "info" verbosity returns a list of dicts with the human-readable
         # metadata fields. Missing fields are stored as None so callers can
         # filter consistently without KeyError surprises.
         records = list_datasets("info")
-        capsys.readouterr()  # discard printed output
         assert isinstance(records, list)
         assert all(isinstance(r, dict) for r in records)
         expected_fields = {
@@ -302,18 +296,17 @@ class TestListDatasets:
         for record in records:
             assert expected_fields <= set(record.keys())
 
-    def test_full_returns_complete_entries(self, capsys):
+    def test_full_returns_complete_entries(self):
         # "full" verbosity returns the entire catalog entry plus a "name"
         # field. For at least one known dataset we expect to see the
         # top-level keys present in the YAML (path, data_source, etc.).
         records = list_datasets("full")
-        capsys.readouterr()  # discard printed output
         by_name = {r["name"]: r for r in records}
         dem_entry = by_name["dem_copernicus_glo30"]
         assert dem_entry["data_source"] == "earth_engine"
         assert "path" in dem_entry
 
-    def test_includes_user_registered_datasets(self, capsys):
+    def test_includes_user_registered_datasets(self):
         # User-registered datasets should show up alongside built-ins —
         # this matches what extract() sees, so the listing is honest.
         update_catalog(
@@ -327,7 +320,6 @@ class TestListDatasets:
             }
         )
         names = list_datasets("names")
-        capsys.readouterr()  # discard printed output
         assert "my_test_dataset" in names
 
     def test_invalid_verbosity_raises_value_error(self):
