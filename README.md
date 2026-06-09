@@ -2,7 +2,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/envoi-geospatial)](https://pypi.org/project/envoi-geospatial/)
 [![Python versions](https://img.shields.io/pypi/pyversions/envoi-geospatial)](https://pypi.org/project/envoi-geospatial/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/BiodiversityDataLab/envoi/blob/main/LICENSE)
 
 Automated feature extraction from environmental data sources for ecological and spatial analysis.
 
@@ -70,7 +70,7 @@ Datasets that come from Google Earth Engine (most of the built-in catalog — `d
 
 ## Quick start
 
-Pass any DataFrame with an identifier column and a latitude/longitude pair. By default envoi expects the GBIF / Darwin Core names `gbifID`, `decimalLatitude`, `decimalLongitude` and treats coordinates as WGS84 (EPSG:4326). If yours differ, override on the call with `id_column=`, `latitude_column=`, `longitude_column=`, and `input_crs=` (e.g. `"EPSG:32634"`) — envoi reprojects to WGS84 internally. An optional `eventDate` column (or any column passed via `date_column=`) enables [date-aware extraction](docs/advanced_usage.md#date-aware-extraction).
+Pass any DataFrame with an identifier column and a latitude/longitude pair. By default envoi expects the GBIF / Darwin Core names `gbifID`, `decimalLatitude`, `decimalLongitude` and treats coordinates as WGS84 (EPSG:4326). If yours differ, override on the call with `id_column=`, `latitude_column=`, `longitude_column=`, and `input_crs=` (e.g. `"EPSG:32634"`) — envoi reprojects to WGS84 internally. An optional `eventDate` column (or any column passed via `date_column=`) enables [date-aware extraction](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md#date-aware-extraction).
 
 ```python
 import pandas as pd
@@ -101,11 +101,11 @@ outputs = extract(sample_points, {
 
 Override the output location with `extract(df, config, output_dir="my_dir")`.
 
-The same config can also live in a YAML file — see [examples/run.yml](examples/run.yml) for a runnable template.
+The same config can also live in a YAML file — see [examples/run.yml](https://github.com/BiodiversityDataLab/envoi/blob/main/examples/run.yml) for a runnable template.
 
 ### Walkthrough
 
-For a guided end-to-end tutorial — tabular and raster extraction, local rasters, multi-dataset runs, date-aware extraction, and catalog discovery — see the [walkthrough notebook](examples/walkthrough.ipynb).
+For a guided end-to-end tutorial — tabular and raster extraction, local rasters, multi-dataset runs, date-aware extraction, and catalog discovery — see the [walkthrough notebook](https://github.com/BiodiversityDataLab/envoi/blob/main/examples/walkthrough.ipynb).
 
 ---
 
@@ -180,7 +180,7 @@ Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`.
 
 ## Advanced usage
 
-Multiple outputs in one call, date-aware extraction, mixing categorical and continuous datasets, per-call band selection, multiple window sizes, and custom dataset registration are covered in [docs/advanced_usage.md](docs/advanced_usage.md). A starter custom catalog (local raster and Earth Engine entries) lives at [examples/catalog.yml](examples/catalog.yml).
+Multiple outputs in one call, date-aware extraction, mixing categorical and continuous datasets, per-call band selection, multiple window sizes, and custom dataset registration are covered in [docs/advanced_usage.md](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md). A starter custom catalog (local raster and Earth Engine entries) lives at [examples/catalog.yml](https://github.com/BiodiversityDataLab/envoi/blob/main/examples/catalog.yml).
 
 ---
 
@@ -210,7 +210,7 @@ A representative subset of the built-in catalog:
 - **Human impact** — `human_impact_index` plus eight `hii_driver_*` subcomponents
 - **Embeddings** — `aef_satellite_embeddings`
 
-The source, including descriptions, citations, and URLs for every entry, is [src/envoi/configs/ee_catalog.yml](src/envoi/configs/ee_catalog.yml).
+The source, including descriptions, citations, and URLs for every entry, is [src/envoi/configs/ee_catalog.yml](https://github.com/BiodiversityDataLab/envoi/blob/main/src/envoi/configs/ee_catalog.yml).
 
 ### Notes
 
@@ -244,8 +244,8 @@ This entry will be updated with a DOI and full citation when the paper is publis
 
 ## Project links
 
-- **License** — [MIT](LICENSE)
-- **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md)
+- **License** — [MIT](https://github.com/BiodiversityDataLab/envoi/blob/main/LICENSE)
+- **Contributing** — [CONTRIBUTING.md](https://github.com/BiodiversityDataLab/envoi/blob/main/CONTRIBUTING.md)
 - **Issues / bug reports** — [github.com/BiodiversityDataLab/envoi/issues](https://github.com/BiodiversityDataLab/envoi/issues)
 - **Repository** — [github.com/BiodiversityDataLab/envoi](https://github.com/BiodiversityDataLab/envoi)
 
