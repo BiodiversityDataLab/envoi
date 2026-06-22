@@ -30,6 +30,7 @@ from tqdm.auto import tqdm
 from ...catalog import load_defaults
 from ...geo import build_tile_crs_zones, get_utm_crs
 from ...metadata import summarize_date_info, summarize_tile_export
+from ...progress import ProgressStepCallback, emit_progress_step
 from ..base import BaseAdapter
 from ._image import (
     _build_image,
@@ -882,6 +883,7 @@ class GeeRasterAdapter(BaseAdapter):
         dates: Sequence | None = None,
         progress_desc: str | None = None,
         disable_progress: bool = False,
+        progress_callback: ProgressStepCallback | None = None,
     ) -> list[tuple[dict[str, float | None], dict]]:
         """Compute server-side statistics for many points in parallel (Mode 1).
 
@@ -941,6 +943,7 @@ class GeeRasterAdapter(BaseAdapter):
         # Progress bar advances as each per-point future completes — gives the
         # user visible feedback for what is otherwise a long, opaque GEE call.
         results: list = [None] * n
+        emit_progress_step(progress_callback, 0, n)
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {
                 executor.submit(
@@ -963,6 +966,7 @@ class GeeRasterAdapter(BaseAdapter):
                 unit="pt",
                 disable=disable_progress,
             ) as pbar:
+                completed = 0
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
                     try:
@@ -976,6 +980,8 @@ class GeeRasterAdapter(BaseAdapter):
                             window_m, original_window_reducers, want_point=want_point
                         )
                     pbar.update(1)
+                    completed += 1
+                    emit_progress_step(progress_callback, completed, n)
 
         return results
 
@@ -1089,6 +1095,7 @@ class GeeRasterAdapter(BaseAdapter):
         filename_suffix: str | None = None,
         progress_desc: str | None = None,
         disable_progress: bool = False,
+        progress_callback: ProgressStepCallback | None = None,
     ) -> tuple[list[Path | None], list[dict]]:
         """Export GeoTIFF tiles for many points in parallel (Mode 2).
 
@@ -1131,6 +1138,7 @@ class GeeRasterAdapter(BaseAdapter):
         # are completely unaffected.
         suffix_part = f"-{filename_suffix}" if filename_suffix else ""
 
+        emit_progress_step(progress_callback, 0, n)
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {}
             for i, (lat, lon, date, sample_id) in enumerate(zip(lats, lons, date_list, id_list)):
@@ -1147,6 +1155,7 @@ class GeeRasterAdapter(BaseAdapter):
                 unit="tile",
                 disable=disable_progress,
             ) as pbar:
+                completed = 0
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
                     try:
@@ -1155,6 +1164,8 @@ class GeeRasterAdapter(BaseAdapter):
                         logger.warning("GEE export failed for point %d: %s", idx, e)
                         results[idx] = None
                     pbar.update(1)
+                    completed += 1
+                    emit_progress_step(progress_callback, completed, n)
 
         return results, meta_list
 

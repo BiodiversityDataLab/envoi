@@ -62,6 +62,12 @@ dev = [
     "build>=1.0.0",
     "twine>=4.0.0",
 ]
+webapp = [
+    "streamlit>=1.36",
+]
+
+[project.scripts]
+envoi-webapp = "envoi_webapp.app:main"
 
 [project.urls]
 Homepage = "https://biodiversity.se/"
@@ -74,6 +80,7 @@ version = { attr = "envoi._version.__version__" }
 
 [tool.setuptools.package-data]
 envoi = ["configs/*.yml", "py.typed"]
+envoi_webapp = ["assets/*.png"]
 
 [tool.ruff]
 line-length = 100

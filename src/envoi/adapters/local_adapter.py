@@ -18,6 +18,7 @@ from .base import BaseAdapter
 from ..reducers import get_reducer
 from ..geo import get_utm_crs
 from ..metadata import summarize_tile_export
+from ..progress import ProgressStepCallback, emit_progress_step
 
 try:
     from . import register as _register
@@ -626,6 +627,7 @@ class LocalRasterAdapter(BaseAdapter):
         ) = None,  # noqa: ARG002 — accepted only for API parity with GeeRasterAdapter; local rasters have no time dimension.
         progress_desc: str | None = None,
         disable_progress: bool = False,
+        progress_callback: ProgressStepCallback | None = None,
     ) -> List[tuple[dict, dict]]:
         """Unified stats fetch: dispatches window reducers and the "point" reducer.
 
@@ -661,6 +663,7 @@ class LocalRasterAdapter(BaseAdapter):
         # the GEE adapter's progress UI so behaviour is consistent across sources.
         total_points = len(lats)
         results: List[tuple[dict, dict]] = []
+        emit_progress_step(progress_callback, 0, total_points)
         for lat, lon in tqdm(
             zip(lats, lons),
             total=total_points,
@@ -673,6 +676,7 @@ class LocalRasterAdapter(BaseAdapter):
                     lat, lon, window_m, window_reducer_fns, want_point=want_point
                 )
             )
+            emit_progress_step(progress_callback, len(results), total_points)
         return results
 
     # ------------------------------------------------------------------
@@ -693,6 +697,7 @@ class LocalRasterAdapter(BaseAdapter):
         filename_suffix: str | None = None,
         progress_desc: str | None = None,
         disable_progress: bool = False,
+        progress_callback: ProgressStepCallback | None = None,
     ):
         """Crop and save a GeoTIFF window centred on each point.
 
@@ -740,6 +745,7 @@ class LocalRasterAdapter(BaseAdapter):
 
         # Wrap the per-point tile loop with tqdm so users get visible progress
         # for what can be a long sequential operation on large input sets.
+        emit_progress_step(progress_callback, 0, len(id_list))
         for lat, lon, sample_id in tqdm(
             zip(lats_list, lons_list, id_list),
             total=len(id_list),
@@ -758,6 +764,7 @@ class LocalRasterAdapter(BaseAdapter):
             if window_array is None or window_array.size == 0 or transform_list is None:
                 paths.append(None)
                 tile_metas.append(meta)
+                emit_progress_step(progress_callback, len(paths), len(id_list))
                 continue
 
             # Multi-band rasters retain all bands in the exported tile so the
@@ -875,6 +882,7 @@ class LocalRasterAdapter(BaseAdapter):
                     tile_writer.write(output_array, 1)
             paths.append(output_path)
             tile_metas.append(meta)
+            emit_progress_step(progress_callback, len(paths), len(id_list))
 
         return paths, tile_metas
 
