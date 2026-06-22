@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import List, Sequence
 
+from ..progress import ProgressStepCallback
+
 
 class BaseAdapter:
     # ---- resource lifecycle -------------------------------------------------
@@ -39,6 +41,7 @@ class BaseAdapter:
         dates: Sequence | None = None,
         progress_desc: str | None = None,
         disable_progress: bool = False,
+        progress_callback: ProgressStepCallback | None = None,
     ) -> List[tuple[dict, dict]]:
         raise NotImplementedError
 

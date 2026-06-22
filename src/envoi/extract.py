@@ -10,6 +10,7 @@ from .catalog import load_catalogs, load_defaults, BUILTIN_EE_CATALOG
 from .qc import attach_quality_control, split_stats_and_qc
 from .reducers import validate_reducers
 from .metadata import write_metadata_sidecar
+from .progress import ProgressCallback, ProgressEvent, ProgressStepCallback
 from ._config_parsing import (
     RunSettings,
     _as_config_list,
@@ -36,6 +37,36 @@ from ._output_assembly import (
 _DEFAULT_CATALOGS = (BUILTIN_EE_CATALOG,)
 
 
+def _make_progress_step_callback(
+    *,
+    callback: ProgressCallback | None,
+    batch_id: str,
+    dataset: str,
+    window_size_m: int,
+    mode: str,
+    unit: str,
+) -> ProgressStepCallback | None:
+    """Wrap adapter-level completed/total updates in public ProgressEvent objects."""
+
+    if callback is None:
+        return None
+
+    def _callback(completed: int, total: int) -> None:
+        callback(
+            ProgressEvent(
+                batch_id=batch_id,
+                dataset=dataset,
+                window_size_m=window_size_m,
+                mode=mode,  # type: ignore[arg-type]
+                completed=completed,
+                total=total,
+                unit=unit,
+            )
+        )
+
+    return _callback
+
+
 def extract(
     df: pd.DataFrame,
     config: str | Path | dict | list,
@@ -47,6 +78,7 @@ def extract(
     date_column: str = "eventDate",
     write_metadata: bool = True,
     quiet: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> Dict[str, Path | pd.DataFrame]:
     """Extract environmental data for a set of geographic sample points.
 
@@ -147,6 +179,11 @@ def extract(
         emitted by both adapters. Useful when calling ``extract()`` from a
         script or notebook where the progress output is just noise.
         Defaults to ``False`` (progress bars on).
+    progress_callback : callable, optional
+        Callback invoked with :class:`envoi.progress.ProgressEvent` updates as
+        each dataset/window batch advances. This is independent of ``quiet``:
+        callers can suppress terminal progress bars while still receiving
+        structured progress events.
 
     Returns
     -------
@@ -248,6 +285,14 @@ def extract(
                         window_size,
                         band_overrides=band_overrides,
                         quiet=quiet,
+                        progress_callback=_make_progress_step_callback(
+                            callback=progress_callback,
+                            batch_id=batch_id,
+                            dataset=dataset,
+                            window_size_m=window_size,
+                            mode=output_type,
+                            unit="pt",
+                        ),
                     )
                     all_qc_columns.extend(dataset_qc_columns)
                     # Record the reducer/data_type mismatch (if any) in the
@@ -277,6 +322,14 @@ def extract(
                         filename_suffix=suffix,
                         band_overrides=band_overrides,
                         quiet=quiet,
+                        progress_callback=_make_progress_step_callback(
+                            callback=progress_callback,
+                            batch_id=batch_id,
+                            dataset=dataset,
+                            window_size_m=window_size,
+                            mode=output_type,
+                            unit="tile",
+                        ),
                     )
                     # Single-window: same key as before. Multi-window: append
                     # the window so callers can locate each window's tiles.
@@ -399,6 +452,7 @@ def _process_dataset_tabular(
     window_size: int,
     band_overrides: Dict[str, Any] | None = None,
     quiet: bool = False,
+    progress_callback: ProgressStepCallback | None = None,
 ) -> tuple[pd.DataFrame, dict, list[str], str | None]:
     """Fetch stats and QC columns for one dataset/window pair in tabular mode.
 
@@ -459,6 +513,7 @@ def _process_dataset_tabular(
             dates=dates,
             progress_desc=f"{dataset} | {window_size}m | tabular",
             disable_progress=quiet,
+            progress_callback=progress_callback,
         )
 
         # Append stat columns to the output DataFrame based on the keys in
@@ -508,6 +563,7 @@ def _process_dataset_raster(
     filename_suffix: str | None = None,
     band_overrides: Dict[str, Any] | None = None,
     quiet: bool = False,
+    progress_callback: ProgressStepCallback | None = None,
 ) -> tuple[Path, dict]:
     """Export GeoTIFF tiles for one dataset/window pair in raster mode.
 
@@ -544,6 +600,7 @@ def _process_dataset_raster(
             filename_suffix=filename_suffix,
             progress_desc=f"{dataset} | {window_size}m | raster",
             disable_progress=quiet,
+            progress_callback=progress_callback,
         )
 
         # Adapter assembles the full per-dataset metadata dict, including
