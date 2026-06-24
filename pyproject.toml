@@ -80,7 +80,7 @@ version = { attr = "envoi._version.__version__" }
 
 [tool.setuptools.package-data]
 envoi = ["configs/*.yml", "py.typed"]
-envoi_webapp = ["assets/*.png"]
+envoi_webapp = ["assets/*.png", "assets/*.svg"]
 
 [tool.ruff]
 line-length = 100
