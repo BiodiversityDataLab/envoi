@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import stat
 from pathlib import Path
@@ -14,6 +15,7 @@ from envoi_webapp.helpers import (
     build_run_config,
     normalize_crs,
     parse_window_sizes,
+    read_points_csv,
     redact_credential_secrets,
     run_extraction,
     temporary_service_account_file,
@@ -79,6 +81,19 @@ def test_validate_output_dir_creates_and_checks_writable_path(tmp_path):
 
 def test_parse_window_sizes_accepts_comma_separated_positive_integers():
     assert parse_window_sizes("100, 250;500") == (100, 250, 500)
+
+
+@pytest.mark.parametrize("delimiter", [",", ";", "\t", " "])
+def test_read_points_csv_infers_common_delimiters(delimiter):
+    raw = (
+        f"gbifID{delimiter}decimalLatitude{delimiter}decimalLongitude\n"
+        f"a{delimiter}59.1{delimiter}18.1\n"
+    )
+
+    result = read_points_csv(io.StringIO(raw))
+
+    assert list(result.columns) == ["gbifID", "decimalLatitude", "decimalLongitude"]
+    assert result.loc[0, "gbifID"] == "a"
 
 
 def test_build_run_config_tabular():

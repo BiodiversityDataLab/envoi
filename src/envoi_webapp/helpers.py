@@ -7,7 +7,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 import pandas as pd
 from pyproj import CRS
@@ -36,6 +36,14 @@ class DatasetSelection:
     dataset: str
     window_sizes: tuple[int, ...]
     statistics: tuple[str, ...] = ()
+
+
+def read_points_csv(source: Any) -> pd.DataFrame:
+    """Read a points CSV while inferring common delimiters."""
+
+    if hasattr(source, "seek"):
+        source.seek(0)
+    return pd.read_csv(source, sep=None, engine="python")
 
 
 def validate_points_dataframe(df: pd.DataFrame) -> CsvValidationResult:
