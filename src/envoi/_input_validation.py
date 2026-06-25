@@ -179,6 +179,14 @@ def _validate_and_reproject_crs(
             message = f"Reprojecting coordinates from {input_crs} to EPSG:4326 (WGS84)."
             warnings.warn(message, stacklevel=2)
             crs_warnings.append(message)
+            # Stash the caller's original coordinates before overwriting the
+            # canonical lat/lon with their WGS84 reprojection. The rest of the
+            # pipeline (the adapters) needs WGS84, but the output table should
+            # still surface the coordinates the user actually supplied — these
+            # helper columns ride along in the DataFrame and are read back when
+            # the tabular output is assembled.
+            df["lat_original"] = df["lat"]
+            df["lon_original"] = df["lon"]
             transformer = Transformer.from_crs(input_crs, "EPSG:4326", always_xy=True)
             lons, lats = transformer.transform(df["lon"].values, df["lat"].values)
             df["lon"] = lons

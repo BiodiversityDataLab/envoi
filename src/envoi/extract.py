@@ -334,6 +334,21 @@ def extract(
             stats_df = _round_stat_columns(
                 stats_df, core_columns, defaults["stats_output_decimals"]
             )
+
+            # When the coordinates were reprojected to WGS84 (input_crs was
+            # given), the canonical lat/lon columns hold the WGS84 values used
+            # internally for extraction. Surface both coordinate systems in the
+            # output: keep the user's lat/lon columns as the ORIGINAL input-CRS
+            # coordinates they supplied, and add "<lat>_wgs84"/"<lon>_wgs84"
+            # columns with the reprojected values. The original coordinates were
+            # stashed in df_copy by _validate_and_reproject_crs.
+            if "lat_original" in df_copy.columns:
+                for output_frame in (stats_df, qc_df):
+                    output_frame[f"{latitude_column}_wgs84"] = output_frame["lat"]
+                    output_frame[f"{longitude_column}_wgs84"] = output_frame["lon"]
+                    output_frame["lat"] = df_copy.loc[output_frame.index, "lat_original"]
+                    output_frame["lon"] = df_copy.loc[output_frame.index, "lon_original"]
+
             stats_df, qc_df = _restore_user_column_names(stats_df, qc_df, column_name_map)
 
             # When format is "dataframe", return the DataFrames directly instead
