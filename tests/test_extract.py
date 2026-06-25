@@ -502,6 +502,26 @@ class TestGbifEventDateParsing:
             f"got {len(caught)} — per-row spam regressed"
         )
 
+    def test_missing_date_column_does_not_raise_warning(self):
+        # A missing date column is a normal case and must NOT raise a
+        # UserWarning (too aggressive). It is still recorded in date_warnings
+        # for the metadata sidecar, and dates comes back as None.
+        from envoi._input_validation import _parse_and_validate_dates
+
+        df = pd.DataFrame(
+            {
+                "id": ["a", "b"],
+                "lat": [62.97, 62.98],
+                "lon": [18.02, 18.03],
+            }
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning would fail the test
+            _, dates, date_warnings = _parse_and_validate_dates(df, date_column_name="eventDate")
+        assert dates is None
+        assert len(date_warnings) == 1
+        assert "No 'eventDate' column" in date_warnings[0]
+
     def test_plain_yyyy_mm_dd_unchanged(self):
         # Regression guard: the pre-existing happy path must still work
         # exactly the same and emit no warnings.
