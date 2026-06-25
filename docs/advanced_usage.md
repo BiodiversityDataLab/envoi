@@ -53,7 +53,7 @@ Time-varying Earth Engine ImageCollections (climate reanalyses, satellite vegeta
 
 ```python
 sample_points = pd.DataFrame({
-    "gbifID":     ["a", "b"],
+    "occurrenceID":     ["a", "b"],
     "decimalLatitude":  [59.85, 59.86],
     "decimalLongitude": [17.63, 17.64],
     "eventDate":        ["2022-06-15", "2023-08-01"],

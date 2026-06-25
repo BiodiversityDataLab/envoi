@@ -70,14 +70,14 @@ Datasets that come from Google Earth Engine (most of the built-in catalog — `d
 
 ## Quick start
 
-Pass any DataFrame with an identifier column and a latitude/longitude pair. By default envoi expects the GBIF / Darwin Core names `gbifID`, `decimalLatitude`, `decimalLongitude` and treats coordinates as WGS84 (EPSG:4326). If yours differ, override on the call with `id_column=`, `latitude_column=`, `longitude_column=`, and `input_crs=` (e.g. `"EPSG:32634"`) — envoi reprojects to WGS84 internally. An optional `eventDate` column (or any column passed via `date_column=`) enables [date-aware extraction](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md#date-aware-extraction).
+Pass any DataFrame with an identifier column and a latitude/longitude pair. By default envoi expects the GBIF / Darwin Core names `occurrenceID`, `decimalLatitude`, `decimalLongitude` and treats coordinates as WGS84 (EPSG:4326). If yours differ, override on the call with `id_column=`, `latitude_column=`, `longitude_column=`, and `input_crs=` (e.g. `"EPSG:32634"`) — envoi reprojects to WGS84 internally. An optional `eventDate` column (or any column passed via `date_column=`) enables [date-aware extraction](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md#date-aware-extraction).
 
 ```python
 import pandas as pd
 from envoi import extract
 
 sample_points = pd.DataFrame({
-    "gbifID":     ["a", "b", "c"],
+    "occurrenceID":     ["a", "b", "c"],
     "decimalLatitude":  [59.85, 59.86, 59.87],
     "decimalLongitude": [17.63, 17.64, 17.65],
 })
