@@ -2,6 +2,16 @@
 
 The [README's quick-start](../README.md#quick-start) covers the common case — one DataFrame, one dataset, one output. The patterns below build on that for runs that involve more than one output, time-varying datasets, mixed continuous and categorical inputs, per-call band selection, multiple window sizes, and your own dataset catalog. Everything documented here is configured through the second argument to `extract()` (a Python dict, a list of dicts, or a path to a YAML file) — nothing requires changes to envoi itself.
 
+## Table of contents
+
+- [Multiple outputs in one call](#multiple-outputs-in-one-call)
+- [Date-aware extraction](#date-aware-extraction)
+- [Mixing categorical and continuous datasets](#mixing-categorical-and-continuous-datasets)
+- [Multiple window sizes in one call](#multiple-window-sizes-in-one-call)
+- [Selecting bands per call](#selecting-bands-per-call)
+- [Custom datasets](#custom-datasets)
+- [Running interactively](#running-interactively)
+
 ## Multiple outputs in one call
 
 `extract()` accepts a list of run configs and produces one output per entry in a single call. This is the right pattern when you want:
@@ -150,6 +160,22 @@ update_catalog({
 
 # From a YAML file — better for multi-dataset projects under version control.
 update_catalog("my_catalog.yml")
+```
+
+Earth Engine assets that aren't in the built-in catalog are registered the same way — just set `data_source: earth_engine` and point `path` at the GEE asset ID. Only `data_source`, `path`, and `data_type` are required (bands are optional — all are loaded if you omit them), and the asset type (`Image` vs `ImageCollection`) is auto-detected, so there's nothing else to declare for a static image:
+
+```python
+# An Earth Engine asset not in the built-in catalog — OpenLandMap soil pH (H2O).
+update_catalog({
+    "datasets": {
+        "soil_ph_openlandmap": {
+            "data_source": "earth_engine",
+            "path": "OpenLandMap/SOL/SOL_PH-H2O_USDA-4C1A2A_M/v02",
+            "data_type": "continuous",
+            "bands": ["b0", "b10"],   # soil pH at 0 cm and 10 cm depth
+        },
+    },
+})
 ```
 
 **Precedence.** User-registered datasets override built-ins with the same name. This is intentional: you can swap an upstream catalog entry for a higher-resolution local copy without renaming every downstream config that references it. Re-registering the same name later overwrites the earlier definition.
