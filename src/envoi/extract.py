@@ -150,12 +150,17 @@ def extract(
 
     Returns
     -------
-    dict[str, Path | pd.DataFrame]
-        Mapping of output key to the result. For tabular outputs the key is
-        ``"<batch_id>"`` pointing to the stats table. For raster outputs the key is
-        ``"<batch_id>:<dataset>"`` pointing to the tiles folder. When
+    dict[str, Path | pd.DataFrame] or pd.DataFrame
+        Usually a mapping of output key to the result. For tabular outputs the key
+        is ``"<batch_id>"`` pointing to the stats table. For raster outputs the key
+        is ``"<batch_id>:<dataset>"`` pointing to the tiles folder. When
         ``output_file_format`` is ``"dataframe"``, the stats value is a pandas
         DataFrame rather than a file path.
+
+        As a convenience, when ``config`` is a single run config (a dict, not a
+        list) *and* ``output_file_format`` is ``"dataframe"``, the stats
+        DataFrame is returned directly instead of being wrapped in a
+        ``{batch_id: df}`` dict.
     """
     output_paths: Dict[str, Path | pd.DataFrame] = {}
 
@@ -194,6 +199,13 @@ def extract(
 
     # Normalize config into a list of output configs, whether the user passed a single dict or a list of dicts.
     output_configs = _as_config_list(config)
+
+    # Track whether the caller passed a single run config (an inline dict, or a
+    # YAML file resolving to a single dict) rather than an explicit list. This
+    # lets us return a bare DataFrame for the common single-output "dataframe"
+    # case below — "ask for a dataframe, get a dataframe" — instead of a
+    # {batch_id: df} dict the caller would have to index into.
+    single_config = len(output_configs) == 1 and not isinstance(config, list)
 
     for idx, run_config in enumerate(output_configs):
         df_copy = df.copy()
@@ -401,6 +413,13 @@ def extract(
                     },
                     warnings=warnings_backlog if warnings_backlog else None,
                 )
+
+    # For the common single-config "dataframe" run, return the DataFrame itself
+    # rather than wrapping it in a {batch_id: df} dict — the caller asked for a
+    # dataframe, so hand them a dataframe. List configs (or non-dataframe
+    # formats) keep the keyed-dict return so multi-output runs stay addressable.
+    if single_config and output_file_format == "dataframe" and len(output_paths) == 1:
+        return next(iter(output_paths.values()))
 
     return output_paths
 

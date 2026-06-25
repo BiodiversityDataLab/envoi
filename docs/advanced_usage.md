@@ -190,11 +190,11 @@ For the full catalog schema, see the commented reference block at the top of [sr
 
 A few `extract()` knobs are aimed at notebook and exploratory use, where writing files to disk on every iteration is overkill:
 
-- `output_file_format: "dataframe"` (tabular only) — returns the stats table as an in-memory DataFrame in the `outputs` dict instead of writing CSV or Parquet. Useful when you want to immediately filter, plot, or join the result without round-tripping through a file.
+- `output_file_format: "dataframe"` (tabular only) — returns the stats table as an in-memory DataFrame instead of writing CSV or Parquet. When you pass a single run config (a dict, not a list), `extract()` hands the DataFrame back directly; with a list of configs it stays keyed by `batch_id` like any other run. Useful when you want to immediately filter, plot, or join the result without round-tripping through a file.
 - `write_metadata=False` (keyword argument on `extract()`) — suppresses both the JSON metadata sidecar and the per-point QC table. The main output is still written (unless you also asked for `"dataframe"` format), but the auxiliary files don't accumulate while you iterate.
 
 ```python
-outputs = extract(
+stats = extract(
     sample_points,
     {
         "batch_id": "scratch",
@@ -209,7 +209,7 @@ outputs = extract(
     write_metadata=False,
 )
 
-outputs["scratch"].head()  # the stats table, in memory
+stats.head()  # a single config in "dataframe" mode returns the table directly
 ```
 
 For production runs, leave both at their defaults — the JSON sidecar is the only record of which images and dates were actually used per point, and the QC table is what you filter on to drop low-coverage rows. Both are essential for reproducibility once a run leaves the notebook.

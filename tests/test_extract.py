@@ -374,7 +374,8 @@ class TestCustomColumnNames:
             }
         )
 
-        outputs = extract(
+        # A single config dict + "dataframe" format returns the DataFrame directly.
+        result = extract(
             legacy_df,
             {
                 "batch_id": "legacy_names",
@@ -393,7 +394,6 @@ class TestCustomColumnNames:
             date_column="date",
         )
 
-        result = outputs["legacy_names"]
         # The output must round-trip the user's chosen names — not the new GBIF
         # defaults, and not the internal canonical names.
         assert "id" in result.columns
@@ -1259,8 +1259,9 @@ class TestOutputFormats:
         assert len(qc_df) == len(sample_df)
 
     def test_dataframe_format_returns_in_memory_dataframe(self, sample_df, tmp_path):
-        """output_file_format='dataframe' returns the stats DataFrame instead of a Path."""
-        outputs = extract(
+        """output_file_format='dataframe' with a single config returns the stats
+        DataFrame directly (not a {batch_id: df} dict)."""
+        result = extract(
             sample_df,
             {
                 "batch_id": "df_test",
@@ -1275,10 +1276,10 @@ class TestOutputFormats:
             output_dir=tmp_path,
         )
 
-        # Sanity: the value in the outputs dict is a DataFrame, not a Path.
+        # The return value is the DataFrame itself, not a Path and not a dict.
         # This is the whole point of the "dataframe" mode — skip disk I/O for
-        # the stats output when the caller wants the result in-memory.
-        result = outputs["df_test"]
+        # the stats output when the caller wants the result in-memory, and hand
+        # back a dataframe when a single config was requested.
         assert isinstance(
             result, pd.DataFrame
         ), f"expected DataFrame return, got {type(result).__name__}"
@@ -1289,6 +1290,28 @@ class TestOutputFormats:
         # independently useful.
         assert "gbifID" in result.columns
         assert list(result["gbifID"]) == list(sample_df["gbifID"])
+
+    def test_dataframe_format_list_config_keeps_dict(self, sample_df, tmp_path):
+        """A list config still returns a {batch_id: df} dict even in dataframe
+        mode, so multi-output runs stay addressable by key."""
+        outputs = extract(
+            sample_df,
+            [
+                {
+                    "batch_id": "df_list",
+                    "datasets": ["dem_local"],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["mean"],
+                        "window_size_m": 100,
+                        "output_file_format": "dataframe",
+                    },
+                }
+            ],
+            output_dir=tmp_path,
+        )
+        assert isinstance(outputs, dict)
+        assert isinstance(outputs["df_list"], pd.DataFrame)
 
     def test_unknown_output_format_raises(self, sample_df, tmp_path):
         """An unrecognised output_file_format value raises ValueError."""

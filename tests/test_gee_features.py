@@ -704,7 +704,10 @@ class TestCatalogWalk:
         # and we don't need cross-point comparisons here.
         smoke_df = SWEDEN_SAMPLE_DF.iloc[:1].copy()
 
-        outputs = extract(
+        # A single config dict + ``output_file_format=dataframe`` returns the
+        # result DataFrame directly, so we skip the disk write for this fast
+        # smoke pass.
+        result = extract(
             smoke_df,
             {
                 "batch_id": "smoke",
@@ -719,9 +722,6 @@ class TestCatalogWalk:
             output_dir=tmp_path,
         )
 
-        # ``output_file_format=dataframe`` returns the result in-memory so
-        # we skip the disk write for this fast smoke pass.
-        result = outputs["smoke"]
         assert isinstance(result, pd.DataFrame)
 
         # The dataset must have produced at least one stat column. The
