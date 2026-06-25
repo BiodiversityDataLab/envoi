@@ -2,6 +2,16 @@
 
 The [README's quick-start](../README.md#quick-start) covers the common case — one DataFrame, one dataset, one output. The patterns below build on that for runs that involve more than one output, time-varying datasets, mixed continuous and categorical inputs, per-call band selection, multiple window sizes, and your own dataset catalog. Everything documented here is configured through the second argument to `extract()` (a Python dict, a list of dicts, or a path to a YAML file) — nothing requires changes to envoi itself.
 
+## Table of contents
+
+- [Multiple outputs in one call](#multiple-outputs-in-one-call)
+- [Date-aware extraction](#date-aware-extraction)
+- [Mixing categorical and continuous datasets](#mixing-categorical-and-continuous-datasets)
+- [Multiple window sizes in one call](#multiple-window-sizes-in-one-call)
+- [Selecting bands per call](#selecting-bands-per-call)
+- [Custom datasets](#custom-datasets)
+- [Running interactively](#running-interactively)
+
 ## Multiple outputs in one call
 
 `extract()` accepts a list of run configs and produces one output per entry in a single call. This is the right pattern when you want:
@@ -43,7 +53,7 @@ Time-varying Earth Engine ImageCollections (climate reanalyses, satellite vegeta
 
 ```python
 sample_points = pd.DataFrame({
-    "gbifID":     ["a", "b"],
+    "occurrenceID":     ["a", "b"],
     "decimalLatitude":  [59.85, 59.86],
     "decimalLongitude": [17.63, 17.64],
     "eventDate":        ["2022-06-15", "2023-08-01"],
@@ -152,6 +162,22 @@ update_catalog({
 update_catalog("my_catalog.yml")
 ```
 
+Earth Engine assets that aren't in the built-in catalog are registered the same way — just set `data_source: earth_engine` and point `path` at the GEE asset ID. Only `data_source`, `path`, and `data_type` are required (bands are optional — all are loaded if you omit them), and the asset type (`Image` vs `ImageCollection`) is auto-detected, so there's nothing else to declare for a static image:
+
+```python
+# An Earth Engine asset not in the built-in catalog — OpenLandMap soil pH (H2O).
+update_catalog({
+    "datasets": {
+        "soil_ph_openlandmap": {
+            "data_source": "earth_engine",
+            "path": "OpenLandMap/SOL/SOL_PH-H2O_USDA-4C1A2A_M/v02",
+            "data_type": "continuous",
+            "bands": ["b0", "b10"],   # soil pH at 0 cm and 10 cm depth
+        },
+    },
+})
+```
+
 **Precedence.** User-registered datasets override built-ins with the same name. This is intentional: you can swap an upstream catalog entry for a higher-resolution local copy without renaming every downstream config that references it. Re-registering the same name later overwrites the earlier definition.
 
 **Auto-detection for local rasters.** For `data_source: local` entries, envoi reads the file with rasterio at registration time and fills in CRS, native pixel size, nodata values, and band count automatically — you only need to provide `data_source` and `path`. Set `data_type: categorical` explicitly if the raster is a class map; local entries default to `continuous` otherwise.
@@ -164,11 +190,11 @@ For the full catalog schema, see the commented reference block at the top of [sr
 
 A few `extract()` knobs are aimed at notebook and exploratory use, where writing files to disk on every iteration is overkill:
 
-- `output_file_format: "dataframe"` (tabular only) — returns the stats table as an in-memory DataFrame in the `outputs` dict instead of writing CSV or Parquet. Useful when you want to immediately filter, plot, or join the result without round-tripping through a file.
+- `output_file_format: "dataframe"` (tabular only) — returns the stats table as an in-memory DataFrame instead of writing CSV or Parquet. When you pass a single run config (a dict, not a list), `extract()` hands the DataFrame back directly; with a list of configs it stays keyed by `batch_id` like any other run. Useful when you want to immediately filter, plot, or join the result without round-tripping through a file.
 - `write_metadata=False` (keyword argument on `extract()`) — suppresses both the JSON metadata sidecar and the per-point QC table. The main output is still written (unless you also asked for `"dataframe"` format), but the auxiliary files don't accumulate while you iterate.
 
 ```python
-outputs = extract(
+stats = extract(
     sample_points,
     {
         "batch_id": "scratch",
@@ -183,7 +209,7 @@ outputs = extract(
     write_metadata=False,
 )
 
-outputs["scratch"].head()  # the stats table, in memory
+stats.head()  # a single config in "dataframe" mode returns the table directly
 ```
 
 For production runs, leave both at their defaults — the JSON sidecar is the only record of which images and dates were actually used per point, and the QC table is what you filter on to drop low-coverage rows. Both are essential for reproducibility once a run leaves the notebook.

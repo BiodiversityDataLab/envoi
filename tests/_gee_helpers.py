@@ -37,7 +37,7 @@ def gee_credentials_available() -> bool:
 # close enough together that GEE caches the per-image fetch across them.
 SWEDEN_SAMPLE_DF = pd.DataFrame(
     {
-        "gbifID": ["A", "B"],
+        "occurrenceID": ["A", "B"],
         "decimalLatitude": [62.9768783, 62.9812956],
         "decimalLongitude": [18.026823, 18.0309905],
         "eventDate": ["2020-06-01", "2020-06-01"],

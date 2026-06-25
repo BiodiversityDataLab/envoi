@@ -41,7 +41,7 @@ def extract(
     config: str | Path | dict | list,
     output_dir: str | Path = "outputs",
     input_crs: str | None = None,
-    id_column: str = "gbifID",
+    id_column: str = "occurrenceID",
     latitude_column: str = "decimalLatitude",
     longitude_column: str = "decimalLongitude",
     date_column: str = "eventDate",
@@ -102,7 +102,7 @@ def extract(
     ----------
     df : pd.DataFrame
         Input table of sample points. Must contain identifier and coordinate
-        columns (named ``gbifID``, ``decimalLatitude``, ``decimalLongitude``
+        columns (named ``occurrenceID``, ``decimalLatitude``, ``decimalLongitude``
         by default, following the GBIF / Darwin Core convention — override the
         names with the ``*_column`` parameters below). An optional date column
         (``eventDate``, YYYY-MM-DD strings) enables nearest-date image selection
@@ -120,7 +120,7 @@ def extract(
         omitted, coordinates are assumed to already be in WGS84.
     id_column : str, optional
         Name of the input column containing each row's identifier.
-        Defaults to ``"gbifID"`` (GBIF / Darwin Core). The output
+        Defaults to ``"occurrenceID"`` (GBIF / Darwin Core). The output
         tables will use the same name.
     latitude_column : str, optional
         Name of the input column containing latitude values. Defaults
@@ -150,12 +150,17 @@ def extract(
 
     Returns
     -------
-    dict[str, Path | pd.DataFrame]
-        Mapping of output key to the result. For tabular outputs the key is
-        ``"<batch_id>"`` pointing to the stats table. For raster outputs the key is
-        ``"<batch_id>:<dataset>"`` pointing to the tiles folder. When
+    dict[str, Path | pd.DataFrame] or pd.DataFrame
+        Usually a mapping of output key to the result. For tabular outputs the key
+        is ``"<batch_id>"`` pointing to the stats table. For raster outputs the key
+        is ``"<batch_id>:<dataset>"`` pointing to the tiles folder. When
         ``output_file_format`` is ``"dataframe"``, the stats value is a pandas
         DataFrame rather than a file path.
+
+        As a convenience, when ``config`` is a single run config (a dict, not a
+        list) *and* ``output_file_format`` is ``"dataframe"``, the stats
+        DataFrame is returned directly instead of being wrapped in a
+        ``{batch_id: df}`` dict.
     """
     output_paths: Dict[str, Path | pd.DataFrame] = {}
 
@@ -194,6 +199,13 @@ def extract(
 
     # Normalize config into a list of output configs, whether the user passed a single dict or a list of dicts.
     output_configs = _as_config_list(config)
+
+    # Track whether the caller passed a single run config (an inline dict, or a
+    # YAML file resolving to a single dict) rather than an explicit list. This
+    # lets us return a bare DataFrame for the common single-output "dataframe"
+    # case below — "ask for a dataframe, get a dataframe" — instead of a
+    # {batch_id: df} dict the caller would have to index into.
+    single_config = len(output_configs) == 1 and not isinstance(config, list)
 
     for idx, run_config in enumerate(output_configs):
         df_copy = df.copy()
@@ -334,6 +346,21 @@ def extract(
             stats_df = _round_stat_columns(
                 stats_df, core_columns, defaults["stats_output_decimals"]
             )
+
+            # When the coordinates were reprojected to WGS84 (input_crs was
+            # given), the canonical lat/lon columns hold the WGS84 values used
+            # internally for extraction. Surface both coordinate systems in the
+            # output: keep the user's lat/lon columns as the ORIGINAL input-CRS
+            # coordinates they supplied, and add "<lat>_wgs84"/"<lon>_wgs84"
+            # columns with the reprojected values. The original coordinates were
+            # stashed in df_copy by _validate_and_reproject_crs.
+            if "lat_original" in df_copy.columns:
+                for output_frame in (stats_df, qc_df):
+                    output_frame[f"{latitude_column}_wgs84"] = output_frame["lat"]
+                    output_frame[f"{longitude_column}_wgs84"] = output_frame["lon"]
+                    output_frame["lat"] = df_copy.loc[output_frame.index, "lat_original"]
+                    output_frame["lon"] = df_copy.loc[output_frame.index, "lon_original"]
+
             stats_df, qc_df = _restore_user_column_names(stats_df, qc_df, column_name_map)
 
             # When format is "dataframe", return the DataFrames directly instead
@@ -386,6 +413,13 @@ def extract(
                     },
                     warnings=warnings_backlog if warnings_backlog else None,
                 )
+
+    # For the common single-config "dataframe" run, return the DataFrame itself
+    # rather than wrapping it in a {batch_id: df} dict — the caller asked for a
+    # dataframe, so hand them a dataframe. List configs (or non-dataframe
+    # formats) keep the keyed-dict return so multi-output runs stay addressable.
+    if single_config and output_file_format == "dataframe" and len(output_paths) == 1:
+        return next(iter(output_paths.values()))
 
     return output_paths
 
