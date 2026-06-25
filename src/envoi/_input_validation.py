@@ -68,11 +68,16 @@ def _parse_and_validate_dates(
     date_warnings: list[str] = []
 
     if "date" not in df.columns:
+        # A missing date column is a normal, expected case (static datasets, or
+        # users who simply don't have dates), so this is informational rather
+        # than a Python warning — a raised UserWarning here is too aggressive
+        # and clutters every date-less run. We still record it in date_warnings
+        # so it lands in the metadata sidecar for auditing.
         message = (
             f"No '{date_column_name}' column found in input DataFrame; "
             f"proceeding without dates."
         )
-        warnings.warn(message, stacklevel=2)
+        print(message)
         date_warnings.append(message)
         return df, None, date_warnings
 
