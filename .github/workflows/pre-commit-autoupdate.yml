@@ -8,6 +8,12 @@ on:
 jobs:
   autoupdate:
     runs-on: ubuntu-latest
+    # peter-evans/create-pull-request needs these to push the branch and open
+    # the PR with the default GITHUB_TOKEN. Without them the action pushes the
+    # branch but silently fails to create the PR.
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
