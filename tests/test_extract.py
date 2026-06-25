@@ -191,7 +191,7 @@ class TestTabular:
         )
 
         result = pd.read_csv(outputs["test"])
-        assert list(result["gbifID"]) == list(sample_df["gbifID"])
+        assert list(result["occurrenceID"]) == list(sample_df["occurrenceID"])
 
     def test_csv_format(self, sample_df, tmp_path):
         """Default format is csv; parquet can be requested explicitly."""
@@ -293,7 +293,7 @@ class TestTabular:
         out_of_extent_row = pd.DataFrame(
             [
                 {
-                    "gbifID": "OOB",
+                    "occurrenceID": "OOB",
                     "n_otu": 0,
                     "decimalLatitude": 0.0,
                     "decimalLongitude": 0.0,
@@ -335,7 +335,7 @@ class TestTabular:
         ), f"flat-named columns leaked into multi-band output: {leaked_columns}"
 
         # The out-of-extent row should have NaN in every per-band stat column.
-        oob_row = stats_df.loc[stats_df["gbifID"] == "OOB"].iloc[0]
+        oob_row = stats_df.loc[stats_df["occurrenceID"] == "OOB"].iloc[0]
         for band_index in (1, 2, 3):
             for reducer_name in ("mean", "std"):
                 value = oob_row[f"multi_band_local_b{band_index}_{reducer_name}_100m"]
@@ -351,7 +351,7 @@ class TestTabular:
 
 class TestCustomColumnNames:
     """The default input column names follow the GBIF / Darwin Core convention
-    (``gbifID``, ``decimalLatitude``, ``decimalLongitude``, ``eventDate``),
+    (``occurrenceID``, ``decimalLatitude``, ``decimalLongitude``, ``eventDate``),
     but callers can override every name via the ``*_column`` parameters. These
     tests pin the override path so a future change to the canonical-name
     rename layer can't silently break user-supplied names.
@@ -367,7 +367,7 @@ class TestCustomColumnNames:
         # names so we can exercise the override path with realistic input.
         legacy_df = sample_df.rename(
             columns={
-                "gbifID": "id",
+                "occurrenceID": "id",
                 "decimalLatitude": "lat",
                 "decimalLongitude": "lon",
                 "eventDate": "date",
@@ -397,7 +397,7 @@ class TestCustomColumnNames:
         # The output must round-trip the user's chosen names — not the new GBIF
         # defaults, and not the internal canonical names.
         assert "id" in result.columns
-        assert "gbifID" not in result.columns
+        assert "occurrenceID" not in result.columns
         assert list(result["id"]) == list(legacy_df["id"])
         # And the actual extraction still ran end-to-end.
         assert "dem_local_mean_100m" in result.columns
@@ -684,7 +684,7 @@ class TestRaster:
         # ends up as a non-axis-aligned quadrilateral — corner pixels of the
         # cropped bounding box fall outside the polygon and get masked.
         df = pd.DataFrame(
-            {"gbifID": ["centre"], "decimalLatitude": [62.98], "decimalLongitude": [18.025]}
+            {"occurrenceID": ["centre"], "decimalLatitude": [62.98], "decimalLongitude": [18.025]}
         )
         extract(
             df,
@@ -723,7 +723,7 @@ class TestRaster:
         )
 
         df = pd.DataFrame(
-            {"gbifID": ["centre"], "decimalLatitude": [62.98], "decimalLongitude": [18.025]}
+            {"occurrenceID": ["centre"], "decimalLatitude": [62.98], "decimalLongitude": [18.025]}
         )
         extract(
             df,
@@ -1285,11 +1285,11 @@ class TestOutputFormats:
         ), f"expected DataFrame return, got {type(result).__name__}"
         assert len(result) == len(sample_df)
         assert "dem_local_mean_100m" in result.columns
-        # Core columns (gbifID/decimalLatitude/decimalLongitude) are
+        # Core columns (occurrenceID/decimalLatitude/decimalLongitude) are
         # preserved on the stats output so the returned DataFrame is
         # independently useful.
-        assert "gbifID" in result.columns
-        assert list(result["gbifID"]) == list(sample_df["gbifID"])
+        assert "occurrenceID" in result.columns
+        assert list(result["occurrenceID"]) == list(sample_df["occurrenceID"])
 
     def test_dataframe_format_list_config_keeps_dict(self, sample_df, tmp_path):
         """A list config still returns a {batch_id: df} dict even in dataframe

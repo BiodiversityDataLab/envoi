@@ -41,7 +41,7 @@ def extract(
     config: str | Path | dict | list,
     output_dir: str | Path = "outputs",
     input_crs: str | None = None,
-    id_column: str = "gbifID",
+    id_column: str = "occurrenceID",
     latitude_column: str = "decimalLatitude",
     longitude_column: str = "decimalLongitude",
     date_column: str = "eventDate",
@@ -102,7 +102,7 @@ def extract(
     ----------
     df : pd.DataFrame
         Input table of sample points. Must contain identifier and coordinate
-        columns (named ``gbifID``, ``decimalLatitude``, ``decimalLongitude``
+        columns (named ``occurrenceID``, ``decimalLatitude``, ``decimalLongitude``
         by default, following the GBIF / Darwin Core convention — override the
         names with the ``*_column`` parameters below). An optional date column
         (``eventDate``, YYYY-MM-DD strings) enables nearest-date image selection
@@ -120,7 +120,7 @@ def extract(
         omitted, coordinates are assumed to already be in WGS84.
     id_column : str, optional
         Name of the input column containing each row's identifier.
-        Defaults to ``"gbifID"`` (GBIF / Darwin Core). The output
+        Defaults to ``"occurrenceID"`` (GBIF / Darwin Core). The output
         tables will use the same name.
     latitude_column : str, optional
         Name of the input column containing latitude values. Defaults

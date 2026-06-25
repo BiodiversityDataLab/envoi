@@ -484,7 +484,7 @@ class TestAutoDateSelection:
         # nearest-image selection must pick different timestamps for each.
         in_range_df = pd.DataFrame(
             {
-                "gbifID": ["A_2010", "B_2020"],
+                "occurrenceID": ["A_2010", "B_2020"],
                 "decimalLatitude": [62.97, 62.98],
                 "decimalLongitude": [18.02, 18.03],
                 "eventDate": ["2010-06-01", "2020-06-01"],
@@ -529,7 +529,7 @@ class TestAutoDateSelection:
         """A future date should clamp to the latest available image."""
         future_df = pd.DataFrame(
             {
-                "gbifID": ["future"],
+                "occurrenceID": ["future"],
                 "decimalLatitude": [62.97],
                 "decimalLongitude": [18.02],
                 "eventDate": ["2099-12-31"],
@@ -564,7 +564,7 @@ class TestAutoDateSelection:
         """DataFrame without a date column should use the most recent image."""
         no_date_df = pd.DataFrame(
             {
-                "gbifID": ["A", "B"],
+                "occurrenceID": ["A", "B"],
                 "decimalLatitude": [62.9768783, 62.9812956],
                 "decimalLongitude": [18.026823, 18.0309905],
             }
@@ -770,7 +770,7 @@ class TestGeeNumericalCorrectness:
         """
         bonneville_df = pd.DataFrame(
             {
-                "gbifID": ["bonneville"],
+                "occurrenceID": ["bonneville"],
                 "decimalLatitude": [40.7500],
                 "decimalLongitude": [-113.8500],
                 "eventDate": ["2020-01-01"],
