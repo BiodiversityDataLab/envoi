@@ -101,6 +101,79 @@ class TestTabular:
         assert "dem_local_coverage_pct_100m" in qc_df.columns
         assert "dem_local_coverage_pct_100m" not in stats_df.columns
 
+    def test_input_crs_keeps_original_and_adds_wgs84(self, sample_df, tmp_path):
+        """With input_crs set, the output keeps the original coordinates and
+        adds reprojected *_wgs84 columns.
+
+        The sample points are WGS84; we project them to the DEM's UTM zone
+        (EPSG:32634) and feed those projected coordinates as input. The output
+        must round-trip the projected coordinates the user supplied in
+        decimalLatitude/decimalLongitude, and expose the WGS84 reprojection in
+        decimalLatitude_wgs84/decimalLongitude_wgs84.
+        """
+        from pyproj import Transformer
+
+        # Project the WGS84 sample points into UTM 34N so we have realistic
+        # input-CRS coordinates to feed back in via input_crs.
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+        easting, northing = to_utm.transform(
+            sample_df["decimalLongitude"].values, sample_df["decimalLatitude"].values
+        )
+        projected_df = sample_df.copy()
+        projected_df["decimalLongitude"] = easting
+        projected_df["decimalLatitude"] = northing
+
+        outputs = extract(
+            projected_df,
+            {
+                "batch_id": "crs_test",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+            input_crs="EPSG:32634",
+        )
+        result = pd.read_csv(outputs["crs_test"])
+
+        # The user's lat/lon columns hold the original (UTM) coordinates.
+        np.testing.assert_allclose(result["decimalLatitude"], northing)
+        np.testing.assert_allclose(result["decimalLongitude"], easting)
+
+        # The reprojected WGS84 coordinates are surfaced in extra columns and
+        # match the original WGS84 the points came from.
+        assert "decimalLatitude_wgs84" in result.columns
+        assert "decimalLongitude_wgs84" in result.columns
+        np.testing.assert_allclose(
+            result["decimalLatitude_wgs84"], sample_df["decimalLatitude"], atol=1e-6
+        )
+        np.testing.assert_allclose(
+            result["decimalLongitude_wgs84"], sample_df["decimalLongitude"], atol=1e-6
+        )
+
+    def test_no_input_crs_has_no_wgs84_columns(self, sample_df, tmp_path):
+        """Without input_crs (coordinates already WGS84), no *_wgs84 columns
+        are added — the output is unchanged from the default behaviour."""
+        outputs = extract(
+            sample_df,
+            {
+                "batch_id": "no_crs",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+        )
+        result = pd.read_csv(outputs["no_crs"])
+        assert "decimalLatitude_wgs84" not in result.columns
+        assert "decimalLongitude_wgs84" not in result.columns
+
     def test_row_order_preserved(self, sample_df, tmp_path):
         """IDs in output match input order."""
         outputs = extract(
@@ -118,7 +191,7 @@ class TestTabular:
         )
 
         result = pd.read_csv(outputs["test"])
-        assert list(result["gbifID"]) == list(sample_df["gbifID"])
+        assert list(result["occurrenceID"]) == list(sample_df["occurrenceID"])
 
     def test_csv_format(self, sample_df, tmp_path):
         """Default format is csv; parquet can be requested explicitly."""
@@ -220,7 +293,7 @@ class TestTabular:
         out_of_extent_row = pd.DataFrame(
             [
                 {
-                    "gbifID": "OOB",
+                    "occurrenceID": "OOB",
                     "n_otu": 0,
                     "decimalLatitude": 0.0,
                     "decimalLongitude": 0.0,
@@ -262,7 +335,7 @@ class TestTabular:
         ), f"flat-named columns leaked into multi-band output: {leaked_columns}"
 
         # The out-of-extent row should have NaN in every per-band stat column.
-        oob_row = stats_df.loc[stats_df["gbifID"] == "OOB"].iloc[0]
+        oob_row = stats_df.loc[stats_df["occurrenceID"] == "OOB"].iloc[0]
         for band_index in (1, 2, 3):
             for reducer_name in ("mean", "std"):
                 value = oob_row[f"multi_band_local_b{band_index}_{reducer_name}_100m"]
@@ -278,7 +351,7 @@ class TestTabular:
 
 class TestCustomColumnNames:
     """The default input column names follow the GBIF / Darwin Core convention
-    (``gbifID``, ``decimalLatitude``, ``decimalLongitude``, ``eventDate``),
+    (``occurrenceID``, ``decimalLatitude``, ``decimalLongitude``, ``eventDate``),
     but callers can override every name via the ``*_column`` parameters. These
     tests pin the override path so a future change to the canonical-name
     rename layer can't silently break user-supplied names.
@@ -294,14 +367,15 @@ class TestCustomColumnNames:
         # names so we can exercise the override path with realistic input.
         legacy_df = sample_df.rename(
             columns={
-                "gbifID": "id",
+                "occurrenceID": "id",
                 "decimalLatitude": "lat",
                 "decimalLongitude": "lon",
                 "eventDate": "date",
             }
         )
 
-        outputs = extract(
+        # A single config dict + "dataframe" format returns the DataFrame directly.
+        result = extract(
             legacy_df,
             {
                 "batch_id": "legacy_names",
@@ -320,11 +394,10 @@ class TestCustomColumnNames:
             date_column="date",
         )
 
-        result = outputs["legacy_names"]
         # The output must round-trip the user's chosen names — not the new GBIF
         # defaults, and not the internal canonical names.
         assert "id" in result.columns
-        assert "gbifID" not in result.columns
+        assert "occurrenceID" not in result.columns
         assert list(result["id"]) == list(legacy_df["id"])
         # And the actual extraction still ran end-to-end.
         assert "dem_local_mean_100m" in result.columns
@@ -428,6 +501,26 @@ class TestGbifEventDateParsing:
             f"expected 2 aggregated warnings for {n_rows} interval rows, "
             f"got {len(caught)} — per-row spam regressed"
         )
+
+    def test_missing_date_column_does_not_raise_warning(self):
+        # A missing date column is a normal case and must NOT raise a
+        # UserWarning (too aggressive). It is still recorded in date_warnings
+        # for the metadata sidecar, and dates comes back as None.
+        from envoi._input_validation import _parse_and_validate_dates
+
+        df = pd.DataFrame(
+            {
+                "id": ["a", "b"],
+                "lat": [62.97, 62.98],
+                "lon": [18.02, 18.03],
+            }
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning would fail the test
+            _, dates, date_warnings = _parse_and_validate_dates(df, date_column_name="eventDate")
+        assert dates is None
+        assert len(date_warnings) == 1
+        assert "No 'eventDate' column" in date_warnings[0]
 
     def test_plain_yyyy_mm_dd_unchanged(self):
         # Regression guard: the pre-existing happy path must still work
@@ -591,7 +684,7 @@ class TestRaster:
         # ends up as a non-axis-aligned quadrilateral — corner pixels of the
         # cropped bounding box fall outside the polygon and get masked.
         df = pd.DataFrame(
-            {"gbifID": ["centre"], "decimalLatitude": [62.98], "decimalLongitude": [18.025]}
+            {"occurrenceID": ["centre"], "decimalLatitude": [62.98], "decimalLongitude": [18.025]}
         )
         extract(
             df,
@@ -630,7 +723,7 @@ class TestRaster:
         )
 
         df = pd.DataFrame(
-            {"gbifID": ["centre"], "decimalLatitude": [62.98], "decimalLongitude": [18.025]}
+            {"occurrenceID": ["centre"], "decimalLatitude": [62.98], "decimalLongitude": [18.025]}
         )
         extract(
             df,
@@ -1166,8 +1259,9 @@ class TestOutputFormats:
         assert len(qc_df) == len(sample_df)
 
     def test_dataframe_format_returns_in_memory_dataframe(self, sample_df, tmp_path):
-        """output_file_format='dataframe' returns the stats DataFrame instead of a Path."""
-        outputs = extract(
+        """output_file_format='dataframe' with a single config returns the stats
+        DataFrame directly (not a {batch_id: df} dict)."""
+        result = extract(
             sample_df,
             {
                 "batch_id": "df_test",
@@ -1182,20 +1276,42 @@ class TestOutputFormats:
             output_dir=tmp_path,
         )
 
-        # Sanity: the value in the outputs dict is a DataFrame, not a Path.
+        # The return value is the DataFrame itself, not a Path and not a dict.
         # This is the whole point of the "dataframe" mode — skip disk I/O for
-        # the stats output when the caller wants the result in-memory.
-        result = outputs["df_test"]
+        # the stats output when the caller wants the result in-memory, and hand
+        # back a dataframe when a single config was requested.
         assert isinstance(
             result, pd.DataFrame
         ), f"expected DataFrame return, got {type(result).__name__}"
         assert len(result) == len(sample_df)
         assert "dem_local_mean_100m" in result.columns
-        # Core columns (gbifID/decimalLatitude/decimalLongitude) are
+        # Core columns (occurrenceID/decimalLatitude/decimalLongitude) are
         # preserved on the stats output so the returned DataFrame is
         # independently useful.
-        assert "gbifID" in result.columns
-        assert list(result["gbifID"]) == list(sample_df["gbifID"])
+        assert "occurrenceID" in result.columns
+        assert list(result["occurrenceID"]) == list(sample_df["occurrenceID"])
+
+    def test_dataframe_format_list_config_keeps_dict(self, sample_df, tmp_path):
+        """A list config still returns a {batch_id: df} dict even in dataframe
+        mode, so multi-output runs stay addressable by key."""
+        outputs = extract(
+            sample_df,
+            [
+                {
+                    "batch_id": "df_list",
+                    "datasets": ["dem_local"],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["mean"],
+                        "window_size_m": 100,
+                        "output_file_format": "dataframe",
+                    },
+                }
+            ],
+            output_dir=tmp_path,
+        )
+        assert isinstance(outputs, dict)
+        assert isinstance(outputs["df_list"], pd.DataFrame)
 
     def test_unknown_output_format_raises(self, sample_df, tmp_path):
         """An unrecognised output_file_format value raises ValueError."""
