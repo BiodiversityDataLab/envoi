@@ -101,6 +101,79 @@ class TestTabular:
         assert "dem_local_coverage_pct_100m" in qc_df.columns
         assert "dem_local_coverage_pct_100m" not in stats_df.columns
 
+    def test_input_crs_keeps_original_and_adds_wgs84(self, sample_df, tmp_path):
+        """With input_crs set, the output keeps the original coordinates and
+        adds reprojected *_wgs84 columns.
+
+        The sample points are WGS84; we project them to the DEM's UTM zone
+        (EPSG:32634) and feed those projected coordinates as input. The output
+        must round-trip the projected coordinates the user supplied in
+        decimalLatitude/decimalLongitude, and expose the WGS84 reprojection in
+        decimalLatitude_wgs84/decimalLongitude_wgs84.
+        """
+        from pyproj import Transformer
+
+        # Project the WGS84 sample points into UTM 34N so we have realistic
+        # input-CRS coordinates to feed back in via input_crs.
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+        easting, northing = to_utm.transform(
+            sample_df["decimalLongitude"].values, sample_df["decimalLatitude"].values
+        )
+        projected_df = sample_df.copy()
+        projected_df["decimalLongitude"] = easting
+        projected_df["decimalLatitude"] = northing
+
+        outputs = extract(
+            projected_df,
+            {
+                "batch_id": "crs_test",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+            input_crs="EPSG:32634",
+        )
+        result = pd.read_csv(outputs["crs_test"])
+
+        # The user's lat/lon columns hold the original (UTM) coordinates.
+        np.testing.assert_allclose(result["decimalLatitude"], northing)
+        np.testing.assert_allclose(result["decimalLongitude"], easting)
+
+        # The reprojected WGS84 coordinates are surfaced in extra columns and
+        # match the original WGS84 the points came from.
+        assert "decimalLatitude_wgs84" in result.columns
+        assert "decimalLongitude_wgs84" in result.columns
+        np.testing.assert_allclose(
+            result["decimalLatitude_wgs84"], sample_df["decimalLatitude"], atol=1e-6
+        )
+        np.testing.assert_allclose(
+            result["decimalLongitude_wgs84"], sample_df["decimalLongitude"], atol=1e-6
+        )
+
+    def test_no_input_crs_has_no_wgs84_columns(self, sample_df, tmp_path):
+        """Without input_crs (coordinates already WGS84), no *_wgs84 columns
+        are added — the output is unchanged from the default behaviour."""
+        outputs = extract(
+            sample_df,
+            {
+                "batch_id": "no_crs",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+        )
+        result = pd.read_csv(outputs["no_crs"])
+        assert "decimalLatitude_wgs84" not in result.columns
+        assert "decimalLongitude_wgs84" not in result.columns
+
     def test_row_order_preserved(self, sample_df, tmp_path):
         """IDs in output match input order."""
         outputs = extract(
