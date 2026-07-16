@@ -14,7 +14,7 @@ Automated feature extraction from environmental data sources for ecological and 
 - [Earth Engine setup](#earth-engine-setup)
 - [Quick start](#quick-start)
   - [Walkthrough](#walkthrough)
-- [Streamlit web app](#streamlit-web-app)
+- [Browser-based graphical user interface](#streamlit-web-app)
 - [Outputs](#outputs)
   - [Tabular](#tabular)
   - [Raster](#raster)
