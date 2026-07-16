@@ -112,9 +112,9 @@ For a guided end-to-end tutorial — tabular and raster extraction, local raster
 
 ## Browser-based graphical user interface
 
-![Web app screenshot](docs/assets/webapp-screenshot.png)
-
 envoi also ships with a local Streamlit web app for users who prefer a browser-based workflow over writing Python code. It runs on your own machine at `localhost` and uploaded Earth Engine credentials are only written to a temporary local file for the duration of a run. In the future, this will be available as a hosted service.
+
+![Web app screenshot](docs/assets/webapp-screenshot.png)
 
 Install the optional web app dependencies:
 

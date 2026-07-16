@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1] — 2026-07-16
+
+### Changed
+- Usability refinements in the graphical user interface.
+
+### Fixed
+- Bugs related to dataset selection in the streamlit graphical user interface.
+
 ## [0.2.0] — 2026-07-16
 
 ### Changed
