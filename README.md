@@ -14,6 +14,7 @@ Automated feature extraction from environmental data sources for ecological and 
 - [Earth Engine setup](#earth-engine-setup)
 - [Quick start](#quick-start)
   - [Walkthrough](#walkthrough)
+- [Streamlit web app](#streamlit-web-app)
 - [Outputs](#outputs)
   - [Tabular](#tabular)
   - [Raster](#raster)
@@ -106,6 +107,38 @@ The same config can also live in a YAML file — see [examples/run.yml](https://
 ### Walkthrough
 
 For a guided end-to-end tutorial — tabular and raster extraction, local rasters, multi-dataset runs, date-aware extraction, and catalog discovery — see the [walkthrough notebook](https://github.com/BiodiversityDataLab/envoi/blob/main/examples/walkthrough.ipynb).
+
+---
+
+## Streamlit web app
+
+envoi also ships with a local Streamlit web app for users who prefer a browser-based workflow over writing Python code. It runs on your own machine at `localhost`; it is currently not a hosted service, and uploaded Earth Engine credentials are only written to a temporary local file for the duration of a run.
+
+Install the optional web app dependencies:
+
+```bash
+pip install "envoi-geospatial[webapp]"
+```
+
+For local development from a cloned repository, install the package in editable mode:
+
+```bash
+pip install -e ".[webapp]"
+```
+
+Start the app:
+
+```bash
+envoi-webapp
+```
+
+Then open the local URL printed by Streamlit, usually:
+
+```text
+http://localhost:8501
+```
+
+The app expects a CSV in the same GBIF / Darwin Core schema as the default Python API: `occurrenceID`, `decimalLatitude`, `decimalLongitude`, and optionally `eventDate`. It also asks for an output directory, an output type (`tabular` or `raster`), one or more dataset and variable selections, and a Google Earth Engine service-account JSON key. Earth Engine setup requirements are the same as for the Python API.
 
 ---
 
