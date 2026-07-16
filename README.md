@@ -14,7 +14,7 @@ Automated feature extraction from environmental data sources for ecological and 
 - [Earth Engine setup](#earth-engine-setup)
 - [Quick start](#quick-start)
   - [Walkthrough](#walkthrough)
-- [Browser-based graphical user interface](#streamlit-web-app)
+- [Browser-based user interface](#browser-based-user-interface)
 - [Outputs](#outputs)
   - [Tabular](#tabular)
   - [Raster](#raster)
@@ -110,7 +110,7 @@ For a guided end-to-end tutorial — tabular and raster extraction, local raster
 
 ---
 
-## Browser-based graphical user interface
+## Browser-based user interface
 
 envoi also ships with a local Streamlit web app for users who prefer a browser-based workflow over writing Python code. It runs on your own machine at `localhost` and uploaded Earth Engine credentials are only written to a temporary local file for the duration of a run. In the future, this will be available as a hosted service.
 
