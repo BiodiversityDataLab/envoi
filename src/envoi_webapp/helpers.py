@@ -16,6 +16,7 @@ from pyproj.exceptions import CRSError
 from envoi import extract as envoi_extract
 from envoi import init_gee as envoi_init_gee
 from envoi.progress import ProgressCallback
+from envoi.reducers import CATEGORICAL_ONLY_REDUCERS, CONTINUOUS_ONLY_REDUCERS
 
 GBIF_REQUIRED_COLUMNS = ("occurrenceID", "decimalLatitude", "decimalLongitude")
 GBIF_DATE_COLUMN = "eventDate"
@@ -159,6 +160,23 @@ def default_statistics_for_dataset(dataset_entry: dict) -> tuple[str, ...]:
     if dataset_entry.get("data_type") == "categorical":
         return ("mode", "class_fraction")
     return ("mean", "std")
+
+
+def permissible_statistics_for_dataset(
+    dataset_entry: dict,
+    reducer_names: Sequence[str],
+) -> tuple[str, ...]:
+    """Return reducer names that are compatible with a dataset's declared type."""
+
+    data_type = dataset_entry.get("data_type")
+    if data_type == "categorical":
+        excluded = CONTINUOUS_ONLY_REDUCERS
+    else:
+        # Match envoi.reducers.validate_reducers(): unknown/None is treated
+        # as continuous for categorical-only reducer warnings.
+        excluded = CATEGORICAL_ONLY_REDUCERS
+
+    return tuple(name for name in reducer_names if name.lower() not in excluded)
 
 
 def _window_size_setting(window_sizes: Sequence[int]) -> int | list[int]:

@@ -15,6 +15,7 @@ from envoi_webapp.helpers import (
     build_run_config,
     normalize_crs,
     parse_window_sizes,
+    permissible_statistics_for_dataset,
     read_points_csv,
     redact_credential_secrets,
     run_extraction,
@@ -125,6 +126,22 @@ def test_build_run_config_raster_uses_10m_resampling_and_no_statistics():
         "window_size_m": 200,
         "resample_m": 10,
     }
+
+
+def test_permissible_statistics_for_continuous_dataset_excludes_categorical_only_reducers():
+    reducers = ("mean", "std", "mode", "count", "class_count", "class_fraction")
+
+    result = permissible_statistics_for_dataset({"data_type": "continuous"}, reducers)
+
+    assert result == ("mean", "std", "mode", "count")
+
+
+def test_permissible_statistics_for_categorical_dataset_excludes_continuous_only_reducers():
+    reducers = ("mean", "std", "mode", "count", "class_count", "class_fraction")
+
+    result = permissible_statistics_for_dataset({"data_type": "categorical"}, reducers)
+
+    assert result == ("mode", "count", "class_count", "class_fraction")
 
 
 def test_validate_service_account_json_rejects_bad_shape():

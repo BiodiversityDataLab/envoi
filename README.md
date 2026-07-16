@@ -110,9 +110,11 @@ For a guided end-to-end tutorial — tabular and raster extraction, local raster
 
 ---
 
-## Streamlit web app
+## Browser-based graphical user interface
 
-envoi also ships with a local Streamlit web app for users who prefer a browser-based workflow over writing Python code. It runs on your own machine at `localhost`; it is currently not a hosted service, and uploaded Earth Engine credentials are only written to a temporary local file for the duration of a run.
+![Web app screenshot](docs/assets/webapp-screenshot.png)
+
+envoi also ships with a local Streamlit web app for users who prefer a browser-based workflow over writing Python code. It runs on your own machine at `localhost` and uploaded Earth Engine credentials are only written to a temporary local file for the duration of a run. In the future, this will be available as a hosted service.
 
 Install the optional web app dependencies:
 
@@ -138,7 +140,7 @@ Then open the local URL printed by Streamlit, usually:
 http://localhost:8501
 ```
 
-The app expects a CSV in the same GBIF / Darwin Core schema as the default Python API: `occurrenceID`, `decimalLatitude`, `decimalLongitude`, and optionally `eventDate`. It also asks for an output directory, an output type (`tabular` or `raster`), one or more dataset and variable selections, and a Google Earth Engine service-account JSON key. Earth Engine setup requirements are the same as for the Python API.
+The app expects a CSV in the same GBIF / Darwin Core schema as the default Python API: `occurrenceID`, `decimalLatitude`, `decimalLongitude`, and optionally `eventDate`. It also asks for an output directory, an output type (`tabular` or `raster`), one or more dataset and variable selections, and a Google Earth Engine service account JSON key. Earth Engine setup requirements are the same as for the Python API.
 
 ---
 
