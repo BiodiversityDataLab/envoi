@@ -28,7 +28,7 @@ from envoi_webapp.helpers import (
 def _points_df() -> pd.DataFrame:
     return pd.DataFrame(
         {
-            "gbifID": ["a", "b"],
+            "occurrenceID": ["a", "b"],
             "decimalLatitude": [59.1, 59.2],
             "decimalLongitude": [18.1, 18.2],
         }
@@ -53,7 +53,7 @@ def test_validate_points_dataframe_accepts_optional_date_absent():
 
     assert result.row_count == 2
     assert result.has_date is False
-    assert "gbifID" in result.columns
+    assert "occurrenceID" in result.columns
 
 
 def test_validate_points_dataframe_rejects_missing_gbif_columns():
@@ -86,14 +86,14 @@ def test_parse_window_sizes_accepts_comma_separated_positive_integers():
 @pytest.mark.parametrize("delimiter", [",", ";", "\t", " "])
 def test_read_points_csv_infers_common_delimiters(delimiter):
     raw = (
-        f"gbifID{delimiter}decimalLatitude{delimiter}decimalLongitude\n"
+        f"occurrenceID{delimiter}decimalLatitude{delimiter}decimalLongitude\n"
         f"a{delimiter}59.1{delimiter}18.1\n"
     )
 
     result = read_points_csv(io.StringIO(raw))
 
-    assert list(result.columns) == ["gbifID", "decimalLatitude", "decimalLongitude"]
-    assert result.loc[0, "gbifID"] == "a"
+    assert list(result.columns) == ["occurrenceID", "decimalLatitude", "decimalLongitude"]
+    assert result.loc[0, "occurrenceID"] == "a"
 
 
 def test_build_run_config_tabular():
@@ -202,6 +202,6 @@ def test_run_extraction_initializes_gee_with_temp_key_and_passes_expected_args(t
     assert outputs["extract_01_dem"].name == "extract_01_dem.csv"
     assert captured["config"][0]["batch_id"] == "extract_01_dem"
     assert captured["kwargs"]["input_crs"] == "EPSG:4326"
-    assert captured["kwargs"]["id_column"] == "gbifID"
+    assert captured["kwargs"]["id_column"] == "occurrenceID"
     assert captured["kwargs"]["quiet"] is True
     assert init_paths and not init_paths[0].exists()
