@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 from base64 import b64encode
 from importlib import resources
@@ -22,6 +24,7 @@ try:
         build_run_config,
         normalize_crs,
         parse_window_sizes,
+        permissible_statistics_for_dataset,
         read_points_csv,
         redact_credential_secrets,
         run_extraction,
@@ -35,6 +38,7 @@ except ImportError:
         build_run_config,
         normalize_crs,
         parse_window_sizes,
+        permissible_statistics_for_dataset,
         read_points_csv,
         redact_credential_secrets,
         run_extraction,
@@ -68,6 +72,15 @@ def _logo_path() -> Path | None:
     except ModuleNotFoundError:
         return None
     return Path(str(path)) if Path(str(path)).exists() else None
+
+
+def _favicon_path() -> Path | str:
+    try:
+        path = resources.files("envoi_webapp").joinpath("assets", "bddl_logo.png")
+    except ModuleNotFoundError:
+        return "E"
+    favicon_path = Path(str(path))
+    return favicon_path if favicon_path.exists() else "E"
 
 
 def _inject_css(st) -> None:
@@ -176,6 +189,9 @@ def _inject_css(st) -> None:
         [data-testid="stFileUploader"] button[aria-label="Add files"] {
           display: none;
         }
+        [data-testid="stFileUploaderDropzoneInstructions"] {
+          display: none !important;
+        }
         div[class*="st-key-remove_dataset_action"] button {
           background: #fdecec;
           border-color: #efb6b6;
@@ -201,13 +217,17 @@ def _dataset_catalog() -> dict[str, dict[str, Any]]:
 def _ensure_dataset_state() -> None:
     st = _load_streamlit()
     if "dataset_rows" not in st.session_state:
-        st.session_state.dataset_rows = [
-            {
-                "dataset": "",
-                "window_sizes": "",
-                "statistics": [],
-            }
-        ]
+        st.session_state.dataset_rows = [_empty_dataset_row()]
+    if "_dataset_widget_version" not in st.session_state:
+        st.session_state._dataset_widget_version = 0
+
+
+def _empty_dataset_row() -> dict:
+    return {
+        "dataset": "",
+        "window_sizes": "",
+        "statistics": [],
+    }
 
 
 def _logo_image_html(path: Path) -> str:
@@ -243,57 +263,148 @@ def _read_uploaded_csv(uploaded_file) -> pd.DataFrame | None:
     return read_points_csv(uploaded_file)
 
 
+def _choose_output_directory(initial_dir: str) -> str | None:
+    """Open a native directory chooser through a separate GUI process."""
+
+    initial_path = Path(initial_dir).expanduser()
+    if not initial_path.exists():
+        initial_path = Path.home()
+
+    if sys.platform == "darwin":
+        # Streamlit runs app code outside the macOS main thread, so tkinter/Tk
+        # can abort the whole process. AppleScript opens the chooser in a
+        # separate process and returns the selected POSIX path.
+        script = (
+            'POSIX path of (choose folder with prompt "Select envoi output directory" '
+            f'default location POSIX file "{_escape_applescript_string(str(initial_path))}")'
+        )
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+        if result.returncode == 1 and "User canceled" in result.stderr:
+            return None
+        raise RuntimeError(result.stderr.strip() or "Could not open the folder chooser.")
+
+    if sys.platform.startswith("linux") and shutil.which("zenity"):
+        result = subprocess.run(
+            [
+                "zenity",
+                "--file-selection",
+                "--directory",
+                "--title=Select envoi output directory",
+                f"--filename={initial_path}/",
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+        if result.returncode == 1:
+            return None
+        raise RuntimeError(result.stderr.strip() or "Could not open the folder chooser.")
+
+    raise RuntimeError(
+        "No supported folder chooser is available in this environment. "
+        "Enter the output directory path manually instead."
+    )
+
+
+def _escape_applescript_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _clear_dataset_widget_state(st) -> None:
     for key in list(st.session_state.keys()):
-        if str(key).startswith(("dataset_", "windows_", "stats_")):
+        key_text = str(key)
+        if (
+            key_text.startswith("dataset_select_")
+            or key_text.startswith("windows_input_")
+            or key_text.startswith("stats_select_")
+            or key_text.startswith("remove_dataset_button_")
+            or key_text.startswith("windows_")
+            or key_text.startswith("stats_")
+            or (key_text.startswith("dataset_") and key_text[8:].isdigit())
+        ):
             st.session_state.pop(key, None)
+    st.session_state._dataset_widget_version = (
+        int(st.session_state.get("_dataset_widget_version", 0)) + 1
+    )
+
+
+def _apply_pending_dataset_remove(st) -> None:
+    if "_pending_dataset_remove" not in st.session_state:
+        return
+
+    remove_index = st.session_state.pop("_pending_dataset_remove")
+    rows = list(st.session_state.dataset_rows)
+    if len(rows) <= 1:
+        st.session_state.dataset_rows = [_empty_dataset_row()]
+    elif 0 <= remove_index < len(rows):
+        rows.pop(remove_index)
+        st.session_state.dataset_rows = rows
+
+    _clear_dataset_widget_state(st)
 
 
 def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: str) -> None:
     dataset_names = sorted(catalog)
     reducers = list_reducers()
     if not dataset_names:
-        st.error("No datasets are available in the envoi catalog.")
+        st.error("No data products are available in the envoi catalog.")
         return
 
     _ensure_dataset_state()
+    _apply_pending_dataset_remove(st)
+    widget_version = int(st.session_state.get("_dataset_widget_version", 0))
 
     for index, row in enumerate(st.session_state.dataset_rows):
-        with st.expander(f"Dataset {index + 1}", expanded=True):
+        with st.expander(f"Data product {index + 1}", expanded=True):
+            row_widget_key = f"{widget_version}_{index}"
             top_cols = st.columns([0.65, 0.35], vertical_alignment="bottom")
             current_dataset = row.get("dataset") if row.get("dataset") in dataset_names else None
             selected_dataset = top_cols[0].selectbox(
-                "Dataset",
+                "Data product",
                 dataset_names,
                 index=dataset_names.index(current_dataset) if current_dataset else None,
-                placeholder="Choose a dataset",
-                key=f"dataset_{index}",
+                placeholder="Choose a data product",
+                key=f"dataset_select_{row_widget_key}",
             )
             windows = top_cols[1].text_input(
                 "Window size(s) in meters",
                 value=row.get("window_sizes", ""),
-                placeholder="500, 1000",
-                key=f"windows_{index}",
+                placeholder="e.g. 500, 1000",
+                key=f"windows_input_{row_widget_key}",
             )
 
             st.session_state.dataset_rows[index]["dataset"] = selected_dataset or ""
             st.session_state.dataset_rows[index]["window_sizes"] = windows
 
             if output_type == TABULAR_OUTPUT:
+                permitted_reducers = (
+                    list(permissible_statistics_for_dataset(catalog[selected_dataset], reducers))
+                    if selected_dataset
+                    else []
+                )
                 if selected_dataset and row.get("statistics_dataset") == selected_dataset:
                     defaults = list(row.get("statistics") or [])
                 else:
                     defaults = []
-                valid_defaults = [stat for stat in defaults if stat in reducers]
+                valid_defaults = [stat for stat in defaults if stat in permitted_reducers]
                 selected_stats = st.multiselect(
                     "Spatial statistics",
-                    reducers,
+                    permitted_reducers,
                     default=valid_defaults,
-                    key=f"stats_{index}_{selected_dataset or 'none'}",
+                    key=f"stats_select_{row_widget_key}_{selected_dataset or 'none'}",
                     placeholder=(
                         "Choose one or more statistics"
                         if selected_dataset
-                        else "Choose a dataset first"
+                        else "Choose a data product first"
                     ),
                     disabled=selected_dataset is None,
                 )
@@ -307,32 +418,23 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
             else:
                 st.session_state.dataset_rows[index]["statistics"] = []
                 st.session_state.dataset_rows[index].pop("statistics_dataset", None)
-                st.caption("Raster output uses 10 m resampling.")
 
             remove_disabled = not (
                 selected_dataset
                 or windows.strip()
                 or st.session_state.dataset_rows[index].get("statistics")
             )
-            remove_container = st.container(key=f"remove_dataset_action_{index}")
+            remove_container = st.container(key=f"remove_dataset_action_{row_widget_key}")
             if remove_container.button(
-                "Remove dataset",
-                key=f"remove_{index}",
+                "Remove data product",
+                key=f"remove_dataset_button_{row_widget_key}",
                 disabled=remove_disabled,
             ):
-                if len(st.session_state.dataset_rows) == 1:
-                    st.session_state.dataset_rows[index] = {
-                        "dataset": "",
-                        "window_sizes": "",
-                        "statistics": [],
-                    }
-                else:
-                    st.session_state.dataset_rows.pop(index)
-                _clear_dataset_widget_state(st)
+                st.session_state._pending_dataset_remove = index
                 st.rerun()
 
-    if st.button("Add another dataset"):
-        st.session_state.dataset_rows.append({"dataset": "", "window_sizes": "", "statistics": []})
+    if st.button("Add another data product"):
+        st.session_state.dataset_rows.append(_empty_dataset_row())
         st.rerun()
 
 
@@ -395,8 +497,8 @@ def _render_footer(st) -> None:
 def render_app() -> None:
     st = _load_streamlit()
     st.set_page_config(
-        page_title="Envoi Earth Engine Extractor",
-        page_icon="E",
+        page_title="envoi: Geospatial data extraction",
+        page_icon=_favicon_path(),
         layout="wide",
     )
     _inject_css(st)
@@ -405,13 +507,13 @@ def render_app() -> None:
     catalog = _dataset_catalog()
     points_df: pd.DataFrame | None = None
 
-    st.subheader("1. Upload sampling locations")
+    st.subheader("1. Upload location data")
     st.write(
         "Upload a CSV file with occurrence records or sampling locations. It should contain the following columns, "
-        "in Darwin Core / GBIF format: occurrenceID (a unique identifier), decimalLatitude, and decimalLongitude."
+        "in Darwin Core format: occurrenceID (a unique identifier for the occurrence or location), decimalLatitude, and decimalLongitude."
         " Optionally, eventDate can be included to obtain date-specific information if available."
     )
-    uploaded_csv = st.file_uploader("Sampling CSV", type=["csv"], accept_multiple_files=False)
+    uploaded_csv = st.file_uploader("Location CSV", type=["csv"], accept_multiple_files=False)
     if uploaded_csv is not None:
         try:
             points_df = _read_uploaded_csv(uploaded_csv)
@@ -421,54 +523,109 @@ def render_app() -> None:
                     f"Loaded {validation.row_count} rows. "
                     f"Date column present: {'yes' if validation.has_date else 'no'}."
                 )
-                st.dataframe(points_df.head(20), use_container_width=True)
+                st.dataframe(points_df.head(20), width="stretch")
         except Exception as exc:
             st.error(str(exc))
             points_df = None
 
     crs_cols = st.columns([0.34, 0.66])
-    crs_mode = crs_cols[0].selectbox("Coordinate reference system", ["EPSG:4326", "Other EPSG"])
+    crs_mode = crs_cols[0].selectbox(
+        "Coordinate reference system of uploaded data", ["EPSG:4326", "Other EPSG"]
+    )
     if crs_mode == "Other EPSG":
-        input_crs = crs_cols[1].text_input("EPSG code", value="EPSG:3006")
+        input_crs = crs_cols[1].text_input("EPSG code", placeholder="e.g. EPSG:3006")
     else:
         input_crs = "EPSG:4326"
     try:
-        normalized_crs = normalize_crs(input_crs)
+        normalized_crs = normalize_crs(input_crs) if input_crs else ""
     except ValueError as exc:
         normalized_crs = input_crs
         st.error(str(exc))
 
-    st.subheader("2. Choose output settings")
-    output_type = st.selectbox(
-        "Output type", [TABULAR_OUTPUT, RASTER_OUTPUT], format_func=str.title
+    st.subheader("2. Add Earth Engine credentials")
+    st.markdown(
+        """
+        Upload your Google Earth Engine service account JSON key. The key is only
+        written to a temporary local file during extraction, then deleted when the
+        run finishes. If you do not have a service account yet, follow the
+        <a href="https://developers.google.com/earth-engine/guides/service_account" target="_blank">Earth Engine service account setup guide</a>.
+        """,
+        unsafe_allow_html=True,
     )
-    output_dir = st.text_input("Output directory", value=str(Path("~/envoi_outputs").expanduser()))
     credentials_file = st.file_uploader(
-        "Earth Engine service account key JSON",
+        "Earth Engine service account JSON",
         type=["json"],
         accept_multiple_files=False,
     )
     credentials_bytes = credentials_file.getvalue() if credentials_file is not None else None
 
-    st.subheader("3. Select data products")
+    st.subheader("3. Choose output settings")
+    output_type = st.selectbox(
+        "Output type",
+        [TABULAR_OUTPUT, RASTER_OUTPUT],
+        index=None,
+        placeholder="Choose between tabular or raster output",
+        format_func=str.title,
+    )
+    if "output_dir" not in st.session_state:
+        st.session_state.output_dir = str(Path("~/envoi_outputs").expanduser())
+    if "_pending_output_dir" in st.session_state:
+        st.session_state.output_dir = st.session_state.pop("_pending_output_dir")
+    output_cols = st.columns([0.78, 0.22], vertical_alignment="bottom")
+    output_dir = output_cols[0].text_input("Output directory", key="output_dir")
+    if output_cols[1].button("Browse..."):
+        try:
+            selected_dir = _choose_output_directory(output_dir)
+        except RuntimeError as exc:
+            st.warning(str(exc))
+        else:
+            if selected_dir:
+                st.session_state._pending_output_dir = selected_dir
+                st.rerun()
+
+    st.subheader("4. Select data products")
+    window_guidance = ""
+    if output_type == TABULAR_OUTPUT:
+        window_guidance = (
+            "The window size(s) determines the extent over which spatial statistics "
+            "are calculated. Note that available spatial statistics differ between "
+            "continuous and categorical data products."
+        )
+    elif output_type == RASTER_OUTPUT:
+        window_guidance = (
+            "The window size(s) determines the size of the extracted raster tiles. Note that raster "
+            "outputs use 10 m resampling of source data by default, to ensure "
+            "consistency in spatial resolution between data products."
+        )
     st.markdown(
-        """
-        Add one entry per Earth Engine data product that should be downloaded. Each entry
-        becomes one envoi output batch. If a data product contains multiple bands, all of
-        them will be downloaded. For information about available data products, see the
-        <a href="https://github.com/BiodiversityDataLab/envoi/blob/webapp/src/envoi/configs/ee_catalog.yml" target="_blank">envoi catalog</a>.
+        f"""
+        Add one entry per Earth Engine data product that should be downloaded. If a data product contains multiple bands, all of them will be processed and downloaded. For information about available data products, see the
+        <a href="https://github.com/BiodiversityDataLab/envoi/blob/webapp/src/envoi/configs/ee_catalog.yml" target="_blank">envoi catalog</a>. {window_guidance}
         """,
         unsafe_allow_html=True,
     )
-    _render_dataset_rows(st, catalog, output_type)
+    if output_type is None:
+        st.info("Choose an output type before adding data products.")
+    else:
+        _render_dataset_rows(st, catalog, output_type)
 
-    st.subheader("4. Run extraction")
+    st.subheader("5. Run extraction")
+    st.write(
+        "The final outputs, data quality checks, and metadata are written to the output directory "
+        "chosen in step 3."
+    )
     run_button = st.button("Extract selected data", type="primary")
     if run_button:
         if points_df is None:
-            st.error("Upload a valid sampling CSV before running extraction.")
+            st.error("Upload a valid location CSV before running extraction.")
         elif credentials_bytes is None:
-            st.error("Upload an Earth Engine service account key before running extraction.")
+            st.error("Upload an Earth Engine service-account JSON before running extraction.")
+        elif not normalized_crs:
+            st.error(
+                "Enter the EPSG code for the uploaded location data before running extraction."
+            )
+        elif output_type is None:
+            st.error("Choose between tabular or raster output before running extraction.")
         else:
             progress_bar = st.progress(0, text="Starting extraction")
             status = st.empty()
