@@ -23,7 +23,7 @@ def test_extract_progress_callback_emits_monotonic_events_when_quiet(
     )
     points = pd.DataFrame(
         {
-            "gbifID": ["a", "b", "c"],
+            "occurrenceID": ["a", "b", "c"],
             "decimalLatitude": [62.976878, 62.981296, 62.976671],
             "decimalLongitude": [18.026823, 18.030991, 18.021154],
             "eventDate": ["2025-06-18", "2020-12-12", "1960-04-02"],
