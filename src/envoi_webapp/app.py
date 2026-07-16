@@ -62,7 +62,9 @@ def _load_streamlit():
 
 def _logo_path() -> Path | None:
     try:
-        path = resources.files("envoi_webapp").joinpath("assets", "BDDL_icononly_clearspace_300x300.svg")
+        path = resources.files("envoi_webapp").joinpath(
+            "assets", "BDDL_icononly_clearspace_300x300.svg"
+        )
     except ModuleNotFoundError:
         return None
     return Path(str(path)) if Path(str(path)).exists() else None
@@ -259,9 +261,7 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
     for index, row in enumerate(st.session_state.dataset_rows):
         with st.expander(f"Dataset {index + 1}", expanded=True):
             top_cols = st.columns([0.65, 0.35], vertical_alignment="bottom")
-            current_dataset = (
-                row.get("dataset") if row.get("dataset") in dataset_names else None
-            )
+            current_dataset = row.get("dataset") if row.get("dataset") in dataset_names else None
             selected_dataset = top_cols[0].selectbox(
                 "Dataset",
                 dataset_names,
@@ -332,9 +332,7 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
                 st.rerun()
 
     if st.button("Add another dataset"):
-        st.session_state.dataset_rows.append(
-            {"dataset": "", "window_sizes": "", "statistics": []}
-        )
+        st.session_state.dataset_rows.append({"dataset": "", "window_sizes": "", "statistics": []})
         st.rerun()
 
 
@@ -410,7 +408,7 @@ def render_app() -> None:
     st.subheader("1. Upload sampling locations")
     st.write(
         "Upload a CSV file with occurrence records or sampling locations. It should contain the following columns, "
-        "in Darwin Core / GBIF format: occurrenceID (a unique identifier), decimalLatitude, and decimalLongitude." \
+        "in Darwin Core / GBIF format: occurrenceID (a unique identifier), decimalLatitude, and decimalLongitude."
         " Optionally, eventDate can be included to obtain date-specific information if available."
     )
     uploaded_csv = st.file_uploader("Sampling CSV", type=["csv"], accept_multiple_files=False)

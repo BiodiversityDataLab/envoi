@@ -17,7 +17,7 @@ from envoi import extract as envoi_extract
 from envoi import init_gee as envoi_init_gee
 from envoi.progress import ProgressCallback
 
-GBIF_REQUIRED_COLUMNS = ("gbifID", "decimalLatitude", "decimalLongitude")
+GBIF_REQUIRED_COLUMNS = ("occurrenceID", "decimalLatitude", "decimalLongitude")
 GBIF_DATE_COLUMN = "eventDate"
 TABULAR_OUTPUT = "tabular"
 RASTER_OUTPUT = "raster"
@@ -314,7 +314,7 @@ def run_extraction(
             config,
             output_dir=resolved_output_dir,
             input_crs=normalized_crs,
-            id_column="gbifID",
+            id_column="occurrenceID",
             latitude_column="decimalLatitude",
             longitude_column="decimalLongitude",
             date_column="eventDate",
