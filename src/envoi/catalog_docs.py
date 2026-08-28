@@ -59,12 +59,31 @@ DATASET_SPEC_EXPLANATIONS = {
         "Tiled collection: the tile matching each point's UTM zone is selected, "
         "so points near tile edges get the right image."
     ),
-    "collection_date_policy": (
-        "Image selection from a sample date uses the `{value}` policy "
-        "(`contains` = the image whose time interval covers the date; "
-        "`nearest` = the image with the closest timestamp)."
+    # collection_date_policy is rendered by _explain_date_policy() instead of a
+    # single template, so each policy gets a sentence describing only itself
+    # rather than listing every alternative on every dataset page.
+}
+
+# One sentence per collection_date_policy value. Falls back to a generic line
+# for a value the docs don't know about yet.
+DATE_POLICY_EXPLANATIONS = {
+    "nearest": (
+        "Given a sample date, the image with the closest timestamp is used "
+        "(dates outside the collection's range are clamped to the nearest end)."
+    ),
+    "contains": ("Given a sample date, the image whose time interval covers that date is used."),
+    "mosaic": (
+        "A static product tiled by area rather than a time series: sample dates are "
+        "ignored, and the tiles covering each point are mosaicked together."
     ),
 }
+
+
+def _explain_date_policy(value: Any) -> str:
+    """Describe one collection_date_policy value for the generated docs."""
+    return DATE_POLICY_EXPLANATIONS.get(
+        str(value).lower(), f"Image selection from a sample date uses the `{value}` policy."
+    )
 
 
 def _escape_table_cell(value: Any) -> str:
@@ -326,6 +345,11 @@ def _render_dataset_detail(record: Mapping[str, Any]) -> list[str]:
     # Translate the adapter switches in `dataset_spec` into plain sentences.
     spec_notes = []
     for spec_key, spec_value in dataset_spec.items():
+        # The date policy has one sentence per value, so it gets its own helper
+        # rather than a single template shared by every policy.
+        if spec_key == "collection_date_policy":
+            spec_notes.append(_explain_date_policy(spec_value))
+            continue
         explanation = DATASET_SPEC_EXPLANATIONS.get(spec_key)
         if explanation:
             spec_notes.append(explanation.format(value=spec_value))
