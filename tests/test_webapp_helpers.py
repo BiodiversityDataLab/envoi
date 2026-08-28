@@ -62,6 +62,35 @@ def test_validate_points_dataframe_rejects_missing_gbif_columns():
         validate_points_dataframe(pd.DataFrame({"x": [1], "y": [2]}))
 
 
+def test_validate_points_dataframe_rejects_duplicate_occurrence_ids():
+    """Raster output names one tile per occurrenceID, so duplicates lose data.
+
+    Catching it at upload time means the user sees the problem while they are
+    still looking at their CSV, instead of partway through an extraction run.
+    """
+    df = _points_df()
+    df["occurrenceID"] = ["a", "a"]
+
+    with pytest.raises(ValueError, match="duplicate values"):
+        validate_points_dataframe(df)
+
+
+def test_validate_points_dataframe_rejects_blank_occurrence_ids():
+    df = _points_df()
+    df["occurrenceID"] = ["a", "  "]
+
+    with pytest.raises(ValueError, match="missing or blank"):
+        validate_points_dataframe(df)
+
+
+def test_validate_points_dataframe_accepts_unusual_but_unique_ids():
+    """URL-style occurrenceIDs are valid input — they get sanitized, not rejected."""
+    df = _points_df()
+    df["occurrenceID"] = ["http://arctos.database.museum/guid/A:1", "urn:catalog:MO:2"]
+
+    assert validate_points_dataframe(df).row_count == 2
+
+
 def test_normalize_crs_accepts_epsg_variants():
     assert normalize_crs("") == "EPSG:4326"
     assert normalize_crs("4326") == "EPSG:4326"

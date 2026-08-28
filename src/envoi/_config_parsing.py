@@ -26,6 +26,7 @@ from typing import Any
 
 import yaml
 
+from ._filenames import describe_unsafe_path_component, is_safe_path_component
 from .adapters.earth_engine import KNOWN_DERIVED_BANDS
 
 # Keys allowed inside the full-form dict value
@@ -295,6 +296,19 @@ def _parse_run_config(
     # Use a numbered fallback batch_id when the user didn't provide one.
     batch_id = run_config.get("batch_id", f"output{index + 1}")
 
+    # batch_id becomes a directory name (output_dir/<batch_id>/ for raster
+    # tiles) and a file stem ("<batch_id>_metadata.json"), so it has to be a
+    # valid path component on every OS we support. Unlike sample IDs — which
+    # arrive from a data file and get sanitized — batch_id is hand-authored
+    # config, so the right response is to tell the author to fix it. This also
+    # blocks a "../" batch_id from writing outside the chosen output directory.
+    if not is_safe_path_component(batch_id):
+        raise ValueError(
+            f"Invalid batch_id {batch_id!r}: {describe_unsafe_path_component(batch_id)}. "
+            f"batch_id is used as a folder and file name, so it may contain only "
+            f"letters, digits, '.', '_' and '-'."
+        )
+
     # datasets is required — must be a non-empty list. Each entry is normalized
     # into a (name, band_overrides) tuple by the helper, which also handles all
     # validation (catalog existence, malformed dicts, derived-on-local, ...).
@@ -431,7 +445,7 @@ def _parse_statistics(
         return normalized, raw
 
     raise ValueError(
-        f"Output '{batch_id}': 'statistics' must be a list or dict, " f"got {type(raw).__name__}."
+        f"Output '{batch_id}': 'statistics' must be a list or dict, got {type(raw).__name__}."
     )
 
 

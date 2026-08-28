@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from ._filenames import describe_unsafe_path_component, is_safe_path_component
+
 REQUIRED_DATASET_KEYS = {"data_source", "path"}
 # Earth Engine datasets need a `data_type` so the right reducer set (continuous
 # vs categorical) gets picked. Local rasters can omit it — type is inferred at
@@ -291,6 +293,18 @@ def update_catalog(source: str | Path | dict) -> None:
     # the user spot accidental collisions.
     builtin_names = _get_builtin_dataset_names()
     for name in new_datasets:
+        # A dataset key becomes a folder name in raster mode
+        # (output_dir/<batch_id>/<dataset>/) and a column prefix in tabular
+        # mode, so it must be a valid path component on every OS. Catalog keys
+        # are hand-authored, so an unsafe one is reported rather than silently
+        # rewritten.
+        if not is_safe_path_component(name):
+            raise CatalogError(
+                f"Invalid dataset name {name!r}: {describe_unsafe_path_component(name)}. "
+                f"Dataset names are used as folder names and column prefixes, so they may "
+                f"contain only letters, digits, '.', '_' and '-'."
+            )
+
         if name in builtin_names:
             logger.info(
                 "update_catalog: '%s' shadows the built-in catalog entry of the same name",
