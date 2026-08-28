@@ -65,16 +65,25 @@ def _initialise_gee_once():
 # least one band returns non-null stats for points inside the dataset extent.
 
 
-def _make_catalog(*datasets, data_type="continuous"):
+def _make_catalog(*datasets, data_type="continuous", dataset_spec=None):
     """Helper that builds a one-off catalog dict from ``(name, path)`` tuples.
 
     Every earth_engine entry needs ``data_type`` for the catalog validator;
     it gets stamped onto every dataset here so individual call sites don't
     have to repeat it. Pass ``data_type="categorical"`` for land-cover etc.
+
+    ``dataset_spec`` is stamped onto every entry too, for adapter switches
+    such as ``collection_date_policy`` that a dataset needs to behave the way
+    the shipped catalog configures it.
     """
     return {
         "datasets": {
-            name: {"data_source": "earth_engine", "path": path, "data_type": data_type}
+            name: {
+                "data_source": "earth_engine",
+                "path": path,
+                "data_type": data_type,
+                **({"dataset_spec": dataset_spec} if dataset_spec else {}),
+            }
             for name, path in datasets
         }
     }
@@ -126,7 +135,10 @@ class TestStaticDatasets:
         # Copernicus GLO-30 is an ImageCollection with global tile coverage;
         # the DEM band is the elevation channel we care about. Other bands
         # (EDM, FLM, HEM, WBM) are auxiliary masks.
-        catalog = _make_catalog(("dem_glo30", "COPERNICUS/DEM/GLO30"))
+        catalog = _make_catalog(
+            ("dem_glo30", "COPERNICUS/DEM/GLO30_2024_1"),
+            dataset_spec={"collection_date_policy": "mosaic"},
+        )
         result = _run_stats(SWEDEN_SAMPLE_DF, "dem_glo30", catalog, tmp_path)
         assert result["dem_glo30_DEM_mean_200m"].notna().all()
 
@@ -322,7 +334,8 @@ class TestPointSampling:
             "datasets": {
                 "dem_glo30": {
                     "data_source": "earth_engine",
-                    "path": "COPERNICUS/DEM/GLO30",
+                    "path": "COPERNICUS/DEM/GLO30_2024_1",
+                    "dataset_spec": {"collection_date_policy": "mosaic"},
                     "data_type": "continuous",
                     "bands": ["DEM"],
                     "derived_bands": ["slope", "aspect"],
@@ -389,7 +402,12 @@ class TestRasterExport:
     def test_tiles_dem_glo30(self, tmp_path):
         # IMAGE_COLLECTION with tiled coverage — exercises the per-point
         # mosaicking path. Two sample points must produce two GeoTIFFs.
-        update_catalog(_make_catalog(("dem_glo30", "COPERNICUS/DEM/GLO30")))
+        update_catalog(
+            _make_catalog(
+                ("dem_glo30", "COPERNICUS/DEM/GLO30_2024_1"),
+                dataset_spec={"collection_date_policy": "mosaic"},
+            )
+        )
         try:
             extract(
                 SWEDEN_SAMPLE_DF,

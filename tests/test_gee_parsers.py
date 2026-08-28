@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 
+from envoi.adapters.earth_engine._image import _is_mosaic_date_policy
 from envoi.adapters.earth_engine._reducers import (
     _dedupe_categorical_for_ee,
     _parse_multiband_result,
@@ -247,3 +248,34 @@ class TestCheckTileSize:
         # × 200 bands ~ 72 MB → must raise.
         with pytest.raises(ValueError):
             _check_tile_size(band_count=200, **kwargs)
+
+
+class TestIsMosaicDatePolicy:
+    """The ``collection_date_policy: mosaic`` switch, read from a catalog entry.
+
+    Some Earth Engine collections tile *space* rather than time: every image is
+    a fixed geographic tile of one static product, and its timestamp records
+    when that tile was acquired rather than a step in a time series. Copernicus
+    DEM GLO-30 2024_1 is the built-in example. Reading those timestamps as a
+    time axis makes "most recent image" pick a tile on the other side of the
+    planet, so the policy exists to skip date handling entirely.
+    """
+
+    def test_mosaic_policy_is_detected(self):
+        assert _is_mosaic_date_policy({"collection_date_policy": "mosaic"})
+
+    def test_comparison_is_case_insensitive(self):
+        """Catalog YAML is hand-written, so casing should not matter."""
+        assert _is_mosaic_date_policy({"collection_date_policy": "Mosaic"})
+
+    @pytest.mark.parametrize("policy", ["nearest", "contains"])
+    def test_time_series_policies_are_not_mosaic(self, policy):
+        assert not _is_mosaic_date_policy({"collection_date_policy": policy})
+
+    def test_default_is_not_mosaic(self):
+        """Omitting the key must leave the existing date behaviour untouched."""
+        assert not _is_mosaic_date_policy({})
+
+    def test_unknown_policy_is_not_mosaic(self):
+        """An unrecognised value must not silently disable date selection."""
+        assert not _is_mosaic_date_policy({"collection_date_policy": "whatever"})

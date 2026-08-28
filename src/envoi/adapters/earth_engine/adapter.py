@@ -38,6 +38,7 @@ from ._image import (
     _ensure_gee_init,
     _find_nearest_timestamp,
     _get_collection_time_bounds,
+    _is_mosaic_date_policy,
     _snap_to_grid,
 )
 from ._reducers import (
@@ -162,6 +163,29 @@ class GeeRasterAdapter(BaseAdapter):
             # flips this to False (and builds a static-mosaic fallback) if
             # GEE refuses to materialise the timestamp index.
             self._needs_per_point_date = True
+
+            # ...unless the catalog declares the collection has no meaningful
+            # time axis. Some collections tile *space*, not time: every image
+            # is a fixed geographic tile of one static product, and its
+            # timestamp records when that tile happened to be acquired rather
+            # than marking a step in a time series. Copernicus DEM GLO-30
+            # 2024_1 is the built-in example — 4133 distinct timestamps
+            # globally, 15 of them at a single sample point. Treating those as
+            # a time axis makes "most recent image" select a tile on the other
+            # side of the planet, so every statistic comes back null. Declaring
+            # the policy skips date handling entirely and mosaics the tiles
+            # covering each point, which is what such a product actually means.
+            if _is_mosaic_date_policy(dataset_spec):
+                self._needs_per_point_date = False
+                # Suppress the lazy timestamp fetch: there is no time index to
+                # build, and for a global tiled collection the aggregate_array
+                # call is expensive enough to be worth skipping outright.
+                self._timestamps_loaded = True
+                # Global mosaic for the no-coordinates callers (band-name
+                # probing, scale detection). Constructing it is lazy on GEE's
+                # side — nothing is computed until something reduces over a
+                # region — so this costs nothing here.
+                self._static_image = _build_image(dataset_spec)
         elif "image" in dataset_spec:
             self._native_proj = ee.Image(dataset_spec["image"]).select(0).projection()
             self._static_image = _build_image(dataset_spec)
@@ -321,6 +345,19 @@ class GeeRasterAdapter(BaseAdapter):
         # current sample. Reusing it caused `img.sample(point)` to return
         # empty props, so the "point" reducer silently dropped its columns
         # for tiled IMAGE_COLLECTIONs (issue with dem_glo30 + "point" stat).
+        # Space-tiled collections (collection_date_policy: mosaic) ignore dates
+        # entirely: spatially filter to the tiles covering this point and
+        # mosaic them. Built fresh per point rather than cached, for the same
+        # reason as the per-point-date branch below — a cached global mosaic
+        # would be an arbitrary tile that need not cover this sample.
+        if _is_mosaic_date_policy(self._dataset_spec) and lat is not None and lon is not None:
+            return _build_image(
+                self._dataset_spec,
+                geometry=ee.Geometry.Point([lon, lat]),
+                lat=lat,
+                lon=lon,
+            )
+
         if self._needs_per_point_date and lat is not None and lon is not None:
             target_date = (
                 self._collection_time_starts.max() if date is None else pd.to_datetime(date)

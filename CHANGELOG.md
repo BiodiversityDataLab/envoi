@@ -5,6 +5,10 @@
 ### Added
 - `catalog_markdown()` renders the dataset catalog as a formatted Markdown document — readable output for notebooks and docs instead of raw dicts.
 - Catalog entries accept two new optional keys, both surfaced by `list_datasets("info")`: `display_name`, a human-readable label following the dataset's title in the Earth Engine catalog (e.g. `dem_copernicus_glo30` → "Copernicus DEM GLO-30"), and `category`, the theme the dataset is grouped under. Every built-in dataset now sets both. `display_name` falls back to the dataset key when an entry omits it, so it is always safe to display.
+- New `dataset_spec` option `collection_date_policy: mosaic`, for Earth Engine collections that tile space rather than time — one static product cut into geographic tiles, where each image's timestamp records when that tile was acquired. Dates are ignored and the tiles covering each point are mosaicked. Without it, such timestamps are read as a time axis and "most recent image" selects a tile elsewhere on the planet, nulling every statistic.
+
+### Changed
+- `dem_copernicus_glo30` now points at `COPERNICUS/DEM/GLO30_2024_1`. Earth Engine has deprecated the original `COPERNICUS/DEM/GLO30`, and using it printed a deprecation warning on every run. Elevation values are unchanged (verified identical to 5 decimal places on sample points); the new release carries real per-tile acquisition dates, so the entry declares `collection_date_policy: mosaic`. **Derived `slope` and `aspect` values shift slightly** (up to ~6° of aspect on tested points) because they are now computed across a mosaic of neighbouring tiles instead of a single tile, which removes tile-edge artefacts. All other datasets were audited against Earth Engine's deprecation registry and are current.
 
 ### Documentation
 - New generated dataset reference at `docs/datasets.md`: every built-in dataset grouped by theme, with a summary table plus resolution, temporal coverage, bands, licence, citation, and links per entry. Regenerate it with `python scripts/generate_dataset_docs.py` after editing `ee_catalog.yml`; a test fails if the committed file drifts out of sync.
