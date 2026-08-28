@@ -51,17 +51,29 @@ datasets:
   dem_copernicus_glo30:
     display_name: "Copernicus DEM GLO-30"
     data_source: earth_engine
-    path: COPERNICUS/DEM/GLO30
+    # The 2024_1 release. It supersedes the original COPERNICUS/DEM/GLO30,
+    # which Earth Engine has marked deprecated. Same tiling, bands, CRS and
+    # 30 m resolution, so the swap does not change extraction behaviour.
+    path: COPERNICUS/DEM/GLO30_2024_1
     data_type: continuous
     category: Terrain
     bands: [DEM]
     supported_derived_bands: [slope, aspect]
+    dataset_spec:
+      # The 2024_1 collection tiles space, not time: each image is a fixed
+      # geographic tile whose timestamp records when that tile was acquired
+      # (4133 distinct values globally, 15 at a single point). Without this
+      # the adapter would read them as a time series and "most recent image"
+      # would select a tile on the other side of the world, nulling every
+      # statistic. "mosaic" ignores dates and mosaics the tiles covering
+      # each point, which is what a static DEM actually means.
+      collection_date_policy: mosaic
     dataset_information:
-      description: "Copernicus DEM GLO-30 - global digital surface model derived from TanDEM-X radar data."
+      description: "Copernicus DEM GLO-30 (2024_1 release) - global digital surface model derived from TanDEM-X radar data."
       spatial_resolution: 30 meters
       temporal_resolution: static
       temporal_range: n/a
-      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_DEM_GLO30"
+      ee_source_url: "https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_DEM_GLO30_2024_1"
       source_url: "https://dataspace.copernicus.eu/sites/default/files/media/files/2024-06/geo1988-copernicusdem-spe-002_producthandbook_i5.0.pdf"
       citation: "© DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved."
       license: "Copernicus Data License (free for most uses)"
