@@ -16,6 +16,7 @@ from pyproj.exceptions import CRSError
 
 from envoi import extract as envoi_extract
 from envoi import init_gee as envoi_init_gee
+from envoi._input_validation import _validate_sample_ids
 from envoi.progress import ProgressCallback
 from envoi.reducers import CATEGORICAL_ONLY_REDUCERS, CONTINUOUS_ONLY_REDUCERS
 
@@ -69,6 +70,14 @@ def validate_points_dataframe(df: pd.DataFrame) -> CsvValidationResult:
             raise ValueError(f"Column '{column}' must contain numeric coordinate values.") from exc
         if values.isna().any():
             raise ValueError(f"Column '{column}' contains missing coordinate values.")
+
+    # Raster output names one GeoTIFF per point after that point's
+    # occurrenceID, so blank or duplicated IDs silently cost the user tiles.
+    # Checking it here means the problem surfaces when the CSV is uploaded —
+    # while the user is still looking at their file — rather than partway
+    # through an extraction run. envoi re-checks this itself for raster runs;
+    # this is the same rule applied earlier.
+    _validate_sample_ids(df["occurrenceID"], "occurrenceID")
 
     return CsvValidationResult(
         row_count=len(df),

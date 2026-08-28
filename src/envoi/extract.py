@@ -16,6 +16,7 @@ from ._input_validation import (
     _parse_and_validate_dates,
     _validate_and_reproject_crs,
     _validate_required_columns,
+    _validate_sample_ids,
 )
 from ._output_assembly import (
     _append_stat_columns,
@@ -264,6 +265,15 @@ def extract(
         min_coverage = run_settings.min_coverage
         resample_m = run_settings.resample_m
 
+        # Raster mode names one GeoTIFF per point after that point's ID, so
+        # blank or duplicated IDs would lose tiles. Check now — after any
+        # null-date rows have been dropped, but before the first adapter is
+        # built — so the run fails with an actionable message instead of
+        # burning Earth Engine quota on an export that cannot be written.
+        # Tabular mode puts IDs in a column, where duplicates are harmless.
+        if output_type == "raster":
+            _validate_sample_ids(df_copy["id"], id_column, context=f"Output '{batch_id}'")
+
         # When the user supplies more than one window size we need to keep the
         # window suffix on raster filenames and on the per-window quality
         # entries; with a single window we keep the legacy naming and metadata
@@ -331,6 +341,7 @@ def extract(
                         lats=df_copy.lat,
                         lons=df_copy.lon,
                         ids=df_copy["id"].tolist(),
+                        id_column=id_column,
                         tiles_root=tiles_root,
                         filename_suffix=suffix,
                         band_overrides=band_overrides,
@@ -594,6 +605,7 @@ def _process_dataset_raster(
     lats,
     lons,
     ids: list,
+    id_column: str,
     tiles_root: Path,
     filename_suffix: str | None = None,
     band_overrides: dict[str, Any] | None = None,
@@ -605,6 +617,9 @@ def _process_dataset_raster(
     When ``filename_suffix`` is set, it is appended to each tile's filename
     (before the extension) so multiple window sizes for the same dataset
     can coexist in the same folder without overwriting each other.
+
+    ``id_column`` is the caller's own name for the sample-ID column; it becomes
+    the join key in the tile manifest written alongside the tiles.
 
     `band_overrides` is a dict of per-call settings (currently `bands` and/or
     `derived_bands`) that replace the catalog values before adapter
@@ -649,4 +664,58 @@ def _process_dataset_raster(
             lons=lons,
         )
 
+    # Write the manifest that maps each input row to the tile it produced.
+    # Sample IDs containing characters that are not portable across operating
+    # systems get sanitized on their way into a filename, so the filename is
+    # not always reconstructible from the ID — the manifest is what lets a user
+    # join their tiles back to their input table. It also records which points
+    # produced no tile at all.
+    _write_tile_manifest(
+        tiles_root / dataset,
+        ids=ids,
+        exported_paths=exported_paths,
+        id_column_name=id_column,
+        filename_suffix=filename_suffix,
+    )
+
     return tiles_root / dataset, dataset_meta
+
+
+def _write_tile_manifest(
+    dataset_tiles_dir: Path,
+    *,
+    ids: list,
+    exported_paths: list,
+    id_column_name: str,
+    filename_suffix: str | None = None,
+) -> Path:
+    """Write a CSV mapping each sample ID to the tile file it produced.
+
+    The ID column keeps the caller's own column name so the manifest joins
+    straight onto their input table with ``pandas.merge``. ``exported`` is
+    False for points whose tile failed to export (outside the raster's extent,
+    a GEE download error, ...), in which case ``tile_filename`` is empty.
+
+    The manifest carries the same ``filename_suffix`` as the tiles it
+    describes, so a multi-window run writes one manifest per window into the
+    shared dataset folder instead of overwriting a single file.
+    """
+    suffix_part = f"-{filename_suffix}" if filename_suffix else ""
+    manifest_path = dataset_tiles_dir / f"tiles_manifest{suffix_part}.csv"
+
+    manifest_dataframe = pd.DataFrame(
+        {
+            id_column_name: list(ids),
+            # exported_paths[i] is None when that point's tile failed.
+            "tile_filename": [
+                Path(path).name if path is not None else "" for path in exported_paths
+            ],
+            "exported": [path is not None for path in exported_paths],
+        }
+    )
+
+    # The adapter has already created this directory, but a run where every
+    # single tile failed may not have reached that point.
+    dataset_tiles_dir.mkdir(parents=True, exist_ok=True)
+    manifest_dataframe.to_csv(manifest_path, index=False)
+    return manifest_path

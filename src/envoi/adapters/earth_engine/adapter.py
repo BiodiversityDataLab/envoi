@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
+from ..._filenames import build_tile_filenames
 from ...catalog import load_defaults
 from ...geo import build_tile_crs_zones, get_utm_crs
 from ...metadata import summarize_date_info, summarize_tile_export
@@ -1170,17 +1171,21 @@ class GeeRasterAdapter(BaseAdapter):
 
         meta_list = [self._resolve_date_info(d) for d in date_list]
 
-        # Suffix wrangling: when caller passes "200m", filenames become
-        # "<id>-<dataset>-200m.tif". When suffix is None we keep the
-        # historical "<id>-<dataset>.tif" naming so single-window callers
-        # are completely unaffected.
-        suffix_part = f"-{filename_suffix}" if filename_suffix else ""
+        # Build every tile filename up front. Sample IDs come from the user's
+        # input table and can contain anything (URL-style occurrenceIDs with
+        # "/" in them, "urn:catalog:..." IDs with ":"), so they are sanitized
+        # into a character set that is valid on Windows, macOS and Linux
+        # alike. When the caller passes "200m", filenames become
+        # "<id>-<dataset>-200m.tif"; with no suffix we keep the historical
+        # "<id>-<dataset>.tif" naming, and IDs that were already safe are left
+        # untouched, so existing outputs are unaffected.
+        tile_filenames = build_tile_filenames(id_list, dataset_name, filename_suffix)
 
         emit_progress_step(progress_callback, 0, n)
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {}
-            for i, (lat, lon, date, sample_id) in enumerate(zip(lats, lons, date_list, id_list)):
-                output_path = output_dir / f"{sample_id}-{dataset_name}{suffix_part}.tif"
+            for i, (lat, lon, date) in enumerate(zip(lats, lons, date_list)):
+                output_path = output_dir / tile_filenames[i]
                 future = executor.submit(
                     self._export_single, lat, lon, window_m, output_path, date, resample_m
                 )
