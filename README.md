@@ -3,6 +3,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/envoi-geospatial)](https://pypi.org/project/envoi-geospatial/)
 [![Python versions](https://img.shields.io/pypi/pyversions/envoi-geospatial)](https://pypi.org/project/envoi-geospatial/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/BiodiversityDataLab/envoi/blob/main/LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22144753.svg)](https://doi.org/10.5281/zenodo.22144753)
 
 Automated feature extraction from environmental data sources for ecological and spatial analysis.
 
@@ -273,21 +274,23 @@ The machine-readable source, including descriptions, citations, and URLs for eve
 
 A paper describing envoi is currently in preparation. In the meantime, please cite the software directly:
 
-> Baggström, A., Nyström, J., & Andermann, T. (2026). *envoi: automated environmental feature extraction for ecological analysis* (Version 0.2.1) [Computer software]. https://github.com/BiodiversityDataLab/envoi
+> Baggström, A., Nyström, J., & Andermann, T. (2026). *envoi: automated environmental feature extraction for ecological analysis* [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.22144753
 
 ```bibtex
 @software{envoi,
-  author  = {Baggström, Adrian and Nyström, Jakob and Andermann, Tobias},
-  title   = {envoi: automated environmental feature extraction for ecological analysis},
-  year    = {2026},
-  version = {0.2.1},
-  url     = {https://github.com/BiodiversityDataLab/envoi}
+  author = {Baggström, Adrian and Nyström, Jakob and Andermann, Tobias},
+  title  = {envoi: automated environmental feature extraction for ecological analysis},
+  year   = {2026},
+  doi    = {10.5281/zenodo.22144753},
+  url    = {https://doi.org/10.5281/zenodo.22144753}
 }
 ```
 
-Citation metadata is maintained in [CITATION.cff](https://github.com/BiodiversityDataLab/envoi/blob/main/CITATION.cff) — use the **"Cite this repository"** button in the GitHub sidebar to get an up-to-date entry in APA or BibTeX for the version you used.
+That DOI covers **all versions** and always resolves to the most recent release. If your analysis needs to be reproducible against the exact version you ran, cite that release's own DOI instead — every release is archived separately, and they're listed under "Versions" on the [Zenodo record](https://doi.org/10.5281/zenodo.22144753).
 
-This section will be updated with a DOI, and with the paper citation once it is published.
+Citation metadata is maintained in [CITATION.cff](https://github.com/BiodiversityDataLab/envoi/blob/main/CITATION.cff) — the **"Cite this repository"** button in the GitHub sidebar generates an up-to-date entry in APA or BibTeX.
+
+The paper citation will be added here once it is published.
 
 ---
 
