@@ -8,7 +8,8 @@ reprojection for tile export).
 """
 
 from __future__ import annotations
-from typing import Sequence
+
+from collections.abc import Sequence
 
 
 def get_utm_crs(lon: float, lat: float) -> str:

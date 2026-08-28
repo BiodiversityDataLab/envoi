@@ -165,10 +165,12 @@ def test_temporary_service_account_file_is_deleted_after_failure():
     payload = _credential_bytes()
     path_seen: Path | None = None
 
-    with pytest.raises(RuntimeError, match="boom"):
-        with temporary_service_account_file(payload) as path:
-            path_seen = path
-            raise RuntimeError("boom")
+    with (
+        pytest.raises(RuntimeError, match="boom"),
+        temporary_service_account_file(payload) as path,
+    ):
+        path_seen = path
+        raise RuntimeError("boom")
 
     assert path_seen is not None
     assert not path_seen.exists()

@@ -8,7 +8,7 @@ rest of the codebase used to import from the old single-file
 ``gee_adapter`` module.
 """
 
-from .adapter import GeeRasterAdapter
 from ._image import KNOWN_DERIVED_BANDS
+from .adapter import GeeRasterAdapter
 
-__all__ = ["GeeRasterAdapter", "KNOWN_DERIVED_BANDS"]
+__all__ = ["KNOWN_DERIVED_BANDS", "GeeRasterAdapter"]
