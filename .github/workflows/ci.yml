@@ -41,3 +41,16 @@ jobs:
         run: python -m build
       - name: Check metadata
         run: twine check dist/*
+
+      # CITATION.cff drives GitHub's "Cite this repository" button and the metadata
+      # on the Zenodo DOI record minted for each published release, so a malformed or
+      # stale citation file should fail the build rather than reach a permanent
+      # archive. This lives in the single-run `package` job on purpose — there is
+      # nothing Python-version-specific about it, so running it once is enough.
+      - name: Validate citation metadata
+        run: |
+          pip install cffconvert pyyaml
+          # Schema check: is CITATION.cff valid Citation File Format?
+          cffconvert --validate
+          # Consistency check: does its version match src/envoi/_version.py?
+          python .github/scripts/check_citation_version.py
