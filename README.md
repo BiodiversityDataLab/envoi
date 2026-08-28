@@ -223,17 +223,30 @@ Multiple outputs in one call, date-aware extraction, mixing categorical and cont
 
 ### Built-in datasets
 
-envoi ships with a curated set of Earth Engine datasets spanning terrain, climate, land cover, satellite imagery, vegetation indices, and human-impact themes. Inspect what's available — including any datasets you've registered with `update_catalog()` — using `list_datasets()`:
+envoi ships with a curated set of Earth Engine datasets spanning terrain, climate, land cover, satellite imagery, vegetation indices, and human-impact themes.
+
+**📖 [Browse the full dataset reference → docs/datasets.md](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/datasets.md)** — every built-in dataset grouped by theme, with resolution, temporal coverage, bands, licence, and citation.
+
+To inspect the catalog from Python — including any datasets you've registered with `update_catalog()`:
 
 ```python
-from envoi import list_datasets
+from envoi import list_datasets, catalog_markdown
 
-list_datasets()          # just the names, one per line
-list_datasets("info")    # name + description, citation, source URLs
+list_datasets()          # just the names
+list_datasets("info")    # name + display name, description, citation, source URLs
 list_datasets("full")    # the complete catalog entry for each dataset
+
+print(catalog_markdown())  # the same reference document as Markdown text
 ```
 
-`list_datasets()` both prints the listing and returns the same data as a list (of strings for the default call, of dicts for `"info"` / `"full"`), so you can keep using it programmatically.
+`list_datasets()` returns its result (a list of strings for the default call, of dicts for `"info"` / `"full"`) rather than printing, so you can filter and process it in code. In a Jupyter notebook, render the Markdown version instead of reading raw dicts:
+
+```python
+from IPython.display import Markdown, display
+from envoi import catalog_markdown
+
+display(Markdown(catalog_markdown()))
+```
 
 A representative subset of the built-in catalog:
 
@@ -245,7 +258,7 @@ A representative subset of the built-in catalog:
 - **Human impact** — `human_impact_index` plus eight `hii_driver_*` subcomponents
 - **Embeddings** — `aef_satellite_embeddings`
 
-The source, including descriptions, citations, and URLs for every entry, is [src/envoi/configs/ee_catalog.yml](https://github.com/BiodiversityDataLab/envoi/blob/main/src/envoi/configs/ee_catalog.yml).
+The machine-readable source, including descriptions, citations, and URLs for every entry, is [src/envoi/configs/ee_catalog.yml](https://github.com/BiodiversityDataLab/envoi/blob/main/src/envoi/configs/ee_catalog.yml).
 
 ### Notes
 

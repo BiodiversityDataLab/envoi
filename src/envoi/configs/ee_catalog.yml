@@ -6,9 +6,11 @@ datasets:
   # All other fields are optional.
   #
   # dataset_name:  # provide a unique name for this dataset e.g. "sentinel_2_l2a"
+  #   display_name: "Sentinel-2 Level-2A"  # human-readable label (usually the dataset's title in the GEE catalog); shown in docs/datasets.md and in the web app's dataset menu. Falls back to dataset_name if omitted.
   #   data_source: earth_engine
   #   path: path/to/dataset_on_earth_engine   # GEE asset ID; type (IMAGE / IMAGE_COLLECTION) is auto-detected
   #   data_type: type                 # "continuous" or "categorical"
+  #   category: Climate               # theme used to group the dataset in docs/datasets.md (free text; entries without one land under "Uncategorised")
   #
   #   # Band selection - if omitted, all bands are loaded.
   #   # The values set here are the dataset-wide DEFAULT and apply to every
@@ -47,9 +49,11 @@ datasets:
   
   # ── Terrain ──────────────────────────────────────────────────────────────
   dem_copernicus_glo30:
+    display_name: "Copernicus DEM GLO-30"
     data_source: earth_engine
     path: COPERNICUS/DEM/GLO30
     data_type: continuous
+    category: Terrain
     bands: [DEM]
     supported_derived_bands: [slope, aspect]
     dataset_information:
@@ -64,9 +68,11 @@ datasets:
 
   # ── Climate ──────────────────────────────────────────────────────────────
   climate_worldclim_v1_bioclim:
+    display_name: "WorldClim BIO Variables V1"
     data_source: earth_engine
     path: WORLDCLIM/V1/BIO
     data_type: continuous
+    category: Climate
     dataset_information:
       description: "WorldClim v1 bioclimatic variables - 19 variables derived from temperature and precipitation."
       spatial_resolution: 927 meters
@@ -78,9 +84,11 @@ datasets:
       license: "CC-BY-SA-4.0"
 
   climate_era5_monthly:
+    display_name: "ERA5 Monthly Aggregates"
     data_source: earth_engine
     path: ECMWF/ERA5/MONTHLY
     data_type: continuous
+    category: Climate
     dataset_spec:
       collection_date_policy: contains
     dataset_information:
@@ -94,9 +102,11 @@ datasets:
       license: "Copernicus C3S/CAMS License"
 
   climate_terraclimate_monthly:
+    display_name: "TerraClimate Monthly Climate & Water Balance"
     data_source: earth_engine
     path: IDAHO_EPSCOR/TERRACLIMATE
     data_type: continuous
+    category: Climate
     dataset_spec:
       collection_date_policy: contains
     dataset_information:
@@ -111,9 +121,11 @@ datasets:
 
   # ── Land cover / land use ────────────────────────────────────────────────
   lulc_worldcover_2021:
+    display_name: "ESA WorldCover 10 m (2021)"
     data_source: earth_engine
     path: ESA/WorldCover/v200
     data_type: categorical
+    category: Land cover / land use
     dataset_information:
       description: "ESA WorldCover 2021 - global land use / land cover map with 11 classes."
       spatial_resolution: 10 meters
@@ -125,9 +137,11 @@ datasets:
       license: "CC-BY-4.0"
 
   lulc_copernicus_lc100:
+    display_name: "Copernicus Global Land Cover 100 m"
     data_source: earth_engine
     path: COPERNICUS/Landcover/100m/Proba-V-C3/Global
     data_type: categorical
+    category: Land cover / land use
     bands: [discrete_classification]
     dataset_information:
       description: "Copernicus Global Land Service Land Cover 100m - global land cover maps from PROBA-V."
@@ -156,9 +170,11 @@ datasets:
   #     license: "CC-BY-4.0"
 
   lulc_naturallands_2020:
+    display_name: "SBTN Natural Lands Map v1.1"
     data_source: earth_engine
     path: WRI/SBTN/naturalLands/v1_1/2020
     data_type: categorical
+    category: Land cover / land use
     dataset_information:
       description: "SBTN Natural Lands Map v1.1 - global map distinguishing natural from non-natural land cover, produced for the Science Based Targets Network."
       spatial_resolution: 30 meters
@@ -171,9 +187,11 @@ datasets:
 
   # ── Satellite imagery ────────────────────────────────────────────────────
   sr_landsat_8day:
+    display_name: "Landsat 8-Day Surface Reflectance Composite"
     data_source: earth_engine
     path: LANDSAT/COMPOSITES/C02/T1_L2_8DAY
     data_type: continuous
+    category: Satellite imagery
     dataset_spec:
       native_scale_m: 30
       collection_date_policy: contains
@@ -188,9 +206,11 @@ datasets:
       license: "Public Domain (free for all uses)"
 
   sr_landsat_32day:
+    display_name: "Landsat 32-Day Surface Reflectance Composite"
     data_source: earth_engine
     path: LANDSAT/COMPOSITES/C02/T1_L2_32DAY
     data_type: continuous
+    category: Satellite imagery
     dataset_spec:
       native_scale_m: 30
       collection_date_policy: contains
@@ -205,9 +225,11 @@ datasets:
       license: "Public Domain (free for all uses)"
 
   sr_landsat_annual:
+    display_name: "Landsat Annual Surface Reflectance Composite"
     data_source: earth_engine
     path: LANDSAT/COMPOSITES/C02/T1_L2_ANNUAL
     data_type: continuous
+    category: Satellite imagery
     dataset_spec:
       native_scale_m: 30
       collection_date_policy: contains
@@ -223,9 +245,11 @@ datasets:
 
   # ── Vegetation & productivity ────────────────────────────────────────────
   ndvi_landsat_8day:
+    display_name: "Landsat 8-Day NDVI Composite"
     data_source: earth_engine
     path: LANDSAT/COMPOSITES/C02/T1_L2_8DAY_NDVI
     data_type: continuous
+    category: Vegetation & productivity
     dataset_spec:
       native_scale_m: 30
       collection_date_policy: contains
@@ -240,9 +264,11 @@ datasets:
       license: "Public Domain (free for all uses)"
 
   ndvi_landsat_32day:
+    display_name: "Landsat 32-Day NDVI Composite"
     data_source: earth_engine
     path: LANDSAT/COMPOSITES/C02/T1_L2_32DAY_NDVI
     data_type: continuous
+    category: Vegetation & productivity
     dataset_spec:
       native_scale_m: 30
       collection_date_policy: contains
@@ -257,9 +283,11 @@ datasets:
       license: "Public Domain (free for all uses)"
 
   ndvi_landsat_annual:
+    display_name: "Landsat Annual NDVI Composite"
     data_source: earth_engine
     path: LANDSAT/COMPOSITES/C02/T1_L2_ANNUAL_NDVI
     data_type: continuous
+    category: Vegetation & productivity
     dataset_spec:
       native_scale_m: 30
       collection_date_policy: contains
@@ -274,9 +302,11 @@ datasets:
       license: "Public Domain (free for all uses)"
 
   evi_landsat_8day:
+    display_name: "Landsat 8-Day EVI Composite"
     data_source: earth_engine
     path: LANDSAT/COMPOSITES/C02/T1_L2_8DAY_EVI
     data_type: continuous
+    category: Vegetation & productivity
     dataset_spec:
       native_scale_m: 30
       collection_date_policy: contains
@@ -291,9 +321,11 @@ datasets:
       license: "Public Domain (free for all uses)"
 
   evi_landsat_annual:
+    display_name: "Landsat Annual EVI Composite"
     data_source: earth_engine
     path: LANDSAT/COMPOSITES/C02/T1_L2_ANNUAL_EVI
     data_type: continuous
+    category: Vegetation & productivity
     dataset_spec:
       native_scale_m: 30
       collection_date_policy: contains
@@ -308,9 +340,11 @@ datasets:
       license: "Public Domain (free for all uses)"
 
   npp_modis_terra:
+    display_name: "MODIS Terra Net Primary Production (MOD17A3HGF v061)"
     data_source: earth_engine
     path: MODIS/061/MOD17A3HGF
     data_type: continuous
+    category: Vegetation & productivity
     dataset_spec:
       collection_date_policy: contains
     dataset_information:
@@ -324,9 +358,11 @@ datasets:
       license: "Public Domain (no restrictions on use)"
 
   agb_esa_cci:
+    display_name: "ESA CCI Above-Ground Biomass v6.0"
     data_source: earth_engine
     path: ESA/CCI/Above_Ground_Biomass/V6_0
     data_type: continuous
+    category: Vegetation & productivity
     dataset_information:
       description: "ESA CCI Above-Ground Biomass v6.0 - global forest above-ground biomass (Mg/ha) with per-pixel uncertainty."
       spatial_resolution: 100 meters
@@ -339,9 +375,11 @@ datasets:
 
   # ── Human impact ─────────────────────────────────────────────────────────
   human_impact_index:
+    display_name: "Human Impact Index (HII)"
     data_source: earth_engine
     path: projects/HII/v1/hii
     data_type: continuous
+    category: Human impact
     dataset_information:
       description: "Human Impact Index (HII) - cumulative measure of human influence on terrestrial ecosystems."
       spatial_resolution: 300 meters
@@ -353,9 +391,11 @@ datasets:
       license: "CC BY-NC-SA-3.0"
 
   hii_driver_infrastructure:
+    display_name: "Human Impact Index: Infrastructure"
     data_source: earth_engine
     path: projects/HII/v1/driver/infrastructure
     data_type: continuous
+    category: Human impact
     dataset_information:
       description: "Human Impact Index driver - infrastructure."
       spatial_resolution: 300 meters
@@ -367,9 +407,11 @@ datasets:
       license: "CC BY-NC-SA-3.0"
 
   hii_driver_land_use:
+    display_name: "Human Impact Index: Land Use"
     data_source: earth_engine
     path: projects/HII/v1/driver/land_use
     data_type: continuous
+    category: Human impact
     dataset_information:
       description: "Human Impact Index driver - land use."
       spatial_resolution: 300 meters
@@ -381,9 +423,11 @@ datasets:
       license: "CC BY-NC-SA-3.0"
 
   hii_driver_population_density:
+    display_name: "Human Impact Index: Population Density"
     data_source: earth_engine
     path: projects/HII/v1/driver/population_density
     data_type: continuous
+    category: Human impact
     dataset_information:
       description: "Human Impact Index driver - population density."
       spatial_resolution: 300 meters
@@ -395,9 +439,11 @@ datasets:
       license: "CC BY-NC-SA-3.0"
 
   hii_driver_power:
+    display_name: "Human Impact Index: Power"
     data_source: earth_engine
     path: projects/HII/v1/driver/power
     data_type: continuous
+    category: Human impact
     dataset_information:
       description: "Human Impact Index driver - power."
       spatial_resolution: 300 meters
@@ -409,9 +455,11 @@ datasets:
       license: "CC BY-NC-SA-3.0"
 
   hii_driver_railways:
+    display_name: "Human Impact Index: Railways"
     data_source: earth_engine
     path: projects/HII/v1/driver/railways
     data_type: continuous
+    category: Human impact
     dataset_information:
       description: "Human Impact Index driver - railways."
       spatial_resolution: 300 meters
@@ -423,9 +471,11 @@ datasets:
       license: "CC BY-NC-SA-3.0"
 
   hii_driver_roads:
+    display_name: "Human Impact Index: Roads"
     data_source: earth_engine
     path: projects/HII/v1/driver/roads
     data_type: continuous
+    category: Human impact
     dataset_information:
       description: "Human Impact Index driver - roads."
       spatial_resolution: 300 meters
@@ -437,9 +487,11 @@ datasets:
       license: "CC BY-NC-SA-3.0"
 
   hii_driver_water:
+    display_name: "Human Impact Index: Water"
     data_source: earth_engine
     path: projects/HII/v1/driver/water
     data_type: continuous
+    category: Human impact
     dataset_information:
       description: "Human Impact Index driver - water."
       spatial_resolution: 300 meters
@@ -452,9 +504,11 @@ datasets:
 
   # ── Other ─────────────────────────────────────────────
   aef_satellite_embeddings:
+    display_name: "Google Satellite Embedding V1 (Annual)"
     data_source: earth_engine
     path: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
     data_type: continuous
+    category: Other
     dataset_spec:
       use_utm_zone: true # Some tiled collections need UTM-zone filtering to avoid selecting the wrong tile for a point.
       collection_date_policy: contains
