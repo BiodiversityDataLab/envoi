@@ -1,0 +1,63 @@
+# Citation File Format metadata (https://citation-file-format.github.io).
+#
+# This file has two jobs:
+#   1. GitHub reads it and shows a "Cite this repository" button on the repo page,
+#      which generates APA and BibTeX entries from the fields below.
+#   2. Zenodo reads it when it archives a published GitHub Release, so the authors,
+#      ORCIDs, title, and license on the minted DOI record come from here.
+#
+# IMPORTANT: the `version` and `date-released` fields below must be bumped together
+# with `src/envoi/_version.py` whenever a release is cut. CI checks that the two
+# version strings match (see the "Validate citation metadata" step in
+# .github/workflows/ci.yml), so a forgotten bump fails the build instead of
+# silently producing a mislabelled archive on Zenodo.
+
+cff-version: 1.2.0
+message: "If you use envoi in your research, please cite it using these metadata."
+title: "envoi: automated environmental feature extraction for ecological analysis"
+type: software
+
+authors:
+  - family-names: Baggström
+    given-names: Adrian
+    orcid: "https://orcid.org/0009-0001-1686-4845"
+    email: adrian.baggstrom@ebc.uu.se
+    affiliation: "Uppsala University, Sweden"
+  - family-names: Nyström
+    given-names: Jakob
+    orcid: "https://orcid.org/0009-0008-0734-0936"
+    email: jakob.nystrom@ebc.uu.se
+    affiliation: "Uppsala University, Sweden"
+  - family-names: Andermann
+    given-names: Tobias
+    orcid: "https://orcid.org/0000-0002-0932-1623"
+    email: tobias.andermann@ebc.uu.se
+    affiliation: "Uppsala University, Sweden"
+
+# Version of the software these metadata describe. Kept in sync with
+# src/envoi/_version.py — see the note at the top of this file.
+version: 0.2.1
+date-released: "2026-07-16"
+
+license: MIT
+repository-code: "https://github.com/BiodiversityDataLab/envoi"
+url: "https://github.com/BiodiversityDataLab/envoi"
+
+abstract: >-
+  envoi attaches environmental variables — climate, terrain, land cover, vegetation
+  indices — to tables of geographic sample points for ecological and spatial analysis.
+  A single extract() call runs against both Google Earth Engine and local GeoTIFF
+  rasters and returns the same shape of output, with the same reducers and quality
+  control columns across data sources, so results from the two are directly comparable.
+
+keywords:
+  - gis
+  - raster
+  - geospatial
+  - earth-engine
+  - remote-sensing
+  - feature-extraction
+  - environmental-data
+  - ecology
+  - biodiversity
+  - gbif
