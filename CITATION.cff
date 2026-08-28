@@ -36,8 +36,8 @@ authors:
 
 # Version of the software these metadata describe. Kept in sync with
 # src/envoi/_version.py — see the note at the top of this file.
-version: 0.2.1
-date-released: "2026-07-16"
+version: 0.2.2
+date-released: "2026-08-28"
 
 license: MIT
 repository-code: "https://github.com/BiodiversityDataLab/envoi"
