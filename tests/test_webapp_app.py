@@ -21,12 +21,16 @@ class _SessionState(dict):
 
 def _has_dataset_widget_keys(session_state) -> bool:
     return any(
-        key.startswith("dataset_select_")
-        or key.startswith("windows_input_")
-        or key.startswith("stats_select_")
-        or key.startswith("remove_dataset_button_")
-        or key.startswith("windows_")
-        or key.startswith("stats_")
+        key.startswith(
+            (
+                "dataset_select_",
+                "windows_input_",
+                "stats_select_",
+                "remove_dataset_button_",
+                "windows_",
+                "stats_",
+            )
+        )
         or (key.startswith("dataset_") and key[8:].isdigit())
         for key in session_state
     )

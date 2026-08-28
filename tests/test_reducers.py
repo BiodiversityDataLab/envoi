@@ -320,7 +320,7 @@ class TestClassReducers:
         # Class IDs are cast to int so column names like "class_10_count"
         # don't include a trailing ".0" from the float-typed input array.
         result = r_class_count([10.0, 20.0])
-        assert all(isinstance(k, int) for k in result.keys())
+        assert all(isinstance(k, int) for k in result)
 
     def test_class_count_empty_window(self):
         # Empty input must not raise — must return an empty dict so the

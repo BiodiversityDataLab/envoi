@@ -17,10 +17,11 @@ and how the per-dataset metadata is assembled.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import ee
 import numpy as np
@@ -649,7 +650,7 @@ class GeeRasterAdapter(BaseAdapter):
         lat: float,
         lon: float,
         window_m: int,
-        combined_reducer: "ee.Reducer | None",
+        combined_reducer: ee.Reducer | None,
         reducer_names: Sequence[str],
         suffixes: list[str],
         *,
@@ -720,7 +721,7 @@ class GeeRasterAdapter(BaseAdapter):
 
         # Build up to two server-side reductions into a single ee.Dictionary.
         # GEE evaluates them in parallel and we pay one HTTP round-trip total.
-        branches: dict[str, "ee.Dictionary"] = {}
+        branches: dict[str, ee.Dictionary] = {}
 
         if combined_reducer is not None:
             # Window branch: user reducers + count for QC. The combined reducer
@@ -966,8 +967,9 @@ class GeeRasterAdapter(BaseAdapter):
                 unit="pt",
                 disable=disable_progress,
             ) as pbar:
-                completed = 0
-                for future in as_completed(future_to_idx):
+                # `completed` counts finished points (1-based) for the progress
+                # callback; futures arrive in completion order, not input order.
+                for completed, future in enumerate(as_completed(future_to_idx), start=1):
                     idx = future_to_idx[future]
                     try:
                         results[idx] = future.result()
@@ -980,7 +982,6 @@ class GeeRasterAdapter(BaseAdapter):
                             window_m, original_window_reducers, want_point=want_point
                         )
                     pbar.update(1)
-                    completed += 1
                     emit_progress_step(progress_callback, completed, n)
 
         return results
@@ -1155,8 +1156,9 @@ class GeeRasterAdapter(BaseAdapter):
                 unit="tile",
                 disable=disable_progress,
             ) as pbar:
-                completed = 0
-                for future in as_completed(future_to_idx):
+                # `completed` counts finished points (1-based) for the progress
+                # callback; futures arrive in completion order, not input order.
+                for completed, future in enumerate(as_completed(future_to_idx), start=1):
                     idx = future_to_idx[future]
                     try:
                         results[idx] = future.result()
@@ -1164,7 +1166,6 @@ class GeeRasterAdapter(BaseAdapter):
                         logger.warning("GEE export failed for point %d: %s", idx, e)
                         results[idx] = None
                     pbar.update(1)
-                    completed += 1
                     emit_progress_step(progress_callback, completed, n)
 
         return results, meta_list

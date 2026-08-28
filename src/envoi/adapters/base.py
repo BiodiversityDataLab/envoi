@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Sequence
+from collections.abc import Sequence
 
 from ..progress import ProgressStepCallback
 
@@ -18,7 +18,7 @@ class BaseAdapter:
     # even if the adapter call raises.
     def close(self) -> None:
         """Release any external resources held by the adapter. Default: no-op."""
-        return None
+        return
 
     def __enter__(self):
         return self
@@ -42,7 +42,7 @@ class BaseAdapter:
         progress_desc: str | None = None,
         disable_progress: bool = False,
         progress_callback: ProgressStepCallback | None = None,
-    ) -> List[tuple[dict, dict]]:
+    ) -> list[tuple[dict, dict]]:
         raise NotImplementedError
 
     def fetch_batch(

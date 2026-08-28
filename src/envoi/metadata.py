@@ -1,8 +1,9 @@
 # src/envoi/metadata.py
 from __future__ import annotations
+
 import json
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 
 def summarize_tile_export(exported_paths: list, n_points: int) -> dict:

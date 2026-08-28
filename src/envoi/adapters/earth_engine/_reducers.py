@@ -20,7 +20,7 @@ turns its raw output dict back into Python keys:
 from __future__ import annotations
 
 import re
-from typing import Sequence
+from collections.abc import Sequence
 
 import ee
 
@@ -92,9 +92,12 @@ def _get_ee_reducer(reducer_name: str) -> tuple[ee.Reducer, str]:
 
     # Percentiles: q05 / q10 / q25 / q50 / q75 / q90 / q95 or p10 / p50 …
     pct_value = None
-    if reducer_name.startswith("q") and reducer_name[1:].isdigit():
-        pct_value = int(reducer_name[1:])
-    elif reducer_name.startswith("p") and reducer_name[1:].isdigit():
+    if (
+        reducer_name.startswith("q")
+        and reducer_name[1:].isdigit()
+        or reducer_name.startswith("p")
+        and reducer_name[1:].isdigit()
+    ):
         pct_value = int(reducer_name[1:])
 
     if pct_value is not None and 0 < pct_value <= 100:

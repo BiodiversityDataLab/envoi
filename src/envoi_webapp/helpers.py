@@ -4,10 +4,11 @@ import json
 import os
 import re
 import tempfile
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any
 
 import pandas as pd
 from pyproj import CRS
