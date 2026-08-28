@@ -39,6 +39,12 @@ authors:
 version: 0.2.2
 date-released: "2026-08-28"
 
+# Zenodo "concept" DOI: it covers every release and always resolves to the most
+# recent one, so it stays correct without being updated here. Each individual
+# release also gets its own version DOI on Zenodo — those are listed on the record
+# under "Versions" and are what to cite when an exact version matters.
+doi: 10.5281/zenodo.22144753
+
 license: MIT
 repository-code: "https://github.com/BiodiversityDataLab/envoi"
 url: "https://github.com/BiodiversityDataLab/envoi"
