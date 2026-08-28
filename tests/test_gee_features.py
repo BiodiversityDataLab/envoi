@@ -21,12 +21,11 @@ import json
 import pandas as pd
 import pytest
 import rasterio
+from _gee_helpers import SWEDEN_SAMPLE_DF, gee_credentials_available
 
 from envoi import reset_catalog, update_catalog
 from envoi.catalog import BUILTIN_EE_CATALOG, load_catalogs
 from envoi.extract import extract
-
-from _gee_helpers import SWEDEN_SAMPLE_DF, gee_credentials_available
 
 # Apply two markers to every test in this module:
 #   * ``gee`` — selectable via ``pytest -m gee`` / ``pytest -m 'not gee'``.

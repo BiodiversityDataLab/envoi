@@ -1,6 +1,7 @@
 from __future__ import annotations
-from typing import Iterable, Callable, Dict
+
 import warnings
+from collections.abc import Callable, Iterable
 
 import numpy as np
 
@@ -111,7 +112,7 @@ def r_mode(values: Iterable) -> float:
 # stat keys; do NOT treat the return value as a scalar.
 
 
-def r_class_count(values: Iterable) -> Dict[int, int]:
+def r_class_count(values: Iterable) -> dict[int, int]:
     """Return ``{class_value: pixel_count}`` for a categorical window.
 
     Non-finite values (NaN, +/-inf) are filtered out the same way every
@@ -129,7 +130,7 @@ def r_class_count(values: Iterable) -> Dict[int, int]:
     return {int(value): int(count) for value, count in zip(unique_values, counts)}
 
 
-def r_class_fraction(values: Iterable) -> Dict[int, float]:
+def r_class_fraction(values: Iterable) -> dict[int, float]:
     """Return ``{class_value: fraction_in_[0, 1]}`` for a categorical window.
 
     The denominator is the total number of finite pixels in the window, so
@@ -174,7 +175,7 @@ def make_quantile(quantile: float) -> Callable[[Iterable], float]:
 
 # Add new reducers here, then they are available in configs
 # via their dictionary key, e.g. "mean", "std", "q10", "sum", ...
-_REGISTRY: Dict[str, Callable] = {
+_REGISTRY: dict[str, Callable] = {
     # core stats
     "mean": r_mean,
     "median": r_median,
@@ -329,4 +330,4 @@ def list_reducers() -> list[str]:
     return sorted(_REGISTRY.keys())
 
 
-__all__ = ["get_reducer", "validate_reducers", "list_reducers"]
+__all__ = ["get_reducer", "list_reducers", "validate_reducers"]

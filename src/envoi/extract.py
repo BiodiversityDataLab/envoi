@@ -1,16 +1,11 @@
 # src/envoi/extract.py
 from __future__ import annotations
-from typing import Dict, Any
+
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
-from .adapters import get_adapter
-from .catalog import load_catalogs, load_defaults, BUILTIN_EE_CATALOG
-from .qc import attach_quality_control, split_stats_and_qc
-from .reducers import validate_reducers
-from .metadata import write_metadata_sidecar
-from .progress import ProgressCallback, ProgressEvent, ProgressStepCallback
 from ._config_parsing import (
     RunSettings,
     _as_config_list,
@@ -29,6 +24,12 @@ from ._output_assembly import (
     _round_stat_columns,
     _write_tabular,
 )
+from .adapters import get_adapter
+from .catalog import BUILTIN_EE_CATALOG, load_catalogs, load_defaults
+from .metadata import write_metadata_sidecar
+from .progress import ProgressCallback, ProgressEvent, ProgressStepCallback
+from .qc import attach_quality_control, split_stats_and_qc
+from .reducers import validate_reducers
 
 # Default catalog tuple used when the caller does not supply one.
 # The sentinels tell load_catalogs() to load the YAML files that are
@@ -79,7 +80,7 @@ def extract(
     write_metadata: bool = True,
     quiet: bool = False,
     progress_callback: ProgressCallback | None = None,
-) -> Dict[str, Path | pd.DataFrame]:
+) -> dict[str, Path | pd.DataFrame]:
     """Extract environmental data for a set of geographic sample points.
 
     For each dataset listed in ``config``, this function samples the environmental
@@ -199,7 +200,7 @@ def extract(
         DataFrame is returned directly instead of being wrapped in a
         ``{batch_id: df}`` dict.
     """
-    output_paths: Dict[str, Path | pd.DataFrame] = {}
+    output_paths: dict[str, Path | pd.DataFrame] = {}
 
     df = df.copy()
 
@@ -249,8 +250,8 @@ def extract(
 
         # Per-dataset metadata accumulator. Each adapter builds its own entry
         # (including any quality stats and date-selection info) and stores it here.
-        dataset_metas: Dict[str, Any] = {}
-        warnings_backlog: Dict[str, str] = {}
+        dataset_metas: dict[str, Any] = {}
+        warnings_backlog: dict[str, str] = {}
 
         # Parse and validate all settings from this run's config dict.
         # ValueError is raised for any missing or invalid setting
@@ -481,10 +482,10 @@ def _process_dataset_tabular(
     df: pd.DataFrame,
     dataset: str,
     dataset_config: dict,
-    run_settings: "RunSettings",
+    run_settings: RunSettings,
     dates: list | None,
     window_size: int,
-    band_overrides: Dict[str, Any] | None = None,
+    band_overrides: dict[str, Any] | None = None,
     quiet: bool = False,
     progress_callback: ProgressStepCallback | None = None,
 ) -> tuple[pd.DataFrame, dict, list[str], str | None]:
@@ -586,7 +587,7 @@ def _process_dataset_tabular(
 def _process_dataset_raster(
     dataset: str,
     dataset_config: dict,
-    run_settings: "RunSettings",
+    run_settings: RunSettings,
     dates: list | None,
     window_size: int,
     *,
@@ -595,7 +596,7 @@ def _process_dataset_raster(
     ids: list,
     tiles_root: Path,
     filename_suffix: str | None = None,
-    band_overrides: Dict[str, Any] | None = None,
+    band_overrides: dict[str, Any] | None = None,
     quiet: bool = False,
     progress_callback: ProgressStepCallback | None = None,
 ) -> tuple[Path, dict]:

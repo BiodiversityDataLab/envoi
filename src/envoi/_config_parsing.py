@@ -22,7 +22,7 @@ Most other helpers (``_normalize_dataset_entry``, ``_validate_*``,
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import yaml
 
@@ -77,28 +77,28 @@ class RunSettings:
     # dict for plain-string entries in the user's `datasets` list, and contains
     # `bands` and/or `derived_bands` keys when the user supplied a per-call
     # override (e.g. {"sen2": ["B4", "B8"]} or {"sen2": {"bands": ["B4"]}}).
-    datasets: List[Tuple[str, Dict[str, Any]]]
+    datasets: list[tuple[str, dict[str, Any]]]
     output_type: str  # "tabular" or "raster"
     output_file_format: str  # "csv", "parquet", or "dataframe"
-    window_sizes: List[int]  # one or more square-sampling-window sizes in metres
+    window_sizes: list[int]  # one or more square-sampling-window sizes in metres
     min_coverage: float  # 0–100 — threshold for low-coverage QC flag
     # Normalized stats dict: {"continuous": [...], "categorical": [...]}.
     # A flat list from the user is normalized to identical lists on both keys.
     # Downstream code calls _resolve_stats_for_dataset() to pick the right list
     # per dataset rather than reading this dict directly.
-    stats: Dict[str, List[str]]
+    stats: dict[str, list[str]]
     # Original user-supplied form (flat list or typed dict), stored verbatim
     # so the metadata sidecar round-trips it without normalizing it away.
-    user_stats: list | Dict[str, List[str]]
+    user_stats: list | dict[str, list[str]]
     resample_m: float | None  # target pixel size in metres (raster mode only)
-    user_window_size: int | List[int]  # original input form, preserved for metadata
+    user_window_size: int | list[int]  # original input form, preserved for metadata
 
 
 def _normalize_dataset_entry(
     entry: Any,
     batch_id: str,
     catalog_datasets: dict,
-) -> Tuple[str, Dict[str, Any]]:
+) -> tuple[str, dict[str, Any]]:
     """Normalize one item from the user's `datasets` list into (name, band_overrides).
 
     Three accepted shapes:
@@ -223,7 +223,7 @@ def _normalize_dataset_entry(
         batch_id=batch_id,
     )
 
-    band_overrides: Dict[str, Any] = {}
+    band_overrides: dict[str, Any] = {}
     if source_bands:
         band_overrides["bands"] = source_bands
     if derived_bands:
@@ -380,7 +380,7 @@ def _parse_run_config(
 def _parse_statistics(
     raw: Any,
     batch_id: str,
-) -> tuple[Dict[str, List[str]], Any]:
+) -> tuple[dict[str, list[str]], Any]:
     """Parse and validate the user's `statistics` setting.
 
     Accepts two forms:
@@ -420,7 +420,7 @@ def _parse_statistics(
                 f"Output '{batch_id}': 'statistics' dict must contain at least one of "
                 f"{sorted(_VALID_STAT_TYPES)}."
             )
-        normalized: Dict[str, List[str]] = {}
+        normalized: dict[str, list[str]] = {}
         for key, reducers in raw.items():
             if not isinstance(reducers, list) or not reducers:
                 raise ValueError(
@@ -447,10 +447,10 @@ def _validate_reducer_names(reducers: list, batch_id: str, context: str) -> None
 
 def _resolve_stats_for_dataset(
     data_type: str | None,
-    stats: Dict[str, List[str]],
+    stats: dict[str, list[str]],
     dataset_name: str,
     batch_id: str,
-) -> List[str]:
+) -> list[str]:
     """Return the reducer list to use for one dataset based on its data_type.
 
     Falls back to 'continuous' when data_type is None or unrecognised, since
