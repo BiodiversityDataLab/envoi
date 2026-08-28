@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import pandas as pd
 
@@ -50,7 +50,7 @@ def _round_stat_columns(
 def _restore_user_column_names(
     stats_df: pd.DataFrame,
     qc_df: pd.DataFrame,
-    column_name_map: Dict[str, str],
+    column_name_map: dict[str, str],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Rename canonical core columns back to the user's original names.
 
@@ -68,9 +68,9 @@ def _restore_user_column_names(
 
 
 def _resolve_dataset_metadata(
-    datasets: List[Tuple[str, Dict[str, Any]]],
+    datasets: list[tuple[str, dict[str, Any]]],
     catalog_datasets: dict,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Build the resolved per-dataset list stored in the metadata sidecar.
 
     For each (name, band_overrides) pair, records the bands and derived_bands
@@ -142,10 +142,7 @@ def _append_stat_columns(
             missing_fill = None
 
         # Pull one value per sample row, using the chosen fill for absent keys.
-        column_values = [
-            stat_dict[stat_key] if stat_key in stat_dict else missing_fill
-            for stat_dict, _ in stats_results
-        ]
+        column_values = [stat_dict.get(stat_key, missing_fill) for stat_dict, _ in stats_results]
 
         # Overwrite existing columns (keeps schema stable across windows).
         if column_name in existing_columns:

@@ -121,7 +121,7 @@ def _inspect_raster(name: str, spec: dict[str, Any]) -> None:
     # Deliberately broad: auto-inspection is a convenience, so any failure
     # (missing rasterio, unreadable file, driver error) must degrade to a
     # warning rather than stop the user's catalog from loading.
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("datasets.%s: could not read raster metadata from %s: %s", name, p, e)
 
 

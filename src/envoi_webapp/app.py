@@ -322,15 +322,16 @@ def _escape_applescript_string(value: str) -> str:
 def _clear_dataset_widget_state(st) -> None:
     for key in list(st.session_state.keys()):
         key_text = str(key)
-        if (
-            key_text.startswith("dataset_select_")
-            or key_text.startswith("windows_input_")
-            or key_text.startswith("stats_select_")
-            or key_text.startswith("remove_dataset_button_")
-            or key_text.startswith("windows_")
-            or key_text.startswith("stats_")
-            or (key_text.startswith("dataset_") and key_text[8:].isdigit())
-        ):
+        if key_text.startswith(
+            (
+                "dataset_select_",
+                "windows_input_",
+                "stats_select_",
+                "remove_dataset_button_",
+                "windows_",
+                "stats_",
+            )
+        ) or (key_text.startswith("dataset_") and key_text[8:].isdigit()):
             st.session_state.pop(key, None)
     st.session_state._dataset_widget_version = (
         int(st.session_state.get("_dataset_widget_version", 0)) + 1

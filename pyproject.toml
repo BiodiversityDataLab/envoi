@@ -86,6 +86,24 @@ envoi_webapp = ["assets/*.png", "assets/*.svg"]
 [tool.ruff]
 line-length = 100
 
+[tool.ruff.lint]
+# Rules that recent ruff versions enable by default but that conflict with
+# deliberate choices in this codebase. Everything else ruff selects stays on.
+ignore = [
+    # Broad `except Exception` is intentional throughout the adapters: failures
+    # from third-party libraries (Earth Engine, pandas, rasterio) are caught and
+    # either re-raised as a clear ValueError or downgraded to a logged warning,
+    # so users never see a raw library traceback for a recoverable problem.
+    "BLE001",
+    # try/except/pass is used for best-effort work whose failure is harmless,
+    # e.g. warming a cache before the worker pool starts.
+    "S110",
+    # envoi raises ValueError (and CatalogError, which subclasses it) for invalid
+    # user config, wrong types included. That is the documented error contract and
+    # is asserted in the test suite; raising TypeError instead would break it.
+    "TRY004",
+]
+
 [tool.black]
 line-length = 100
 target-version = ["py310"]

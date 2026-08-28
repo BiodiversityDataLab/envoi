@@ -4,10 +4,10 @@ The synthetic DEM and ``sample_df`` fixtures are provided by ``conftest.py``,
 so this module no longer references any on-disk fixture paths.
 """
 
-from pathlib import Path
 import json
 import math
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -15,8 +15,8 @@ import pytest
 import rasterio
 from rasterio.transform import from_bounds
 
+from envoi import reset_catalog, update_catalog
 from envoi.extract import extract
-from envoi import update_catalog, reset_catalog
 
 
 @pytest.fixture(autouse=True)

@@ -12,7 +12,6 @@ most cases here verify that path.
 
 from __future__ import annotations
 
-
 import pytest
 
 from envoi.adapters.earth_engine._reducers import (

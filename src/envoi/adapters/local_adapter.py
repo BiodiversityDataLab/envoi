@@ -1,24 +1,26 @@
 # src/envoi/adapters/local_adapter.py
 from __future__ import annotations
+
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, List, Sequence
+from typing import Any
 
 import numpy as np
 import rasterio
+from pyproj import Transformer
+from rasterio.errors import RasterioIOError, WindowError
 from rasterio.mask import mask as rio_mask
 from rasterio.warp import transform_geom
 from shapely.geometry import box, mapping
-from pyproj import Transformer
-from rasterio.errors import RasterioIOError, WindowError
 from tqdm.auto import tqdm
 
-from .base import BaseAdapter
-from ..reducers import get_reducer
 from ..geo import get_utm_crs
 from ..metadata import summarize_tile_export
 from ..progress import ProgressStepCallback, emit_progress_step
+from ..reducers import get_reducer
+from .base import BaseAdapter
 
 try:
     from . import register as _register
@@ -51,7 +53,7 @@ def _is_nodata(value, nodata) -> bool:
 
 @dataclass
 class LocalRasterAdapter(BaseAdapter):
-    spec: Dict[str, Any]
+    spec: dict[str, Any]
 
     # ------------------------------------------------------------------
     # Setup / lifecycle
@@ -488,7 +490,7 @@ class LocalRasterAdapter(BaseAdapter):
             return _missing()
 
         if is_multiband:
-            values: Dict[str, Any] = {}
+            values: dict[str, Any] = {}
             for band_num, pixel_value, band_nodata in zip(
                 self.band, raw_pixel_values, per_band_nodata
             ):
@@ -540,8 +542,8 @@ class LocalRasterAdapter(BaseAdapter):
         is_multiband = self._is_multiband
         band_nums = self.band
 
-        stats: Dict[str, Any] = {}
-        meta: Dict[str, Any] = {}
+        stats: dict[str, Any] = {}
+        meta: dict[str, Any] = {}
 
         # ---- window branch ----
         if window_reducer_fns:
@@ -622,13 +624,11 @@ class LocalRasterAdapter(BaseAdapter):
         window_m: int,
         reducer_names: Sequence[str],
         *,
-        dates: (
-            Sequence | None
-        ) = None,  # noqa: ARG002 — accepted only for API parity with GeeRasterAdapter; local rasters have no time dimension.
+        dates: Sequence | None = None,
         progress_desc: str | None = None,
         disable_progress: bool = False,
         progress_callback: ProgressStepCallback | None = None,
-    ) -> List[tuple[dict, dict]]:
+    ) -> list[tuple[dict, dict]]:
         """Unified stats fetch: dispatches window reducers and the "point" reducer.
 
         ``reducer_names`` may contain any mix of window reducers (e.g. "mean",
@@ -662,7 +662,7 @@ class LocalRasterAdapter(BaseAdapter):
         # The tqdm wrapper gives users per-point progress feedback, mirroring
         # the GEE adapter's progress UI so behaviour is consistent across sources.
         total_points = len(lats)
-        results: List[tuple[dict, dict]] = []
+        results: list[tuple[dict, dict]] = []
         emit_progress_step(progress_callback, 0, total_points)
         for lat, lon in tqdm(
             zip(lats, lons),
@@ -714,7 +714,7 @@ class LocalRasterAdapter(BaseAdapter):
         ``"<id>-<dataset>.tif"`` naming.
         """
         from rasterio.transform import Affine
-        from rasterio.warp import reproject, Resampling
+        from rasterio.warp import Resampling, reproject
 
         output_dir = Path(output_dir) / dataset_name
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -729,11 +729,11 @@ class LocalRasterAdapter(BaseAdapter):
         else:
             id_list = [str(i) for i in range(len(lats_list))]
 
-        paths: List[Any] = []
+        paths: list[Any] = []
         # One meta dict per tile, mirroring fetch_values' meta. Carries the
         # per-point QC info (in_extent, n_pixels, coverage_pct, …) so the
         # raster-mode QC summary can report which tiles failed and why.
-        tile_metas: List[dict] = []
+        tile_metas: list[dict] = []
 
         n_pixels = max(1, round(window_m / resample_m)) if resample_m is not None else None
 
@@ -892,20 +892,20 @@ class LocalRasterAdapter(BaseAdapter):
 
     def build_dataset_meta(
         self,
-        spec: Dict[str, Any],
+        spec: dict[str, Any],
         meta_list: list | None = None,
         exported_paths: list | None = None,
         quality: dict | None = None,
         lats: Sequence[float] | None = None,
         lons: Sequence[float] | None = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Build per-dataset metadata using this adapter's local raster state.
 
         No date dimension and a single native CRS, so this is much simpler
         than the GEE implementation. Quality stats are added when present.
         """
         # Static dataset info from the catalog spec.
-        meta: Dict[str, Any] = {
+        meta: dict[str, Any] = {
             "data_source": spec.get("data_source"),
             "path": spec.get("path"),
             "asset_type": "local_raster",
