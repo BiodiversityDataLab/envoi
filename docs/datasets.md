@@ -30,23 +30,27 @@ To add your own local rasters or Earth Engine assets, register them with `update
 
 | Dataset | What it is | Resolution | Temporal | Values |
 | --- | --- | --- | --- | --- |
-| [**Copernicus DEM GLO-30**](#copernicus-dem-glo-30)<br>`dem_copernicus_glo30` | Copernicus DEM GLO-30 - global digital surface model derived from TanDEM-X radar data | 30 meters | static | continuous |
+| [**Copernicus DEM GLO-30**](#copernicus-dem-glo-30)<br>`dem_copernicus_glo30` | Copernicus DEM GLO-30 (2024_1 release) - global digital surface model derived from TanDEM-X radar data | 30 meters | static | continuous |
 
 #### Copernicus DEM GLO-30
 
-Copernicus DEM GLO-30 - global digital surface model derived from TanDEM-X radar data.
+Copernicus DEM GLO-30 (2024_1 release) - global digital surface model derived from TanDEM-X radar data.
 
 | | |
 | --- | --- |
 | **Use in `extract()`** | `dem_copernicus_glo30` |
-| **Source** | Earth Engine — `COPERNICUS/DEM/GLO30` |
+| **Source** | Earth Engine — `COPERNICUS/DEM/GLO30_2024_1` |
 | **Values** | continuous |
 | **Spatial resolution** | 30 meters |
 | **Temporal resolution** | static |
 | **Default bands** | `DEM` |
 | **Derived bands available** | `slope`, `aspect` |
 | **Licence** | Copernicus Data License (free for most uses) |
-| **Links** | [Earth Engine catalog](https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_DEM_GLO30) · [Provider documentation](https://dataspace.copernicus.eu/sites/default/files/media/files/2024-06/geo1988-copernicusdem-spe-002_producthandbook_i5.0.pdf) |
+| **Links** | [Earth Engine catalog](https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_DEM_GLO30_2024_1) · [Provider documentation](https://dataspace.copernicus.eu/sites/default/files/media/files/2024-06/geo1988-copernicusdem-spe-002_producthandbook_i5.0.pdf) |
+
+Extraction notes:
+
+- A static product tiled by area rather than a time series: sample dates are ignored, and the tiles covering each point are mosaicked together.
 
 > **Cite as:** © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved.
 
@@ -76,7 +80,7 @@ ERA5 monthly aggregates - global climate reanalysis from ECMWF
 
 Extraction notes:
 
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Copernicus Climate Change Service (C3S) (2017): ERA5: Fifth generation of ECMWF atmospheric reanalyses of the global climate. Copernicus Climate Change Service Climate Data Store (CDS), (date of access), https://cds.climate.copernicus.eu/cdsapp#!/home
 
@@ -98,7 +102,7 @@ TerraClimate - monthly global climate and water-balance variables (temperature, 
 
 Extraction notes:
 
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Abatzoglou, J.T., Dobrowski, S.Z., Parks, S.A., Hegewisch, K.C. (2018). TerraClimate, a high-resolution global dataset of monthly climate and climatic water balance from 1958-2015. Scientific Data 5:170191. https://doi.org/10.1038/sdata.2017.191
 
@@ -209,7 +213,7 @@ Landsat 32-day surface reflectance composite - global composites of Landsat C2 L
 Extraction notes:
 
 - Native resolution is set manually to 30 m (the asset does not report a usable scale to Earth Engine).
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Landsat surface reflectance products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center.
 
@@ -232,7 +236,7 @@ Landsat 8-day surface reflectance composite - global composites of Landsat C2 L2
 Extraction notes:
 
 - Native resolution is set manually to 30 m (the asset does not report a usable scale to Earth Engine).
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Landsat surface reflectance products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center.
 
@@ -255,7 +259,7 @@ Landsat annual surface reflectance composite - global composites of Landsat C2 L
 Extraction notes:
 
 - Native resolution is set manually to 30 m (the asset does not report a usable scale to Earth Engine).
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Landsat surface reflectance products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center.
 
@@ -308,7 +312,7 @@ Landsat 32-day NDVI - global composites of NDVI.
 Extraction notes:
 
 - Native resolution is set manually to 30 m (the asset does not report a usable scale to Earth Engine).
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Landsat NDVI products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center.
 
@@ -331,7 +335,7 @@ Landsat 8-day EVI - global composites of Enhanced Vegetation Index.
 Extraction notes:
 
 - Native resolution is set manually to 30 m (the asset does not report a usable scale to Earth Engine).
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Landsat EVI products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center.
 
@@ -354,7 +358,7 @@ Landsat 8-day NDVI - global composites of NDVI.
 Extraction notes:
 
 - Native resolution is set manually to 30 m (the asset does not report a usable scale to Earth Engine).
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Landsat NDVI products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center.
 
@@ -377,7 +381,7 @@ Landsat Annual EVI - global composites of Enhanced Vegetation Index.
 Extraction notes:
 
 - Native resolution is set manually to 30 m (the asset does not report a usable scale to Earth Engine).
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Landsat EVI products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center.
 
@@ -400,7 +404,7 @@ Landsat Annual NDVI - global composites of NDVI.
 Extraction notes:
 
 - Native resolution is set manually to 30 m (the asset does not report a usable scale to Earth Engine).
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Landsat NDVI products courtesy of the U.S. Geological Survey Earth Resources Observation and Science Center.
 
@@ -422,7 +426,7 @@ MODIS Terra Net Primary Productivity (MOD17A3HGF v061) - NPP and GPP (kg C/m²) 
 
 Extraction notes:
 
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Running, S., & Zhao, M. (2021). MODIS/Terra Net Primary Production Gap-Filled Yearly L4 Global 500m SIN Grid V061 [Data set]. NASA Land Processes Distributed Active Archive Center. https://doi.org/10.5067/MODIS/MOD17A3HGF.061
 
@@ -608,7 +612,7 @@ Google Satellite Embeddings V1 - 64-dimensional embeddings.
 Extraction notes:
 
 - Tiled collection: the tile matching each point's UTM zone is selected, so points near tile edges get the right image.
-- Image selection from a sample date uses the `contains` policy (`contains` = the image whose time interval covers the date; `nearest` = the image with the closest timestamp).
+- Given a sample date, the image whose time interval covers that date is used.
 
 > **Cite as:** Brown, C. F., Kazmierski, M. R., Pasquarella, V. J., Rucklidge, W. J., Samsikova, M., Zhang, C., Shelhamer, E., Lahera, E., Wiles, O., Ilyushchenko, S., Gorelick, N., Zhang, L. L., Alj, S., Schechter, E., Askay, S., Guinan, O., Moore, R., Boukouvalas, A., & Kohli, P. (2025). AlphaEarth Foundations: An embedding field model for accurate and efficient global mapping from sparse label data. arXiv preprint arXiv:2507.22291.
 

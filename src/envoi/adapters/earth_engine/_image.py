@@ -224,6 +224,22 @@ def _find_nearest_timestamp(
     return time_starts[idx], False
 
 
+def _is_mosaic_date_policy(dataset_spec: dict) -> bool:
+    """True when a collection's images tile space rather than time.
+
+    Declared in the catalog as ``collection_date_policy: mosaic``. Such a
+    collection is one static product cut into geographic tiles; the per-image
+    timestamp records when a tile was acquired, not a step in a time series.
+    Date selection is meaningless for it — picking "the nearest image in time"
+    returns a tile somewhere else entirely — so the adapter spatially filters
+    and mosaics instead, ignoring dates completely.
+
+    Shared by the adapter and :func:`_build_image` so both agree on how the
+    catalog value is spelled and compared.
+    """
+    return str(dataset_spec.get("collection_date_policy", "nearest")).lower() == "mosaic"
+
+
 def _resolve_date_filter_range(
     date_timestamp: pd.Timestamp,
     policy: str,
@@ -403,7 +419,24 @@ def _build_image(
 
         # --- Date-based image selection ---
         date_policy = str(dataset_spec.get("collection_date_policy", "nearest")).lower()
-        if date is not None:
+        if _is_mosaic_date_policy(dataset_spec):
+            # Space-tiled collection: dates carry no meaning here, so mosaic
+            # whatever filterBounds left us regardless of any date passed in.
+            # The guard is belt-and-braces — the adapter never passes a date
+            # for these — but it keeps the two modules from drifting apart.
+            #
+            # mosaic() discards the source projection, leaving the result on
+            # the EPSG:4326 1-degree default. Reductions are unaffected (they
+            # take an explicit scale), but neighbourhood algorithms are not:
+            # ee.Terrain.slope/aspect silently return null on a projectionless
+            # image. Stamping the collection's native projection back on keeps
+            # derived bands working, and matches what the single-image path
+            # gets for free from .first().
+            native_projection = (
+                ee.ImageCollection(dataset_spec["collection"]).first().select(0).projection()
+            )
+            image = image_collection.mosaic().setDefaultProjection(native_projection)
+        elif date is not None:
             date_ts = pd.to_datetime(date)
             start, end = _resolve_date_filter_range(
                 date_ts,
