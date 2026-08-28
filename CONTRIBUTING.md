@@ -66,7 +66,8 @@ Live GEE tests are marked with `@pytest.mark.gee` and need network access plus c
 - `tests/` — pytest suite, including the `gee`-marked live Earth Engine tests and shared fixtures in `conftest.py`.
 - `examples/` — minimal example `run.yml` and `catalog.yml` showing the config schema.
 - `demo/` — `getting_started.ipynb`, an interactive walkthrough of the main features.
-- `docs/` — design notes (`architecture.md`) and extended usage (`advanced_usage.md`).
+- `docs/` — design notes (`architecture.md`), extended usage (`advanced_usage.md`), and the generated dataset reference (`datasets.md`).
+- `scripts/` — repository tooling, currently `generate_dataset_docs.py` (regenerates `docs/datasets.md` from the catalog).
 - `.github/workflows/` — CI (`ci.yml`) and PyPI release (`release.yml`) pipelines.
 
 ---
@@ -100,7 +101,10 @@ Built-in Earth Engine datasets live in [src/envoi/configs/ee_catalog.yml](src/en
 1. Pick a stable, descriptive ID (e.g. `ndvi_landsat_annual`, `lulc_worldcover_2021`). The convention is `<theme>_<source>_<additonal_information>`.
 2. Add an entry with at least `data_source: earth_engine` and `path: <GEE asset ID>`. Most other fields are auto-detected; only override them when the default is wrong (see the commented reference block at the top of the catalog file).
 3. Include a short `description`, a `citation`, and the `data_type` (`continuous` or `categorical`).
-4. Add a smoke test in `tests/test_gee_features.py` marked `@pytest.mark.gee`.
+4. Set `display_name` to the dataset's title as it appears in the Earth Engine catalog (e.g. `"Copernicus DEM GLO-30"`), shortening it if the official title is a full sentence. This is the label shown in the documentation and in the web app's dataset menu, so it must be unique across the catalog.
+5. Set `category` to the theme the dataset belongs to (`Terrain`, `Climate`, `Land cover / land use`, `Satellite imagery`, `Vegetation & productivity`, `Human impact`, `Other`). This is the heading the dataset is filed under in the generated documentation.
+6. Regenerate the dataset reference: `python scripts/generate_dataset_docs.py`, and commit the updated `docs/datasets.md`. A test fails if the two drift apart.
+7. Add a smoke test in `tests/test_gee_features.py` marked `@pytest.mark.gee`.
 
 ---
 

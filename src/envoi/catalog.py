@@ -1,9 +1,12 @@
 # src/envoi/catalog.py
 from __future__ import annotations
+
 import importlib.resources as importlib_resources
-from pathlib import Path
-from typing import Dict, Any, Mapping
 import logging
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
 import yaml
 
 REQUIRED_DATASET_KEYS = {"data_source", "path"}
@@ -13,7 +16,7 @@ REQUIRED_DATASET_KEYS = {"data_source", "path"}
 EE_REQUIRED_DATASET_KEYS = {"data_type"}
 
 # Module-level cache so each bundled YAML is only read once per process.
-_defaults_cache: Dict[str, Any] | None = None
+_defaults_cache: dict[str, Any] | None = None
 
 # Cached set of built-in dataset names, used by update_catalog() to detect
 # when a user-registered entry shadows a built-in. Lazy-loaded on first use.
@@ -22,12 +25,12 @@ _builtin_dataset_names_cache: frozenset[str] | None = None
 # Datasets registered by the user via update_catalog(). Persists for the
 # duration of the Python session. Applied as the final merge layer in
 # load_catalogs() so user entries always override built-in ones.
-_user_catalog_datasets: Dict[str, Any] = {}
+_user_catalog_datasets: dict[str, Any] = {}
 
 logger = logging.getLogger(__name__)
 
 
-def _read_builtin_yaml(filename: str) -> Dict[str, Any]:
+def _read_builtin_yaml(filename: str) -> dict[str, Any]:
     """Read a YAML file bundled inside the envoi package under configs/.
 
     Uses importlib.resources so the file is found correctly whether the
@@ -38,7 +41,7 @@ def _read_builtin_yaml(filename: str) -> Dict[str, Any]:
     return yaml.safe_load(text) or {}
 
 
-def load_defaults() -> Dict[str, Any]:
+def load_defaults() -> dict[str, Any]:
     """Load project-wide defaults from the bundled configs/defaults.yml.
 
     Returns a dict of default values (e.g. window_size_m, output_file_format).
@@ -70,13 +73,13 @@ class CatalogError(ValueError):
     """Invalid or incomplete catalog.yaml."""
 
 
-def _require_keys(d: Dict[str, Any], required: set, ctx: str) -> None:
+def _require_keys(d: dict[str, Any], required: set, ctx: str) -> None:
     missing = required - set(d.keys())
     if missing:
         raise CatalogError(f"{ctx}: missing required key(s): {sorted(missing)}")
 
 
-def _inspect_raster(name: str, spec: Dict[str, Any]) -> None:
+def _inspect_raster(name: str, spec: dict[str, Any]) -> None:
     """Read CRS, resolution, type, and nodata from a local raster file
     and fill in any missing spec fields automatically."""
     if spec.get("data_source") != "local":
@@ -115,11 +118,14 @@ def _inspect_raster(name: str, spec: Dict[str, Any]) -> None:
                 # Which bands to actually read is decided by the adapter at runtime.
                 spec["band_count"] = src.count
 
-    except Exception as e:
+    # Deliberately broad: auto-inspection is a convenience, so any failure
+    # (missing rasterio, unreadable file, driver error) must degrade to a
+    # warning rather than stop the user's catalog from loading.
+    except Exception as e:  # noqa: BLE001
         logger.warning("datasets.%s: could not read raster metadata from %s: %s", name, p, e)
 
 
-def _validate_catalog(data: Dict[str, Any], source_label: str) -> Dict[str, Any]:
+def _validate_catalog(data: dict[str, Any], source_label: str) -> dict[str, Any]:
     """Validate a parsed catalog dict and run auto-inspection on local rasters.
 
     Raises CatalogError if the structure is invalid.
@@ -152,7 +158,7 @@ def _validate_catalog(data: Dict[str, Any], source_label: str) -> Dict[str, Any]
     return data
 
 
-def load_catalog(path: str | Path) -> Dict[str, Any]:
+def load_catalog(path: str | Path) -> dict[str, Any]:
     """Load and validate a dataset catalog YAML from a file path.
 
     Required structure:
@@ -182,7 +188,7 @@ def load_catalog(path: str | Path) -> Dict[str, Any]:
 BUILTIN_EE_CATALOG = object()
 
 
-def _load_catalog_any(src: Any) -> Dict[str, Any]:
+def _load_catalog_any(src: Any) -> dict[str, Any]:
     """
     Internal helper: accept a path, a dict-like catalog, or the BUILTIN_EE_CATALOG
     sentinel and return a normalized {'datasets': {...}} structure.
@@ -226,13 +232,13 @@ def _load_catalog_any(src: Any) -> Dict[str, Any]:
     return load_catalog(src)
 
 
-def load_catalogs(*sources: Any) -> Dict[str, Any]:
+def load_catalogs(*sources: Any) -> dict[str, Any]:
     """
     Merge one or more catalogs (paths, dicts, or lists of paths/dicts) into a
     single catalog. Later sources override earlier ones on a per-dataset basis.
     Always returns: {'datasets': {...}}.
     """
-    merged: Dict[str, Any] = {"datasets": {}}
+    merged: dict[str, Any] = {"datasets": {}}
 
     flat = []
     for src in sources:
@@ -272,7 +278,8 @@ def update_catalog(source: str | Path | dict) -> None:
         update_catalog("my_catalog.yml")
         update_catalog({"datasets": {"ndvi_local": {"data_source": "local", "path": "data/ndvi.tif"}}})
     """
-    global _user_catalog_datasets
+    # No `global` declaration needed: the module-level dict is mutated in
+    # place (see the .update() below), never rebound.
     cat = _load_catalog_any(source)
     new_datasets = cat.get("datasets", {})
 
@@ -322,7 +329,9 @@ def list_datasets(verbosity: str = "names") -> list:
               Returns ``list[str]`` of sorted dataset names.
             - ``"info"``: name plus the ``dataset_information`` fields
               (description, citation, ee_source_url, source_url) and the
-              top-level ``data_source`` / ``data_type``.
+              top-level ``display_name`` / ``data_source`` / ``data_type`` /
+              ``category``. ``display_name`` falls back to the dataset name
+              when the catalog entry does not define one.
               Returns ``list[dict]`` with those fields.
             - ``"full"``: the complete catalog entry — every key present
               in the YAML (bands, dataset_spec, paths, etc.).
@@ -366,8 +375,13 @@ def list_datasets(verbosity: str = "names") -> list:
             info_records.append(
                 {
                     "name": name,
+                    # Human-readable label for menus and documentation. Falls
+                    # back to the catalog key so callers can always display
+                    # something, even for entries that omit the field.
+                    "display_name": entry.get("display_name") or name,
                     "data_source": entry.get("data_source"),
                     "data_type": entry.get("data_type"),
+                    "category": entry.get("category"),
                     "description": dataset_information.get("description"),
                     "citation": dataset_information.get("citation"),
                     "ee_source_url": dataset_information.get("ee_source_url"),
