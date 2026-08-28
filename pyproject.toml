@@ -75,6 +75,8 @@ Homepage = "https://biodiversity.se/"
 Repository = "https://github.com/BiodiversityDataLab/envoi"
 Issues = "https://github.com/BiodiversityDataLab/envoi/issues"
 Documentation = "https://github.com/BiodiversityDataLab/envoi#readme"
+# Zenodo concept DOI — resolves to the most recent archived release.
+DOI = "https://doi.org/10.5281/zenodo.22144753"
 
 [tool.setuptools.dynamic]
 version = { attr = "envoi._version.__version__" }
