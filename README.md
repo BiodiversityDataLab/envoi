@@ -260,9 +260,21 @@ The source, including descriptions, citations, and URLs for every entry, is [src
 
 A paper describing envoi is currently in preparation. In the meantime, please cite the software directly:
 
-> Baggström, A., Nyström, J., & Andermann, T. (*in prep.*). envoi: automated environmental feature extraction for ecological analysis. Retrieved from https://github.com/BiodiversityDataLab/envoi
+> Baggström, A., Nyström, J., & Andermann, T. (2026). *envoi: automated environmental feature extraction for ecological analysis* (Version 0.2.1) [Computer software]. https://github.com/BiodiversityDataLab/envoi
 
-This entry will be updated with a DOI and full citation when the paper is published.
+```bibtex
+@software{envoi,
+  author  = {Baggström, Adrian and Nyström, Jakob and Andermann, Tobias},
+  title   = {envoi: automated environmental feature extraction for ecological analysis},
+  year    = {2026},
+  version = {0.2.1},
+  url     = {https://github.com/BiodiversityDataLab/envoi}
+}
+```
+
+Citation metadata is maintained in [CITATION.cff](https://github.com/BiodiversityDataLab/envoi/blob/main/CITATION.cff) — use the **"Cite this repository"** button in the GitHub sidebar to get an up-to-date entry in APA or BibTeX for the version you used.
+
+This section will be updated with a DOI, and with the paper citation once it is published.
 
 ---
 
