@@ -1,11 +1,13 @@
 # src/envoi/_input_validation.py
 """Input-DataFrame validation for :func:`envoi.extract`.
 
-Three concerns, separately invokable:
+Four concerns, separately invokable:
 
 * :func:`_validate_required_columns` — fail fast with an actionable message
   when id / latitude / longitude columns are missing under whichever names
   the user supplied.
+* :func:`_validate_sample_ids` — reject blank or duplicated sample IDs before
+  raster mode tries to name one output file per point with them.
 * :func:`_parse_and_validate_dates` — accept GBIF / Darwin Core ISO 8601
   flexibility (intervals, time-of-day, timezone suffixes, year-only, year-month)
   and collapse each entry to a YYYY-MM-DD day. Drops rows whose date is null;
@@ -24,6 +26,8 @@ import warnings
 
 import pandas as pd
 from pyproj import Transformer
+
+from ._filenames import format_id_list
 
 
 def _validate_required_columns(
@@ -46,6 +50,57 @@ def _validate_required_columns(
             f"Expected columns: {id_column}, {latitude_column}, {longitude_column} "
             f"(and optionally a date column).\n"
             f"Found columns: {sorted(df.columns.tolist())}"
+        )
+
+
+def _validate_sample_ids(
+    id_values: pd.Series,
+    id_column_name: str,
+    *,
+    context: str = "",
+) -> None:
+    """Raise ValueError if sample IDs cannot safely name one file per point.
+
+    Raster mode writes one GeoTIFF per point, named after that point's ID. A
+    blank ID has no name to use, and two points sharing an ID would have their
+    tiles silently overwrite one another — the user would get fewer tiles than
+    points with nothing to indicate why. Both are real data errors, so we fail
+    loudly and early (before any adapter is built or any Earth Engine quota is
+    spent) rather than producing a quietly incomplete result.
+
+    Args:
+        id_values: The ID column of the input DataFrame.
+        id_column_name: The user-facing column name, used in the error message
+            so it points at the column the caller actually has — matching the
+            convention used by :func:`_parse_and_validate_dates`.
+        context: Optional prefix identifying which output config triggered the
+            check, e.g. ``"Output 'terrain'"``.
+    """
+    # Prefix every message with the batch context when we have one, so a
+    # multi-output run says which config the bad IDs belong to.
+    message_prefix = f"{context}: " if context else ""
+
+    # Treat NaN/None and whitespace-only strings alike — neither can name a
+    # file. Coerce to str first so numeric ID columns compare cleanly.
+    normalized_ids = id_values.astype("string").str.strip()
+    blank_mask = normalized_ids.isna() | (normalized_ids == "")
+    if blank_mask.any():
+        # Report 1-based row positions, matching how a user reads their CSV.
+        blank_row_numbers = [int(position) + 1 for position in blank_mask.to_numpy().nonzero()[0]]
+        raise ValueError(
+            f"{message_prefix}column '{id_column_name}' has missing or blank values at "
+            f"row(s) {format_id_list(blank_row_numbers)}. Raster output names one GeoTIFF "
+            f"per point using this column, so every row needs an identifier."
+        )
+
+    duplicate_mask = normalized_ids.duplicated(keep=False)
+    if duplicate_mask.any():
+        duplicated_values = sorted(set(normalized_ids[duplicate_mask].tolist()))
+        raise ValueError(
+            f"{message_prefix}column '{id_column_name}' has duplicate values: "
+            f"{format_id_list(duplicated_values)}. Raster output names one GeoTIFF per "
+            f"point using this column, so duplicated IDs would overwrite each other's "
+            f"tiles. Give every point a unique identifier."
         )
 
 
@@ -74,8 +129,7 @@ def _parse_and_validate_dates(
         # and clutters every date-less run. We still record it in date_warnings
         # so it lands in the metadata sidecar for auditing.
         message = (
-            f"No '{date_column_name}' column found in input DataFrame; "
-            f"proceeding without dates."
+            f"No '{date_column_name}' column found in input DataFrame; proceeding without dates."
         )
         print(message)
         date_warnings.append(message)
@@ -147,8 +201,7 @@ def _parse_and_validate_dates(
         parsed_dates = pd.to_datetime(preprocessed_dates, format="mixed")
     except Exception as e:
         raise ValueError(
-            f"Error parsing '{date_column_name}' column: {e}. "
-            f"Expected dates in YYYY-MM-DD format."
+            f"Error parsing '{date_column_name}' column: {e}. Expected dates in YYYY-MM-DD format."
         )
 
     # Detect incomplete dates (year-only "2002" or year-month "2002-02") by

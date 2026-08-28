@@ -16,6 +16,7 @@ from rasterio.warp import transform_geom
 from shapely.geometry import box, mapping
 from tqdm.auto import tqdm
 
+from .._filenames import build_tile_filenames
 from ..geo import get_utm_crs
 from ..metadata import summarize_tile_export
 from ..progress import ProgressStepCallback, emit_progress_step
@@ -737,23 +738,28 @@ class LocalRasterAdapter(BaseAdapter):
 
         n_pixels = max(1, round(window_m / resample_m)) if resample_m is not None else None
 
-        # Suffix wrangling: when caller passes "200m", filenames become
-        # "<id>-<dataset>-200m.tif". When suffix is None we keep the
-        # historical "<id>-<dataset>.tif" naming so single-window callers
-        # are completely unaffected.
-        suffix_part = f"-{filename_suffix}" if filename_suffix else ""
+        # Build every tile filename up front, using the same shared helper as
+        # the Earth Engine adapter so both sources name their tiles
+        # identically. Sample IDs come from the user's input table and can
+        # contain anything (URL-style occurrenceIDs with "/" in them,
+        # "urn:catalog:..." IDs with ":"), so they are sanitized into a
+        # character set that is valid on Windows, macOS and Linux alike. When
+        # the caller passes "200m", filenames become "<id>-<dataset>-200m.tif";
+        # with no suffix we keep the historical "<id>-<dataset>.tif" naming,
+        # and IDs that were already safe are left untouched.
+        tile_filenames = build_tile_filenames(id_list, dataset_name, filename_suffix)
 
         # Wrap the per-point tile loop with tqdm so users get visible progress
         # for what can be a long sequential operation on large input sets.
         emit_progress_step(progress_callback, 0, len(id_list))
-        for lat, lon, sample_id in tqdm(
-            zip(lats_list, lons_list, id_list),
+        for lat, lon, tile_filename in tqdm(
+            zip(lats_list, lons_list, tile_filenames),
             total=len(id_list),
             desc=progress_desc or "Local tiles",
             unit="tile",
             disable=disable_progress,
         ):
-            output_path = output_dir / f"{sample_id}-{dataset_name}{suffix_part}.tif"
+            output_path = output_dir / tile_filename
             _, meta = self.fetch_values(lat, lon, window_m, return_meta=True)
 
             window_array = meta.get("window_arr")

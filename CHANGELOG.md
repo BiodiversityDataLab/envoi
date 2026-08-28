@@ -6,6 +6,13 @@
 - `catalog_markdown()` renders the dataset catalog as a formatted Markdown document — readable output for notebooks and docs instead of raw dicts.
 - Catalog entries accept two new optional keys, both surfaced by `list_datasets("info")`: `display_name`, a human-readable label following the dataset's title in the Earth Engine catalog (e.g. `dem_copernicus_glo30` → "Copernicus DEM GLO-30"), and `category`, the theme the dataset is grouped under. Every built-in dataset now sets both. `display_name` falls back to the dataset key when an entry omits it, so it is always safe to display.
 
+- Raster output now writes a `tiles_manifest.csv` into each dataset's tile folder, mapping every input row to the tile file it produced (`<your id column>`, `tile_filename`, `exported`). Join it onto your input table to find a point's tile, including for points whose tile failed to export. Multi-window runs write one suffixed manifest per window (`tiles_manifest-200m.csv`).
+
+### Fixed
+- **Tile filenames are now portable across Windows, macOS and Linux.** Tile names are built from your ID column, which was previously interpolated into the path unchanged. URL-style occurrenceIDs (`http://arctos.database.museum/guid/MSB:Mamm:1`) contain `/`, which scattered tiles into nested directories on the Earth Engine path and raised an error on the local-raster path; `urn:catalog:...` IDs contain `:`, which is illegal on Windows. IDs are now reduced to `[A-Za-z0-9._-]`, with a short hash appended when a rewrite was needed so two IDs can never collide. **IDs that were already portable are untouched, so existing tile filenames are unchanged.**
+- Raster mode now rejects blank and duplicated sample IDs up front, with a message naming the offending rows. Previously duplicated IDs silently overwrote each other's tiles and blank IDs produced a `nan-<dataset>.tif`, so a run could return fewer tiles than points with no error. The web app applies the same check when a CSV is uploaded. Tabular mode is unaffected — duplicates are harmless in a column.
+- `batch_id` values and `update_catalog()` dataset names are validated as path components, since both become folder names. An unusable one (`my/batch`, `..`, a name with spaces) now raises instead of producing a broken or misplaced output folder.
+
 ### Documentation
 - New generated dataset reference at `docs/datasets.md`: every built-in dataset grouped by theme, with a summary table plus resolution, temporal coverage, bands, licence, citation, and links per entry. Regenerate it with `python scripts/generate_dataset_docs.py` after editing `ee_catalog.yml`; a test fails if the committed file drifts out of sync.
 

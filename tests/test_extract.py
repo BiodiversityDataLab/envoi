@@ -6,6 +6,7 @@ so this module no longer references any on-disk fixture paths.
 
 import json
 import math
+import re
 import warnings
 from pathlib import Path
 
@@ -323,9 +324,9 @@ class TestTabular:
         for band_index in (1, 2, 3):
             for reducer_name in ("mean", "std"):
                 expected_column = f"multi_band_local_b{band_index}_{reducer_name}_100m"
-                assert expected_column in stats_df.columns, (
-                    f"missing expected column {expected_column}; " f"got {sorted(stats_df.columns)}"
-                )
+                assert (
+                    expected_column in stats_df.columns
+                ), f"missing expected column {expected_column}; got {sorted(stats_df.columns)}"
 
         # Flat-named columns must NOT exist — they are the symptom of the bug.
         forbidden_columns = {"multi_band_local_mean_100m", "multi_band_local_std_100m"}
@@ -1788,3 +1789,269 @@ def test_all_known_reducers_includes_class_reducers():
 
     assert "class_count" in _ALL_KNOWN_REDUCERS
     assert "class_fraction" in _ALL_KNOWN_REDUCERS
+
+
+# ------------------------------------------------------------------
+# Tile naming — sample IDs from a user's CSV must never break file writing
+# ------------------------------------------------------------------
+
+
+class TestTileNaming:
+    """Raster tiles are named after the user's ID column.
+
+    Real GBIF occurrenceIDs routinely contain characters that are illegal in a
+    filename — "/" is read as a path separator on every OS, and ":" is illegal
+    on Windows — so the ID is sanitized on its way into the filename. These
+    tests pin the behaviour end to end, through the real extract() pipeline.
+    """
+
+    # Character set that is valid on Windows, macOS and Linux alike.
+    PORTABLE_TILE_NAME = re.compile(r"^[A-Za-z0-9._-]+\.tif$")
+
+    def _points_with_ids(self, sample_ids):
+        """Build an input table placing every point inside the synthetic DEM."""
+        return pd.DataFrame(
+            {
+                "occurrenceID": list(sample_ids),
+                # Reuse one in-extent coordinate for every point; this suite is
+                # about naming, not about the pixel values.
+                "decimalLatitude": [62.98] * len(sample_ids),
+                "decimalLongitude": [18.025] * len(sample_ids),
+            }
+        )
+
+    def _export(self, df, tmp_path, batch_id="naming", **settings):
+        extract(
+            df,
+            {
+                "batch_id": batch_id,
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200, **settings},
+            },
+            output_dir=tmp_path,
+        )
+        return tmp_path / batch_id / "dem_local"
+
+    @pytest.mark.parametrize(
+        "hostile_id",
+        [
+            "http://arctos.database.museum/guid/MSB:Mamm:1",
+            "urn:catalog:MO:Tropicos:100123",
+            "record 12 ",
+            "émile",
+            "CON",
+            "x" * 300,
+        ],
+    )
+    def test_hostile_ids_export_to_portable_filenames(self, hostile_id, tmp_path):
+        """An ID that used to crash or scatter tiles now writes one flat file."""
+        tile_dir = self._export(self._points_with_ids([hostile_id]), tmp_path)
+
+        # rglob rather than glob: a "/" in the ID used to create nested
+        # directories, so this would still find the tile if that regressed.
+        tiles = list(tile_dir.rglob("*.tif"))
+        assert len(tiles) == 1, f"expected exactly one tile, found {tiles}"
+
+        tile = tiles[0]
+        assert tile.parent == tile_dir, f"tile landed in a subdirectory: {tile}"
+        assert self.PORTABLE_TILE_NAME.match(tile.name), f"{tile.name!r} is not portable"
+        assert len(tile.name.encode("utf-8")) <= 255
+
+    def test_no_nested_directories_are_created(self, tmp_path):
+        """The "/" case specifically: everything stays in one flat folder."""
+        tile_dir = self._export(self._points_with_ids(["a/b/c", "d/e"]), tmp_path)
+
+        subdirectories = [path for path in tile_dir.iterdir() if path.is_dir()]
+        assert not subdirectories, f"unexpected nested directories: {subdirectories}"
+
+    def test_ids_that_sanitize_alike_do_not_overwrite_each_other(self, tmp_path):
+        """`a/b` and `a_b` both reduce to `a_b` — they need distinct files."""
+        tile_dir = self._export(self._points_with_ids(["a/b", "a_b"]), tmp_path)
+        assert len(list(tile_dir.glob("*.tif"))) == 2
+
+    def test_clean_ids_keep_their_historical_filenames(self, sample_df, tmp_path):
+        """Backward compatibility: unaffected inputs produce unchanged names."""
+        tile_dir = self._export(sample_df, tmp_path)
+
+        expected = {f"{sample_id}-dem_local.tif" for sample_id in sample_df["occurrenceID"]}
+        assert {tile.name for tile in tile_dir.glob("*.tif")} == expected
+
+    def test_clean_ids_keep_historical_names_with_window_suffix(self, sample_df, tmp_path):
+        """The multi-window naming is likewise unchanged for clean IDs."""
+        tile_dir = self._export(sample_df, tmp_path, window_size_m=[200, 400])
+
+        assert (tile_dir / f"{sample_df['occurrenceID'][0]}-dem_local-200m.tif").exists()
+        assert (tile_dir / f"{sample_df['occurrenceID'][0]}-dem_local-400m.tif").exists()
+
+
+class TestSampleIdValidation:
+    """Blank or duplicated IDs cost the user tiles, so raster mode rejects them."""
+
+    def _points_with_ids(self, sample_ids):
+        return pd.DataFrame(
+            {
+                "occurrenceID": list(sample_ids),
+                "decimalLatitude": [62.98] * len(sample_ids),
+                "decimalLongitude": [18.025] * len(sample_ids),
+            }
+        )
+
+    def _raster_config(self):
+        return {
+            "batch_id": "id_check",
+            "datasets": ["dem_local"],
+            "settings": {"output_type": "raster", "window_size_m": 200},
+        }
+
+    def test_duplicate_ids_raise(self, tmp_path):
+        with pytest.raises(ValueError, match="duplicate values"):
+            extract(
+                self._points_with_ids(["dup", "dup", "unique"]),
+                self._raster_config(),
+                output_dir=tmp_path,
+            )
+
+    def test_blank_ids_raise(self, tmp_path):
+        with pytest.raises(ValueError, match="missing or blank"):
+            extract(
+                self._points_with_ids(["ok", "   "]),
+                self._raster_config(),
+                output_dir=tmp_path,
+            )
+
+    def test_null_ids_raise(self, tmp_path):
+        with pytest.raises(ValueError, match="missing or blank"):
+            extract(
+                self._points_with_ids(["ok", None]),
+                self._raster_config(),
+                output_dir=tmp_path,
+            )
+
+    def test_error_names_the_users_own_column(self, tmp_path):
+        """The message must quote the caller's column name, not internal 'id'."""
+        df = self._points_with_ids(["dup", "dup"]).rename(columns={"occurrenceID": "my_site_id"})
+        with pytest.raises(ValueError, match="my_site_id"):
+            extract(
+                df,
+                self._raster_config(),
+                output_dir=tmp_path,
+                id_column="my_site_id",
+            )
+
+    def test_validation_runs_before_any_tile_is_written(self, tmp_path):
+        """Failing fast means no half-finished output folder is left behind."""
+        with pytest.raises(ValueError):
+            extract(
+                self._points_with_ids(["dup", "dup"]),
+                self._raster_config(),
+                output_dir=tmp_path,
+            )
+        assert not (tmp_path / "id_check").exists()
+
+    def test_tabular_mode_allows_duplicate_ids(self, tmp_path):
+        """Tabular output puts IDs in a column, where duplicates are harmless."""
+        extract(
+            self._points_with_ids(["dup", "dup"]),
+            {
+                "batch_id": "tab",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "window_size_m": 200,
+                    "statistics": ["mean"],
+                },
+            },
+            output_dir=tmp_path,
+        )
+        # Both rows survive to the output table — the run is not blocked.
+        assert len(pd.read_csv(tmp_path / "tab.csv")) == 2
+
+
+class TestTileManifest:
+    """Every raster export writes a CSV mapping input rows to tile files."""
+
+    def test_manifest_joins_back_to_the_input_table(self, sample_df, tmp_path):
+        extract(
+            sample_df,
+            {
+                "batch_id": "manifest",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            output_dir=tmp_path,
+        )
+
+        manifest_path = tmp_path / "manifest" / "dem_local" / "tiles_manifest.csv"
+        assert manifest_path.exists()
+
+        manifest = pd.read_csv(manifest_path)
+        assert list(manifest.columns) == ["occurrenceID", "tile_filename", "exported"]
+        assert len(manifest) == len(sample_df)
+
+        # The join key is the caller's own column, so a merge just works.
+        merged = sample_df.merge(manifest, on="occurrenceID", how="inner")
+        assert len(merged) == len(sample_df)
+
+    def test_manifest_names_the_actual_files_on_disk(self, tmp_path):
+        """The point of the manifest: recovering a sanitized filename."""
+        df = pd.DataFrame(
+            {
+                "occurrenceID": ["http://x/guid/A:B"],
+                "decimalLatitude": [62.98],
+                "decimalLongitude": [18.025],
+            }
+        )
+        extract(
+            df,
+            {
+                "batch_id": "manifest_hostile",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            output_dir=tmp_path,
+        )
+
+        tile_dir = tmp_path / "manifest_hostile" / "dem_local"
+        manifest = pd.read_csv(tile_dir / "tiles_manifest.csv")
+
+        assert manifest.loc[0, "occurrenceID"] == "http://x/guid/A:B"
+        assert (tile_dir / manifest.loc[0, "tile_filename"]).exists()
+
+    def test_multi_window_runs_write_one_manifest_per_window(self, sample_df, tmp_path):
+        """Both manifests share a folder, so they carry the window suffix."""
+        extract(
+            sample_df,
+            {
+                "batch_id": "manifest_multi",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": [200, 400]},
+            },
+            output_dir=tmp_path,
+        )
+
+        tile_dir = tmp_path / "manifest_multi" / "dem_local"
+        assert (tile_dir / "tiles_manifest-200m.csv").exists()
+        assert (tile_dir / "tiles_manifest-400m.csv").exists()
+
+
+class TestConfigPathComponents:
+    """batch_id and dataset keys become folder names, so they are validated."""
+
+    @pytest.mark.parametrize("bad_batch_id", ["my/batch", "..", "with space", "CON", "trailing."])
+    def test_unsafe_batch_id_is_rejected(self, sample_df, bad_batch_id, tmp_path):
+        with pytest.raises(ValueError, match="Invalid batch_id"):
+            extract(
+                sample_df,
+                {
+                    "batch_id": bad_batch_id,
+                    "datasets": ["dem_local"],
+                    "settings": {"output_type": "tabular", "window_size_m": 200},
+                },
+                output_dir=tmp_path,
+            )
+
+    def test_unsafe_dataset_name_is_rejected(self, dem_tif):
+        with pytest.raises(ValueError, match="Invalid dataset name"):
+            update_catalog(
+                {"datasets": {"my/dataset": {"data_source": "local", "path": str(dem_tif)}}}
+            )
