@@ -11,6 +11,7 @@ status 1 and an explanatory message when the two disagree, so the mistake surfac
 as a failed build rather than as a permanently wrong citation record.
 """
 
+import ast
 import sys
 from pathlib import Path
 
@@ -35,13 +36,23 @@ def read_version_from_citation_file() -> str:
 def read_version_from_package() -> str:
     """Return `__version__` from src/envoi/_version.py without importing the package.
 
-    `_version.py` has no imports of its own, so executing it in an empty namespace is
-    safe and avoids having to install envoi (and all of its heavy geospatial
-    dependencies) just to read one string.
+    The file is parsed into a syntax tree and the `__version__ = "..."` assignment is
+    read straight out of it. Nothing is executed and nothing is imported, so this works
+    without installing envoi and all of its heavy geospatial dependencies just to read
+    one string.
     """
-    version_module_namespace: dict[str, object] = {}
-    exec(version_module_path.read_text(encoding="utf-8"), version_module_namespace)
-    return str(version_module_namespace["__version__"])
+    version_module_syntax_tree = ast.parse(version_module_path.read_text(encoding="utf-8"))
+
+    # Walk the module's top-level statements looking for `__version__ = <literal>`.
+    for statement in version_module_syntax_tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        for assignment_target in statement.targets:
+            if isinstance(assignment_target, ast.Name) and assignment_target.id == "__version__":
+                # literal_eval only accepts plain literals, so a string stays a string.
+                return str(ast.literal_eval(statement.value))
+
+    raise RuntimeError(f"No `__version__` assignment found in {version_module_path}")
 
 
 def main() -> int:
