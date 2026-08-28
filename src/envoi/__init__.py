@@ -1,18 +1,20 @@
-from .extract import extract
-from .reducers import list_reducers
-from .catalog import update_catalog, reset_catalog, list_datasets, CatalogError
-from .auth import init_gee
-from .progress import ProgressEvent
 from ._version import __version__
+from .auth import init_gee
+from .catalog import CatalogError, list_datasets, reset_catalog, update_catalog
+from .catalog_docs import catalog_markdown
+from .extract import extract
+from .progress import ProgressEvent
+from .reducers import list_reducers
 
 __all__ = [
+    "CatalogError",
+    "ProgressEvent",
+    "__version__",
+    "catalog_markdown",
     "extract",
-    "update_catalog",
-    "reset_catalog",
+    "init_gee",
     "list_datasets",
     "list_reducers",
-    "init_gee",
-    "ProgressEvent",
-    "CatalogError",
-    "__version__",
+    "reset_catalog",
+    "update_catalog",
 ]

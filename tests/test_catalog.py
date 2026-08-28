@@ -284,8 +284,10 @@ class TestListDatasets:
         assert all(isinstance(r, dict) for r in records)
         expected_fields = {
             "name",
+            "display_name",
             "data_source",
             "data_type",
+            "category",
             "description",
             "citation",
             "ee_source_url",
@@ -295,6 +297,25 @@ class TestListDatasets:
         # some values are None — the shape is part of the contract.
         for record in records:
             assert expected_fields <= set(record.keys())
+
+    def test_info_display_name_falls_back_to_the_dataset_name(self):
+        # display_name is optional in a catalog entry, but the info listing
+        # always has to hand callers something printable — menus and docs
+        # would otherwise show a blank label.
+        update_catalog(
+            {
+                "datasets": {
+                    "unlabelled_dataset": {
+                        "data_source": "local",
+                        "path": "/tmp/nonexistent.tif",
+                    }
+                }
+            }
+        )
+        records = {record["name"]: record for record in list_datasets("info")}
+        assert records["unlabelled_dataset"]["display_name"] == "unlabelled_dataset"
+        # Built-in entries carry a real label instead.
+        assert records["dem_copernicus_glo30"]["display_name"] == "Copernicus DEM GLO-30"
 
     def test_full_returns_complete_entries(self):
         # "full" verbosity returns the entire catalog entry plus a "name"
