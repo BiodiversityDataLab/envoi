@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 from base64 import b64encode
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,8 @@ try:
         redact_credential_secrets,
         run_extraction,
         validate_points_dataframe,
+        validate_service_account_json,
+        validate_wgs84_ranges,
     )
 except ImportError:
     from envoi_webapp.helpers import (
@@ -43,6 +46,8 @@ except ImportError:
         redact_credential_secrets,
         run_extraction,
         validate_points_dataframe,
+        validate_service_account_json,
+        validate_wgs84_ranges,
     )
 
 # Adjust these values to tune the Streamlit page gutters.
@@ -56,6 +61,22 @@ HEADER_BODY_FONT_SIZE_REM = 1.2
 HEADER_KICKER_GAP_REM = -0.05
 STAT_TAG_BACKGROUND = "#6fb488"
 STAT_TAG_TEXT = "#17302b"
+THEME_PRIMARY_COLOR = STAT_TAG_BACKGROUND
+DATASET_CATALOG_URL = "https://github.com/BiodiversityDataLab/envoi/blob/main/docs/datasets.md"
+VALIDATION_ERROR_COLOR = "#d32f2f"
+
+
+@dataclass(frozen=True)
+class _ValidationIssue:
+    message: str
+    widget_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _FormValidation:
+    issues: tuple[_ValidationIssue, ...]
+    selections: tuple[DatasetSelection, ...]
+    normalized_crs: str
 
 
 def _load_streamlit():
@@ -143,6 +164,10 @@ def _inject_css(st) -> None:
           color: {STAT_TAG_TEXT} !important;
           fill: {STAT_TAG_TEXT} !important;
         }}
+        div[data-testid="stCheckbox"] label[data-baseweb="checkbox"]:has(input:checked) > span {{
+          background-color: {STAT_TAG_BACKGROUND} !important;
+          border-color: {STAT_TAG_BACKGROUND} !important;
+        }}
         """
         + """
         .stApp {
@@ -214,6 +239,21 @@ def _dataset_catalog() -> dict[str, dict[str, Any]]:
     return {entry["name"]: entry for entry in entries}
 
 
+def _dataset_display_name(dataset_name: str, catalog: dict[str, dict[str, Any]]) -> str:
+    """Return the catalog label while keeping the dataset key as a safe fallback."""
+
+    display_name = catalog.get(dataset_name, {}).get("display_name")
+    if isinstance(display_name, str) and display_name.strip():
+        return display_name.strip()
+    return dataset_name
+
+
+def _dataset_label(dataset_name: str, index: int, catalog: dict[str, dict[str, Any]]) -> str:
+    if dataset_name:
+        return f"Data product “{_dataset_display_name(dataset_name, catalog)}”"
+    return f"Data product {index + 1}"
+
+
 def _ensure_dataset_state() -> None:
     st = _load_streamlit()
     if "dataset_rows" not in st.session_state:
@@ -225,6 +265,8 @@ def _ensure_dataset_state() -> None:
 def _empty_dataset_row() -> dict:
     return {
         "dataset": "",
+        "sample_point": False,
+        "sample_window": False,
         "window_sizes": "",
         "statistics": [],
     }
@@ -264,11 +306,17 @@ def _read_uploaded_csv(uploaded_file) -> pd.DataFrame | None:
 
 
 def _choose_output_directory(initial_dir: str) -> str | None:
-    """Open a native directory chooser through a separate GUI process."""
+    """Open a native directory chooser on the machine running the local app.
+
+    Prefer the operating system's own chooser, then fall back to Tk in a
+    separate process. Keeping every GUI outside Streamlit's worker thread
+    avoids platform-specific GUI event-loop failures.
+    """
 
     initial_path = Path(initial_dir).expanduser()
     if not initial_path.exists():
         initial_path = Path.home()
+    errors: list[str] = []
 
     if sys.platform == "darwin":
         # Streamlit runs app code outside the macOS main thread, so tkinter/Tk
@@ -288,35 +336,116 @@ def _choose_output_directory(initial_dir: str) -> str | None:
             return result.stdout.strip() or None
         if result.returncode == 1 and "User canceled" in result.stderr:
             return None
-        raise RuntimeError(result.stderr.strip() or "Could not open the folder chooser.")
+        errors.append(result.stderr.strip() or "AppleScript folder chooser failed.")
 
-    if sys.platform.startswith("linux") and shutil.which("zenity"):
-        result = subprocess.run(
-            [
-                "zenity",
-                "--file-selection",
-                "--directory",
-                "--title=Select envoi output directory",
-                f"--filename={initial_path}/",
-            ],
-            capture_output=True,
-            check=False,
-            text=True,
+    elif sys.platform.startswith("win"):
+        powershell = (
+            shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
         )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-        if result.returncode == 1:
-            return None
-        raise RuntimeError(result.stderr.strip() or "Could not open the folder chooser.")
+        if powershell:
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                f"$dialog.SelectedPath = '{_escape_powershell_string(str(initial_path))}'; "
+                "$dialog.Description = 'Select envoi output directory'; "
+                "if ($dialog.ShowDialog() -eq 'OK') { Write-Output $dialog.SelectedPath }"
+            )
+            result = subprocess.run(
+                [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip() or None
+            errors.append(result.stderr.strip() or "Windows folder chooser failed.")
 
+    elif sys.platform.startswith("linux"):
+        linux_choosers = (
+            (
+                "zenity",
+                [
+                    "--file-selection",
+                    "--directory",
+                    "--title=Select envoi output directory",
+                    f"--filename={initial_path}/",
+                ],
+            ),
+            (
+                "kdialog",
+                [
+                    "--getexistingdirectory",
+                    str(initial_path),
+                    "--title",
+                    "Select envoi output directory",
+                ],
+            ),
+            (
+                "yad",
+                [
+                    "--file-selection",
+                    "--directory",
+                    "--title=Select envoi output directory",
+                    f"--filename={initial_path}/",
+                ],
+            ),
+        )
+        for executable, arguments in linux_choosers:
+            chooser = shutil.which(executable)
+            if chooser is None:
+                continue
+            result = subprocess.run(
+                [chooser, *arguments], capture_output=True, check=False, text=True
+            )
+            if result.returncode == 0:
+                return result.stdout.strip() or None
+            if result.returncode == 1:
+                return None
+            errors.append(result.stderr.strip() or f"{executable} folder chooser failed.")
+
+    tkinter_script = """
+import sys
+import tkinter as tk
+from tkinter import filedialog
+
+root = tk.Tk()
+root.withdraw()
+root.update()
+selected = filedialog.askdirectory(
+    initialdir=sys.argv[1],
+    title="Select envoi output directory",
+    mustexist=True,
+)
+root.destroy()
+if selected:
+    print(selected)
+""".strip()
+    result = subprocess.run(
+        [sys.executable, "-c", tkinter_script, str(initial_path)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip() or None
+    errors.append(result.stderr.strip() or "Tk folder chooser failed.")
+
+    detail = next((error.splitlines()[-1] for error in reversed(errors) if error), "")
+    suffix = f" Last error: {detail}" if detail else ""
     raise RuntimeError(
-        "No supported folder chooser is available in this environment. "
-        "Enter the output directory path manually instead."
+        "No graphical folder chooser is available. Enter the output directory path manually."
+        + suffix
     )
 
 
 def _escape_applescript_string(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _escape_powershell_string(value: str) -> str:
+    """Escape a value embedded in a single-quoted PowerShell string."""
+
+    return value.replace("'", "''")
 
 
 def _clear_dataset_widget_state(st) -> None:
@@ -325,6 +454,8 @@ def _clear_dataset_widget_state(st) -> None:
         if key_text.startswith(
             (
                 "dataset_select_",
+                "point_checkbox_",
+                "window_checkbox_",
                 "windows_input_",
                 "stats_select_",
                 "remove_dataset_button_",
@@ -354,7 +485,10 @@ def _apply_pending_dataset_remove(st) -> None:
 
 
 def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: str) -> None:
-    dataset_names = sorted(catalog)
+    dataset_names = sorted(
+        catalog,
+        key=lambda name: (_dataset_display_name(name, catalog).casefold(), name.casefold()),
+    )
     reducers = list_reducers()
     if not dataset_names:
         st.error("No data products are available in the envoi catalog.")
@@ -367,7 +501,10 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
     for index, row in enumerate(st.session_state.dataset_rows):
         with st.expander(f"Data product {index + 1}", expanded=True):
             row_widget_key = f"{widget_version}_{index}"
-            top_cols = st.columns([0.65, 0.35], vertical_alignment="bottom")
+            if output_type == TABULAR_OUTPUT:
+                top_cols = st.columns([0.78, 0.11, 0.11], vertical_alignment="bottom")
+            else:
+                top_cols = st.columns([0.65, 0.35], vertical_alignment="bottom")
             current_dataset = row.get("dataset") if row.get("dataset") in dataset_names else None
             selected_dataset = top_cols[0].selectbox(
                 "Data product",
@@ -375,20 +512,35 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
                 index=dataset_names.index(current_dataset) if current_dataset else None,
                 placeholder="Choose a data product",
                 key=f"dataset_select_{row_widget_key}",
+                format_func=lambda name: _dataset_display_name(name, catalog),
             )
-            windows = top_cols[1].text_input(
-                "Window size(s) in meters",
-                value=row.get("window_sizes", ""),
-                placeholder="e.g. 500, 1000",
-                key=f"windows_input_{row_widget_key}",
-            )
-
+            windows = str(row.get("window_sizes", ""))
             st.session_state.dataset_rows[index]["dataset"] = selected_dataset or ""
-            st.session_state.dataset_rows[index]["window_sizes"] = windows
 
             if output_type == TABULAR_OUTPUT:
+                sample_point = top_cols[1].checkbox(
+                    "Point",
+                    value=bool(row.get("sample_point", False)),
+                    key=f"point_checkbox_{row_widget_key}",
+                    help="Sample the raster pixel value at each coordinate.",
+                )
+                sample_window = top_cols[2].checkbox(
+                    "Window",
+                    value=bool(row.get("sample_window", False)),
+                    key=f"window_checkbox_{row_widget_key}",
+                    help="Calculate spatial statistics within one or more sampling windows.",
+                )
+                st.session_state.dataset_rows[index]["sample_point"] = sample_point
+                st.session_state.dataset_rows[index]["sample_window"] = sample_window
+
                 permitted_reducers = (
-                    list(permissible_statistics_for_dataset(catalog[selected_dataset], reducers))
+                    [
+                        reducer
+                        for reducer in permissible_statistics_for_dataset(
+                            catalog[selected_dataset], reducers
+                        )
+                        if reducer != "point"
+                    ]
                     if selected_dataset
                     else []
                 )
@@ -397,31 +549,51 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
                 else:
                     defaults = []
                 valid_defaults = [stat for stat in defaults if stat in permitted_reducers]
-                selected_stats = st.multiselect(
-                    "Spatial statistics",
-                    permitted_reducers,
-                    default=valid_defaults,
-                    key=f"stats_select_{row_widget_key}_{selected_dataset or 'none'}",
-                    placeholder=(
-                        "Choose one or more statistics"
-                        if selected_dataset
-                        else "Choose a data product first"
-                    ),
-                    disabled=selected_dataset is None,
-                )
-                st.session_state.dataset_rows[index]["statistics"] = (
-                    selected_stats if selected_dataset else []
-                )
-                if selected_dataset:
-                    st.session_state.dataset_rows[index]["statistics_dataset"] = selected_dataset
-                else:
-                    st.session_state.dataset_rows[index].pop("statistics_dataset", None)
+                if sample_window:
+                    detail_cols = st.columns([0.65, 0.35], vertical_alignment="bottom")
+                    selected_stats = detail_cols[0].multiselect(
+                        "Spatial statistics",
+                        permitted_reducers,
+                        default=valid_defaults,
+                        key=f"stats_select_{row_widget_key}_{selected_dataset or 'none'}",
+                        placeholder=(
+                            "Choose one or more statistics"
+                            if selected_dataset
+                            else "Choose a data product first"
+                        ),
+                        disabled=selected_dataset is None,
+                    )
+                    windows = detail_cols[1].text_input(
+                        "Window size(s) in meters",
+                        value=row.get("window_sizes", ""),
+                        placeholder="e.g. 500, 1000",
+                        key=f"windows_input_{row_widget_key}",
+                    )
+                    st.session_state.dataset_rows[index]["statistics"] = (
+                        selected_stats if selected_dataset else []
+                    )
+                    st.session_state.dataset_rows[index]["window_sizes"] = windows
+                    if selected_dataset:
+                        st.session_state.dataset_rows[index]["statistics_dataset"] = (
+                            selected_dataset
+                        )
+                    else:
+                        st.session_state.dataset_rows[index].pop("statistics_dataset", None)
             else:
+                windows = top_cols[1].text_input(
+                    "Window size(s) in meters",
+                    value=row.get("window_sizes", ""),
+                    placeholder="e.g. 500, 1000",
+                    key=f"windows_input_{row_widget_key}",
+                )
+                st.session_state.dataset_rows[index]["window_sizes"] = windows
                 st.session_state.dataset_rows[index]["statistics"] = []
                 st.session_state.dataset_rows[index].pop("statistics_dataset", None)
 
             remove_disabled = not (
                 selected_dataset
+                or st.session_state.dataset_rows[index].get("sample_point")
+                or st.session_state.dataset_rows[index].get("sample_window")
                 or windows.strip()
                 or st.session_state.dataset_rows[index].get("statistics")
             )
@@ -439,19 +611,222 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
         st.rerun()
 
 
-def _dataset_selections(output_type: str) -> list[DatasetSelection]:
-    st = _load_streamlit()
+def _validate_dataset_rows(
+    rows: list[dict],
+    output_type: str,
+    catalog: dict[str, dict[str, Any]],
+    widget_version: int,
+) -> tuple[list[_ValidationIssue], list[DatasetSelection]]:
+    """Validate visible data-product fields in their left-to-right order."""
+
+    issues: list[_ValidationIssue] = []
     selections: list[DatasetSelection] = []
-    for row in st.session_state.dataset_rows:
-        statistics = tuple(row.get("statistics") or []) if output_type == TABULAR_OUTPUT else ()
+    if not rows:
+        return [_ValidationIssue("Step 4 — Add at least one data product.", ())], selections
+
+    for index, row in enumerate(rows):
+        row_widget_key = f"{widget_version}_{index}"
+        dataset = str(row.get("dataset") or "")
+        label = _dataset_label(dataset, index, catalog)
+        if not dataset:
+            issues.append(
+                _ValidationIssue(
+                    f"Step 4 — {label}: choose a data product.",
+                    (f"dataset_select_{row_widget_key}",),
+                )
+            )
+            # Point/window and their dependent fields are irrelevant until a
+            # product has actually been selected.
+            continue
+
+        if output_type == TABULAR_OUTPUT:
+            sample_point = bool(row.get("sample_point", False))
+            sample_window = bool(row.get("sample_window", False))
+            if not sample_point and not sample_window:
+                issues.append(
+                    _ValidationIssue(
+                        f"Step 4 — {label}: choose Point, Window, or both.",
+                        (
+                            f"point_checkbox_{row_widget_key}",
+                            f"window_checkbox_{row_widget_key}",
+                        ),
+                    )
+                )
+                continue
+
+            statistics = tuple(row.get("statistics") or []) if sample_window else ()
+            row_has_error = False
+            if sample_window and not statistics:
+                issues.append(
+                    _ValidationIssue(
+                        f"Step 4 — {label}: choose at least one spatial statistic.",
+                        (f"stats_select_{row_widget_key}_{dataset}",),
+                    )
+                )
+                row_has_error = True
+
+            if sample_window:
+                try:
+                    window_sizes = parse_window_sizes(str(row.get("window_sizes") or ""))
+                except ValueError as exc:
+                    detail = str(exc)
+                    if detail == "At least one window size is required.":
+                        detail = "enter at least one sampling-window size."
+                    else:
+                        detail = f"enter valid sampling-window sizes. {detail}"
+                    issues.append(
+                        _ValidationIssue(
+                            f"Step 4 — {label}: {detail}",
+                            (f"windows_input_{row_widget_key}",),
+                        )
+                    )
+                    row_has_error = True
+                    window_sizes = ()
+            else:
+                window_sizes = (0,)
+
+            if sample_point:
+                statistics += ("point",)
+            if row_has_error:
+                continue
+        else:
+            try:
+                window_sizes = parse_window_sizes(str(row.get("window_sizes") or ""))
+            except ValueError as exc:
+                detail = str(exc)
+                if detail == "At least one window size is required.":
+                    detail = "enter at least one sampling-window size."
+                else:
+                    detail = f"enter valid sampling-window sizes. {detail}"
+                issues.append(
+                    _ValidationIssue(
+                        f"Step 4 — {label}: {detail}",
+                        (f"windows_input_{row_widget_key}",),
+                    )
+                )
+                continue
+            statistics = ()
+
         selections.append(
             DatasetSelection(
-                dataset=str(row.get("dataset") or ""),
-                window_sizes=parse_window_sizes(str(row.get("window_sizes") or "")),
+                dataset=dataset,
+                window_sizes=window_sizes,
                 statistics=statistics,
             )
         )
-    return selections
+    return issues, selections
+
+
+def _validate_form(
+    *,
+    points_df: pd.DataFrame | None,
+    points_error: str | None,
+    input_crs: str,
+    credentials_bytes: bytes | None,
+    output_type: str | None,
+    output_dir: str,
+    dataset_rows: list[dict],
+    catalog: dict[str, dict[str, Any]],
+    widget_version: int,
+) -> _FormValidation:
+    """Collect form errors in step order without running the extraction."""
+
+    issues: list[_ValidationIssue] = []
+    normalized_crs = ""
+
+    # Step 1: location file, then its coordinate reference system.
+    if points_df is None:
+        message = points_error or "Upload a valid location CSV."
+        issues.append(_ValidationIssue(f"Step 1 — {message}", ("location_csv",)))
+
+    if not input_crs.strip():
+        issues.append(
+            _ValidationIssue(
+                "Step 1 — Enter the EPSG code for the uploaded location data.",
+                ("custom_epsg",),
+            )
+        )
+    else:
+        try:
+            normalized_crs = normalize_crs(input_crs)
+        except ValueError as exc:
+            issues.append(_ValidationIssue(f"Step 1 — {exc}", ("custom_epsg",)))
+        else:
+            if points_df is not None:
+                try:
+                    validate_wgs84_ranges(points_df, normalized_crs)
+                except ValueError as exc:
+                    issues.append(_ValidationIssue(f"Step 1 — {exc}", ("location_csv",)))
+
+    # Step 2: credentials.
+    if credentials_bytes is None:
+        issues.append(
+            _ValidationIssue(
+                "Step 2 — Upload an Earth Engine service-account JSON key.",
+                ("credentials_json",),
+            )
+        )
+    else:
+        try:
+            validate_service_account_json(credentials_bytes)
+        except ValueError as exc:
+            issues.append(_ValidationIssue(f"Step 2 — {exc}", ("credentials_json",)))
+
+    # Step 3: output type, then output directory.
+    if output_type not in {TABULAR_OUTPUT, RASTER_OUTPUT}:
+        issues.append(
+            _ValidationIssue(
+                "Step 3 — Choose between tabular or raster output.",
+                ("output_type",),
+            )
+        )
+    if not output_dir.strip():
+        issues.append(
+            _ValidationIssue(
+                "Step 3 — Enter an output directory.",
+                ("output_dir",),
+            )
+        )
+
+    # Step 4 is hidden until the output type is known, so only validate fields
+    # the user could actually interact with.
+    selections: list[DatasetSelection] = []
+    if output_type in {TABULAR_OUTPUT, RASTER_OUTPUT}:
+        dataset_issues, selections = _validate_dataset_rows(
+            dataset_rows, output_type, catalog, widget_version
+        )
+        issues.extend(dataset_issues)
+
+    return _FormValidation(tuple(issues), tuple(selections), normalized_crs)
+
+
+def _render_validation_issues(st, issues: tuple[_ValidationIssue, ...]) -> None:
+    """Show one ordered summary and outline every implicated widget in red."""
+
+    summary = "Please fix the following:\n\n" + "\n".join(f"- {issue.message}" for issue in issues)
+    st.error(summary)
+
+    widget_keys = dict.fromkeys(key for issue in issues for key in issue.widget_keys)
+    selectors: list[str] = []
+    for key in widget_keys:
+        wrapper = f'div[class*="st-key-{key}"]'
+        selectors.extend(
+            (
+                f'{wrapper} div[data-baseweb="select"] > div',
+                f'{wrapper} div[data-baseweb="input"]',
+                f'{wrapper} [data-testid="stFileUploaderDropzone"]',
+                f'{wrapper} label[data-baseweb="checkbox"] > span',
+            )
+        )
+    if selectors:
+        st.markdown(
+            "<style>\n"
+            + ",\n".join(selectors)
+            + f" {{ border-color: {VALIDATION_ERROR_COLOR} !important; "
+            f"box-shadow: 0 0 0 1px {VALIDATION_ERROR_COLOR} !important; }}\n"
+            "</style>",
+            unsafe_allow_html=True,
+        )
 
 
 def _progress_segments(
@@ -507,6 +882,7 @@ def render_app() -> None:
 
     catalog = _dataset_catalog()
     points_df: pd.DataFrame | None = None
+    points_error: str | None = None
 
     st.subheader("1. Upload location data")
     st.write(
@@ -514,7 +890,12 @@ def render_app() -> None:
         "in Darwin Core format: occurrenceID (a unique identifier for the occurrence or location), decimalLatitude, and decimalLongitude."
         " Optionally, eventDate can be included to obtain date-specific information if available."
     )
-    uploaded_csv = st.file_uploader("Location CSV", type=["csv"], accept_multiple_files=False)
+    uploaded_csv = st.file_uploader(
+        "Location CSV",
+        type=["csv"],
+        accept_multiple_files=False,
+        key="location_csv",
+    )
     if uploaded_csv is not None:
         try:
             points_df = _read_uploaded_csv(uploaded_csv)
@@ -526,7 +907,8 @@ def render_app() -> None:
                 )
                 st.dataframe(points_df.head(20), width="stretch")
         except Exception as exc:
-            st.error(str(exc))
+            points_error = str(exc)
+            st.error(points_error)
             points_df = None
 
     crs_cols = st.columns([0.34, 0.66])
@@ -534,14 +916,16 @@ def render_app() -> None:
         "Coordinate reference system of uploaded data", ["EPSG:4326", "Other EPSG"]
     )
     if crs_mode == "Other EPSG":
-        input_crs = crs_cols[1].text_input("EPSG code", placeholder="e.g. EPSG:3006")
+        input_crs = crs_cols[1].text_input(
+            "EPSG code", placeholder="e.g. EPSG:3006", key="custom_epsg"
+        )
     else:
         input_crs = "EPSG:4326"
-    try:
-        normalized_crs = normalize_crs(input_crs) if input_crs else ""
-    except ValueError as exc:
-        normalized_crs = input_crs
-        st.error(str(exc))
+    if input_crs:
+        try:
+            normalize_crs(input_crs)
+        except ValueError as exc:
+            st.error(str(exc))
 
     st.subheader("2. Add Earth Engine credentials")
     st.markdown(
@@ -557,6 +941,7 @@ def render_app() -> None:
         "Earth Engine service account JSON",
         type=["json"],
         accept_multiple_files=False,
+        key="credentials_json",
     )
     credentials_bytes = credentials_file.getvalue() if credentials_file is not None else None
 
@@ -567,6 +952,7 @@ def render_app() -> None:
         index=None,
         placeholder="Choose between tabular or raster output",
         format_func=str.title,
+        key="output_type",
     )
     if "output_dir" not in st.session_state:
         st.session_state.output_dir = str(Path("~/envoi_outputs").expanduser())
@@ -587,11 +973,7 @@ def render_app() -> None:
     st.subheader("4. Select data products")
     window_guidance = ""
     if output_type == TABULAR_OUTPUT:
-        window_guidance = (
-            "The window size(s) determines the extent over which spatial statistics "
-            "are calculated. Note that available spatial statistics differ between "
-            "continuous and categorical data products."
-        )
+        window_guidance = "Coordinate point values as well as spatial statistics over sampling window(s) can be extracted. "
     elif output_type == RASTER_OUTPUT:
         window_guidance = (
             "The window size(s) determines the size of the extracted raster tiles. Note that raster "
@@ -601,7 +983,7 @@ def render_app() -> None:
     st.markdown(
         f"""
         Add one entry per Earth Engine data product that should be downloaded. If a data product contains multiple bands, all of them will be processed and downloaded. For information about available data products, see the
-        <a href="https://github.com/BiodiversityDataLab/envoi/blob/webapp/src/envoi/configs/ee_catalog.yml" target="_blank">envoi catalog</a>. {window_guidance}
+        <a href="{DATASET_CATALOG_URL}" target="_blank">envoi catalog</a>. {window_guidance}
         """,
         unsafe_allow_html=True,
     )
@@ -617,23 +999,26 @@ def render_app() -> None:
     )
     run_button = st.button("Extract selected data", type="primary")
     if run_button:
-        if points_df is None:
-            st.error("Upload a valid location CSV before running extraction.")
-        elif credentials_bytes is None:
-            st.error("Upload an Earth Engine service-account JSON before running extraction.")
-        elif not normalized_crs:
-            st.error(
-                "Enter the EPSG code for the uploaded location data before running extraction."
-            )
-        elif output_type is None:
-            st.error("Choose between tabular or raster output before running extraction.")
+        validation = _validate_form(
+            points_df=points_df,
+            points_error=points_error,
+            input_crs=input_crs,
+            credentials_bytes=credentials_bytes,
+            output_type=output_type,
+            output_dir=output_dir,
+            dataset_rows=list(st.session_state.get("dataset_rows", [])),
+            catalog=catalog,
+            widget_version=int(st.session_state.get("_dataset_widget_version", 0)),
+        )
+        if validation.issues:
+            _render_validation_issues(st, validation.issues)
         else:
             progress_bar = st.progress(0, text="Starting extraction")
             status = st.empty()
             completed_by_segment: dict[tuple[str, str, int, str], int] = {}
 
             try:
-                selections = _dataset_selections(output_type)
+                selections = list(validation.selections)
                 config = build_run_config(selections, output_type)
                 expected_segments = _progress_segments(config, len(points_df))
 
@@ -650,7 +1035,8 @@ def render_app() -> None:
                     progress_bar.progress(
                         fraction,
                         text=(
-                            f"{event.dataset} | {event.window_size_m} m | "
+                            f"{event.dataset} | "
+                            f"{'point' if event.window_size_m == 0 else f'{event.window_size_m} m'} | "
                             f"{event.completed}/{event.total} {event.unit}"
                         ),
                     )
@@ -661,7 +1047,7 @@ def render_app() -> None:
                     selections,
                     output_type,
                     output_dir,
-                    normalized_crs,
+                    validation.normalized_crs,
                     credentials_bytes,
                     progress_callback=handle_progress,
                 )
@@ -694,6 +1080,8 @@ def main() -> None:
         "true",
         "--browser.gatherUsageStats",
         "false",
+        "--theme.primaryColor",
+        THEME_PRIMARY_COLOR,
         str(app_path),
     ]
     raise SystemExit(stcli.main())

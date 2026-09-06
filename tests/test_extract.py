@@ -266,7 +266,7 @@ class TestTabular:
                 "settings": {
                     "output_type": "tabular",
                     "statistics": ["point"],
-                    "window_size_m": 100,
+                    "window_size_m": 0,
                 },
             },
             output_dir=tmp_path,
@@ -972,6 +972,22 @@ class TestErrors:
                     "batch_id": "fail",
                     "datasets": ["dem_local"],
                     "settings": {"output_type": "tabular", "window_size_m": 100},
+                },
+                output_dir=tmp_path,
+            )
+
+    def test_zero_window_is_rejected_for_window_statistics(self, sample_df, tmp_path):
+        with pytest.raises(ValueError, match="zero is allowed only for point-only"):
+            extract(
+                sample_df,
+                {
+                    "batch_id": "fail",
+                    "datasets": ["dem_local"],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["mean"],
+                        "window_size_m": 0,
+                    },
                 },
                 output_dir=tmp_path,
             )
