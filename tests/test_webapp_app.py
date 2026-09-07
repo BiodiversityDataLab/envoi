@@ -6,13 +6,19 @@ import pytest
 
 from envoi_webapp import app
 from envoi_webapp.app import (
+    ALL_DATASET_TYPES,
     DATASET_CATALOG_URL,
     _apply_pending_dataset_remove,
     _choose_output_directory,
     _dataset_display_name,
+    _dataset_names_for_type,
+    _dataset_option_label,
+    _dataset_type,
     _escape_applescript_string,
     _escape_powershell_string,
+    _ordered_dataset_types,
     _render_validation_issues,
+    _type_option_label,
     _validate_dataset_rows,
     _validate_form,
 )
@@ -52,6 +58,7 @@ def _has_dataset_widget_keys(session_state) -> bool:
         key.startswith(
             (
                 "dataset_select_",
+                "dataset_type_select_",
                 "point_checkbox_",
                 "window_checkbox_",
                 "windows_input_",
@@ -92,6 +99,57 @@ def test_dataset_display_name_uses_catalog_label_and_falls_back_to_key():
     assert _dataset_display_name("dem_copernicus_glo30", catalog) == "Copernicus DEM GLO-30"
     assert _dataset_display_name("custom_raster", catalog) == "custom_raster"
     assert _dataset_display_name("blank_label", catalog) == "blank_label"
+
+
+def test_dataset_types_follow_documented_order_with_custom_and_missing_last():
+    catalog = {
+        "roads": {"category": "Human impact"},
+        "custom": {"category": "A custom type"},
+        "dem": {"category": "Terrain"},
+        "uncategorised": {},
+        "era5": {"category": "Climate"},
+    }
+
+    assert _ordered_dataset_types(catalog) == [
+        "Terrain",
+        "Climate",
+        "Human impact",
+        "A custom type",
+        "Uncategorised",
+    ]
+    assert _dataset_type("uncategorised", catalog) == "Uncategorised"
+
+
+def test_dataset_names_are_grouped_by_type_then_sorted_by_display_name():
+    catalog = {
+        "climate_z": {"display_name": "Zulu", "category": "Climate"},
+        "terrain_b": {"display_name": "Beta", "category": "Terrain"},
+        "terrain_a": {"display_name": "Alpha", "category": "Terrain"},
+        "climate_a": {"display_name": "Alpha", "category": "Climate"},
+    }
+
+    assert _dataset_names_for_type(catalog, ALL_DATASET_TYPES) == [
+        "terrain_a",
+        "terrain_b",
+        "climate_a",
+        "climate_z",
+    ]
+    assert _dataset_names_for_type(catalog, "Climate") == [
+        "climate_a",
+        "climate_z",
+    ]
+
+
+def test_type_and_dataset_options_use_counts_and_contextual_labels():
+    catalog = {
+        "era5": {"display_name": "ERA5 Monthly", "category": "Climate"},
+        "worldclim": {"display_name": "WorldClim BIO", "category": "Climate"},
+    }
+
+    assert _type_option_label(ALL_DATASET_TYPES, catalog) == "All types (2)"
+    assert _type_option_label("Climate", catalog) == "Climate (2)"
+    assert _dataset_option_label("era5", catalog, include_type=True) == ("Climate · ERA5 Monthly")
+    assert _dataset_option_label("era5", catalog, include_type=False) == "ERA5 Monthly"
 
 
 def test_validate_form_collects_errors_in_step_and_field_order():
@@ -280,6 +338,7 @@ def test_apply_pending_dataset_remove_removes_only_requested_row_and_clears_widg
             "_pending_dataset_remove": 1,
             "_dataset_widget_version": 4,
             "dataset_select_4_0": "dem",
+            "dataset_type_select_4_0": ALL_DATASET_TYPES,
             "dataset_select_4_1": "agb",
             "dataset_select_4_2": "lulc",
             "windows_input_4_1": "200",
