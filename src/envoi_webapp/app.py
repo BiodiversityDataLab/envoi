@@ -15,6 +15,8 @@ if __package__ in {None, ""}:
 import pandas as pd
 
 from envoi import list_datasets, list_reducers
+from envoi.catalog_docs import CATEGORY_ORDER as DATASET_TYPE_ORDER
+from envoi.catalog_docs import UNCATEGORISED_LABEL
 from envoi.progress import ProgressEvent
 
 try:
@@ -64,6 +66,7 @@ STAT_TAG_TEXT = "#17302b"
 THEME_PRIMARY_COLOR = STAT_TAG_BACKGROUND
 DATASET_CATALOG_URL = "https://github.com/BiodiversityDataLab/envoi/blob/main/docs/datasets.md"
 VALIDATION_ERROR_COLOR = "#d32f2f"
+ALL_DATASET_TYPES = "__all_dataset_types__"
 
 
 @dataclass(frozen=True)
@@ -246,6 +249,74 @@ def _dataset_display_name(dataset_name: str, catalog: dict[str, dict[str, Any]])
     if isinstance(display_name, str) and display_name.strip():
         return display_name.strip()
     return dataset_name
+
+
+def _dataset_type(dataset_name: str, catalog: dict[str, dict[str, Any]]) -> str:
+    """Return a dataset's type with a safe label for missing catalog metadata."""
+
+    category = catalog.get(dataset_name, {}).get("category")
+    if isinstance(category, str) and category.strip():
+        return category.strip()
+    return UNCATEGORISED_LABEL
+
+
+def _ordered_dataset_types(catalog: dict[str, dict[str, Any]]) -> list[str]:
+    """Return present dataset types in the order used by the dataset docs."""
+
+    present = {_dataset_type(name, catalog) for name in catalog}
+    ordered = [dataset_type for dataset_type in DATASET_TYPE_ORDER if dataset_type in present]
+    ordered.extend(
+        sorted(
+            present.difference(DATASET_TYPE_ORDER, {UNCATEGORISED_LABEL}),
+            key=str.casefold,
+        )
+    )
+    if UNCATEGORISED_LABEL in present:
+        ordered.append(UNCATEGORISED_LABEL)
+    return ordered
+
+
+def _dataset_names_for_type(catalog: dict[str, dict[str, Any]], dataset_type: str) -> list[str]:
+    """Return display-name-sorted dataset keys for one type or the full catalog."""
+
+    dataset_types = _ordered_dataset_types(catalog)
+    type_order = {name: index for index, name in enumerate(dataset_types)}
+    names = [
+        name
+        for name in catalog
+        if dataset_type == ALL_DATASET_TYPES or _dataset_type(name, catalog) == dataset_type
+    ]
+    return sorted(
+        names,
+        key=lambda name: (
+            type_order[_dataset_type(name, catalog)] if dataset_type == ALL_DATASET_TYPES else 0,
+            _dataset_display_name(name, catalog).casefold(),
+            name.casefold(),
+        ),
+    )
+
+
+def _type_option_label(dataset_type: str, catalog: dict[str, dict[str, Any]]) -> str:
+    """Format a type filter option with its live dataset count."""
+
+    if dataset_type == ALL_DATASET_TYPES:
+        return f"All types ({len(catalog)})"
+    count = sum(_dataset_type(name, catalog) == dataset_type for name in catalog)
+    return f"{dataset_type} ({count})"
+
+
+def _dataset_option_label(
+    dataset_name: str,
+    catalog: dict[str, dict[str, Any]],
+    *,
+    include_type: bool,
+) -> str:
+    """Format a product option, including its type when viewing all products."""
+
+    display_name = _dataset_display_name(dataset_name, catalog)
+    if include_type:
+        return f"{_dataset_type(dataset_name, catalog)} · {display_name}"
+    return display_name
 
 
 def _dataset_label(dataset_name: str, index: int, catalog: dict[str, dict[str, Any]]) -> str:
@@ -453,6 +524,7 @@ def _clear_dataset_widget_state(st) -> None:
         key_text = str(key)
         if key_text.startswith(
             (
+                "dataset_type_select_",
                 "dataset_select_",
                 "point_checkbox_",
                 "window_checkbox_",
@@ -485,46 +557,55 @@ def _apply_pending_dataset_remove(st) -> None:
 
 
 def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: str) -> None:
-    dataset_names = sorted(
-        catalog,
-        key=lambda name: (_dataset_display_name(name, catalog).casefold(), name.casefold()),
-    )
     reducers = list_reducers()
-    if not dataset_names:
+    if not catalog:
         st.error("No data products are available in the envoi catalog.")
         return
 
     _ensure_dataset_state()
     _apply_pending_dataset_remove(st)
     widget_version = int(st.session_state.get("_dataset_widget_version", 0))
+    type_options = [ALL_DATASET_TYPES, *_ordered_dataset_types(catalog)]
 
     for index, row in enumerate(st.session_state.dataset_rows):
         with st.expander(f"Data product {index + 1}", expanded=True):
             row_widget_key = f"{widget_version}_{index}"
             if output_type == TABULAR_OUTPUT:
-                top_cols = st.columns([0.78, 0.11, 0.11], vertical_alignment="bottom")
+                top_cols = st.columns([0.29, 0.49, 0.11, 0.11], vertical_alignment="bottom")
             else:
-                top_cols = st.columns([0.65, 0.35], vertical_alignment="bottom")
+                top_cols = st.columns([0.29, 0.36, 0.35], vertical_alignment="bottom")
+            selected_type = top_cols[0].selectbox(
+                "Type",
+                type_options,
+                index=0,
+                key=f"dataset_type_select_{row_widget_key}",
+                format_func=lambda dataset_type: _type_option_label(dataset_type, catalog),
+            )
+            dataset_names = _dataset_names_for_type(catalog, selected_type)
             current_dataset = row.get("dataset") if row.get("dataset") in dataset_names else None
-            selected_dataset = top_cols[0].selectbox(
+            selected_dataset = top_cols[1].selectbox(
                 "Data product",
                 dataset_names,
                 index=dataset_names.index(current_dataset) if current_dataset else None,
                 placeholder="Choose a data product",
                 key=f"dataset_select_{row_widget_key}",
-                format_func=lambda name: _dataset_display_name(name, catalog),
+                format_func=lambda name: _dataset_option_label(
+                    name,
+                    catalog,
+                    include_type=selected_type == ALL_DATASET_TYPES,
+                ),
             )
             windows = str(row.get("window_sizes", ""))
             st.session_state.dataset_rows[index]["dataset"] = selected_dataset or ""
 
             if output_type == TABULAR_OUTPUT:
-                sample_point = top_cols[1].checkbox(
+                sample_point = top_cols[2].checkbox(
                     "Point",
                     value=bool(row.get("sample_point", False)),
                     key=f"point_checkbox_{row_widget_key}",
                     help="Sample the raster pixel value at each coordinate.",
                 )
-                sample_window = top_cols[2].checkbox(
+                sample_window = top_cols[3].checkbox(
                     "Window",
                     value=bool(row.get("sample_window", False)),
                     key=f"window_checkbox_{row_widget_key}",
@@ -574,13 +655,13 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
                     )
                     st.session_state.dataset_rows[index]["window_sizes"] = windows
                     if selected_dataset:
-                        st.session_state.dataset_rows[index]["statistics_dataset"] = (
-                            selected_dataset
-                        )
+                        st.session_state.dataset_rows[index][
+                            "statistics_dataset"
+                        ] = selected_dataset
                     else:
                         st.session_state.dataset_rows[index].pop("statistics_dataset", None)
             else:
-                windows = top_cols[1].text_input(
+                windows = top_cols[2].text_input(
                     "Window size(s) in meters",
                     value=row.get("window_sizes", ""),
                     placeholder="e.g. 500, 1000",
@@ -591,7 +672,8 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
                 st.session_state.dataset_rows[index].pop("statistics_dataset", None)
 
             remove_disabled = not (
-                selected_dataset
+                selected_type != ALL_DATASET_TYPES
+                or selected_dataset
                 or st.session_state.dataset_rows[index].get("sample_point")
                 or st.session_state.dataset_rows[index].get("sample_window")
                 or windows.strip()
