@@ -279,6 +279,42 @@ def test_choose_output_directory_supports_windows(monkeypatch, tmp_path):
 
     assert _choose_output_directory(str(tmp_path)) == "C:\\output"
     assert calls[0][0] == "C:\\Windows\\powershell.exe"
+    assert "FileOpenDialog" in calls[0][-1]
+    assert "PickFolders" in calls[0][-1]
+
+
+def test_choose_output_directory_supports_wsl(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(app.sys, "platform", "linux")
+    monkeypatch.setattr(app, "_is_wsl", lambda: True)
+
+    executables = {
+        "powershell.exe": "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        "wslpath": "/usr/bin/wslpath",
+    }
+    monkeypatch.setattr(app.shutil, "which", executables.get)
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["/usr/bin/wslpath", "-w"]:
+            return CompletedProcess(
+                command,
+                0,
+                stdout="\\\\wsl.localhost\\Ubuntu\\home\\user\\output\n",
+                stderr="",
+            )
+        if command[0].endswith("powershell.exe"):
+            return CompletedProcess(command, 0, stdout="C:\\Users\\user\\output\n", stderr="")
+        if command[:2] == ["/usr/bin/wslpath", "-u"]:
+            return CompletedProcess(command, 0, stdout="/mnt/c/Users/user/output\n", stderr="")
+        raise AssertionError(f"Unexpected command: {command}")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+
+    assert _choose_output_directory(str(tmp_path)) == "/mnt/c/Users/user/output"
+    assert calls[0][:2] == ["/usr/bin/wslpath", "-w"]
+    assert calls[1][0].endswith("powershell.exe")
+    assert calls[2][:2] == ["/usr/bin/wslpath", "-u"]
 
 
 def test_choose_output_directory_uses_available_linux_chooser(monkeypatch, tmp_path):

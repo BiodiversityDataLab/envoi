@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -376,6 +377,181 @@ def _read_uploaded_csv(uploaded_file) -> pd.DataFrame | None:
     return read_points_csv(uploaded_file)
 
 
+def _is_wsl() -> bool:
+    """Return whether the web app is running under Windows Subsystem for Linux."""
+
+    return bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"))
+
+
+def _windows_folder_picker_script(initial_path: str) -> str:
+    """Build a PowerShell script using Windows' modern folder picker."""
+
+    escaped_initial_path = _escape_powershell_string(initial_path)
+    return rf"""
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace EnvoiWebApp {{
+    [Flags]
+    internal enum FileOpenOptions : uint {{
+        PickFolders = 0x00000020,
+        ForceFileSystem = 0x00000040,
+        PathMustExist = 0x00000800
+    }}
+
+    internal enum DisplayName : uint {{
+        FileSystemPath = 0x80058000
+    }}
+
+    [ComImport]
+    [Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
+    internal class FileOpenDialog {{}}
+
+    [ComImport]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    [Guid("42F85136-DB7E-439C-85F1-E4075D135FC8")]
+    internal interface IFileOpenDialog {{
+        [PreserveSig] int Show(IntPtr parent);
+        void SetFileTypes(uint count, IntPtr filterSpec);
+        void SetFileTypeIndex(uint index);
+        void GetFileTypeIndex(out uint index);
+        void Advise(IntPtr events, out uint cookie);
+        void Unadvise(uint cookie);
+        void SetOptions(FileOpenOptions options);
+        void GetOptions(out FileOpenOptions options);
+        void SetDefaultFolder(IShellItem item);
+        void SetFolder(IShellItem item);
+        void GetFolder(out IShellItem item);
+        void GetCurrentSelection(out IShellItem item);
+        void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string name);
+        void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string name);
+        void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string title);
+        void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+        void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string label);
+        void GetResult(out IShellItem item);
+        void AddPlace(IShellItem item, int alignment);
+        void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string extension);
+        void Close(int result);
+        void SetClientGuid(ref Guid guid);
+        void ClearClientData();
+        void SetFilter(IntPtr filter);
+    }}
+
+    [ComImport]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    [Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE")]
+    internal interface IShellItem {{
+        void BindToHandler(IntPtr bindContext, ref Guid handler, ref Guid iid, out IntPtr result);
+        void GetParent(out IShellItem parent);
+        void GetDisplayName(DisplayName displayName, out IntPtr name);
+        void GetAttributes(uint mask, out uint attributes);
+        void Compare(IShellItem other, uint hint, out int order);
+    }}
+
+    public static class FolderPicker {{
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+        private static extern void SHCreateItemFromParsingName(
+            string path,
+            IntPtr bindContext,
+            ref Guid iid,
+            [MarshalAs(UnmanagedType.Interface)] out IShellItem item
+        );
+
+        public static string Pick(string initialPath) {{
+            IFileOpenDialog dialog = (IFileOpenDialog)new FileOpenDialog();
+            IShellItem initialFolder = null;
+            IShellItem selectedFolder = null;
+            IntPtr selectedPath = IntPtr.Zero;
+            try {{
+                FileOpenOptions options;
+                dialog.GetOptions(out options);
+                dialog.SetOptions(
+                    options
+                    | FileOpenOptions.PickFolders
+                    | FileOpenOptions.ForceFileSystem
+                    | FileOpenOptions.PathMustExist
+                );
+                dialog.SetTitle("Select envoi output directory");
+
+                if (!String.IsNullOrWhiteSpace(initialPath)) {{
+                    try {{
+                        Guid shellItemId = typeof(IShellItem).GUID;
+                        SHCreateItemFromParsingName(
+                            initialPath, IntPtr.Zero, ref shellItemId, out initialFolder
+                        );
+                        dialog.SetFolder(initialFolder);
+                    }} catch {{
+                        // The picker can still open at its default location.
+                    }}
+                }}
+
+                int result = dialog.Show(IntPtr.Zero);
+                if (result == unchecked((int)0x800704C7)) {{
+                    return null;
+                }}
+                if (result != 0) {{
+                    Marshal.ThrowExceptionForHR(result);
+                }}
+
+                dialog.GetResult(out selectedFolder);
+                selectedFolder.GetDisplayName(DisplayName.FileSystemPath, out selectedPath);
+                return Marshal.PtrToStringUni(selectedPath);
+            }} finally {{
+                if (selectedPath != IntPtr.Zero) Marshal.FreeCoTaskMem(selectedPath);
+                if (selectedFolder != null) Marshal.FinalReleaseComObject(selectedFolder);
+                if (initialFolder != null) Marshal.FinalReleaseComObject(initialFolder);
+                Marshal.FinalReleaseComObject(dialog);
+            }}
+        }}
+    }}
+}}
+'@
+
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$selected = [EnvoiWebApp.FolderPicker]::Pick('{escaped_initial_path}')
+if ($null -ne $selected) {{ Write-Output $selected }}
+""".strip()
+
+
+def _choose_windows_output_directory(powershell: str, initial_path: str) -> str | None:
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-STA",
+            "-Command",
+            _windows_folder_picker_script(initial_path),
+        ],
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+        errors="replace",
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Windows folder chooser failed.")
+    return result.stdout.strip() or None
+
+
+def _convert_wsl_path(path: str, direction: str) -> str:
+    """Convert between WSL and Windows paths with the system's wslpath tool."""
+
+    wslpath = shutil.which("wslpath")
+    if wslpath is None:
+        raise RuntimeError("The WSL path conversion tool (wslpath) is unavailable.")
+    result = subprocess.run(
+        [wslpath, direction, path],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"Could not convert WSL path: {path}")
+    return result.stdout.strip()
+
+
 def _choose_output_directory(initial_dir: str) -> str | None:
     """Open a native directory chooser on the machine running the local app.
 
@@ -414,24 +590,26 @@ def _choose_output_directory(initial_dir: str) -> str | None:
             shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
         )
         if powershell:
-            script = (
-                "Add-Type -AssemblyName System.Windows.Forms; "
-                "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
-                f"$dialog.SelectedPath = '{_escape_powershell_string(str(initial_path))}'; "
-                "$dialog.Description = 'Select envoi output directory'; "
-                "if ($dialog.ShowDialog() -eq 'OK') { Write-Output $dialog.SelectedPath }"
-            )
-            result = subprocess.run(
-                [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
-                capture_output=True,
-                check=False,
-                text=True,
-            )
-            if result.returncode == 0:
-                return result.stdout.strip() or None
-            errors.append(result.stderr.strip() or "Windows folder chooser failed.")
+            try:
+                return _choose_windows_output_directory(powershell, str(initial_path))
+            except RuntimeError as exc:
+                errors.append(str(exc))
 
     elif sys.platform.startswith("linux"):
+        if _is_wsl():
+            powershell = shutil.which("powershell.exe")
+            if powershell:
+                try:
+                    windows_initial_path = _convert_wsl_path(str(initial_path), "-w")
+                    selected_path = _choose_windows_output_directory(
+                        powershell, windows_initial_path
+                    )
+                    if selected_path is None:
+                        return None
+                    return _convert_wsl_path(selected_path, "-u")
+                except RuntimeError as exc:
+                    errors.append(str(exc))
+
         linux_choosers = (
             (
                 "zenity",
