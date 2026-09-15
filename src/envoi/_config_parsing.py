@@ -81,7 +81,9 @@ class RunSettings:
     datasets: list[tuple[str, dict[str, Any]]]
     output_type: str  # "tabular" or "raster"
     output_file_format: str  # "csv", "parquet", or "dataframe"
-    window_sizes: list[int]  # one or more square-sampling-window sizes in metres
+    # One or more square-sampling-window sizes in metres. Zero is reserved for
+    # point-only tabular runs, where no sampling window is constructed.
+    window_sizes: list[int]
     min_coverage: float  # 0–100 — threshold for low-coverage QC flag
     # Normalized stats dict: {"continuous": [...], "categorical": [...]}.
     # A flat list from the user is normalized to identical lists on both keys.
@@ -355,7 +357,8 @@ def _parse_run_config(
     else:
         stats, user_stats = {}, None
 
-    # window_size_m can be either a single positive integer or a list of them.
+    # window_size_m can be either one size or a list. Sizes are positive except
+    # for the explicit zero sentinel used by point-only tabular sampling.
     # When the user supplies a list, statistics (or tiles) are produced for
     # each window size and the column / filename suffix disambiguates them.
     user_window_size = settings.get("window_size_m", defaults["window_size_m"])
@@ -365,16 +368,28 @@ def _parse_run_config(
             raise ValueError(f"Output '{batch_id}': window_size_m list must not be empty.")
     else:
         window_sizes = [user_window_size]
+    point_only = (
+        output_type == "tabular"
+        and bool(stats)
+        and all(
+            reducers and all(reducer == "point" for reducer in reducers)
+            for reducers in stats.values()
+        )
+    )
     for window_size in window_sizes:
         # Reject non-integers explicitly. window_size feeds f-string column
         # names like "{dataset}_mean_{window_size_m}m", and a float would
         # silently yield columns like "dem_mean_200.0m" — breaking schema
         # expectations downstream. ``bool`` is a subclass of ``int`` in
         # Python, so we filter it out first to avoid accepting True/False.
-        if isinstance(window_size, bool) or not isinstance(window_size, int) or window_size <= 0:
+        invalid_type_or_sign = (
+            isinstance(window_size, bool) or not isinstance(window_size, int) or window_size < 0
+        )
+        if invalid_type_or_sign or (window_size == 0 and not point_only):
             raise ValueError(
                 f"Output '{batch_id}': invalid window_size_m: {window_size!r}. "
-                f"Must be a positive integer (or a list of positive integers)."
+                "Must be a positive integer (or a list of positive integers); "
+                "zero is allowed only for point-only tabular sampling."
             )
 
     return RunSettings(
