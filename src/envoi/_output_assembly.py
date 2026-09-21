@@ -27,9 +27,11 @@ import pandas as pd
 
 # Matches the per-class stat keys produced by the categorical reducers, in
 # either single-band form ("class_10_count") or multi-band form
-# ("b2_class_10_fraction"). Used to zero-fill rows that didn't see a class
-# observed by some other row in the same batch.
-_CLASS_COLUMN_RE = re.compile(r"^(?:b\d+_)?class_-?\d+_(count|fraction)$")
+# ("b2_class_10_fraction" or, for datasets with real band names rather than
+# generic "bN" indices, "classification_class_10_fraction"). Used to
+# zero-fill rows that didn't see a class observed by some other row in the
+# same batch.
+_CLASS_COLUMN_RE = re.compile(r"^(?:\w+_)?class_-?\d+_(count|fraction)$")
 
 
 def _round_stat_columns(
