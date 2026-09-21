@@ -145,6 +145,28 @@ def test_build_run_config_tabular():
     ]
 
 
+def test_build_run_config_point_only_uses_zero_window_sentinel():
+    rows = [DatasetSelection("dem_copernicus_glo30", (0,), ("point",))]
+
+    config = build_run_config(rows, TABULAR_OUTPUT)
+
+    assert config[0]["settings"] == {
+        "output_type": "tabular",
+        "window_size_m": 0,
+        "statistics": ["point"],
+        "output_file_format": "csv",
+    }
+
+
+def test_build_run_config_combines_point_and_window_statistics():
+    rows = [DatasetSelection("dem_copernicus_glo30", (200,), ("mean", "point"))]
+
+    config = build_run_config(rows, TABULAR_OUTPUT)
+
+    assert config[0]["settings"]["window_size_m"] == 200
+    assert config[0]["settings"]["statistics"] == ["mean", "point"]
+
+
 def test_build_run_config_raster_uses_10m_resampling_and_no_statistics():
     rows = [DatasetSelection("dem_copernicus_glo30", (200,), ("mean",))]
 
