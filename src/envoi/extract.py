@@ -420,11 +420,15 @@ def extract(
             # columns with the reprojected values. The original coordinates were
             # stashed in df_copy by _validate_and_reproject_crs.
             if "lat_original" in df_copy.columns:
+                insert_at = len(core_columns)
                 for output_frame in (stats_df, qc_df):
-                    output_frame[f"{latitude_column}_wgs84"] = output_frame["lat"]
-                    output_frame[f"{longitude_column}_wgs84"] = output_frame["lon"]
+                    lat_wgs84 = output_frame["lat"]
+                    lon_wgs84 = output_frame["lon"]
                     output_frame["lat"] = df_copy.loc[output_frame.index, "lat_original"]
                     output_frame["lon"] = df_copy.loc[output_frame.index, "lon_original"]
+                    output_frame.insert(insert_at, f"{latitude_column}_wgs84", lat_wgs84)
+                    output_frame.insert(insert_at + 1, f"{longitude_column}_wgs84", lon_wgs84)
+                stats_df = stats_df.drop(columns=["lat_original", "lon_original"])
 
             stats_df, qc_df = _restore_user_column_names(stats_df, qc_df, column_name_map)
 
