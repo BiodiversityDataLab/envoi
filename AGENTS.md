@@ -52,6 +52,7 @@ pre-commit run --files <changed paths>
 ```
 
 Use these exact command forms. Other forms, such as `python3 -m pytest` or `PYTHONPATH=src pytest`, can cause extra permission prompts.
+In Claude Code, `.claude/settings.json` allows `pytest -m "not gee"`, `ruff check src tests`, `black --check src tests`, and `pre-commit run --files ...` without a prompt.
 
 Live GEE tests require network access and service-account credentials.
 Use `credentials/ee_credentials.json` or the `ENVOI_EE_CREDENTIALS` environment variable as documented in `README.md`.
@@ -208,6 +209,8 @@ Check for them when adding or changing a GEE catalog entry or `dataset_spec`.
 - Keep credentials, secrets, large datasets, and runtime outputs outside version control.
 - Do not read, print, or copy the contents of `credentials/` or the file named by `ENVOI_EE_CREDENTIALS`.
   To debug authentication, check only whether the file exists, and call `envoi.auth.init_gee()`.
+  In Claude Code, `.claude/settings.json` also denies reads of `credentials/`, `.env`, and the default user credential folders.
+  This protection works only in sessions started in the repository root. The rule above applies to all agents in every case.
 - Do not change `src/envoi/_version.py`, `CITATION.cff`, or published release sections in `CHANGELOG.md` unless the user asks.
   Turning `[Unreleased]` into a release section is part of the release, not routine work.
   Releases follow the checklist in `CONTRIBUTING.md`.
