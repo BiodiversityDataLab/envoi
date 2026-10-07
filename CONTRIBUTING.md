@@ -63,6 +63,21 @@ See [docs/coding_guidelines.md](docs/coding_guidelines.md) for the full code, do
 
 ---
 
+## AI coding agents
+
+The repository includes shared instructions and configuration for AI coding agents (Claude Code and Codex). You don't need them to contribute, but if you use an agent:
+
+- **Instructions** — [AGENTS.md](AGENTS.md) holds the rules every agent follows. Claude Code reads it through [CLAUDE.md](CLAUDE.md). Larger tasks follow [.agents/WORKFLOW.md](.agents/WORKFLOW.md).
+- **Specialist roles** — the role instructions live in `.codex/agents/*.toml`. Codex uses them directly. Claude Code uses the short wrappers in `.claude/agents/`, which read the same files. Change a role's instructions only in its `.toml` file.
+- **Skills** — shared skills live in `.agents/skills/`. Claude Code finds them through the link in `.claude/skills/`. On Windows without symlink support, that link is checked out as a plain file, and Claude Code then finds the `asd-ste100` skill only through its path in `AGENTS.md`.
+- **Models** — the Codex role files pin model names, and the Claude Code wrappers use model aliases (`opus`, `sonnet`). Update both by hand when a model is replaced.
+- **Permissions** — [.claude/settings.json](.claude/settings.json) lets Claude Code run the routine checks without asking, and blocks it from reading `credentials/`. The block works only when you start Claude Code in the repository root. Put personal permissions in `.claude/settings.local.json`, which Git ignores.
+- **Before you start an agent**, activate the development environment (see [Development setup](#development-setup)), so the agent can run `pytest` and `ruff` directly.
+- **Codex** loads `.codex/` only for trusted projects. A role file cannot make a role read-only, so start read-only reviews with `codex --sandbox read-only`.
+- **Local files** — `.agents/work/` (task plans and notes) and `.claude/worktrees/` (temporary agent worktrees) are ignored by Git.
+
+---
+
 ## Repository map
 
 - `src/envoi/` — package source (the orchestrator, adapters, catalog, reducers, QC, output assembly, metadata).
