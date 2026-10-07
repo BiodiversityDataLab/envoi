@@ -18,6 +18,33 @@ Typical triggers include:
 - multiple agents or parallel work
 - meaningful regression, compatibility, or operational risk
 
+## Roles and coordination
+
+The primary agent owns coordination, decisions, synthesis, and communication with the user.
+Delegate substantial specialist work to these roles:
+
+| Role | Work | Codex | Claude Code | Claude Code tools |
+|---|---|---|---|---|
+| `explorer` | repository investigation | `.codex/agents/explorer.toml` | `.claude/agents/explorer.md` | Read, Grep, Glob |
+| `researcher` | external research | `.codex/agents/researcher.toml` | `.claude/agents/researcher.md` | Read, Grep, Glob, WebSearch, WebFetch |
+| `plan_reviewer` | independent plan review | `.codex/agents/plan_reviewer.toml` | `.claude/agents/plan_reviewer.md` | Read, Grep, Glob |
+| `implementer` | code changes and associated tests | `.codex/agents/implementer.toml` | `.claude/agents/implementer.md` | all |
+| `code_reviewer` | independent implementation review | `.codex/agents/code_reviewer.toml` | `.claude/agents/code_reviewer.md` | Read, Grep, Glob |
+
+The `developer_instructions` in each `.codex/agents/*.toml` file are the only copy of the role's instructions.
+Each Claude Code role file tells the agent to read the matching `.toml` file.
+Change a role's instructions only in its `.toml` file.
+
+The Claude Code read-only roles cannot run commands.
+Give `code_reviewer` the complete diff and the check results, and give `plan_reviewer` the specification and the plan.
+The Claude Code `researcher` cannot write files. When a task needs a research file, the primary agent writes it from the researcher's answer.
+
+Codex ignores `sandbox_mode` in role files (since Codex v0.149). A Codex role gets the permissions of the session that starts it.
+For a read-only Codex role, start the session with `codex --sandbox read-only`, or select Read Only in `/permissions`, before you start the role.
+
+Use parallel work for independent tasks with clear ownership.
+If specialist agents are unavailable, perform feasible work sequentially and report any missing independent review.
+
 ## Durable task state
 
 For substantial work that benefits from resumability, create:
@@ -25,6 +52,7 @@ For substantial work that benefits from resumability, create:
 `.agents/work/<TASK-ID-or-short-slug>/`
 
 Use the templates under `.agents/templates/`.
+This folder is gitignored. Do not commit task artifacts unless the user asks.
 
 Keep task artifacts concise and current. Do not copy raw agent transcripts into
 them, and do not rely on chat history as the only record of material
@@ -42,7 +70,7 @@ task belong in `docs/decision_log.md`.
 ## Writing standard
 Write durable task artifacts in clear, direct technical English. 
 
-When creating or updating `spec.md` or `plan.md`, apply the `asd-ste100` skill. Preserve all technical precision, constraints, exceptions, and acceptance criteria.
+When creating or updating `spec.md` or `plan.md`, apply the `asd-ste100` skill (`.agents/skills/asd-ste100/SKILL.md`). Preserve all technical precision, constraints, exceptions, and acceptance criteria.
 
 Do not introduce new terminology when plain existing terms are sufficient. Define necessary project-specific terms when first used.
 
@@ -147,18 +175,23 @@ Each work assignment should provide:
 - objective
 - relevant spec/plan/task paths
 - constraints and scope
+- assigned file ownership and task dependencies
 - completion criteria
 - required checks
 
-Prefer isolated branches/worktrees for concurrent writers. Do not assign
-overlapping write ownership unless explicitly coordinated.
+Where implementers work:
+- One implementer at a time works in the normal checkout, on the current branch.
+- For parallel implementers, commit first. Then create one worktree per implementer from the current branch
+  with `git worktree add .claude/worktrees/<name> <branch>`, and give each implementer its folder.
+- Do not use the worktree isolation of the Claude Code Agent tool for implementers.
+  It starts from `origin/main`, so it does not contain the current branch or uncommitted work.
+- Do not assign overlapping write ownership. The primary agent merges the results and removes the worktrees.
 
 Implementers must:
 - inspect relevant repository instructions before editing
 - follow the root-level `AGENTS.md` for all work
 - follow `docs/coding_guidelines.md`
-- follow `docs/test_guidelines.md` and `src/tests/AGENTS.md` when modifying tests
-- follow applicable notebook-specific `AGENTS.md` when modifying notebooks
+- follow the "Tests" section of `docs/coding_guidelines.md` when modifying tests
 - add or update tests for changed behavior where appropriate
 - run the smallest relevant checks plus required pre-commit checks
 - report commands run, results, changed files, and unresolved risks
@@ -191,6 +224,9 @@ The reviewer should inspect enough surrounding code to assess the change in cont
 - repository conventions in `docs/coding_guidelines.md`
 - relevant security concerns
 
+Prioritize functional bugs, requirement violations, and regression risks before style concerns.
+Report findings in severity order with concrete locations, evidence, and suggested corrections.
+
 Route findings through the primary agent. Raise issues that require reconsidering or material decisions to the user.
 
 For immediate narrow corrections, resume the original implementer when
@@ -221,4 +257,5 @@ explicitly delegated.
 
 ## Decision log
 
-Always summarize and log important changes in `docs/decision_log.md`.
+Record lasting architectural, workflow, and scientific decisions in `docs/decision_log.md`.
+Create the file when a lasting decision needs recording and it does not exist.

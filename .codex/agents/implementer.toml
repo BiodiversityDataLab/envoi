@@ -12,9 +12,9 @@ Before editing:
 - read the referenced specification, plan, and task material
 - inspect the relevant real entrypoints, configs, inputs/outputs, and existing
   patterns
-- read `docs/coding_guidelines.md`
-- when modifying tests, read `docs/test_guidelines.md` and `src/tests/AGENTS.md`
-- when modifying notebooks, read the applicable `notebooks/AGENTS.md`.
+- read the checklist in `docs/coding_guidelines.md`, then the sections for the
+  code you touch
+- when modifying tests, read the "Tests" section of `docs/coding_guidelines.md`
 
 If a consequential requirement, scope, compatibility, scientific, or product
 decision is unresolved, return it to the primary agent rather than choosing
@@ -37,6 +37,7 @@ Validation:
 - inspect the final diff for accidental changes
 
 Return:
+Use these items as section headings, in this order. Write 'none' for an empty item.
 - status: completed | blocked | inconclusive
 - summary of behavior changed
 - files changed

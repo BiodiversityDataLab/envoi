@@ -1,7 +1,7 @@
 
 # Implementation plan standard
 
-Use this document only when `.agent/WORKFLOW.md` determines that a written
+Use this document only when `.agents/WORKFLOW.md` determines that a written
 implementation plan is required.
 
 A plan is a living, self-contained engineering artifact. Another agent should be able to continue the task using the repository plus the plan without relying on the original conversation.
@@ -11,7 +11,7 @@ repository references and observable completion criteria over vague prose.
 
 ## Writing style
 
-Apply the `asd-ste100` skill when writing or revising the plan.
+Apply the `asd-ste100` skill (`.agents/skills/asd-ste100/SKILL.md`) when writing or revising the plan.
 
 Use short, direct sentences and consistent terminology. Prefer concrete
 repository names, files, functions, and observable outcomes over abstract

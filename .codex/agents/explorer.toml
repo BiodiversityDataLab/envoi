@@ -28,6 +28,7 @@ Do not design or implement the entire solution unless explicitly asked. You may
 surface plausible options when they follow directly from the evidence.
 
 Return a concise handoff:
+Use these items as section headings, in this order. Write 'none' for an empty item.
 - conclusion
 - relevant code map
 - evidence

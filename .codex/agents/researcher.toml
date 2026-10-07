@@ -19,6 +19,7 @@ For time-sensitive claims, verify current versions and publication dates.
 Separate vendor claims from independent evidence.
 
 Return a concise, decision-oriented synthesis:
+Use these items as section headings, in this order. Write 'none' for an empty item.
 - answer or recommendation
 - relevant alternatives and tradeoffs
 - version-specific caveats
