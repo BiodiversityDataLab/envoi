@@ -68,6 +68,12 @@ Datasets that come from Google Earth Engine (most of the built-in catalog — `d
   init_gee(credentials_path="/path/to/my-project-1234-abcdef.json")
   ```
 
+- **Without a file:** if the key comes from a secret store or another program, pass its content with `credentials_json`. It accepts the JSON text (`str` or `bytes`) or a `dict`. envoi then does not look for a key file. Pass `credentials_path` or `credentials_json`, not both.
+
+  ```python
+  init_gee(credentials_json=key_text)
+  ```
+
 ---
 
 ## Quick start
