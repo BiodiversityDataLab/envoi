@@ -146,7 +146,7 @@ Built-in Earth Engine datasets live in [src/envoi/configs/ee_catalog.yml](src/en
 
 Two GitHub Actions workflows run automatically:
 
-- **`ci.yml`** runs on every push and pull request. It installs envoi with the `dev` extras across Python 3.10–3.13, runs `ruff check src tests` and `black --check src tests`, then `pytest -q`. The live `gee`-marked tests are skipped in CI (no service account is provisioned), so they should pass deterministically based on the non-GEE suite.
+- **`ci.yml`** runs on every push and pull request. It installs envoi with the `dev` and `webapp` extras across Python 3.10–3.13, runs `ruff check src tests` and `black --check src tests`, then `pytest -q`. The live `gee`-marked tests are skipped in CI (no service account is provisioned), so they should pass deterministically based on the non-GEE suite.
 
 If CI fails on your PR, the formatter/lint output is the first thing to check — running `pre-commit run --all-files` locally reproduces those steps.
 
