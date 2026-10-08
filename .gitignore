@@ -38,5 +38,9 @@ credentials/
 
 # Personal / scratch
 CLAUDE.local.md
-.claude/
+.claude/settings.local.json
+.claude/worktrees/
 examples/walkthrough_output/
+
+# Agent task artifacts (see AGENTS.md)
+.agents/work/

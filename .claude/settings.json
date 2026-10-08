@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest -m \"not gee\")",
+      "Bash(ruff check src tests)",
+      "Bash(black --check src tests)",
+      "Bash(pre-commit run --files *)",
+      "Bash(git status)",
+      "Bash(git diff)",
+      "Bash(git diff --stat)",
+      "Bash(git diff --cached)",
+      "Bash(git log --oneline)"
+    ],
+    "deny": [
+      "Read(./credentials/**)",
+      "Read(/credentials/**)",
+      "Read(./.env)",
+      "Read(/.env)",
+      "Read(~/.config/envoi/**)",
+      "Read(~/AppData/Roaming/envoi/**)"
+    ]
+  }
+}

@@ -18,10 +18,13 @@ Thanks for your interest in contributing! This guide covers how to set up a deve
 git clone https://github.com/BiodiversityDataLab/envoi.git
 cd envoi
 python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate (PowerShell: .venv\Scripts\Activate.ps1)
 pip install -e ".[dev]"
+pip install pre-commit
 pre-commit install                 # one-time, sets up git hooks
 ```
+
+To work on the web app, install its extra with `pip install -e ".[dev,webapp]"` and start it with `envoi-webapp`.
 
 This installs envoi in editable mode along with the development dependencies (`pytest`, `ruff`, `black`, `build`, `twine`). The `pre-commit install` step wires up the formatting and lint hooks defined in `.pre-commit-config.yaml` so they run automatically on each commit. To run them manually on specific files:
 
@@ -51,10 +54,27 @@ Live GEE tests are marked with `@pytest.mark.gee` and need network access plus c
 
 ## Code style
 
+See [docs/coding_guidelines.md](docs/coding_guidelines.md) for the full code, documentation, and test conventions. The main points:
+
 - **Formatting** — `black` with a 100-character line length. Run `black .` before committing.
 - **Linting** — `ruff` with the project config. Run `ruff check .` and fix or justify any new warnings.
 - **Comments** — write inline comments liberally. Explain *what* non-trivial blocks do, not only *why* — many users and contributors are not professional programmers, so err on the side of more comments rather than fewer.
 - **Variable names** — prefer full, descriptive names (`run_config`, `output_dir`, `coverage_values`) over short abbreviations. `df` for a pandas DataFrame is fine; `cfg`, `cov`, `col` are not.
+
+---
+
+## AI coding agents
+
+The repository includes shared instructions and configuration for AI coding agents (Claude Code and Codex). You don't need them to contribute, but if you use an agent:
+
+- **Instructions** — [AGENTS.md](AGENTS.md) holds the rules every agent follows. Claude Code reads it through [CLAUDE.md](CLAUDE.md). Larger tasks follow [.agents/WORKFLOW.md](.agents/WORKFLOW.md).
+- **Specialist roles** — the role instructions live in `.codex/agents/*.toml`. Codex uses them directly. Claude Code uses the short wrappers in `.claude/agents/`, which read the same files. Change a role's instructions only in its `.toml` file.
+- **Skills** — shared skills live in `.agents/skills/`. Claude Code finds them through the link in `.claude/skills/`. On Windows without symlink support, that link is checked out as a plain file, and Claude Code then finds the `asd-ste100` skill only through its path in `AGENTS.md`.
+- **Models** — the Codex role files pin model names, and the Claude Code wrappers use model aliases (`opus`, `sonnet`). Update both by hand when a model is replaced.
+- **Permissions** — [.claude/settings.json](.claude/settings.json) lets Claude Code run the routine checks without asking, and blocks it from reading `credentials/`. The block works only when you start Claude Code in the repository root. Put personal permissions in `.claude/settings.local.json`, which Git ignores.
+- **Before you start an agent**, activate the development environment (see [Development setup](#development-setup)), so the agent can run `pytest` and `ruff` directly.
+- **Codex** loads `.codex/` only for trusted projects. A role file cannot make a role read-only, so start read-only reviews with `codex --sandbox read-only`.
+- **Local files** — `.agents/work/` (task plans and notes) and `.claude/worktrees/` (temporary agent worktrees) are ignored by Git.
 
 ---
 
@@ -65,8 +85,9 @@ Live GEE tests are marked with `@pytest.mark.gee` and need network access plus c
 - `src/envoi/adapters/` — adapter registry, `BaseAdapter`, `LocalRasterAdapter`, and the `earth_engine/` subpackage.
 - `tests/` — pytest suite, including the `gee`-marked live Earth Engine tests and shared fixtures in `conftest.py`.
 - `examples/` — minimal example `run.yml` and `catalog.yml` showing the config schema.
-- `demo/` — `getting_started.ipynb`, an interactive walkthrough of the main features.
-- `docs/` — design notes (`architecture.md`), extended usage (`advanced_usage.md`), and the generated dataset reference (`datasets.md`).
+- `examples/walkthrough.ipynb` — an interactive walkthrough of the main features.
+- `src/envoi_webapp/` — the optional Streamlit web app.
+- `docs/` — design notes (`architecture.md`), extended usage (`advanced_usage.md`), coding conventions (`coding_guidelines.md`), and the generated dataset reference (`datasets.md`).
 - `scripts/` — repository tooling, currently `generate_dataset_docs.py` (regenerates `docs/datasets.md` from the catalog).
 - `.github/workflows/` — CI (`ci.yml`) and PyPI release (`release.yml`) pipelines.
 
@@ -103,7 +124,7 @@ Built-in Earth Engine datasets live in [src/envoi/configs/ee_catalog.yml](src/en
 3. Include a short `description`, a `citation`, and the `data_type` (`continuous` or `categorical`).
 4. Set `display_name` to the dataset's title as it appears in the Earth Engine catalog (e.g. `"Copernicus DEM GLO-30"`), shortening it if the official title is a full sentence. This is the label shown in the documentation and in the web app's dataset menu, so it must be unique across the catalog.
 5. Set `category` to the theme the dataset belongs to (`Terrain`, `Climate`, `Land cover / land use`, `Satellite imagery`, `Vegetation & productivity`, `Human impact`, `Other`). This is the heading the dataset is filed under in the generated documentation.
-6. Regenerate the dataset reference: `python scripts/generate_dataset_docs.py`, and commit the updated `docs/datasets.md`. A test fails if the two drift apart.
+6. Regenerate the dataset reference: `python scripts/generate_dataset_docs.py`, and commit the updated `docs/datasets.md`. A test fails if the two drift apart; check with `pytest tests/test_catalog_docs.py`.
 7. Add a smoke test in `tests/test_gee_features.py` marked `@pytest.mark.gee`.
 
 ---
@@ -112,6 +133,9 @@ Built-in Earth Engine datasets live in [src/envoi/configs/ee_catalog.yml](src/en
 
 1. Fork the repository and create a feature branch (`git checkout -b feature/my-change`).
 2. Make your changes with appropriate tests.
+   For user-visible changes, add an entry to `CHANGELOG.md` under `## [Unreleased]`, in `Added`, `Changed`, or `Fixed`.
+   Create the `## [Unreleased]` heading at the top if it does not exist.
+   Write the entry for users: state what changed and what they must do differently.
 3. Run `black .`, `ruff check .`, and `pytest -m "not gee"` locally.
 4. Push your branch and open a pull request against `main`. Describe the change, link any related issues, and note whether the change requires Earth Engine credentials to test.
 5. A maintainer will review. Small, focused PRs are easier to review and merge than large multi-purpose ones.
@@ -122,7 +146,7 @@ Built-in Earth Engine datasets live in [src/envoi/configs/ee_catalog.yml](src/en
 
 Two GitHub Actions workflows run automatically:
 
-- **`ci.yml`** runs on every push and pull request. It installs envoi with the `dev` extras across Python 3.10–3.13, runs `ruff check src tests` and `black --check src tests`, then `pytest -q`. The live `gee`-marked tests are skipped in CI (no service account is provisioned), so they should pass deterministically based on the non-GEE suite.
+- **`ci.yml`** runs on every push and pull request. It installs envoi with the `dev` and `webapp` extras across Python 3.10–3.13, runs `ruff check src tests` and `black --check src tests`, then `pytest -q`. The live `gee`-marked tests are skipped in CI (no service account is provisioned), so they should pass deterministically based on the non-GEE suite.
 
 If CI fails on your PR, the formatter/lint output is the first thing to check — running `pre-commit run --all-files` locally reproduces those steps.
 

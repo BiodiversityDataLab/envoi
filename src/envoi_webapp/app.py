@@ -761,16 +761,18 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
             )
             dataset_names = _dataset_names_for_type(catalog, selected_type)
             current_dataset = row.get("dataset") if row.get("dataset") in dataset_names else None
+            include_type = selected_type == ALL_DATASET_TYPES
             selected_dataset = top_cols[1].selectbox(
                 "Data product",
                 dataset_names,
                 index=dataset_names.index(current_dataset) if current_dataset else None,
                 placeholder="Choose a data product",
                 key=f"dataset_select_{row_widget_key}",
-                format_func=lambda name: _dataset_option_label(
+                # Bind include_type as a default so the label uses this row's value.
+                format_func=lambda name, include_type=include_type: _dataset_option_label(
                     name,
                     catalog,
-                    include_type=selected_type == ALL_DATASET_TYPES,
+                    include_type=include_type,
                 ),
             )
             windows = str(row.get("window_sizes", ""))
