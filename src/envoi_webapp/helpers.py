@@ -37,6 +37,7 @@ class CsvValidationResult:
 @dataclass(frozen=True)
 class DatasetSelection:
     dataset: str
+    output_type: str  # TABULAR_OUTPUT or RASTER_OUTPUT, chosen per data-product row
     window_sizes: tuple[int, ...]
     statistics: tuple[str, ...] = ()
 
@@ -201,29 +202,33 @@ def _batch_id(index: int, dataset: str) -> str:
     return f"extract_{index:02d}_{slug}"
 
 
-def build_run_config(
-    rows: Sequence[DatasetSelection],
-    output_type: str,
-) -> list[dict]:
-    """Build the config list consumed by envoi.extract()."""
+def build_run_config(rows: Sequence[DatasetSelection]) -> list[dict]:
+    """Build the config list consumed by envoi.extract().
 
-    if output_type not in {TABULAR_OUTPUT, RASTER_OUTPUT}:
-        raise ValueError("Output type must be 'tabular' or 'raster'.")
+    Each row becomes one run configuration with that row's own output type,
+    so one list can mix tabular and raster outputs.
+    """
+
     if not rows:
         raise ValueError("At least one dataset row is required.")
 
     configs: list[dict] = []
     for index, row in enumerate(rows, start=1):
+        if row.output_type not in {TABULAR_OUTPUT, RASTER_OUTPUT}:
+            raise ValueError(
+                f"Dataset row {index}: output type must be 'tabular' or 'raster', "
+                f"not {row.output_type!r}."
+            )
         if not row.dataset:
             raise ValueError(f"Dataset row {index} is missing a dataset.")
         if not row.window_sizes:
             raise ValueError(f"Dataset row {index} is missing window sizes.")
 
         settings: dict = {
-            "output_type": output_type,
+            "output_type": row.output_type,
             "window_size_m": _window_size_setting(row.window_sizes),
         }
-        if output_type == TABULAR_OUTPUT:
+        if row.output_type == TABULAR_OUTPUT:
             if not row.statistics:
                 raise ValueError(f"Dataset row {index} needs at least one summary statistic.")
             settings["statistics"] = list(row.statistics)
@@ -318,7 +323,6 @@ def redact_credential_secrets(message: str, raw_credential_bytes: bytes | None) 
 def run_extraction(
     points: pd.DataFrame,
     dataset_rows: Sequence[DatasetSelection],
-    output_type: str,
     output_dir: str | Path,
     input_crs: str,
     credentials_json: bytes,
@@ -333,7 +337,7 @@ def run_extraction(
     normalized_crs = normalize_crs(input_crs)
     validate_wgs84_ranges(points, normalized_crs)
     resolved_output_dir = validate_output_dir(output_dir)
-    config = build_run_config(dataset_rows, output_type)
+    config = build_run_config(dataset_rows)
 
     with temporary_service_account_file(credentials_json) as credentials_path:
         init_gee_func(credentials_path)

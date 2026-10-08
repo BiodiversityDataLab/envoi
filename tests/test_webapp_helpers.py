@@ -127,9 +127,16 @@ def test_read_points_csv_infers_common_delimiters(delimiter):
 
 
 def test_build_run_config_tabular():
-    rows = [DatasetSelection("dem_copernicus_glo30", (100, 250), ("mean", "std"))]
+    rows = [
+        DatasetSelection(
+            dataset="dem_copernicus_glo30",
+            output_type=TABULAR_OUTPUT,
+            window_sizes=(100, 250),
+            statistics=("mean", "std"),
+        )
+    ]
 
-    config = build_run_config(rows, TABULAR_OUTPUT)
+    config = build_run_config(rows)
 
     assert config == [
         {
@@ -146,9 +153,16 @@ def test_build_run_config_tabular():
 
 
 def test_build_run_config_point_only_uses_zero_window_sentinel():
-    rows = [DatasetSelection("dem_copernicus_glo30", (0,), ("point",))]
+    rows = [
+        DatasetSelection(
+            dataset="dem_copernicus_glo30",
+            output_type=TABULAR_OUTPUT,
+            window_sizes=(0,),
+            statistics=("point",),
+        )
+    ]
 
-    config = build_run_config(rows, TABULAR_OUTPUT)
+    config = build_run_config(rows)
 
     assert config[0]["settings"] == {
         "output_type": "tabular",
@@ -159,24 +173,116 @@ def test_build_run_config_point_only_uses_zero_window_sentinel():
 
 
 def test_build_run_config_combines_point_and_window_statistics():
-    rows = [DatasetSelection("dem_copernicus_glo30", (200,), ("mean", "point"))]
+    rows = [
+        DatasetSelection(
+            dataset="dem_copernicus_glo30",
+            output_type=TABULAR_OUTPUT,
+            window_sizes=(200,),
+            statistics=("mean", "point"),
+        )
+    ]
 
-    config = build_run_config(rows, TABULAR_OUTPUT)
+    config = build_run_config(rows)
 
     assert config[0]["settings"]["window_size_m"] == 200
     assert config[0]["settings"]["statistics"] == ["mean", "point"]
 
 
 def test_build_run_config_raster_uses_10m_resampling_and_no_statistics():
-    rows = [DatasetSelection("dem_copernicus_glo30", (200,), ("mean",))]
+    rows = [
+        DatasetSelection(
+            dataset="dem_copernicus_glo30",
+            output_type=RASTER_OUTPUT,
+            window_sizes=(200,),
+            statistics=("mean",),
+        )
+    ]
 
-    config = build_run_config(rows, RASTER_OUTPUT)
+    config = build_run_config(rows)
 
     assert config[0]["settings"] == {
         "output_type": "raster",
         "window_size_m": 200,
         "resample_m": 10,
     }
+
+
+def test_build_run_config_mixes_output_types_per_row():
+    """Each row keeps its own output type and settings, and batch IDs follow row order."""
+    rows = [
+        DatasetSelection(
+            dataset="dem_copernicus_glo30",
+            output_type=RASTER_OUTPUT,
+            window_sizes=(200, 500),
+        ),
+        DatasetSelection(
+            dataset="dem_copernicus_glo30",
+            output_type=TABULAR_OUTPUT,
+            window_sizes=(100,),
+            statistics=("mean", "point"),
+        ),
+        DatasetSelection(
+            dataset="worldclim_bio",
+            output_type=RASTER_OUTPUT,
+            window_sizes=(1000,),
+        ),
+    ]
+
+    config = build_run_config(rows)
+
+    assert config == [
+        {
+            "batch_id": "extract_01_dem_copernicus_glo30",
+            "datasets": ["dem_copernicus_glo30"],
+            "settings": {
+                "output_type": "raster",
+                "window_size_m": [200, 500],
+                "resample_m": 10,
+            },
+        },
+        {
+            "batch_id": "extract_02_dem_copernicus_glo30",
+            "datasets": ["dem_copernicus_glo30"],
+            "settings": {
+                "output_type": "tabular",
+                "window_size_m": 100,
+                "statistics": ["mean", "point"],
+                "output_file_format": "csv",
+            },
+        },
+        {
+            "batch_id": "extract_03_worldclim_bio",
+            "datasets": ["worldclim_bio"],
+            "settings": {
+                "output_type": "raster",
+                "window_size_m": 1000,
+                "resample_m": 10,
+            },
+        },
+    ]
+
+
+@pytest.mark.parametrize("output_type", ["", "Tabular", "csv"])
+def test_build_run_config_rejects_unknown_row_output_type(output_type):
+    """A row with an output type other than tabular or raster raises and names the row."""
+    rows = [
+        DatasetSelection(
+            dataset="dem_copernicus_glo30",
+            output_type=TABULAR_OUTPUT,
+            window_sizes=(100,),
+            statistics=("mean",),
+        ),
+        DatasetSelection(
+            dataset="dem_copernicus_glo30",
+            output_type=output_type,
+            window_sizes=(100,),
+        ),
+    ]
+
+    with pytest.raises(
+        ValueError, match="Dataset row 2: output type must be 'tabular' or 'raster'"
+    ):
+        build_run_config(rows)
 
 
 def test_permissible_statistics_for_continuous_dataset_excludes_categorical_only_reducers():
@@ -260,8 +366,15 @@ def test_run_extraction_initializes_gee_with_temp_key_and_passes_expected_args(t
 
     outputs = run_extraction(
         _points_df(),
-        [DatasetSelection("dem", (100,), ("mean",))],
-        TABULAR_OUTPUT,
+        [
+            DatasetSelection(
+                dataset="dem",
+                output_type=TABULAR_OUTPUT,
+                window_sizes=(100,),
+                statistics=("mean",),
+            ),
+            DatasetSelection(dataset="dem", output_type=RASTER_OUTPUT, window_sizes=(200,)),
+        ],
         tmp_path / "outputs",
         "EPSG:4326",
         payload,
@@ -270,7 +383,14 @@ def test_run_extraction_initializes_gee_with_temp_key_and_passes_expected_args(t
     )
 
     assert outputs["extract_01_dem"].name == "extract_01_dem.csv"
-    assert captured["config"][0]["batch_id"] == "extract_01_dem"
+    assert [run_config["batch_id"] for run_config in captured["config"]] == [
+        "extract_01_dem",
+        "extract_02_dem",
+    ]
+    assert [run_config["settings"]["output_type"] for run_config in captured["config"]] == [
+        "tabular",
+        "raster",
+    ]
     assert captured["kwargs"]["input_crs"] == "EPSG:4326"
     assert captured["kwargs"]["id_column"] == "occurrenceID"
     assert captured["kwargs"]["quiet"] is True

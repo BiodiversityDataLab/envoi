@@ -301,7 +301,7 @@ def _type_option_label(dataset_type: str, catalog: dict[str, dict[str, Any]]) ->
     """Format a type filter option with its live dataset count."""
 
     if dataset_type == ALL_DATASET_TYPES:
-        return f"All types ({len(catalog)})"
+        return f"All categories ({len(catalog)})"
     count = sum(_dataset_type(name, catalog) == dataset_type for name in catalog)
     return f"{dataset_type} ({count})"
 
@@ -336,6 +336,7 @@ def _ensure_dataset_state() -> None:
 
 def _empty_dataset_row() -> dict:
     return {
+        "output_type": None,
         "dataset": "",
         "sample_point": False,
         "sample_window": False,
@@ -702,6 +703,7 @@ def _clear_dataset_widget_state(st) -> None:
         key_text = str(key)
         if key_text.startswith(
             (
+                "output_type_select_",
                 "dataset_type_select_",
                 "dataset_select_",
                 "point_checkbox_",
@@ -734,7 +736,42 @@ def _apply_pending_dataset_remove(st) -> None:
     _clear_dataset_widget_state(st)
 
 
-def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: str) -> None:
+def _apply_row_output_type(st, index: int, row_widget_key: str, output_type: str | None) -> None:
+    """Store one row's output type, and clear its statistics state when the type changed.
+
+    Point, window, and statistic choices exist only for tabular rows. When a
+    row's type changes, this function resets these choices and removes their
+    widget state for that row only. A later change back to tabular then starts
+    with no choices, and does not restore choices that were hidden. Other rows,
+    and the row's data product and window sizes, keep their values.
+
+    Args:
+        st: The Streamlit module.
+        index: Position of the row in ``st.session_state.dataset_rows``.
+        row_widget_key: The ``<widget version>_<index>`` suffix of the row's widget keys.
+        output_type: The type that the row's "Output type" widget returned, or None.
+    """
+
+    row = st.session_state.dataset_rows[index]
+    if row.get("output_type") == output_type:
+        return
+
+    row["output_type"] = output_type
+    row["sample_point"] = False
+    row["sample_window"] = False
+    row["statistics"] = []
+    row.pop("statistics_dataset", None)
+
+    # The trailing "_" of the statistics prefix stops row 1 from matching row 10.
+    checkbox_keys = {f"point_checkbox_{row_widget_key}", f"window_checkbox_{row_widget_key}"}
+    statistics_prefix = f"stats_select_{row_widget_key}_"
+    for key in list(st.session_state.keys()):
+        key_text = str(key)
+        if key_text in checkbox_keys or key_text.startswith(statistics_prefix):
+            st.session_state.pop(key, None)
+
+
+def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]]) -> None:
     reducers = list_reducers()
     if not catalog:
         st.error("No data products are available in the envoi catalog.")
@@ -744,16 +781,32 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
     _apply_pending_dataset_remove(st)
     widget_version = int(st.session_state.get("_dataset_widget_version", 0))
     type_options = [ALL_DATASET_TYPES, *_ordered_dataset_types(catalog)]
+    output_type_options = [TABULAR_OUTPUT, RASTER_OUTPUT]
 
     for index, row in enumerate(st.session_state.dataset_rows):
         with st.expander(f"Data product {index + 1}", expanded=True):
             row_widget_key = f"{widget_version}_{index}"
-            if output_type == TABULAR_OUTPUT:
-                top_cols = st.columns([0.29, 0.49, 0.11, 0.11], vertical_alignment="bottom")
-            else:
-                top_cols = st.columns([0.29, 0.36, 0.35], vertical_alignment="bottom")
-            selected_type = top_cols[0].selectbox(
-                "Type",
+
+            # First line: the output type and the data product. The other
+            # controls depend on the output type, so they appear only after
+            # the user chooses it.
+            top_cols = st.columns([0.18, 0.29, 0.53], vertical_alignment="bottom")
+            current_output_type = row.get("output_type")
+            output_type = top_cols[0].selectbox(
+                "Output type",
+                output_type_options,
+                index=(
+                    output_type_options.index(current_output_type)
+                    if current_output_type in output_type_options
+                    else None
+                ),
+                placeholder="Choose output type",
+                format_func=str.title,
+                key=f"output_type_select_{row_widget_key}",
+            )
+            _apply_row_output_type(st, index, row_widget_key, output_type)
+            selected_type = top_cols[1].selectbox(
+                "Category",
                 type_options,
                 index=0,
                 key=f"dataset_type_select_{row_widget_key}",
@@ -762,7 +815,7 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
             dataset_names = _dataset_names_for_type(catalog, selected_type)
             current_dataset = row.get("dataset") if row.get("dataset") in dataset_names else None
             include_type = selected_type == ALL_DATASET_TYPES
-            selected_dataset = top_cols[1].selectbox(
+            selected_dataset = top_cols[2].selectbox(
                 "Data product",
                 dataset_names,
                 index=dataset_names.index(current_dataset) if current_dataset else None,
@@ -779,17 +832,22 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
             st.session_state.dataset_rows[index]["dataset"] = selected_dataset or ""
 
             if output_type == TABULAR_OUTPUT:
-                sample_point = top_cols[2].checkbox(
+                sampling_cols = st.columns([0.12, 0.12, 0.76], vertical_alignment="bottom")
+                sample_point = sampling_cols[0].checkbox(
                     "Point",
                     value=bool(row.get("sample_point", False)),
                     key=f"point_checkbox_{row_widget_key}",
                     help="Sample the raster pixel value at each coordinate.",
                 )
-                sample_window = top_cols[3].checkbox(
+                sample_window = sampling_cols[1].checkbox(
                     "Window",
                     value=bool(row.get("sample_window", False)),
                     key=f"window_checkbox_{row_widget_key}",
                     help="Calculate spatial statistics within one or more sampling windows.",
+                )
+                st.caption(
+                    "Coordinate point values as well as spatial statistics over sampling "
+                    "window(s) can be extracted."
                 )
                 st.session_state.dataset_rows[index]["sample_point"] = sample_point
                 st.session_state.dataset_rows[index]["sample_window"] = sample_window
@@ -840,19 +898,24 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
                         ] = selected_dataset
                     else:
                         st.session_state.dataset_rows[index].pop("statistics_dataset", None)
-            else:
-                windows = top_cols[2].text_input(
+            elif output_type == RASTER_OUTPUT:
+                window_cols = st.columns([0.35, 0.65], vertical_alignment="bottom")
+                windows = window_cols[0].text_input(
                     "Window size(s) in meters",
                     value=row.get("window_sizes", ""),
                     placeholder="e.g. 500, 1000",
                     key=f"windows_input_{row_widget_key}",
                 )
+                st.caption(
+                    "The window size(s) determines the size of the extracted raster tiles. "
+                    "Note that raster outputs use 10 m resampling of source data by default, "
+                    "to ensure consistency in spatial resolution between data products."
+                )
                 st.session_state.dataset_rows[index]["window_sizes"] = windows
-                st.session_state.dataset_rows[index]["statistics"] = []
-                st.session_state.dataset_rows[index].pop("statistics_dataset", None)
 
             remove_disabled = not (
-                selected_type != ALL_DATASET_TYPES
+                output_type
+                or selected_type != ALL_DATASET_TYPES
                 or selected_dataset
                 or st.session_state.dataset_rows[index].get("sample_point")
                 or st.session_state.dataset_rows[index].get("sample_window")
@@ -875,11 +938,15 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]], output_type: st
 
 def _validate_dataset_rows(
     rows: list[dict],
-    output_type: str,
     catalog: dict[str, dict[str, Any]],
     widget_version: int,
 ) -> tuple[list[_ValidationIssue], list[DatasetSelection]]:
-    """Validate visible data-product fields in their left-to-right order."""
+    """Validate visible data-product fields in their left-to-right order.
+
+    Each row is checked with its own output type. A row without an output type
+    or without a data product gets an issue for each missing choice, and its
+    other fields are not checked.
+    """
 
     issues: list[_ValidationIssue] = []
     selections: list[DatasetSelection] = []
@@ -888,8 +955,16 @@ def _validate_dataset_rows(
 
     for index, row in enumerate(rows):
         row_widget_key = f"{widget_version}_{index}"
+        output_type = row.get("output_type")
         dataset = str(row.get("dataset") or "")
         label = _dataset_label(dataset, index, catalog)
+        if output_type not in {TABULAR_OUTPUT, RASTER_OUTPUT}:
+            issues.append(
+                _ValidationIssue(
+                    f"Step 4 — {label}: choose an output type (Tabular or Raster).",
+                    (f"output_type_select_{row_widget_key}",),
+                )
+            )
         if not dataset:
             issues.append(
                 _ValidationIssue(
@@ -897,8 +972,9 @@ def _validate_dataset_rows(
                     (f"dataset_select_{row_widget_key}",),
                 )
             )
-            # Point/window and their dependent fields are irrelevant until a
-            # product has actually been selected.
+        # Point/window and their dependent fields are hidden or irrelevant
+        # until both the output type and the product are chosen.
+        if output_type not in {TABULAR_OUTPUT, RASTER_OUTPUT} or not dataset:
             continue
 
         if output_type == TABULAR_OUTPUT:
@@ -972,6 +1048,7 @@ def _validate_dataset_rows(
         selections.append(
             DatasetSelection(
                 dataset=dataset,
+                output_type=output_type,
                 window_sizes=window_sizes,
                 statistics=statistics,
             )
@@ -985,7 +1062,6 @@ def _validate_form(
     points_error: str | None,
     input_crs: str,
     credentials_bytes: bytes | None,
-    output_type: str | None,
     output_dir: str,
     dataset_rows: list[dict],
     catalog: dict[str, dict[str, Any]],
@@ -1034,14 +1110,7 @@ def _validate_form(
         except ValueError as exc:
             issues.append(_ValidationIssue(f"Step 2 — {exc}", ("credentials_json",)))
 
-    # Step 3: output type, then output directory.
-    if output_type not in {TABULAR_OUTPUT, RASTER_OUTPUT}:
-        issues.append(
-            _ValidationIssue(
-                "Step 3 — Choose between tabular or raster output.",
-                ("output_type",),
-            )
-        )
+    # Step 3: output directory.
     if not output_dir.strip():
         issues.append(
             _ValidationIssue(
@@ -1050,14 +1119,9 @@ def _validate_form(
             )
         )
 
-    # Step 4 is hidden until the output type is known, so only validate fields
-    # the user could actually interact with.
-    selections: list[DatasetSelection] = []
-    if output_type in {TABULAR_OUTPUT, RASTER_OUTPUT}:
-        dataset_issues, selections = _validate_dataset_rows(
-            dataset_rows, output_type, catalog, widget_version
-        )
-        issues.extend(dataset_issues)
+    # Step 4: data-product rows, each with its own output type.
+    dataset_issues, selections = _validate_dataset_rows(dataset_rows, catalog, widget_version)
+    issues.extend(dataset_issues)
 
     return _FormValidation(tuple(issues), tuple(selections), normalized_crs)
 
@@ -1208,14 +1272,6 @@ def render_app() -> None:
     credentials_bytes = credentials_file.getvalue() if credentials_file is not None else None
 
     st.subheader("3. Choose output settings")
-    output_type = st.selectbox(
-        "Output type",
-        [TABULAR_OUTPUT, RASTER_OUTPUT],
-        index=None,
-        placeholder="Choose between tabular or raster output",
-        format_func=str.title,
-        key="output_type",
-    )
     if "output_dir" not in st.session_state:
         st.session_state.output_dir = str(Path("~/envoi_outputs").expanduser())
     if "_pending_output_dir" in st.session_state:
@@ -1233,26 +1289,14 @@ def render_app() -> None:
                 st.rerun()
 
     st.subheader("4. Select data products")
-    window_guidance = ""
-    if output_type == TABULAR_OUTPUT:
-        window_guidance = "Coordinate point values as well as spatial statistics over sampling window(s) can be extracted. "
-    elif output_type == RASTER_OUTPUT:
-        window_guidance = (
-            "The window size(s) determines the size of the extracted raster tiles. Note that raster "
-            "outputs use 10 m resampling of source data by default, to ensure "
-            "consistency in spatial resolution between data products."
-        )
     st.markdown(
         f"""
         Add one entry per Earth Engine data product that should be downloaded. If a data product contains multiple bands, all of them will be processed and downloaded. For information about available data products, see the
-        <a href="{DATASET_CATALOG_URL}" target="_blank">envoi catalog</a>. {window_guidance}
+        <a href="{DATASET_CATALOG_URL}" target="_blank">envoi catalog</a>.
         """,
         unsafe_allow_html=True,
     )
-    if output_type is None:
-        st.info("Choose an output type before adding data products.")
-    else:
-        _render_dataset_rows(st, catalog, output_type)
+    _render_dataset_rows(st, catalog)
 
     st.subheader("5. Run extraction")
     st.write(
@@ -1266,7 +1310,6 @@ def render_app() -> None:
             points_error=points_error,
             input_crs=input_crs,
             credentials_bytes=credentials_bytes,
-            output_type=output_type,
             output_dir=output_dir,
             dataset_rows=list(st.session_state.get("dataset_rows", [])),
             catalog=catalog,
@@ -1281,7 +1324,7 @@ def render_app() -> None:
 
             try:
                 selections = list(validation.selections)
-                config = build_run_config(selections, output_type)
+                config = build_run_config(selections)
                 expected_segments = _progress_segments(config, len(points_df))
 
                 def handle_progress(event: ProgressEvent) -> None:
@@ -1307,7 +1350,6 @@ def render_app() -> None:
                 outputs = run_extraction(
                     points_df,
                     selections,
-                    output_type,
                     output_dir,
                     validation.normalized_crs,
                     credentials_bytes,
