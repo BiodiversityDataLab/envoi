@@ -190,8 +190,10 @@ def _fake_extract_writing_outputs(points, run_configs, *, output_dir, progress_c
     output_dir = Path(output_dir)
     tiles_dir = output_dir / "extract_02_dem" / "dem"
     tiles_dir.mkdir(parents=True)
-    (output_dir / "extract_01_dem.csv").write_text(
-        "occurrenceID,dem_mean_100m\nP1,12.5\nP2,13.0\n", encoding="utf-8"
+    # Bytes, not text: write_text() writes "\r\n" on Windows, and the archive
+    # test compares exact bytes.
+    (output_dir / "extract_01_dem.csv").write_bytes(
+        b"occurrenceID,dem_mean_100m\nP1,12.5\nP2,13.0\n"
     )
     (output_dir / "extract_01_dem_qc.csv").write_text("occurrenceID,in_extent\n", encoding="utf-8")
     (output_dir / "extract_01_dem_metadata.json").write_text("{}", encoding="utf-8")
