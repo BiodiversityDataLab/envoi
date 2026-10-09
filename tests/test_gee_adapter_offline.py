@@ -625,19 +625,19 @@ class _StubDownloadImage:
 
 
 class _StubTileResponse:
-    """Stands in for a streamed ``requests`` response with HTTP status 200.
+    """Stands in for a streamed ``requests`` response.
 
     ``chunks`` holds the parts of the body. An exception in ``chunks`` is
     raised when the stream reaches it, as when a connection breaks.
     """
 
-    status_code = 200
-
-    def __init__(self, chunks: list):
+    def __init__(self, chunks: list, status_code: int):
         self._chunks = chunks
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
-        pass
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} Client Error: stub")
 
     def close(self) -> None:
         pass
@@ -649,16 +649,16 @@ class _StubTileResponse:
             yield chunk
 
 
-def _stub_tile_responses(monkeypatch, chunks: list) -> list[str]:
+def _stub_tile_responses(monkeypatch, chunks: list, status_code: int = 200) -> list[str]:
     """Replace ``requests`` and ``time`` in ``_tiles``: each GET streams ``chunks``, with no waits.
 
-    Returns a list that records the URL of each GET.
+    Every response has ``status_code``. Returns a list that records the URL of each GET.
     """
     requested_urls: list[str] = []
 
     def get(url, stream=False, timeout=None):
         requested_urls.append(url)
-        return _StubTileResponse(chunks)
+        return _StubTileResponse(chunks, status_code)
 
     stub_requests = SimpleNamespace(get=get, RequestException=requests.RequestException)
     monkeypatch.setattr(_tiles, "requests", stub_requests)
@@ -683,7 +683,7 @@ class TestDownloadTile:
         )
 
     def test_request_has_the_grid_and_no_region_or_scale(self, monkeypatch, tmp_path):
-        """The download parameters are the grid and the format; the body is written to the file."""
+        """The download parameters are the grid and the format; only the tile is written."""
         requested_urls = _stub_tile_responses(monkeypatch, [b"GeoTIFF ", b"bytes"])
         image = _StubDownloadImage()
         output_path = tmp_path / "a-test_dataset.tif"
@@ -701,18 +701,50 @@ class TestDownloadTile:
         ]
         assert requested_urls == ["https://earthengine.invalid/tile"]
         assert output_path.read_bytes() == b"GeoTIFF bytes"
+        # No temporary file stays next to the tile.
+        assert list(tmp_path.iterdir()) == [output_path]
 
-    def test_failed_stream_leaves_no_partial_file(self, monkeypatch, tmp_path):
+    def test_broken_stream_is_retried_and_leaves_no_file(self, monkeypatch, tmp_path):
         """When every attempt breaks during the stream, the error is raised and no file stays."""
         broken_connection = requests.exceptions.ChunkedEncodingError("stub: connection broken")
         requested_urls = _stub_tile_responses(monkeypatch, [b"partial ", broken_connection])
-        output_path = tmp_path / "a-test_dataset.tif"
 
         with pytest.raises(RuntimeError, match="after 3 attempts: stub: connection broken"):
-            self._download(_StubDownloadImage(), output_path)
+            self._download(_StubDownloadImage(), tmp_path / "a-test_dataset.tif")
 
         assert len(requested_urls) == 3
-        assert not output_path.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_other_error_in_the_stream_leaves_no_file(self, monkeypatch, tmp_path):
+        """An error that is not a request error stops the download at once, and no file stays."""
+        disk_error = OSError("stub: no space left on device")
+        requested_urls = _stub_tile_responses(monkeypatch, [b"partial ", disk_error])
+
+        with pytest.raises(OSError, match="stub: no space left on device"):
+            self._download(_StubDownloadImage(), tmp_path / "a-test_dataset.tif")
+
+        assert len(requested_urls) == 1
+        assert list(tmp_path.iterdir()) == []
+
+    def test_client_error_is_not_retried(self, monkeypatch, tmp_path):
+        """An HTTP 400 answer raises at once, after one request, and no file stays."""
+        requested_urls = _stub_tile_responses(monkeypatch, [b"error page"], status_code=400)
+
+        with pytest.raises(requests.HTTPError, match="400 Client Error"):
+            self._download(_StubDownloadImage(), tmp_path / "a-test_dataset.tif")
+
+        assert len(requested_urls) == 1
+        assert list(tmp_path.iterdir()) == []
+
+    def test_rate_limit_is_retried(self, monkeypatch, tmp_path):
+        """HTTP 429 answers are retried; after the last attempt, the error names the status."""
+        requested_urls = _stub_tile_responses(monkeypatch, [], status_code=429)
+
+        with pytest.raises(RuntimeError, match="returned HTTP 429 on attempt 3"):
+            self._download(_StubDownloadImage(), tmp_path / "a-test_dataset.tif")
+
+        assert len(requested_urls) == 3
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestBandNameCache:
@@ -1376,6 +1408,63 @@ class TestCountOnlyStatistics:
         assert meta["in_extent"] is True
 
 
+class TestWindowWithoutValidPixels:
+    """A window without valid pixels has in_extent False, also when count or sum is 0, not null."""
+
+    @pytest.mark.parametrize(
+        ("bands", "reducer_names", "window_result", "expected_stats"),
+        [
+            (
+                "DEM",
+                ["mean", "sum"],
+                {"DEM_mean": None, "DEM_sum": 0, "DEM_count": 0},
+                {"mean": None, "sum": 0},
+            ),
+            (
+                "DEM",
+                ["mean", "count"],
+                {"DEM_mean": None, "DEM_count": 0},
+                {"mean": None, "count": 0},
+            ),
+            (
+                ["B1", "B2"],
+                ["mean", "sum"],
+                {
+                    "B1_mean": None,
+                    "B1_sum": 0,
+                    "B1_count": 0,
+                    "B2_mean": None,
+                    "B2_sum": 0,
+                    "B2_count": 0,
+                },
+                {"B1_mean": None, "B2_mean": None, "B1_sum": 0, "B2_sum": 0},
+            ),
+        ],
+    )
+    def test_zero_sum_or_count_is_not_data(
+        self, monkeypatch, bands, reducer_names, window_result, expected_stats
+    ):
+        """Statistics that are 0 on an empty window do not make the point look inside the extent."""
+        adapter = _statistics_adapter({"bands": bands})
+        _stub_statistics_request(monkeypatch, adapter, {"window": window_result})
+        suffixes = [f"_{reducer_name}" for reducer_name in reducer_names]
+
+        stats, meta = _fetch_point_statistics(adapter, reducer_names, suffixes)
+
+        assert stats == expected_stats
+        assert (meta["in_extent"], meta["n_pixels"], meta["coverage_pct"]) == (False, 0, 0.0)
+
+    def test_one_valid_pixel_is_data(self, monkeypatch):
+        """A window with one valid pixel has in_extent True."""
+        adapter = _statistics_adapter({"bands": "DEM"})
+        window_result = {"DEM_mean": 250.0, "DEM_sum": 250.0, "DEM_count": 1}
+        _stub_statistics_request(monkeypatch, adapter, {"window": window_result})
+
+        _, meta = _fetch_point_statistics(adapter, ["mean", "sum"], ["_mean", "_sum"])
+
+        assert (meta["in_extent"], meta["n_pixels"]) == (True, 1)
+
+
 class TestCircularAspectInPointStatistics:
     """The circular aspect values replace only the requested linear mean, std, and var of aspect."""
 
@@ -1645,6 +1734,9 @@ class _SymbolicCollection:
     def filterBounds(self, geometry: str) -> _SymbolicCollection:
         return _SymbolicCollection(f"{self.expression} at {geometry}")
 
+    def filter(self, condition: str) -> _SymbolicCollection:
+        return _SymbolicCollection(f"{self.expression} where {condition}")
+
     def filterDate(self, start: str, end: str) -> _SymbolicCollection:
         return _SymbolicCollection(f"{self.expression} from {start} to {end}")
 
@@ -1719,7 +1811,7 @@ class TestCircularAspectImage:
 
 
 class TestEmptyDateSelection:
-    """With no image at the point on the selected dates, ``_build_image`` gives a masked image."""
+    """``_build_image`` gives a masked image only when the collection has no image at the point."""
 
     @pytest.fixture(autouse=True)
     def symbolic_earth_engine(self, monkeypatch):
@@ -1736,44 +1828,64 @@ class TestEmptyDateSelection:
             Image=cast_to_image,
             ImageCollection=_SymbolicCollection,
             Algorithms=SimpleNamespace(If=server_side_if),
+            Filter=SimpleNamespace(eq=lambda property_name, value: f"{property_name} == {value}"),
         )
         monkeypatch.setattr(_image, "ee", stub_ee)
 
     @pytest.mark.parametrize(
-        ("policy", "time_starts", "time_ends", "selected_days"),
+        ("dataset_spec", "time_starts", "time_ends", "point_images", "selected_days"),
         [
-            # The interval that contains 2021-06-15.
+            # The interval that contains 2021-06-15, in the point's UTM zone.
             (
-                "contains",
+                {"collection_date_policy": "contains", "use_utm_zone": True},
                 pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
                 pd.DatetimeIndex(["2022-01-01", "2023-01-01"]),
+                "embeddings at point where UTM_ZONE == 26N",
                 "2021-01-01 to 2022-01-01",
             ),
             # The nearest start.
             (
-                "nearest",
+                {"collection_date_policy": "nearest"},
                 pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
                 None,
+                "embeddings at point",
                 "2021-01-01 to 2021-01-02",
             ),
             # No timestamp index: one day before and after the sample date.
-            ("nearest", None, None, "2021-06-14 to 2021-06-16"),
+            ({}, None, None, "embeddings at point", "2021-06-14 to 2021-06-16"),
         ],
     )
-    def test_selection_falls_back_to_a_masked_image(
-        self, policy, time_starts, time_ends, selected_days
+    def test_point_without_images_gets_a_masked_image(
+        self, dataset_spec, time_starts, time_ends, point_images, selected_days
     ):
-        """The first selected image when there is one, else the first image of the collection, masked."""
+        """The check counts the point's images on every date; the image is the first selected one."""
         image = _image._build_image(
-            {"collection": "embeddings", "collection_date_policy": policy, "bands": ["A00", "A01"]},
+            {"collection": "embeddings", "bands": ["A00", "A01"], **dataset_spec},
             date=pd.Timestamp("2021-06-15"),
             geometry="point",
             collection_time_starts=time_starts,
             collection_time_ends=time_ends,
+            lat=0.0,
+            lon=-30.0,
         )
 
-        selection = f"embeddings at point from {selected_days}"
+        # The condition counts the images at the point before the date filter.
+        # When the point has images, but none on the selected days, the first
+        # selected image is null, and the point's request fails.
+        selection = f"{point_images} from {selected_days}"
         assert image.expression == (
-            f"(if size of {selection} > 0 then first of {selection} "
+            f"(if size of {point_images} > 0 then first of {selection} "
             f"else (first of embeddings) masked to 0).select(['A00', 'A01'])"
+        )
+
+    def test_no_masked_image_without_a_point(self):
+        """Without a point geometry, the image is the first selected image, with no condition."""
+        image = _image._build_image(
+            {"collection": "embeddings", "collection_date_policy": "nearest", "bands": ["A00"]},
+            date=pd.Timestamp("2021-06-15"),
+            collection_time_starts=pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
+        )
+
+        assert (
+            image.expression == "first of embeddings from 2021-01-01 to 2021-01-02.select(['A00'])"
         )

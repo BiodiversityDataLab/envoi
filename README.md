@@ -208,7 +208,9 @@ extract(sample_points, {
 })
 ```
 
-Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`.
+Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`. Each dataset folder also has a `tiles_manifest.csv`, which maps each input row to its tile (`exported` is `False` when no tile was written).
+
+For a point without data, the two kinds of dataset differ. Earth Engine datasets write a tile in which every pixel is masked (`exported` is `True`, and the sidecar counts the tile in `n_exported`). Local datasets write no tile for a point outside the raster (`exported` is `False`, and the sidecar counts the point in `n_failed`).
 
 **With `resample_m`,** every tile is reprojected to the point's UTM zone at exactly `resample_m` meters per pixel. Earth Engine and local datasets use the same rule for the size and position of a tile:
 

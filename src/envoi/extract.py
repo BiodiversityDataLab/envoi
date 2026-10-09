@@ -898,9 +898,9 @@ def _raise_if_every_point_failed(meta_list: list[dict], *, dataset: str, batch_l
     raise RuntimeError(
         f"Dataset '{dataset}', {batch_label}: every point failed "
         f"({len(meta_list)} of {len(meta_list)}), so the run stops. "
-        f"Check your network connection and your access to the dataset, "
-        f"then run the extraction again. "
-        f"First error: {first_failed_meta['error']}"
+        f"Correct the cause of the first error below (for example the network "
+        f"connection, your access to the dataset, or a damaged file), then run the "
+        f"extraction again. First error: {first_failed_meta['error']}"
     ) from first_failed_meta.get("exception")
 
 

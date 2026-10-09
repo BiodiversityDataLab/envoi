@@ -16,6 +16,7 @@ band count off the live ee.Image before delegating here).
 from __future__ import annotations
 
 import time
+import uuid
 from pathlib import Path
 
 import ee
@@ -93,8 +94,9 @@ def _download_tile_via_url(
     Asks GEE for a single multi-band GeoTIFF (``format='GEO_TIFF'``
     with ``filePerBand=False``) so we get a TIFF in the response body
     directly — no zip wrapping, no per-band extraction step. Streams
-    the response straight to ``output_path`` with retries for
-    transient HTTP errors.
+    the response to a temporary file next to ``output_path``, with
+    retries for transient errors, and moves it to ``output_path`` when it
+    is complete. A failed download leaves no file.
 
     Args:
         img: The image to download.
@@ -102,7 +104,13 @@ def _download_tile_via_url(
         crs_transform: Affine transform of the tile in ``crs``, in the order
             ``[x pixel size, 0, west edge, 0, -y pixel size, north edge]``.
         dimensions: Tile size in pixels, ``"<width>x<height>"``.
-        output_path: Path of the GeoTIFF to write.
+        output_path: Path of the GeoTIFF to write. Its folder must exist.
+
+    Raises:
+        requests.HTTPError: Earth Engine answered with an HTTP error other
+            than 429 (for example 400). It is not retried.
+        RuntimeError: Every attempt failed with HTTP 429, a 5xx error, or a
+            connection error or timeout (also during the stream).
     """
     # GEE's getDownloadURL is server-side: it builds the URL synchronously
     # but the URL itself points to a streamed export, so the actual image
@@ -125,13 +133,26 @@ def _download_tile_via_url(
         }
     )
 
-    # Retry loop for transient errors (429 = rate-limited, 5xx = GEE-side
-    # blip). Permanent errors (4xx other than 429) raise immediately so
-    # we don't waste time retrying a bad request.
-    last_error: Exception | None = None
-    for attempt in range(_TILE_DOWNLOAD_MAX_RETRIES):
-        try:
-            response = requests.get(url, stream=True, timeout=_TILE_DOWNLOAD_TIMEOUT_S)
+    # Stream the body to a temporary file in the same folder, and give it the
+    # tile's name only after the last chunk. A download that fails part way,
+    # with any error, then leaves no partial GeoTIFF that looks like a valid
+    # tile. The temporary name is short and unique: the tile's name plus a
+    # suffix could exceed the 255-byte limit of a file name.
+    partial_path = output_path.with_name(f"download-{uuid.uuid4().hex}.part")
+    try:
+        # Retry loop for transient errors (429 = rate-limited, 5xx = GEE-side
+        # blip, and connection errors or timeouts, also during the stream).
+        # Other HTTP errors (4xx except 429) are permanent: a retry gets the
+        # same answer, so they raise at once.
+        last_error: Exception | None = None
+        for attempt in range(_TILE_DOWNLOAD_MAX_RETRIES):
+            try:
+                response = requests.get(url, stream=True, timeout=_TILE_DOWNLOAD_TIMEOUT_S)
+            except requests.RequestException as request_error:
+                last_error = request_error
+                time.sleep(2**attempt)
+                continue
+
             status_code = response.status_code
             if status_code == 429 or 500 <= status_code < 600:
                 # Drain the connection and back off before retrying.
@@ -141,25 +162,34 @@ def _download_tile_via_url(
                 )
                 time.sleep(2**attempt)
                 continue
-            response.raise_for_status()
+            if status_code >= 400:
+                response.close()
+                response.raise_for_status()
 
             # Stream to disk in 1 MiB chunks so peak memory stays bounded
             # even for the largest allowed tiles (~32 MB).
-            with output_path.open("wb") as output_file:
-                for chunk in response.iter_content(chunk_size=1 << 20):
-                    if chunk:
-                        output_file.write(chunk)
-            return
-        except requests.RequestException as request_error:
-            # Connection errors / timeouts also get the backoff treatment.
-            last_error = request_error
-            time.sleep(2**attempt)
+            try:
+                with partial_path.open("wb") as partial_file:
+                    for chunk in response.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            partial_file.write(chunk)
+            except requests.RequestException as stream_error:
+                last_error = stream_error
+                time.sleep(2**attempt)
+                continue
 
-    # Exhausted retries — surface the last error so export_tiles can
-    # log it per-point and mark the result slot as None. A download that
-    # failed while it was streamed leaves part of a GeoTIFF on disk. Remove
-    # it, so that no damaged tile stays next to the valid tiles.
-    output_path.unlink(missing_ok=True)
-    raise RuntimeError(
-        f"Failed to download GEE tile after {_TILE_DOWNLOAD_MAX_RETRIES} attempts: {last_error}"
-    )
+            # The tile is complete. replace() also overwrites a tile of an
+            # earlier run with the same name, on Windows too.
+            partial_path.replace(output_path)
+            return
+
+        # Exhausted retries — surface the last error so export_tiles can
+        # log it per-point and mark the result slot as None.
+        raise RuntimeError(
+            f"Failed to download GEE tile after {_TILE_DOWNLOAD_MAX_RETRIES} attempts: "
+            f"{last_error}"
+        )
+    finally:
+        # After an error, remove the partial download. After a successful
+        # download, the temporary file no longer exists.
+        partial_path.unlink(missing_ok=True)

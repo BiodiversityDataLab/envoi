@@ -957,13 +957,16 @@ class GeeRasterAdapter(BaseAdapter):
             # Clamp to 100% — the geometric total can be off by a cell or two,
             # so a fully-valid window can otherwise read as 101%.
             coverage_pct = min(coverage_pct, 100.0)
-            if count_only:
-                # Every window statistic is a count. A window without valid
-                # pixels gives a count of 0, not a null value, so only a
-                # count above 0 shows that the window has data.
-                has_values = any(count is not None and count > 0 for count in window_stats.values())
+            # The window has data when at least one band has a valid pixel.
+            # Use the pixel counts, not the statistics: on a window without
+            # valid pixels, Earth Engine gives null for most statistics, but
+            # 0 for count and sum, so a non-null statistic does not show data.
+            # The window branch always has a count for each band: the QC
+            # count, or the user's count.
+            if multiband:
+                has_values = any(count > 0 for count in per_band_counts.values())
             else:
-                has_values = any(v is not None for v in window_stats.values())
+                has_values = valid_count > 0
             n_pixels = int(valid_count)
             had_nodata = valid_count < total_cells
         else:

@@ -340,7 +340,7 @@ def _resolve_date_filter_range(
     # collections have images with system:time_end == system:time_start
     # (instantaneous events), or an end later on the same day as the start.
     # Formatted as days, start and end are then the same string: the filter
-    # is empty and .first() returns null, so every statistic is null. Use the
+    # is empty and .first() returns null, so the point's request fails. Use the
     # next day as the end in that case, so the range always covers the
     # start day and the selected image is always inside it.
     if end_date.normalize() <= start_date.normalize():
@@ -439,9 +439,12 @@ def _build_image(
     - date provided + no timestamps (fallback): filterDate ±1 day, .first()
     - no date: mosaic (most recent non-masked pixel per position)
 
-    When the date filter leaves no image at the point, the image is the first
-    image of the collection with every pixel masked, so its statistics are
-    null (Earth Engine decides this in the point's request).
+    When the collection has no image at the point ``geometry`` on any date,
+    the image is the first image of the collection with every pixel masked,
+    so the point gets the values of a point without data: null statistics,
+    except ``count`` and ``sum``, which are 0 (Earth Engine decides this in
+    the point's request). When the point has images, but none on the
+    selected dates, the image is null, and the point's request fails.
 
     Parameters
     ----------
@@ -498,27 +501,34 @@ def _build_image(
                 time_starts=collection_time_starts,
                 time_ends=collection_time_ends,
             )
-            image_collection = image_collection.filterDate(start, end)
-            # When no image covers the point on the selected dates (for
-            # example an ocean point of a tiled land product), the filtered
-            # collection is empty, and .first() gives a null image. Every
-            # request on a null image raises ("Parameter 'image' is required"),
-            # so the point would be a failed point. Use the first image of the
-            # whole collection with every pixel masked instead: it has the
+            dated_collection = image_collection.filterDate(start, end)
+            image = dated_collection.first()
+
+            # When the collection has no image at the point on any date (for
+            # example an ocean point of a tiled land product), .first() gives
+            # a null image. Every request on a null image raises ("Parameter
+            # 'image' is required"), so the point would be a failed point
+            # although it only has no data. Use the first image of the whole
+            # collection with every pixel masked instead: it has the
             # collection's bands, so the band selection and the derived bands
-            # below work, and the point gets null statistics and in_extent
-            # False, as a point outside a mosaic does. Earth Engine evaluates
-            # the condition in the point's own request, so no request is added.
-            masked_placeholder = ee.Image(
-                ee.ImageCollection(dataset_spec["collection"]).first()
-            ).updateMask(0)
-            image = ee.Image(
-                ee.Algorithms.If(
-                    image_collection.size().gt(0),
-                    image_collection.first(),
-                    masked_placeholder,
+            # below work, and the point gets the values of a point without
+            # data, as a point outside a mosaic does.
+            # The check uses the collection before the date filter on
+            # purpose. When the point has images, but none in the selected
+            # date range, the image stays null and the point is a failed
+            # point with an error, so a problem with the date selection stays
+            # visible and is not reported as missing data.
+            # Earth Engine evaluates the condition in the point's own request,
+            # so no request is added. Without a point geometry, there is no
+            # location to check, and the condition would only count every
+            # image of the collection, so it is left out.
+            if geometry is not None:
+                masked_placeholder = ee.Image(
+                    ee.ImageCollection(dataset_spec["collection"]).first()
+                ).updateMask(0)
+                image = ee.Image(
+                    ee.Algorithms.If(image_collection.size().gt(0), image, masked_placeholder)
                 )
-            )
         else:
             # No date: mosaic (most recent non-masked pixel per position)
             image = image_collection.mosaic()

@@ -289,7 +289,7 @@ class TestFailedPointsTabular:
 
         message = str(error_info.value)
         assert "Dataset 'dem_local', window 100 m" in message
-        assert "Check your network connection and your access to the dataset" in message
+        assert "Correct the cause of the first error below" in message
         assert "First error: RasterioIOError: stub: damaged block in read 1" in message
         assert error_info.value.__cause__ is raised_errors[0]
         assert not (tmp_path / "all_failed.csv").exists()

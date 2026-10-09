@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 
 import pandas as pd
 import pytest
@@ -800,6 +801,57 @@ class TestAutoDateSelection:
         # Source label should explicitly indicate "no date column was provided"
         # so users can audit which path their points took.
         assert qc_df["era5_date_source_200m"].eq("most_recent_no_date").all()
+
+    def test_point_without_images_has_no_data_and_no_error(self, tmp_path):
+        """A point where the collection has no image gets no data, not a failed-point error."""
+        # The satellite embeddings cover land only. Their collection selects one
+        # image per point with .first() (collection_date_policy: contains), so
+        # the open-ocean point has no image to select.
+        points = pd.DataFrame(
+            {
+                "occurrenceID": ["land", "ocean"],
+                "decimalLatitude": [62.9768783, 0.0],
+                "decimalLongitude": [18.026823, -30.0],
+                "eventDate": ["2021-06-15", "2021-06-15"],
+            }
+        )
+        with warnings.catch_warnings(record=True) as recorded_warnings:
+            warnings.simplefilter("always")
+            outputs = extract(
+                points,
+                {
+                    "batch_id": "no_image",
+                    "datasets": [{"aef_satellite_embeddings": ["A00", "A01"]}],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["mean", "sum"],
+                        "window_size_m": 100,
+                    },
+                },
+                output_dir=tmp_path,
+            )
+
+        # No point failed: the ocean point is a point without data.
+        assert not [
+            recorded for recorded in recorded_warnings if "points failed" in str(recorded.message)
+        ]
+        stats = pd.read_csv(outputs["no_image"]).set_index("occurrenceID")
+        qc = pd.read_csv(tmp_path / "no_image_qc.csv").set_index("occurrenceID")
+        assert "aef_satellite_embeddings_error_100m" not in qc.columns
+        mean_columns = [f"aef_satellite_embeddings_{band}_mean_100m" for band in ("A00", "A01")]
+        sum_columns = [f"aef_satellite_embeddings_{band}_sum_100m" for band in ("A00", "A01")]
+
+        # Land: values inside the extent.
+        assert bool(qc.loc["land", "aef_satellite_embeddings_in_extent_100m"]) is True
+        assert qc.loc["land", "aef_satellite_embeddings_n_pixels_100m"] > 0
+        assert stats.loc["land", mean_columns].notna().all()
+
+        # Ocean: no data. Earth Engine gives 0, not null, for the sum of no
+        # pixels (seen live on 2026-10-09); the mean is null.
+        assert bool(qc.loc["ocean", "aef_satellite_embeddings_in_extent_100m"]) is False
+        assert qc.loc["ocean", "aef_satellite_embeddings_n_pixels_100m"] == 0
+        assert stats.loc["ocean", mean_columns].isna().all()
+        assert stats.loc["ocean", sum_columns].tolist() == [0.0, 0.0]
 
 
 # ------------------------------------------------------------------
