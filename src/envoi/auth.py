@@ -1,7 +1,12 @@
 # src/envoi/auth.py
+from __future__ import annotations
+
+import json
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import ee
 
@@ -54,7 +59,62 @@ def _default_credentials_path() -> Path | None:
     return None
 
 
-def init_gee(credentials_path: str | Path | None = None) -> None:
+def _build_credentials_from_json(credentials_json: str | bytes | Mapping[str, Any]) -> Any:
+    """Build Earth Engine credentials from the content of a service account key.
+
+    Args:
+        credentials_json: The key as JSON text (``str``, or ``bytes`` in
+            UTF-8) or as a mapping of the parsed JSON.
+
+    Returns:
+        The credentials object from ``ee.ServiceAccountCredentials``.
+
+    Raises:
+        ValueError: when ``credentials_json`` has a wrong type or is not a
+            valid service account key. The error message, its cause, and its
+            context contain no part of the key.
+    """
+    if not isinstance(credentials_json, (str, bytes, Mapping)):
+        raise ValueError(
+            "credentials_json must be the content of a service account key: JSON text "
+            f"(str or bytes) or a dict. Got {type(credentials_json).__name__}."
+        )
+
+    # Convert the key to JSON text and build the credentials. For a key without
+    # "token_uri", or with a malformed "private_key", ee.ServiceAccountCredentials
+    # retries the parsed key as a PEM key, and google-auth then raises an error
+    # whose message contains the whole key, private key included.
+    key_is_invalid = False
+    try:
+        if isinstance(credentials_json, bytes):
+            key_text = credentials_json.decode("utf-8")
+        elif isinstance(credentials_json, str):
+            key_text = credentials_json
+        else:
+            key_text = json.dumps(dict(credentials_json))
+        credentials = ee.ServiceAccountCredentials(email=None, key_data=key_text)
+    # Broad catch, re-raised below as a clear ValueError. On purpose, the
+    # ValueError does not chain the original error, unlike "Chain converted
+    # third-party exceptions" in docs/coding_guidelines.md: the original error
+    # can contain the key. A "raise ... from None" inside this block still keeps
+    # the original error as __context__ (PEP 415), so this block only sets a flag.
+    except Exception:
+        key_is_invalid = True
+    if key_is_invalid:
+        raise ValueError(
+            "The supplied service account key is not a valid Google service account key. "
+            "Supply the complete, unchanged content of the JSON key file from the Google "
+            "Cloud Console. It must contain 'type', 'client_email', 'private_key', "
+            "and 'token_uri'."
+        )
+    return credentials
+
+
+def init_gee(
+    credentials_path: str | Path | None = None,
+    *,
+    credentials_json: str | bytes | Mapping[str, Any] | None = None,
+) -> None:
     """Initialize Earth Engine from a Google service account key JSON.
 
     The key file is the JSON downloaded from the Google Cloud Console for
@@ -68,53 +128,78 @@ def init_gee(credentials_path: str | Path | None = None) -> None:
             on macOS/Linux or ``%APPDATA%\\envoi\\ee_credentials.json`` on
             Windows, then (3) ``./credentials/ee_credentials.json``. Pass
             an explicit path to bypass the lookup.
+        credentials_json: The content of the service account key instead of
+            a path: JSON text (``str``, or ``bytes`` in UTF-8) or a dict of
+            the parsed JSON. Use it when the key comes from a secret store or
+            an upload. Earth Engine then uses only this key, and the file
+            lookup above does not run. Do not combine it with
+            ``credentials_path``.
 
     Raises:
+        ValueError: when both ``credentials_path`` and ``credentials_json``
+            are given, or when ``credentials_json`` is not a valid service
+            account key. The error contains no part of the key.
         FileNotFoundError: when no credentials file is found in any of the
             checked locations. The error message lists every location it
             looked at so the user can fix it without guessing.
         RuntimeError: when Earth Engine refuses the credentials (typically
             because the service account lacks GEE access).
     """
-    # Resolve the path: explicit argument wins, otherwise walk the lookup chain.
-    if credentials_path is not None:
-        path = Path(credentials_path)
+    if credentials_path is not None and credentials_json is not None:
+        raise ValueError(
+            "init_gee() takes credentials_path or credentials_json, not both. "
+            "Pass the path of the key file, or the content of the key."
+        )
+
+    # Build the credentials. A key given as content skips the file lookup, so a
+    # key file on the computer cannot replace it.
+    if credentials_json is not None:
+        credentials = _build_credentials_from_json(credentials_json)
+        key_source = "the supplied key"
+        key_container = "key"
     else:
-        path = _default_credentials_path()
+        # Resolve the path: explicit argument wins, otherwise walk the lookup chain.
+        if credentials_path is not None:
+            path = Path(credentials_path)
+        else:
+            path = _default_credentials_path()
 
-    if path is None or not path.exists():
-        # Build the location list so the error message is actionable. The
-        # env-var line shows the current value when set so the user can
-        # spot typos in their config.
-        env_value = os.environ.get(ENV_VAR)
-        env_line = (
-            f"  - ${ENV_VAR} (currently: {env_value!r})"
-            if env_value
-            else f"  - ${ENV_VAR} (not set)"
-        )
-        checked = "\n".join(
-            [
-                env_line,
-                f"  - {USER_CONFIG_PATH}",
-                f"  - {Path.cwd() / CWD_RELATIVE_PATH}",
-            ]
-        )
-        raise FileNotFoundError(
-            "Google Earth Engine credentials not found. Checked:\n"
-            f"{checked}\n"
-            "Download a service account JSON from the GCP Console and either "
-            f"set ${ENV_VAR} or place it at one of the paths above."
-        )
+        if path is None or not path.exists():
+            # Build the location list so the error message is actionable. The
+            # env-var line shows the current value when set so the user can
+            # spot typos in their config.
+            env_value = os.environ.get(ENV_VAR)
+            env_line = (
+                f"  - ${ENV_VAR} (currently: {env_value!r})"
+                if env_value
+                else f"  - ${ENV_VAR} (not set)"
+            )
+            checked = "\n".join(
+                [
+                    env_line,
+                    f"  - {USER_CONFIG_PATH}",
+                    f"  - {Path.cwd() / CWD_RELATIVE_PATH}",
+                ]
+            )
+            raise FileNotFoundError(
+                "Google Earth Engine credentials not found. Checked:\n"
+                f"{checked}\n"
+                "Download a service account JSON from the GCP Console and either "
+                f"set ${ENV_VAR} or place it at one of the paths above."
+            )
 
-    # ee.ServiceAccountCredentials reads the email out of the JSON itself,
-    # so we don't need to crack the file open here — just pass the path.
-    credentials = ee.ServiceAccountCredentials(email=None, key_file=str(path))
+        # ee.ServiceAccountCredentials reads the email out of the JSON itself,
+        # so we don't need to crack the file open here — just pass the path.
+        credentials = ee.ServiceAccountCredentials(email=None, key_file=str(path))
+        key_source = f"'{path}'"
+        key_container = "file"
+
     try:
         ee.Initialize(credentials)
     except Exception as e:
         raise RuntimeError(
-            f"Google Earth Engine authentication failed using '{path}'.\n"
-            f"Check that the service account in the file is valid and has "
+            f"Google Earth Engine authentication failed using {key_source}.\n"
+            f"Check that the service account in the {key_container} is valid and has "
             f"access to GEE.\n"
             f"Original error: {e}"
         ) from e

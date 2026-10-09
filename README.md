@@ -16,6 +16,9 @@ Automated feature extraction from environmental data sources for ecological and 
 - [Quick start](#quick-start)
   - [Walkthrough](#walkthrough)
 - [Browser-based user interface](#browser-based-user-interface)
+  - [Using the web app](#using-the-web-app)
+  - [Hosted web app](#hosted-web-app)
+  - [Local web app](#local-web-app)
 - [Outputs](#outputs)
   - [Tabular](#tabular)
   - [Raster](#raster)
@@ -68,6 +71,12 @@ Datasets that come from Google Earth Engine (most of the built-in catalog — `d
   init_gee(credentials_path="/path/to/my-project-1234-abcdef.json")
   ```
 
+- **Without a file:** if the key comes from a secret store or another program, pass its content with `credentials_json`. It accepts the JSON text (`str` or `bytes`) or a `dict`. With `credentials_json`, `init_gee()` does not look for a key file. Pass `credentials_path` or `credentials_json`, not both.
+
+  ```python
+  init_gee(credentials_json=key_text)
+  ```
+
 ---
 
 ## Quick start
@@ -113,11 +122,65 @@ For a guided end-to-end tutorial — tabular and raster extraction, local raster
 
 ## Browser-based user interface
 
-envoi also ships with a local Streamlit web app for users who prefer a browser-based workflow over writing Python code. It runs on your own machine at `localhost` and uploaded Earth Engine credentials are only written to a temporary local file for the duration of a run. In the future, this will be available as a hosted service.
+envoi also includes a web app for users who prefer to work in a browser instead of writing Python code. You can use the web app in two ways:
+
+- **Hosted web app:** a public web app on [SciLifeLab Serve](https://serve.scilifelab.se/). You need only a web browser and an Earth Engine key. The hosted web app is not online yet. Its address will be added here when it is available.
+- **Local web app:** you install envoi and run the web app on your own computer. Use it for larger runs, or when you want the results written straight into a folder on your computer.
 
 ![Web app screenshot](docs/assets/webapp-screenshot.png)
 
-Install the optional web app dependencies:
+### Using the web app
+
+You need:
+
+- a CSV file with your points, with the same GBIF / Darwin Core columns as the Python API: `occurrenceID`, `decimalLatitude`, `decimalLongitude`, and optionally `eventDate`,
+- a Google Earth Engine service account JSON key. Step 1 of [Earth Engine setup](#earth-engine-setup) tells you how to get one. You upload the key file in the web app, so you do not need to save it in a special folder.
+
+The page has five steps:
+
+1. Upload the CSV file. If your coordinates are not in WGS84 (EPSG:4326), choose "Other EPSG" and enter the EPSG code.
+2. Upload the service account key.
+3. In the local web app, choose the output directory. The hosted web app has no output directory, because you download the results.
+4. Add one row for each data product. In each row, choose the output type: **Tabular** gives statistics for each point (see [Tabular](#tabular)), and **Raster** gives one GeoTIFF tile for each point (see [Raster](#raster)). One run can contain both tabular and raster rows. The **Category** list filters the data products by theme.
+5. Click **Extract selected data**.
+
+While the extraction runs, the page shows a progress bar and a **Cancel** button. The progress and the results stay on the page when you change other settings. **Clear results** removes them from the page.
+
+Each data-product row becomes one batch with the name `extract_<row number>_<data product>`, for example `extract_01_dem_copernicus_glo30`. The output files have the names and the folder layout that [Outputs](#outputs) describes.
+
+**Run log.** Each extraction also writes a run log next to the outputs. The run log is a text file with the start time of the extraction (UTC) in its name, for example `envoi-run-log-20261008T141500Z.txt`. It lists the warnings and errors that envoi reported during the extraction: for example rows without a date, dates that are not complete (such as a year only), points with low pixel coverage, and points for which Earth Engine returned an error. The page shows the number of warnings. When an extraction fails, the page also shows the last lines of the run log. A cancelled or stopped extraction has no run log.
+
+### Hosted web app
+
+The hosted web app runs on a server that many users share. It handles your key and your data as follows:
+
+- **Your key** stays in the server's memory for your browser session only. The web app never writes it to disk. Each extraction runs in its own process on the server, and that process uses only your key.
+- **Your points and the results** stay on the server's disk only while they are needed. The server deletes the results 10 minutes after your first click on **Download results**, or at the latest 30 minutes after the extraction ends. A new extraction or **Clear results** deletes them earlier. A failed, cancelled, or stopped extraction gives no results, and the server deletes its files when it ends. Like your key, the uploaded points file stays in the server's memory for your browser session, and the results contain the IDs and coordinates of your points.
+- **A server restart** stops running extractions and deletes all results.
+
+**Keep the page open and visible while an extraction runs.** The page asks the server for the status every 2 seconds. When no page asks for 10 minutes, for example because you closed the tab or your computer went to sleep, the server stops the extraction. A page reload loses the link to a running extraction. If you then start an extraction with the same key, the web app offers **Cancel the earlier job**.
+
+**Download.** When the extraction is complete, click **Download results**. You get one ZIP file, for example `envoi-results-20261008T141500Z.zip`, with all output files and the run log. You can download it again until the server deletes it. Your browser saves the file in its download folder. Most browsers can be set to ask where to save each download.
+
+**Limits.** The hosted web app has these limits. They are starting values and can change, and the web app always shows the limits that apply.
+
+| What                         | Limit                                                                                                         |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| CSV file                     | 50 MB, and 10,000 data rows                                                                                   |
+| Data-product rows            | 10 per extraction                                                                                             |
+| Tabular rows                 | Windows up to 10,000 m. Points × window sizes up to 20,000 over all tabular rows (**Point** counts as one window size). |
+| Raster rows                  | Windows up to 2,000 m. Points × window sizes up to 1,000 tiles over all raster rows.                          |
+| Run time                     | 60 minutes per extraction                                                                                     |
+| Size of the results          | 1 GB per extraction                                                                                           |
+| Extractions at the same time | One per page and one per key. The server also runs only a few extractions at the same time (2 by default).   |
+
+The web app checks the file, the rows, and the windows before an extraction starts, and tells you what to change. It stops an extraction that runs longer than the run time, or whose results grow larger than the size limit, and you then get no results. Raster rows of data products with many bands give large results. When the server is busy, the web app asks you to try again in a few minutes.
+
+For larger runs, or to write the results straight into a folder, use the [local web app](#local-web-app) or the Python package.
+
+### Local web app
+
+Install envoi with the optional web app dependencies:
 
 ```bash
 pip install "envoi-geospatial[webapp]"
@@ -141,7 +204,9 @@ Then open the local URL printed by Streamlit, usually:
 http://localhost:8501
 ```
 
-The app expects a CSV in the same GBIF / Darwin Core schema as the default Python API: `occurrenceID`, `decimalLatitude`, `decimalLongitude`, and optionally `eventDate`. It also asks for an output directory, an output type (`tabular` or `raster`), one or more dataset and variable selections, and a Google Earth Engine service account JSON key. Earth Engine setup requirements are the same as for the Python API.
+The local web app runs only on your own computer. It has no limits, except one running extraction per page. It writes the results into the output directory that you choose in step 3 (default: `envoi_outputs` in your home folder), and the page shows the paths of the output files and the run log. Like the hosted web app, it keeps your key in memory only and runs each extraction in a separate process.
+
+**Cancel** stops the extraction. Files that the extraction wrote before you clicked **Cancel** stay in the output directory. They can be incomplete, so check or delete them before you use them.
 
 ---
 

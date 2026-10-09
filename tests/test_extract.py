@@ -908,6 +908,59 @@ class TestMultipleOutputs:
         tile_dir = tmp_path / "tiles_out" / "dem_local"
         assert any(tile_dir.glob("*.tif"))
 
+    def test_mixed_list_writes_same_files_as_separate_calls(self, sample_df, tmp_path):
+        """One call with a tabular and a raster config writes the files of two separate calls."""
+        # The same run configurations as the web app builds for one tabular
+        # row and one raster row.
+        tabular_config = {
+            "batch_id": "extract_01_dem_local",
+            "datasets": ["dem_local"],
+            "settings": {
+                "output_type": "tabular",
+                "window_size_m": 100,
+                "statistics": ["mean", "point"],
+                "output_file_format": "csv",
+            },
+        }
+        raster_config = {
+            "batch_id": "extract_02_dem_local",
+            "datasets": ["dem_local"],
+            "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 10},
+        }
+        combined_dir = tmp_path / "combined"
+        tabular_dir = tmp_path / "tabular_only"
+        raster_dir = tmp_path / "raster_only"
+
+        extract(sample_df, [tabular_config, raster_config], output_dir=combined_dir, quiet=True)
+        extract(sample_df, tabular_config, output_dir=tabular_dir, quiet=True)
+        extract(sample_df, raster_config, output_dir=raster_dir, quiet=True)
+
+        def relative_files(folder: Path) -> set[Path]:
+            return {path.relative_to(folder) for path in folder.rglob("*") if path.is_file()}
+
+        combined_files = relative_files(combined_dir)
+        tabular_files = relative_files(tabular_dir)
+        raster_files = relative_files(raster_dir)
+        assert tabular_files and raster_files
+        assert tabular_files.isdisjoint(raster_files)
+        assert combined_files == tabular_files | raster_files
+
+        # Compare file contents too. The metadata JSON files are left out,
+        # because they record the run time.
+        for relative_path in sorted(combined_files):
+            separate_dir = tabular_dir if relative_path in tabular_files else raster_dir
+            separate_path = separate_dir / relative_path
+            if relative_path.suffix == ".csv":
+                pd.testing.assert_frame_equal(
+                    pd.read_csv(combined_dir / relative_path), pd.read_csv(separate_path)
+                )
+            elif relative_path.suffix == ".tif":
+                with (
+                    rasterio.open(combined_dir / relative_path) as combined_tile,
+                    rasterio.open(separate_path) as separate_tile,
+                ):
+                    np.testing.assert_array_equal(combined_tile.read(), separate_tile.read())
+
 
 # ------------------------------------------------------------------
 # Error handling

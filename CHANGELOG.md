@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `init_gee()` accepts the content of a service-account key with the new keyword argument `credentials_json`: the JSON text (`str` or `bytes`) or a `dict`. Use it when the key comes from a secret store or an upload instead of a file. With `credentials_json`, `init_gee()` does not look for a key file. Pass `credentials_path` or `credentials_json`, not both. If the key is not valid, the error message contains no part of the key.
+- The web app has a hosted mode for a shared public server, selected with the environment variable `ENVOI_WEBAPP_MODE=hosted`. A public instance on SciLifeLab Serve is in preparation. In hosted mode:
+  - Each user uploads their own Earth Engine key. The key stays in the server's memory for the browser session and is never written to disk. Each extraction runs in its own process with that key only.
+  - The results come as one ZIP download with the outputs and the run log. There is no output directory on the server to choose.
+  - Limits apply to the upload, the number of rows and data products, the window sizes, the run time, the size of the results, and the number of extractions at the same time. The page shows the limits.
+  - The server deletes the results 10 minutes after the first download, or at the latest 30 minutes after the extraction ends. A failed, cancelled, or stopped extraction gives no results.
+
+  See "Hosted web app" in the README.
+- Web app: a **Cancel** button stops a running extraction.
+- Web app: the progress and the results stay on the page when you change other settings, until you click **Clear results** or start a new extraction.
+- Web app: each extraction writes a run log (`envoi-run-log-<UTC start time>.txt`) next to the outputs. It lists the warnings and errors that envoi reported, for example points for which Earth Engine returned an error. The page shows the number of warnings, and the last lines of the run log when an extraction fails.
+- Web app: each data-product row has its own **Output type** (tabular or raster), so one run can mix tabular statistics and raster tiles.
+- A container image definition for the hosted web app on SciLifeLab Serve (`deploy/serve/`), and a GitHub workflow that builds, checks, and publishes the image as `ghcr.io/biodiversitydatalab/envoi-webapp`.
+
+### Changed
+- The web app runs each extraction in a separate background process instead of inside the page. In the local web app, the outputs still go to the output directory that you choose, with the same file names, plus the run log.
+- Web app: the global **Output type** selector is gone. Choose the output type in each data-product row.
+- Web app: the data-product filter **Type** is now called **Category**.
+- Web app: a service-account key without `token_uri` is now rejected when you start an extraction, with a message that names the missing field. Keys that Google issues contain this field, so use the unchanged key file from the Google Cloud Console.
+- The `webapp` extra now needs Streamlit 1.52 or later. Run `pip install --upgrade "envoi-geospatial[webapp]"` to update an existing installation.
+- Web app: **Cancel** in the local web app leaves the files that the extraction wrote before the cancel in the output directory. They can be incomplete, so check or delete them before you use them.
+
 ## [0.2.2] — 2026-08-28
 
 ### Added
