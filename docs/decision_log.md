@@ -129,3 +129,20 @@ These decisions came from the review of the extraction pipeline (branch `pipelin
 - **Rejected:**
   - The even rule 2 · round(window / (2 · pixel)) in both adapters: Earth Engine tiles would not change, but the tile side would differ from the window by up to one pixel, and the point would be at a pixel corner, not inside a centre pixel.
   - Document the difference between the adapters only: tiles from the two data sources would not be comparable.
+
+### Pixel size in metres
+
+- **Decision:** envoi converts the pixel width of a local raster to metres with one rule (`geo.pixel_size_m`).
+  - Geographic CRS: the pixel width in degrees multiplied by 111 319.49 m per degree, the length of one degree at the equator.
+    Earth Engine uses this value as the nominal scale of assets in degrees.
+  - Projected CRS: the pixel width multiplied by the CRS's linear unit factor. Other CRS: no value (`null`).
+- **Consequences:**
+  - Away from the equator, the value is larger than the east–west width of a pixel on the ground, by the factor 1/cos(latitude) (2 at 60°).
+  - The rule gives the sidecar field `native_spatial_resolution_m` of local datasets and the catalog field `resolution_m` that `_inspect_raster` fills in.
+  - The same value is the threshold below which the local adapter widens a statistics window to two pixels.
+    Away from the equator, a window a little wider than the true east–west pixel width can therefore also be widened.
+- **Reason:** before, both fields held the pixel width in the units of the CRS (for example 0.001 for pixels of 0.001°), although their names say metres.
+  One value for each raster, by the rule that Earth Engine uses, keeps the local and Earth Engine values comparable for data in degrees.
+- **Rejected:**
+  - A pixel width that depends on the latitude (at the raster centre, or at each point): the sidecar and catalog fields hold one value for each raster,
+    and the value would differ from Earth Engine's nominal scale for the same data.

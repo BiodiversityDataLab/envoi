@@ -161,7 +161,9 @@ class TestFailedPointsTabular:
         # Exactly one failed-point warning, which the sidecar also records.
         assert len(failed_point_warnings) == 1
         warning_text = failed_point_warnings[0]
-        assert "Dataset 'dem_local', window 100 m: 1 of 3 points failed" in warning_text
+        assert "Dataset 'dem_local', window 100 m: 1 of 3 points failed (IDs: 'T6WPKD')." in (
+            warning_text
+        )
         assert "QC column 'dem_local_error_100m'" in warning_text
         assert f"First error: {_SECOND_READ_ERROR}" in warning_text
         assert sidecar["warnings"]["failed_dem_local_100m"] == warning_text
@@ -204,8 +206,12 @@ class TestFailedPointsTabular:
         assert (quality["n_errors"], quality["ids_errors"]) == (1, ["T6WPKD"])
         assert len(failed_point_warnings) == 1
         assert "QC column 'dem_local_error_point'" in failed_point_warnings[0]
-        # A point-only run has no window, so the warning names point values.
+        # A point-only run has no window, so the warning names point values,
+        # and its sidecar key ends like its QC columns.
         assert "Dataset 'dem_local', point values: 1 of 3" in failed_point_warnings[0]
+        sidecar = _read_sidecar(tmp_path / "failed_pixel_metadata.json")
+        assert sidecar["warnings"]["failed_dem_local_point"] == failed_point_warnings[0]
+        assert "failed_dem_local_100m" not in sidecar["warnings"]
 
     def test_failed_pixel_read_with_window_statistics(self, monkeypatch, three_points, tmp_path):
         """When the window read works and the pixel read fails, every statistic of the point is null."""
@@ -283,6 +289,7 @@ class TestFailedPointsTabular:
 
         message = str(error_info.value)
         assert "Dataset 'dem_local', window 100 m" in message
+        assert "Check your network connection and your access to the dataset" in message
         assert "First error: RasterioIOError: stub: damaged block in read 1" in message
         assert error_info.value.__cause__ is raised_errors[0]
         assert not (tmp_path / "all_failed.csv").exists()
@@ -370,6 +377,64 @@ class TestFailedTiles:
             error_info.value
         )
         assert error_info.value.__cause__ is raised_errors[0]
+
+
+class TestFailedPointWarning:
+    """The failed-point warning lists the failed IDs and says where their errors are."""
+
+    def test_tabular_warning_without_metadata(self, monkeypatch, three_points, tmp_path):
+        """With write_metadata=False, the warning lists the ID and says that no QC table is written."""
+        _fail_reads(monkeypatch, local_adapter, "rio_mask", {2})
+
+        _, failed_point_warnings = _run_and_record_warnings(
+            three_points,
+            _tabular_config("no_metadata", ["mean"]),
+            output_dir=tmp_path,
+            write_metadata=False,
+        )
+
+        [warning_text] = failed_point_warnings
+        assert "Dataset 'dem_local', window 100 m: 1 of 3 points failed (IDs: 'T6WPKD')." in (
+            warning_text
+        )
+        assert (
+            "The QC table, whose column 'dem_local_error_100m' has the error of each failed "
+            "point, is not written because write_metadata is False."
+        ) in warning_text
+        assert f"First error: {_SECOND_READ_ERROR}" in warning_text
+        assert not (tmp_path / "no_metadata_qc.csv").exists()
+        assert not (tmp_path / "no_metadata_metadata.json").exists()
+
+    def test_raster_warning_without_metadata(self, monkeypatch, three_points, tmp_path):
+        """With write_metadata=False, the manifest is written, and the warning names it."""
+        _fail_reads(monkeypatch, local_adapter, "rio_mask", {2})
+
+        _, failed_point_warnings = _run_and_record_warnings(
+            three_points, _raster_config("tiles"), output_dir=tmp_path, write_metadata=False
+        )
+
+        manifest_path = tmp_path / "tiles" / "dem_local" / "tiles_manifest.csv"
+        [warning_text] = failed_point_warnings
+        assert "1 of 3 points failed (IDs: 'T6WPKD')." in warning_text
+        assert f"'error' column of the tile manifest '{manifest_path}'" in warning_text
+        assert pd.read_csv(manifest_path).loc[1, "error"] == _SECOND_READ_ERROR
+        assert not (tmp_path / "tiles" / "tiles_metadata.json").exists()
+
+    def test_warning_lists_at_most_ten_ids(self, monkeypatch, sample_df, tmp_path):
+        """With 11 failed points, the warning lists the first 10 IDs and the number of the others."""
+        # Twelve points inside the DEM: the six sample points, twice, with new IDs.
+        twelve_points = pd.concat([sample_df, sample_df], ignore_index=True)
+        twelve_points["occurrenceID"] = [f"P{index:02d}" for index in range(12)]
+        _fail_reads(monkeypatch, local_adapter, "rio_mask", set(range(1, 12)))
+
+        _, failed_point_warnings = _run_and_record_warnings(
+            twelve_points, _tabular_config("many_failed", ["mean"]), output_dir=tmp_path
+        )
+
+        listed_ids = ", ".join(f"'P{index:02d}'" for index in range(10))
+        [warning_text] = failed_point_warnings
+        assert f"11 of 12 points failed (IDs: {listed_ids}, ... and 1 more)." in warning_text
+        assert "First error: RasterioIOError: stub: damaged block in read 1" in warning_text
 
 
 class TestSidecarJson:

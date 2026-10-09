@@ -477,9 +477,10 @@ class GeeRasterAdapter(BaseAdapter):
         if combined:
             # Populate band cache from the config — no GEE API call needed.
             if not hasattr(self, "_cached_band_name"):
-                self._cached_band_name = combined[0]
                 self._cached_band_names = combined
                 self._cached_band_count = len(combined)
+                # Set last: worker threads read this attribute as "cache is filled".
+                self._cached_band_name = combined[0]
             return self._cached_band_name
         # Fallback: ask GEE (costs one getInfo call, cached after first success).
         # A failed request raises and caches nothing. Caching a fallback name
@@ -956,7 +957,13 @@ class GeeRasterAdapter(BaseAdapter):
             # Clamp to 100% — the geometric total can be off by a cell or two,
             # so a fully-valid window can otherwise read as 101%.
             coverage_pct = min(coverage_pct, 100.0)
-            has_values = any(v is not None for v in window_stats.values())
+            if count_only:
+                # Every window statistic is a count. A window without valid
+                # pixels gives a count of 0, not a null value, so only a
+                # count above 0 shows that the window has data.
+                has_values = any(count is not None and count > 0 for count in window_stats.values())
+            else:
+                has_values = any(v is not None for v in window_stats.values())
             n_pixels = int(valid_count)
             had_nodata = valid_count < total_cells
         else:
@@ -1011,12 +1018,14 @@ class GeeRasterAdapter(BaseAdapter):
         """Compute server-side statistics for many points in parallel (Mode 1).
 
         Each point is resolved with one server-side ``ee.Dictionary``
-        containing one or two reductions: a window reduction (whenever
-        any non-point reducer was requested) and a point reduction
-        (whenever ``"point"`` is in *reducer_names*). GEE evaluates the
-        branches in parallel server-side and we pull them back together
-        with one ``getInfo()`` round-trip, so the cost is one HTTP call
-        per point regardless of which combination the user requested.
+        containing up to three reductions: a window reduction (whenever
+        any non-point reducer was requested), a circular aspect reduction
+        (whenever the derived ``aspect`` band is reduced with ``mean``,
+        ``std``, or ``var``), and a point reduction (whenever ``"point"``
+        is in *reducer_names*). GEE evaluates the branches in parallel
+        server-side and we pull them back together with one ``getInfo()``
+        round-trip, so the cost is one HTTP call per point regardless of
+        which combination the user requested. See ``_fetch_stats_single``.
 
         Output keys per point:
           - window stats: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
@@ -1043,6 +1052,14 @@ class GeeRasterAdapter(BaseAdapter):
         lats = list(lats)
         lons = list(lons)
         date_list = list(dates) if dates is not None else [None] * n
+
+        # A batch without points needs no request. Without this return, the
+        # timestamp request below would have no points to filter the
+        # collection by, and would ask for the dates of every image of the
+        # collection, which can exceed Earth Engine's limits.
+        if n == 0:
+            emit_progress_step(progress_callback, 0, 0)
+            return []
 
         # Fetch the collection's timestamp index now that we know the
         # batch's spatial extent and date range — without this the fetch
@@ -1254,6 +1271,11 @@ class GeeRasterAdapter(BaseAdapter):
         date_list = list(dates) if dates is not None else [None] * n
         id_list = list(ids) if ids is not None else [str(i) for i in range(n)]
         results: list = [None] * n
+
+        # A batch without points needs no request (see fetch_stats_batch).
+        if n == 0:
+            emit_progress_step(progress_callback, 0, 0)
+            return [], []
 
         # Fetch the collection's timestamp index now that we know the
         # batch's spatial extent and date range — see fetch_stats_batch

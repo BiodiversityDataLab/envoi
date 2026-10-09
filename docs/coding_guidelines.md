@@ -364,7 +364,7 @@ batch_id = run_settings.batch_id
 
 ### Module docstrings
 
-Start each module with a docstring. **[Proposed]** `qc.py`, `metadata.py`, `catalog.py`, and `reducers.py` do not have one yet.
+Start each module with a docstring. **[Proposed]** `metadata.py`, `catalog.py`, and `reducers.py` do not have one yet.
 Add one when you make a substantial change to such a module. The model is `_input_validation.py`.
 It states the module's responsibility, its main functions, and its boundaries (for example "no GEE calls").
 

@@ -108,10 +108,13 @@ def _download_tile_via_url(
     # but the URL itself points to a streamed export, so the actual image
     # generation happens during the GET below.
     # With crs, crs_transform and dimensions, and without region or scale,
-    # Earth Engine returns exactly this rectangle of pixels
-    # (ee.Image._apply_crs_and_affine). Do not add a region or a scale: with
-    # a region, Earth Engine raises an error; with a scale, it resizes the
-    # image to the dimensions instead.
+    # the Earth Engine client turns the dimensions into a rectangle in that
+    # projection, so Earth Engine returns exactly this rectangle of pixels
+    # (ee.Image._apply_crs_and_affine). Do not add a region or a scale. With
+    # a region, Earth Engine raises an error. A scale has no use: Earth
+    # Engine ignores it when crs and crs_transform are set (getDownloadURL
+    # documentation), and with it the client no longer turns the dimensions
+    # into this rectangle.
     url = img.getDownloadURL(
         {
             "crs": crs,
@@ -153,7 +156,10 @@ def _download_tile_via_url(
             time.sleep(2**attempt)
 
     # Exhausted retries — surface the last error so export_tiles can
-    # log it per-point and mark the result slot as None.
+    # log it per-point and mark the result slot as None. A download that
+    # failed while it was streamed leaves part of a GeoTIFF on disk. Remove
+    # it, so that no damaged tile stays next to the valid tiles.
+    output_path.unlink(missing_ok=True)
     raise RuntimeError(
         f"Failed to download GEE tile after {_TILE_DOWNLOAD_MAX_RETRIES} attempts: {last_error}"
     )

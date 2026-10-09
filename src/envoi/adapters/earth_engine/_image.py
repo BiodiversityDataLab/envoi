@@ -151,6 +151,9 @@ def _get_collection_time_bounds(
         the original error. Every point of the batch needs the timestamps to
         select its image, so the caller lets this error stop the run.
     """
+    # Request the timestamps. Only the Earth Engine calls are inside the try,
+    # so an error in the local processing below is not reported as an Earth
+    # Engine error.
     try:
         image_collection = ee.ImageCollection(collection_id)
         # Narrow the collection BEFORE aggregating timestamps. Order matters
@@ -176,57 +179,6 @@ def _get_collection_time_bounds(
                 "ends": image_collection.aggregate_array("system:time_end"),
             }
         ).getInfo()
-        start_times = raw["starts"]
-        end_times = raw["ends"]
-
-        # Pair each start with the end at the same position BEFORE dropping
-        # missing (None) values. Dropping first would shift the later values
-        # of one list: with one image missing its start and another missing
-        # its end, the lists keep the same length, and starts get the ends of
-        # other images. Pairing by position needs lists of the same length;
-        # otherwise there are no reliable pairs, so use no end times.
-        if len(end_times) == len(start_times):
-            paired_times = list(zip(start_times, end_times))
-        else:
-            paired_times = [(start, None) for start in start_times]
-        # Drop pairs without a start — we still need at least one valid start
-        # to do anything useful, regardless of which branch we end up in.
-        paired_times = [(start, end) for start, end in paired_times if start is not None]
-        clean_starts = [int(start) for start, _ in paired_times]
-        if not clean_starts:
-            return None, None
-
-        # Branch 1: end-times are missing or partial → return a start-only
-        # index. Build it from clean_starts (sorted + deduped) so it's
-        # directly usable for nearest-neighbour lookups downstream.
-        if any(end is None for _, end in paired_times):
-            logger.debug(
-                "system:time_end missing for some images in %s; interval-based "
-                "date selection will fall back to next-start boundaries.",
-                collection_id,
-            )
-            start_series = (
-                pd.to_datetime(pd.Series(clean_starts), unit="ms", origin="unix")
-                .drop_duplicates()
-                .sort_values()
-            )
-            return pd.DatetimeIndex(start_series), None
-
-        # Branch 2: every image has a paired (start, end). Build both indices
-        # from the same DataFrame, with one row per start and sorted by start,
-        # so they stay aligned element-by-element — required for
-        # `time_ends[idx]` lookups to map back to the correct start.
-        # Two images can have the same start and different ends. A duplicate
-        # start makes the index non-unique, and the nearest-image lookup
-        # (`get_indexer`) then raises. Keep the latest end of each start, so
-        # the interval covers every image with that start.
-        bounds_df = pd.DataFrame(
-            {"start": clean_starts, "end": [int(end) for _, end in paired_times]}
-        )
-        bounds_df = bounds_df.groupby("start", as_index=False, sort=True)["end"].max()
-        start_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["start"], unit="ms", origin="unix"))
-        end_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["end"], unit="ms", origin="unix"))
-        return start_index, end_index
     # Broad catch that re-raises a clear error: Earth Engine reports unrelated
     # failures (network, quota, unknown asset) with one exception type.
     # Without the timestamps, the adapter cannot select the image for each
@@ -241,6 +193,57 @@ def _get_collection_time_bounds(
             f"network connection, then run the extraction again. "
             f"Original error: {error}"
         ) from error
+    start_times = raw["starts"]
+    end_times = raw["ends"]
+
+    # Pair each start with the end at the same position, and only then drop
+    # the pairs without a start. This keeps the pairs correct when Earth
+    # Engine returns a null value for an image without the property. When
+    # Earth Engine instead leaves such an image out of a list, the positions
+    # of the two lists do not match. Lists of different lengths show this:
+    # there are then no reliable pairs, so use no end times. Known limitation:
+    # one image without a start and another image without an end give two
+    # lists of the same length, and their pairs can then be wrong.
+    if len(end_times) == len(start_times):
+        paired_times = list(zip(start_times, end_times))
+    else:
+        paired_times = [(start, None) for start in start_times]
+    # Drop pairs without a start — we still need at least one valid start
+    # to do anything useful, regardless of which branch we end up in.
+    paired_times = [(start, end) for start, end in paired_times if start is not None]
+    clean_starts = [int(start) for start, _ in paired_times]
+    if not clean_starts:
+        return None, None
+
+    # Branch 1: end-times are missing or partial → return a start-only
+    # index. Build it from clean_starts (sorted + deduped) so it's
+    # directly usable for nearest-neighbour lookups downstream.
+    if any(end is None for _, end in paired_times):
+        logger.debug(
+            "system:time_end missing for some images in %s; interval-based "
+            "date selection will fall back to next-start boundaries.",
+            collection_id,
+        )
+        start_series = (
+            pd.to_datetime(pd.Series(clean_starts), unit="ms", origin="unix")
+            .drop_duplicates()
+            .sort_values()
+        )
+        return pd.DatetimeIndex(start_series), None
+
+    # Branch 2: every image has a paired (start, end). Build both indices
+    # from the same DataFrame, with one row per start and sorted by start,
+    # so they stay aligned element-by-element — required for
+    # `time_ends[idx]` lookups to map back to the correct start.
+    # Two images can have the same start and different ends. A duplicate
+    # start makes the index non-unique, and the nearest-image lookup
+    # (`get_indexer`) then raises. Keep the latest end of each start, so
+    # the interval covers every image with that start.
+    bounds_df = pd.DataFrame({"start": clean_starts, "end": [int(end) for _, end in paired_times]})
+    bounds_df = bounds_df.groupby("start", as_index=False, sort=True)["end"].max()
+    start_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["start"], unit="ms", origin="unix"))
+    end_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["end"], unit="ms", origin="unix"))
+    return start_index, end_index
 
 
 def _find_nearest_timestamp(
@@ -436,6 +439,10 @@ def _build_image(
     - date provided + no timestamps (fallback): filterDate ±1 day, .first()
     - no date: mosaic (most recent non-masked pixel per position)
 
+    When the date filter leaves no image at the point, the image is the first
+    image of the collection with every pixel masked, so its statistics are
+    null (Earth Engine decides this in the point's request).
+
     Parameters
     ----------
     geometry : ee.Geometry, optional
@@ -492,7 +499,26 @@ def _build_image(
                 time_ends=collection_time_ends,
             )
             image_collection = image_collection.filterDate(start, end)
-            image = image_collection.first()
+            # When no image covers the point on the selected dates (for
+            # example an ocean point of a tiled land product), the filtered
+            # collection is empty, and .first() gives a null image. Every
+            # request on a null image raises ("Parameter 'image' is required"),
+            # so the point would be a failed point. Use the first image of the
+            # whole collection with every pixel masked instead: it has the
+            # collection's bands, so the band selection and the derived bands
+            # below work, and the point gets null statistics and in_extent
+            # False, as a point outside a mosaic does. Earth Engine evaluates
+            # the condition in the point's own request, so no request is added.
+            masked_placeholder = ee.Image(
+                ee.ImageCollection(dataset_spec["collection"]).first()
+            ).updateMask(0)
+            image = ee.Image(
+                ee.Algorithms.If(
+                    image_collection.size().gt(0),
+                    image_collection.first(),
+                    masked_placeholder,
+                )
+            )
         else:
             # No date: mosaic (most recent non-masked pixel per position)
             image = image_collection.mosaic()

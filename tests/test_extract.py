@@ -2991,6 +2991,22 @@ class TestSampleIdValidation:
             )
         assert not (tmp_path / "id_check").exists()
 
+    def test_list_checks_ids_before_an_earlier_tabular_output(self, tmp_path):
+        """In a list, a raster config with duplicate IDs stops the call before the tabular config runs."""
+        tabular_config = {
+            "batch_id": "tabular_first",
+            "datasets": ["dem_local"],
+            "settings": {"output_type": "tabular", "window_size_m": 200, "statistics": ["mean"]},
+        }
+
+        with pytest.raises(ValueError, match="Output 'id_check': column 'occurrenceID' has dup"):
+            extract(
+                self._points_with_ids(["dup", "dup", "unique"]),
+                [tabular_config, self._raster_config()],
+                output_dir=tmp_path,
+            )
+        assert list(tmp_path.iterdir()) == []
+
     def test_tabular_mode_allows_duplicate_ids(self, tmp_path):
         """Tabular output puts IDs in a column, where duplicates are harmless."""
         extract(

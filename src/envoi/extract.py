@@ -13,7 +13,9 @@ from ._config_parsing import (
     _parse_run_configs,
     _resolve_stats_for_dataset,
 )
+from ._filenames import format_id_list
 from ._input_validation import (
+    _MAX_IDS_IN_MESSAGE,
     _build_reserved_column_renames,
     _parse_and_validate_dates,
     _validate_and_reproject_crs,
@@ -284,6 +286,22 @@ def extract(
     # Earth Engine quota is used.
     all_run_settings = _parse_run_configs(output_configs, defaults, catalog_datasets)
 
+    # Raster mode names one GeoTIFF per point after that point's ID, so
+    # blank or duplicated IDs would lose tiles. Every run config uses the same
+    # points, so check once, when any run config is raster: after any
+    # null-date rows have been dropped, but before the first adapter is built
+    # or any output is written. The run then fails with an actionable message
+    # instead of burning Earth Engine quota on an export that cannot be
+    # written. Tabular mode puts IDs in a column, where duplicates are harmless.
+    raster_batch_ids = [
+        run_settings.batch_id
+        for run_settings in all_run_settings
+        if run_settings.output_type == "raster"
+    ]
+    if raster_batch_ids:
+        quoted_batch_ids = ", ".join(f"'{batch_id}'" for batch_id in raster_batch_ids)
+        _validate_sample_ids(df["id"], id_column, context=f"Output {quoted_batch_ids}")
+
     for run_settings in all_run_settings:
         df_copy = df.copy()
 
@@ -299,15 +317,6 @@ def extract(
         window_sizes = run_settings.window_sizes
         min_coverage = run_settings.min_coverage
         resample_m = run_settings.resample_m
-
-        # Raster mode names one GeoTIFF per point after that point's ID, so
-        # blank or duplicated IDs would lose tiles. Check now — after any
-        # null-date rows have been dropped, but before the first adapter is
-        # built — so the run fails with an actionable message instead of
-        # burning Earth Engine quota on an export that cannot be written.
-        # Tabular mode puts IDs in a column, where duplicates are harmless.
-        if output_type == "raster":
-            _validate_sample_ids(df_copy["id"], id_column, context=f"Output '{batch_id}'")
 
         # When the user supplies more than one window size we need to keep the
         # window suffix on raster filenames and on the per-window quality
@@ -333,6 +342,7 @@ def extract(
                         df_copy,
                         dataset_meta,
                         dataset_qc_columns,
+                        quality_key,
                         reducer_warning,
                         failed_point_warning,
                     ) = _process_dataset_tabular(
@@ -343,6 +353,7 @@ def extract(
                         dates,
                         window_size,
                         band_overrides=band_overrides,
+                        write_metadata=write_metadata,
                         quiet=quiet,
                         progress_callback=_make_progress_step_callback(
                             callback=progress_callback,
@@ -360,9 +371,11 @@ def extract(
                     # assignment naturally deduplicates repeat windows.
                     if reducer_warning:
                         warnings_backlog[f"reducer_{dataset}"] = reducer_warning
-                    # One failed-point warning per (dataset, window) batch.
+                    # One failed-point warning per (dataset, window) batch. The
+                    # key ends like the batch's QC columns and quality summary:
+                    # "200m", or "point" for a point-only run.
                     if failed_point_warning:
-                        warnings_backlog[f"failed_{dataset}_{window_size}m"] = failed_point_warning
+                        warnings_backlog[f"failed_{dataset}_{quality_key}"] = failed_point_warning
 
                 # In raster mode, the helper exports a folder of GeoTIFF tiles
                 # and returns the path plus the per-dataset metadata dict. With
@@ -541,9 +554,10 @@ def _process_dataset_tabular(
     dates: list | None,
     window_size: int,
     band_overrides: dict[str, Any] | None = None,
+    write_metadata: bool = True,
     quiet: bool = False,
     progress_callback: ProgressStepCallback | None = None,
-) -> tuple[pd.DataFrame, dict, list[str], str | None, str | None]:
+) -> tuple[pd.DataFrame, dict, list[str], str, str | None, str | None]:
     """Fetch stats and QC columns for one dataset/window pair in tabular mode.
 
     Owns adapter instantiation, statistic computation, QC column assembly,
@@ -556,8 +570,14 @@ def _process_dataset_tabular(
     instantiation. The catalog dict itself is never mutated — the override
     is shallow-merged into a fresh dict per call.
 
-    Returns ``(df, dataset_meta, qc_column_names, reducer_warning,
-    failed_point_warning)`` where ``reducer_warning`` is the message from
+    ``write_metadata`` tells whether ``extract()`` writes the QC table, so
+    that the failed-point warning names a place where the errors are.
+
+    Returns ``(df, dataset_meta, qc_column_names, quality_key,
+    reducer_warning, failed_point_warning)`` where ``quality_key`` is the key
+    of the batch's quality summary and the end of its QC column names
+    (``"200m"``, or ``"point"`` for a point-only run), and
+    ``reducer_warning`` is the message from
     :func:`validate_reducers` when the requested stats don't match the
     dataset's data_type (e.g. ``mean`` on a categorical raster) — or ``None``
     when everything is fine. ``failed_point_warning`` is the warning about
@@ -648,14 +668,31 @@ def _process_dataset_tabular(
 
     # Warn once when some points failed. The QC error column, built by
     # attach_quality_control above, has the error text of each failed point.
+    # extract() writes the QC table only with write_metadata=True.
+    error_column = f"{dataset}_error_{quality_key}"
+    if write_metadata:
+        error_location = f"The error of each failed point is in the QC column '{error_column}'."
+    else:
+        error_location = (
+            f"The QC table, whose column '{error_column}' has the error of each failed "
+            f"point, is not written because write_metadata is False."
+        )
     failed_point_warning = _warn_about_failed_points(
         meta_list,
+        df["id"].tolist(),
         dataset=dataset,
         batch_label=batch_label,
-        error_location=f"the QC column '{dataset}_error_{quality_key}'",
+        error_location=error_location,
     )
 
-    return df, dataset_meta, qc_column_names, reducer_warning, failed_point_warning
+    return (
+        df,
+        dataset_meta,
+        qc_column_names,
+        quality_key,
+        reducer_warning,
+        failed_point_warning,
+    )
 
 
 def _process_dataset_raster(
@@ -758,12 +795,17 @@ def _process_dataset_raster(
         errors=[tile_meta.get("error") for tile_meta in meta_list],
     )
 
-    # Warn once when some tiles failed. The manifest has their error text.
+    # Warn once when some tiles failed. The manifest, which extract() writes
+    # also with write_metadata=False, has their error text.
     failed_point_warning = _warn_about_failed_points(
         meta_list,
+        ids,
         dataset=dataset,
         batch_label=f"window {window_size} m",
-        error_location=f"the 'error' column of the tile manifest '{manifest_path}'",
+        error_location=(
+            f"The error of each failed point is in the 'error' column of the tile "
+            f"manifest '{manifest_path}'."
+        ),
     )
 
     return tiles_root / dataset, dataset_meta, failed_point_warning
@@ -856,12 +898,15 @@ def _raise_if_every_point_failed(meta_list: list[dict], *, dataset: str, batch_l
     raise RuntimeError(
         f"Dataset '{dataset}', {batch_label}: every point failed "
         f"({len(meta_list)} of {len(meta_list)}), so the run stops. "
+        f"Check your network connection and your access to the dataset, "
+        f"then run the extraction again. "
         f"First error: {first_failed_meta['error']}"
     ) from first_failed_meta.get("exception")
 
 
 def _warn_about_failed_points(
     meta_list: list[dict],
+    ids: list,
     *,
     dataset: str,
     batch_label: str,
@@ -869,12 +914,20 @@ def _warn_about_failed_points(
 ) -> str | None:
     """Emit one warning when some points of one batch failed, and return it.
 
-    The warning names the dataset, the window, the number of failed points,
-    where the error of each failed point is (``error_location``), and the
-    error text of the first failed point (the lowest input index). It is
-    emitted with ``warnings.warn`` and returned, so ``extract()`` can record
-    it in the metadata sidecar. See :func:`_raise_if_every_point_failed` for
-    what a failed point is.
+    The warning names the dataset, the window, the number of failed points
+    and the IDs of up to 10 of them, where the error of each failed point is
+    (``error_location``), and the error text of the first failed point (the
+    lowest input index). It is emitted with ``warnings.warn`` and returned, so
+    ``extract()`` can record it in the metadata sidecar. See
+    :func:`_raise_if_every_point_failed` for what a failed point is.
+
+    Args:
+        meta_list: One adapter meta dict per point of the batch, in input order.
+        ids: The input IDs, in the same order as ``meta_list``.
+        dataset: The dataset name, for the message.
+        batch_label: The window ("window 200 m") or "point values", for the message.
+        error_location: One or more sentences that say where the error of each
+            failed point is, or why it is not written.
 
     Returns:
         The warning text, or ``None`` when no point failed.
@@ -882,10 +935,12 @@ def _warn_about_failed_points(
     failed_metas = [point_meta for point_meta in meta_list if "error" in point_meta]
     if not failed_metas:
         return None
+    failed_ids = summarize_point_errors(meta_list, ids)["ids_errors"]
     message = (
         f"Dataset '{dataset}', {batch_label}: {len(failed_metas)} of "
-        f"{len(meta_list)} points failed. The error of each failed point is in "
-        f"{error_location}. First error: {failed_metas[0]['error']}"
+        f"{len(meta_list)} points failed (IDs: "
+        f"{format_id_list(failed_ids, limit=_MAX_IDS_IN_MESSAGE)}). "
+        f"{error_location} First error: {failed_metas[0]['error']}"
     )
     # stacklevel=4 points the warning at the caller of extract():
     # this helper <- _process_dataset_* <- extract() <- caller.

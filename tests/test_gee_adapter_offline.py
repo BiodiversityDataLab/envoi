@@ -26,10 +26,11 @@ from types import SimpleNamespace
 import ee
 import pandas as pd
 import pytest
+import requests
 
 from envoi import update_catalog
 from envoi._output_assembly import _append_stat_columns
-from envoi.adapters.earth_engine import _image
+from envoi.adapters.earth_engine import _image, _tiles
 from envoi.adapters.earth_engine import adapter as adapter_module
 from envoi.adapters.earth_engine._image import (
     _get_collection_time_bounds,
@@ -607,6 +608,113 @@ class TestExportSingleTileGrid:
         assert download["dimensions"] == "20x20"
 
 
+# ------------------------------------------------------------------
+# _download_tile_via_url — the request and the file of one tile
+# ------------------------------------------------------------------
+
+
+class _StubDownloadImage:
+    """Stands in for an ``ee.Image``. ``getDownloadURL`` records its parameters."""
+
+    def __init__(self):
+        self.download_parameters: list[dict] = []
+
+    def getDownloadURL(self, parameters: dict) -> str:
+        self.download_parameters.append(parameters)
+        return "https://earthengine.invalid/tile"
+
+
+class _StubTileResponse:
+    """Stands in for a streamed ``requests`` response with HTTP status 200.
+
+    ``chunks`` holds the parts of the body. An exception in ``chunks`` is
+    raised when the stream reaches it, as when a connection breaks.
+    """
+
+    status_code = 200
+
+    def __init__(self, chunks: list):
+        self._chunks = chunks
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def iter_content(self, chunk_size: int):
+        for chunk in self._chunks:
+            if isinstance(chunk, Exception):
+                raise chunk
+            yield chunk
+
+
+def _stub_tile_responses(monkeypatch, chunks: list) -> list[str]:
+    """Replace ``requests`` and ``time`` in ``_tiles``: each GET streams ``chunks``, with no waits.
+
+    Returns a list that records the URL of each GET.
+    """
+    requested_urls: list[str] = []
+
+    def get(url, stream=False, timeout=None):
+        requested_urls.append(url)
+        return _StubTileResponse(chunks)
+
+    stub_requests = SimpleNamespace(get=get, RequestException=requests.RequestException)
+    monkeypatch.setattr(_tiles, "requests", stub_requests)
+    monkeypatch.setattr(_tiles, "time", SimpleNamespace(sleep=lambda seconds: None))
+    return requested_urls
+
+
+# The grid of a 7 × 7 tile of 30 m pixels in UTM zone 33N.
+_TILE_CRS_TRANSFORM = [30.0, 0.0, 600_000.0, 0.0, -30.0, 6_640_000.0]
+
+
+class TestDownloadTile:
+    """``_download_tile_via_url`` requests the exact pixel grid and writes only complete tiles."""
+
+    def _download(self, image: _StubDownloadImage, output_path) -> None:
+        _tiles._download_tile_via_url(
+            image,
+            crs="EPSG:32633",
+            crs_transform=_TILE_CRS_TRANSFORM,
+            dimensions="7x7",
+            output_path=output_path,
+        )
+
+    def test_request_has_the_grid_and_no_region_or_scale(self, monkeypatch, tmp_path):
+        """The download parameters are the grid and the format; the body is written to the file."""
+        requested_urls = _stub_tile_responses(monkeypatch, [b"GeoTIFF ", b"bytes"])
+        image = _StubDownloadImage()
+        output_path = tmp_path / "a-test_dataset.tif"
+
+        self._download(image, output_path)
+
+        assert image.download_parameters == [
+            {
+                "crs": "EPSG:32633",
+                "crs_transform": _TILE_CRS_TRANSFORM,
+                "dimensions": "7x7",
+                "format": "GEO_TIFF",
+                "filePerBand": False,
+            }
+        ]
+        assert requested_urls == ["https://earthengine.invalid/tile"]
+        assert output_path.read_bytes() == b"GeoTIFF bytes"
+
+    def test_failed_stream_leaves_no_partial_file(self, monkeypatch, tmp_path):
+        """When every attempt breaks during the stream, the error is raised and no file stays."""
+        broken_connection = requests.exceptions.ChunkedEncodingError("stub: connection broken")
+        requested_urls = _stub_tile_responses(monkeypatch, [b"partial ", broken_connection])
+        output_path = tmp_path / "a-test_dataset.tif"
+
+        with pytest.raises(RuntimeError, match="after 3 attempts: stub: connection broken"):
+            self._download(_StubDownloadImage(), output_path)
+
+        assert len(requested_urls) == 3
+        assert not output_path.exists()
+
+
 class TestBandNameCache:
     """``_get_band_name`` caches the band information only after a successful request."""
 
@@ -709,6 +817,27 @@ class TestCollectionTimeBoundsRequestFailure:
 
         assert "stub: computation timed out" in str(error_info.value)
         assert error_info.value.__cause__ is request_error
+
+    def test_error_after_the_request_is_not_wrapped(self, monkeypatch):
+        """An error in the processing of the response propagates as it is, without RuntimeError."""
+
+        class ResponseWithoutEnds:
+            """Stands in for ``ee.Dictionary``. ``getInfo`` returns no ``ends`` list."""
+
+            def __init__(self, values: dict):
+                self._values = values
+
+            def getInfo(self) -> dict:
+                return {"starts": [_epoch_ms("2021-01-01")]}
+
+        def open_collection(collection_id):
+            return _StubImageCollection({"system:time_start": [], "system:time_end": []})
+
+        stub_ee = SimpleNamespace(ImageCollection=open_collection, Dictionary=ResponseWithoutEnds)
+        monkeypatch.setattr(_image, "ee", stub_ee)
+
+        with pytest.raises(KeyError, match="ends"):
+            _get_collection_time_bounds("users/test/collection")
 
     def test_collection_without_images_returns_no_index(self, monkeypatch):
         """A collection with no images at the batch's points gives ``(None, None)`` and no error."""
@@ -896,6 +1025,61 @@ class TestFailedPointsInBatch:
             "exception": raised_errors[1],
         }
         assert meta_list[0] == {} and meta_list[2] == {}
+
+
+class TestBatchWithoutPoints:
+    """A batch without points sends no Earth Engine request, also no timestamp request."""
+
+    def _collection_adapter(self) -> GeeRasterAdapter:
+        """Return an offline adapter for a collection whose timestamps are not loaded yet.
+
+        A timestamp request would reach the blocked Earth Engine network calls.
+        """
+        return _tile_export_adapter(
+            _dataset_spec={"collection": "users/test/collection", "bands": ["B1", "B2"]},
+            _static_image=None,
+            _is_collection=True,
+            _timestamps_loaded=False,
+            _needs_per_point_date=True,
+        )
+
+    def test_statistics_batch_without_points(self):
+        """``fetch_stats_batch`` returns an empty list and reports progress 0 of 0."""
+        adapter = self._collection_adapter()
+        progress_steps: list[tuple[int, int]] = []
+
+        results = adapter.fetch_stats_batch(
+            [],
+            [],
+            200,
+            ["mean"],
+            disable_progress=True,
+            progress_callback=lambda completed, total: progress_steps.append((completed, total)),
+        )
+
+        assert results == []
+        assert progress_steps == [(0, 0)]
+        assert adapter._timestamps_loaded is False
+
+    def test_tile_batch_without_points(self, tmp_path):
+        """``export_tiles`` returns two empty lists and reports progress 0 of 0."""
+        adapter = self._collection_adapter()
+        progress_steps: list[tuple[int, int]] = []
+
+        paths, meta_list = adapter.export_tiles(
+            [],
+            [],
+            200,
+            tmp_path,
+            ids=[],
+            dataset_name="test_dataset",
+            disable_progress=True,
+            progress_callback=lambda completed, total: progress_steps.append((completed, total)),
+        )
+
+        assert (paths, meta_list) == ([], [])
+        assert progress_steps == [(0, 0)]
+        assert adapter._timestamps_loaded is False
 
 
 @pytest.fixture
@@ -1165,6 +1349,32 @@ class TestCountOnlyStatistics:
         assert meta["coverage_pct"] == pytest.approx(95.0)
         assert meta["band_coverage_pct"] == {"B1": 100.0, "B2": 95.0}
 
+    @pytest.mark.parametrize(
+        ("bands", "window_result", "expected_stats"),
+        [
+            ("DEM", {"DEM": 0}, {"count": 0}),
+            (["B1", "B2"], {"B1": 0, "B2": 0}, {"B1_count": 0, "B2_count": 0}),
+        ],
+    )
+    def test_zero_counts_give_no_values(self, monkeypatch, bands, window_result, expected_stats):
+        """Counts of 0 (no valid pixel in the window) give in_extent False and coverage 0."""
+        adapter = _statistics_adapter({"bands": bands})
+        _stub_statistics_request(monkeypatch, adapter, {"window": window_result})
+
+        stats, meta = _fetch_point_statistics(adapter, ["count"], ["_count"])
+
+        assert stats == expected_stats
+        assert (meta["in_extent"], meta["n_pixels"], meta["coverage_pct"]) == (False, 0, 0.0)
+
+    def test_one_band_with_a_count_above_zero_has_values(self, monkeypatch):
+        """With two bands, a count above 0 in one band gives in_extent True."""
+        adapter = _statistics_adapter({"bands": ["B1", "B2"]})
+        _stub_statistics_request(monkeypatch, adapter, {"window": {"B1": 12, "B2": 0}})
+
+        _, meta = _fetch_point_statistics(adapter, ["count"], ["_count"])
+
+        assert meta["in_extent"] is True
+
 
 class TestCircularAspectInPointStatistics:
     """The circular aspect values replace only the requested linear mean, std, and var of aspect."""
@@ -1402,8 +1612,9 @@ class _SymbolicImage:
     def gt(self, threshold) -> _SymbolicImage:
         return _SymbolicImage(f"{self.expression} > {threshold}")
 
-    def updateMask(self, mask: _SymbolicImage) -> _SymbolicImage:
-        return _SymbolicImage(f"({self.expression}) masked to {mask.expression}")
+    def updateMask(self, mask: _SymbolicImage | int) -> _SymbolicImage:
+        mask_expression = mask.expression if isinstance(mask, _SymbolicImage) else mask
+        return _SymbolicImage(f"({self.expression}) masked to {mask_expression}")
 
     def select(self, band) -> _SymbolicImage:
         return _SymbolicImage(f"{self.expression}.select({band})")
@@ -1415,6 +1626,16 @@ class _SymbolicImage:
         return _SymbolicImage(f"{self.expression} in {projection}")
 
 
+class _SymbolicNumber:
+    """Stands in for an ``ee.Number``. A comparison returns the text of the condition."""
+
+    def __init__(self, expression: str):
+        self.expression = expression
+
+    def gt(self, threshold) -> str:
+        return f"{self.expression} > {threshold}"
+
+
 class _SymbolicCollection:
     """Stands in for an ``ee.ImageCollection``, with the operations of a mosaic collection."""
 
@@ -1423,6 +1644,12 @@ class _SymbolicCollection:
 
     def filterBounds(self, geometry: str) -> _SymbolicCollection:
         return _SymbolicCollection(f"{self.expression} at {geometry}")
+
+    def filterDate(self, start: str, end: str) -> _SymbolicCollection:
+        return _SymbolicCollection(f"{self.expression} from {start} to {end}")
+
+    def size(self) -> _SymbolicNumber:
+        return _SymbolicNumber(f"size of {self.expression}")
 
     def first(self) -> _SymbolicImage:
         return _SymbolicImage(f"first of {self.expression}")
@@ -1488,4 +1715,65 @@ class TestCircularAspectImage:
         assert circular_image.expression == (
             f"(cat(sin(aspect({mosaic}) * 0.017453) as sin, "
             f"cos(aspect({mosaic}) * 0.017453) as cos)) masked to slope({mosaic}) > 0"
+        )
+
+
+class TestEmptyDateSelection:
+    """With no image at the point on the selected dates, ``_build_image`` gives a masked image."""
+
+    @pytest.fixture(autouse=True)
+    def symbolic_earth_engine(self, monkeypatch):
+        """Replace ``ee`` in ``_image`` with symbolic stubs, including the server-side ``If``."""
+
+        def cast_to_image(value) -> _SymbolicImage:
+            # ee.Image() keeps an image as it is; the text of an If is put in brackets.
+            return value if isinstance(value, _SymbolicImage) else _SymbolicImage(f"({value})")
+
+        def server_side_if(condition: str, true_case, false_case) -> str:
+            return f"if {condition} then {true_case.expression} else {false_case.expression}"
+
+        stub_ee = SimpleNamespace(
+            Image=cast_to_image,
+            ImageCollection=_SymbolicCollection,
+            Algorithms=SimpleNamespace(If=server_side_if),
+        )
+        monkeypatch.setattr(_image, "ee", stub_ee)
+
+    @pytest.mark.parametrize(
+        ("policy", "time_starts", "time_ends", "selected_days"),
+        [
+            # The interval that contains 2021-06-15.
+            (
+                "contains",
+                pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
+                pd.DatetimeIndex(["2022-01-01", "2023-01-01"]),
+                "2021-01-01 to 2022-01-01",
+            ),
+            # The nearest start.
+            (
+                "nearest",
+                pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
+                None,
+                "2021-01-01 to 2021-01-02",
+            ),
+            # No timestamp index: one day before and after the sample date.
+            ("nearest", None, None, "2021-06-14 to 2021-06-16"),
+        ],
+    )
+    def test_selection_falls_back_to_a_masked_image(
+        self, policy, time_starts, time_ends, selected_days
+    ):
+        """The first selected image when there is one, else the first image of the collection, masked."""
+        image = _image._build_image(
+            {"collection": "embeddings", "collection_date_policy": policy, "bands": ["A00", "A01"]},
+            date=pd.Timestamp("2021-06-15"),
+            geometry="point",
+            collection_time_starts=time_starts,
+            collection_time_ends=time_ends,
+        )
+
+        selection = f"embeddings at point from {selected_days}"
+        assert image.expression == (
+            f"(if size of {selection} > 0 then first of {selection} "
+            f"else (first of embeddings) masked to 0).select(['A00', 'A01'])"
         )

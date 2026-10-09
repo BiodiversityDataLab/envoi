@@ -158,7 +158,7 @@ The app expects a CSV in the same GBIF / Darwin Core schema as the default Pytho
 **Available reducers:**
 
 - Core stats: `mean`, `median`, `min`, `max`, `sum`, `std`, `var`, `count`, `mode`
-  - `std` and `var` are population statistics: they divide by the number of pixels n, not n − 1. Earth Engine and local rasters give the same values.
+  - `std` and `var` are population statistics: they divide by the number of pixels n, not n − 1. Earth Engine and local rasters use the same formula. Their values can still differ a little at the edge of the window, because Earth Engine gives a weight to pixels that are only partly inside the window, and the local adapter does not.
   - For the Earth Engine derived band `aspect`, `mean`, `std`, and `var` are circular statistics in degrees (the mean of 350° and 10° is 0°, not 180°). Flat pixels (slope 0) are not used. See [Circular aspect statistics](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md#circular-aspect-statistics).
 - Quantiles: `q05`, `q10`, `q25`, `q50`, `q75`, `q90`, `q95`
 - Categorical: `class_count`, `class_fraction` (expanded per-class downstream)
@@ -212,7 +212,7 @@ Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`.
 
 **With `resample_m`,** every tile is reprojected to the point's UTM zone at exactly `resample_m` meters per pixel. Earth Engine and local datasets use the same rule for the size and position of a tile:
 
-- A tile has n × n pixels. n is `window_size_m / resample_m` rounded to the nearest whole number, with ties rounded up (2.5 gives 3), and at least 1. For example, a 200 m window gives 7 × 7 pixels at `resample_m: 30` and 20 × 20 pixels at `resample_m: 10`. The side of a tile (n × `resample_m`) differs from `window_size_m` by at most half a pixel.
+- A tile has n × n pixels. n is `window_size_m / resample_m` rounded to the nearest whole number, with ties rounded up (2.5 gives 3), and at least 1. For example, a 200 m window gives 7 × 7 pixels at `resample_m: 30` and 20 × 20 pixels at `resample_m: 10`. When `window_size_m` is at least half of `resample_m`, the side of a tile (n × `resample_m`) differs from `window_size_m` by at most half a pixel. A smaller window gives a tile of 1 × 1 pixel, which is larger than the window.
 - The tile corners lie on multiples of `resample_m` in the UTM zone.
 - When n is odd, the pixel that contains the point is the centre pixel of the tile. When n is even, the centre of the tile is the grid line nearest to the point.
 

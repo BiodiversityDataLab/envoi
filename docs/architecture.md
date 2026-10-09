@@ -156,8 +156,8 @@ Update this document when you add a module or change the adapter interface.
 | `adapters/base.py` | `BaseAdapter`, which declares the members that `extract()` uses and nothing else: `fetch_stats_batch`, `export_tiles`, and `build_dataset_meta` (with their shared signatures), and the context-manager lifecycle (`close()`, `__enter__` / `__exit__`). See "Adapter interface". |
 | `adapters/local_adapter.py` | Local raster adapter. Reads GeoTIFFs through rasterio, crops a UTM-zone square around each point, supports per-band nodata (including NaN), widens a statistics window smaller than one native pixel to two pixels (as the GEE adapter does), and exports tiles at native resolution, or resampled onto the shared UTM tile grid of `geo.py` with `rasterio.warp.reproject` for parity with GEE. |
 | `adapters/earth_engine/adapter.py` | `GeeRasterAdapter`. Detects the asset type, checks the native scale, runs per-point work in a `ThreadPoolExecutor`, composes the sibling helpers, and builds the per-dataset metadata. Caches collection-level state for the lifetime of the adapter instance (see "GEE image building pipeline"). |
-| `adapters/earth_engine/_image.py` | GEE initialization on first use (calls `auth.init_gee()` when Earth Engine is not yet initialized) and the session-pool patch, the collection timestamp index, `nearest` / `contains` / `mosaic` image selection, derived-band registration (`KNOWN_DERIVED_BANDS`: slope, aspect), and the central `_build_image` pipeline. |
-| `adapters/earth_engine/_reducers.py` | Server-side reducer registry, `_build_combined_reducer` (so all statistics for a point resolve in one round-trip), `reduceRegion` result parsing (single-band, multi-band, per-class histogram), and the per-band coverage summary. |
+| `adapters/earth_engine/_image.py` | GEE initialization on first use (calls `auth.init_gee()` when Earth Engine is not yet initialized) and the session-pool patch, the collection timestamp index, `nearest` / `contains` / `mosaic` image selection, derived-band registration (`KNOWN_DERIVED_BANDS`: slope, aspect), and the central `_build_image` pipeline, which also builds the companion image for circular aspect statistics (`circular_aspect=True`: the sine and cosine of the aspect, without flat pixels). |
+| `adapters/earth_engine/_reducers.py` | Server-side reducer registry, `_build_combined_reducer` (so all statistics for a point resolve in one round-trip), `reduceRegion` result parsing (single-band, multi-band, per-class histogram), the circular mean, standard deviation, and variance of `aspect` (`_circular_aspect_statistics`), and the per-band coverage summary. |
 | `adapters/earth_engine/_tiles.py` | Size guard for synchronous downloads (`_check_tile_size`) and the retrying tile downloader (`_download_tile_via_url`, which wraps `ee.Image.getDownloadURL` + `requests` with exponential backoff for 429 / 5xx responses, and requests the exact tile grid with `crs_transform` and `dimensions`). |
 | `reducers.py` | Python-side reducer registry (mean, median, min, max, sum, std, var, count, mode, class_count, class_fraction, q05..q95), used by the local adapter. Also `list_reducers()` (public) and `validate_reducers()`, which warns about reducer / `data_type` mismatches such as `mean` on a categorical raster. `point` is not in the registry; the adapters handle it. |
 | `qc.py` | Builds per-dataset QC columns from the adapters' meta dicts (core flags, plus date, CRS, per-band coverage, and the error of failed points where available), warns when points fall below `min_coverage_pct`, and splits the merged DataFrame into the stats and QC tables. Also formats the error text of a failed point for both adapters (`format_point_error`), and counts failed points for the sidecar (`summarize_point_errors`). |
@@ -234,10 +234,22 @@ For each point: _build_image(dataset_spec, date, geometry, ...)
                              sample date (±1 day for "nearest", [date, date + 1 day] for
                              "contains"), or a mosaic of the whole collection when there is
                              no date
+          empty selection -> when filterDate leaves no image at the point: the first image of
+                             the collection with every pixel masked (ee.Algorithms.If in the
+                             point's request), so the point gets null statistics, not an error
     _apply_derived_bands                  <- slope, aspect (KNOWN_DERIVED_BANDS)
     select(bands + derived bands)         <- derived bands only when no bands are set;
                                              all bands when neither is set
+
+    circular_aspect=True (in place of the two steps above):
+        sin and cos of aspect, masked to slope > 0   <- for the circular mean, std, and var
+                                                        of the derived aspect band
 ```
+
+`_fetch_stats_single` sends up to three reductions in one `ee.Dictionary` request: the window statistics,
+the circular aspect statistics (only when the derived `aspect` band is reduced with `mean`, `std`, or `var`),
+and the point value (only for the `point` statistic).
+The circular aspect image is built for each point from the same image as the main image, and it is never cached in `_static_image`.
 
 This pipeline lives in `adapters/earth_engine/_image.py` (`_build_image`, `_resolve_date_filter_range`, `_find_nearest_timestamp`, `_get_collection_time_bounds`).
 `GeeRasterAdapter._get_image()` in `adapter.py` decides which branch applies to each point.
