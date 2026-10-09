@@ -155,6 +155,8 @@ The app expects a CSV in the same GBIF / Darwin Core schema as the default Pytho
 
 **QC columns** look like: `dem_copernicus_glo30_in_extent_200m`, `dem_copernicus_glo30_n_pixels_200m`, `dem_copernicus_glo30_had_nodata_200m`, `dem_copernicus_glo30_coverage_pct_200m`. When the data request or read of a point failed, the QC table also has `dem_copernicus_glo30_error_200m` (`..._error_point` for point-only statistics), with the error for that point and an empty value for the other points. This column exists only when at least one point of that dataset and window failed.
 
+For a window without valid pixels, the two kinds of dataset differ. Earth Engine datasets set `in_extent` to `False` and give `sum` and `count` as `0`. Local datasets set `in_extent` to `True` when the window overlaps the raster (with `n_pixels` `0`), and give empty values for `sum` and `count`.
+
 **Available reducers:**
 
 - Core stats: `mean`, `median`, `min`, `max`, `sum`, `std`, `var`, `count`, `mode`

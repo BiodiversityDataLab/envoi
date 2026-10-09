@@ -439,12 +439,13 @@ def _build_image(
     - date provided + no timestamps (fallback): filterDate ±1 day, .first()
     - no date: mosaic (most recent non-masked pixel per position)
 
-    When the collection has no image at the point ``geometry`` on any date,
-    the image is the first image of the collection with every pixel masked,
-    so the point gets the values of a point without data: null statistics,
-    except ``count`` and ``sum``, which are 0 (Earth Engine decides this in
-    the point's request). When the point has images, but none on the
-    selected dates, the image is null, and the point's request fails.
+    When the collection has no image at the point ``geometry`` on any date
+    (before the UTM-zone and date filters), the image is the first image of
+    the collection with every pixel masked, so the point gets the values of a
+    point without data: null statistics, except ``count`` and ``sum``, which
+    are 0 (Earth Engine decides this in the point's request). When the point
+    has images, but the UTM-zone or date filter removes all of them, the image
+    is null, and the point's request fails.
 
     Parameters
     ----------
@@ -467,6 +468,9 @@ def _build_image(
 
         if geometry is not None:
             image_collection = image_collection.filterBounds(geometry)
+        # Every image at the point, on any date, before the selection filters
+        # below. The date branch checks it for an image at the point.
+        bounds_collection = image_collection
 
         # Some tiled collections (e.g. satellite embeddings) need UTM-zone
         # filtering to avoid selecting the wrong tile for a point.
@@ -513,22 +517,24 @@ def _build_image(
             # collection's bands, so the band selection and the derived bands
             # below work, and the point gets the values of a point without
             # data, as a point outside a mosaic does.
-            # The check uses the collection before the date filter on
-            # purpose. When the point has images, but none in the selected
-            # date range, the image stays null and the point is a failed
-            # point with an error, so a problem with the date selection stays
+            # The check uses the collection after filterBounds only, before
+            # the UTM-zone filter and the date filter, on purpose. When the
+            # point has images, but the selection filters remove all of them
+            # (no image in the selected date range, or a wrong use_utm_zone
+            # setting), the image stays null and the point is a failed point
+            # with an error. A problem with the image selection then stays
             # visible and is not reported as missing data.
             # Earth Engine evaluates the condition in the point's own request,
-            # so no request is added. Without a point geometry, there is no
-            # location to check, and the condition would only count every
-            # image of the collection, so it is left out.
+            # so no request is added, and limit(1) lets it stop at the first
+            # image. Without a point geometry, there is no location to check,
+            # and the condition would only count the images of the whole
+            # collection, so it is left out.
             if geometry is not None:
                 masked_placeholder = ee.Image(
                     ee.ImageCollection(dataset_spec["collection"]).first()
                 ).updateMask(0)
-                image = ee.Image(
-                    ee.Algorithms.If(image_collection.size().gt(0), image, masked_placeholder)
-                )
+                point_has_images = bounds_collection.limit(1).size().gt(0)
+                image = ee.Image(ee.Algorithms.If(point_has_images, image, masked_placeholder))
         else:
             # No date: mosaic (most recent non-masked pixel per position)
             image = image_collection.mosaic()

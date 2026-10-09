@@ -631,13 +631,9 @@ class _StubTileResponse:
     raised when the stream reaches it, as when a connection breaks.
     """
 
-    def __init__(self, chunks: list, status_code: int):
+    def __init__(self, chunks: list, status_code: int = 200):
         self._chunks = chunks
         self.status_code = status_code
-
-    def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            raise requests.HTTPError(f"{self.status_code} Client Error: stub")
 
     def close(self) -> None:
         pass
@@ -649,21 +645,31 @@ class _StubTileResponse:
             yield chunk
 
 
-def _stub_tile_responses(monkeypatch, chunks: list, status_code: int = 200) -> list[str]:
-    """Replace ``requests`` and ``time`` in ``_tiles``: each GET streams ``chunks``, with no waits.
+def _broken_stream() -> _StubTileResponse:
+    """Return a response whose connection breaks after the first part of the body."""
+    broken_connection = requests.exceptions.ChunkedEncodingError("stub: connection broken")
+    return _StubTileResponse([b"partial ", broken_connection])
 
-    Every response has ``status_code``. Returns a list that records the URL of each GET.
+
+def _stub_tile_responses(monkeypatch, responses: list[_StubTileResponse]) -> SimpleNamespace:
+    """Replace ``requests`` and ``time`` in ``_tiles``: GET number N returns ``responses[N - 1]``.
+
+    Returns a record with the URL of each GET (``requested_urls``) and the
+    length of each wait in seconds (``waits``). The waits do not sleep.
     """
-    requested_urls: list[str] = []
+    record = SimpleNamespace(requested_urls=[], waits=[])
+    remaining_responses = list(responses)
 
     def get(url, stream=False, timeout=None):
-        requested_urls.append(url)
-        return _StubTileResponse(chunks, status_code)
+        record.requested_urls.append(url)
+        return remaining_responses.pop(0)
 
-    stub_requests = SimpleNamespace(get=get, RequestException=requests.RequestException)
+    stub_requests = SimpleNamespace(
+        get=get, RequestException=requests.RequestException, HTTPError=requests.HTTPError
+    )
     monkeypatch.setattr(_tiles, "requests", stub_requests)
-    monkeypatch.setattr(_tiles, "time", SimpleNamespace(sleep=lambda seconds: None))
-    return requested_urls
+    monkeypatch.setattr(_tiles, "time", SimpleNamespace(sleep=record.waits.append))
+    return record
 
 
 # The grid of a 7 × 7 tile of 30 m pixels in UTM zone 33N.
@@ -673,9 +679,9 @@ _TILE_CRS_TRANSFORM = [30.0, 0.0, 600_000.0, 0.0, -30.0, 6_640_000.0]
 class TestDownloadTile:
     """``_download_tile_via_url`` requests the exact pixel grid and writes only complete tiles."""
 
-    def _download(self, image: _StubDownloadImage, output_path) -> None:
+    def _download(self, output_path, image: _StubDownloadImage | None = None) -> None:
         _tiles._download_tile_via_url(
-            image,
+            image or _StubDownloadImage(),
             crs="EPSG:32633",
             crs_transform=_TILE_CRS_TRANSFORM,
             dimensions="7x7",
@@ -684,11 +690,11 @@ class TestDownloadTile:
 
     def test_request_has_the_grid_and_no_region_or_scale(self, monkeypatch, tmp_path):
         """The download parameters are the grid and the format; only the tile is written."""
-        requested_urls = _stub_tile_responses(monkeypatch, [b"GeoTIFF ", b"bytes"])
+        record = _stub_tile_responses(monkeypatch, [_StubTileResponse([b"GeoTIFF ", b"bytes"])])
         image = _StubDownloadImage()
         output_path = tmp_path / "a-test_dataset.tif"
 
-        self._download(image, output_path)
+        self._download(output_path, image)
 
         assert image.download_parameters == [
             {
@@ -699,51 +705,127 @@ class TestDownloadTile:
                 "filePerBand": False,
             }
         ]
-        assert requested_urls == ["https://earthengine.invalid/tile"]
+        assert record.requested_urls == ["https://earthengine.invalid/tile"]
+        assert record.waits == []
         assert output_path.read_bytes() == b"GeoTIFF bytes"
         # No temporary file stays next to the tile.
         assert list(tmp_path.iterdir()) == [output_path]
 
+    @pytest.mark.parametrize(
+        "failed_response",
+        [_broken_stream, lambda: _StubTileResponse([], status_code=503)],
+        ids=["broken stream", "HTTP 503"],
+    )
+    def test_good_response_after_a_failed_attempt(self, monkeypatch, tmp_path, failed_response):
+        """After a failed attempt, the next good response gives the tile, with nothing else."""
+        record = _stub_tile_responses(
+            monkeypatch, [failed_response(), _StubTileResponse([b"good ", b"tile"])]
+        )
+        output_path = tmp_path / "a-test_dataset.tif"
+
+        self._download(output_path)
+
+        assert output_path.read_bytes() == b"good tile"
+        assert len(record.requested_urls) == 2
+        assert record.waits == [1]
+        assert list(tmp_path.iterdir()) == [output_path]
+
+    def test_existing_tile_is_replaced(self, monkeypatch, tmp_path):
+        """A tile of an earlier run with the same name is replaced by the new tile."""
+        _stub_tile_responses(monkeypatch, [_StubTileResponse([b"new tile"])])
+        output_path = tmp_path / "a-test_dataset.tif"
+        output_path.write_bytes(b"old tile")
+
+        self._download(output_path)
+
+        assert output_path.read_bytes() == b"new tile"
+        assert list(tmp_path.iterdir()) == [output_path]
+
     def test_broken_stream_is_retried_and_leaves_no_file(self, monkeypatch, tmp_path):
         """When every attempt breaks during the stream, the error is raised and no file stays."""
-        broken_connection = requests.exceptions.ChunkedEncodingError("stub: connection broken")
-        requested_urls = _stub_tile_responses(monkeypatch, [b"partial ", broken_connection])
+        record = _stub_tile_responses(monkeypatch, [_broken_stream() for _ in range(3)])
 
-        with pytest.raises(RuntimeError, match="after 3 attempts: stub: connection broken"):
-            self._download(_StubDownloadImage(), tmp_path / "a-test_dataset.tif")
+        with pytest.raises(
+            RuntimeError, match="after 3 attempts: stub: connection broken"
+        ) as error_info:
+            self._download(tmp_path / "a-test_dataset.tif")
 
-        assert len(requested_urls) == 3
+        assert isinstance(error_info.value.__cause__, requests.exceptions.ChunkedEncodingError)
+        assert len(record.requested_urls) == 3
+        # A wait before each retry, and none after the last attempt.
+        assert record.waits == [1, 2]
+        assert list(tmp_path.iterdir()) == []
+
+    def test_existing_tile_is_removed_when_every_attempt_fails(self, monkeypatch, tmp_path):
+        """A tile of an earlier run is removed, so the folder matches the manifest (not exported)."""
+        _stub_tile_responses(
+            monkeypatch, [_StubTileResponse([], status_code=503) for _ in range(3)]
+        )
+        output_path = tmp_path / "a-test_dataset.tif"
+        output_path.write_bytes(b"old tile")
+
+        with pytest.raises(RuntimeError, match="returned HTTP 503 on attempt 3"):
+            self._download(output_path)
+
         assert list(tmp_path.iterdir()) == []
 
     def test_other_error_in_the_stream_leaves_no_file(self, monkeypatch, tmp_path):
         """An error that is not a request error stops the download at once, and no file stays."""
         disk_error = OSError("stub: no space left on device")
-        requested_urls = _stub_tile_responses(monkeypatch, [b"partial ", disk_error])
+        record = _stub_tile_responses(monkeypatch, [_StubTileResponse([b"partial ", disk_error])])
 
         with pytest.raises(OSError, match="stub: no space left on device"):
-            self._download(_StubDownloadImage(), tmp_path / "a-test_dataset.tif")
+            self._download(tmp_path / "a-test_dataset.tif")
 
-        assert len(requested_urls) == 1
+        assert len(record.requested_urls) == 1
         assert list(tmp_path.iterdir()) == []
 
-    def test_client_error_is_not_retried(self, monkeypatch, tmp_path):
-        """An HTTP 400 answer raises at once, after one request, and no file stays."""
-        requested_urls = _stub_tile_responses(monkeypatch, [b"error page"], status_code=400)
+    @pytest.mark.parametrize(
+        ("body", "expected_text"),
+        [
+            (
+                json.dumps(
+                    {"error": {"code": 400, "message": "stub: invalid crs_transform"}}
+                ).encode(),
+                "HTTP 400: stub: invalid crs_transform",
+            ),
+            (b"stub: bad\n request", "HTTP 400: stub: bad request"),
+        ],
+        ids=["JSON body", "text body"],
+    )
+    def test_client_error_keeps_the_message(self, monkeypatch, tmp_path, body, expected_text):
+        """An HTTP 400 answer raises at once, with Earth Engine's message, and no file stays."""
+        record = _stub_tile_responses(monkeypatch, [_StubTileResponse([body], status_code=400)])
 
-        with pytest.raises(requests.HTTPError, match="400 Client Error"):
-            self._download(_StubDownloadImage(), tmp_path / "a-test_dataset.tif")
+        with pytest.raises(requests.HTTPError) as error_info:
+            self._download(tmp_path / "a-test_dataset.tif")
 
-        assert len(requested_urls) == 1
+        assert str(error_info.value) == f"GEE tile download returned {expected_text}"
+        assert len(record.requested_urls) == 1
+        assert record.waits == []
+        assert list(tmp_path.iterdir()) == []
+
+    def test_success_status_other_than_200_is_not_a_tile(self, monkeypatch, tmp_path):
+        """An HTTP 204 answer (no content) raises at once, and no tile is written."""
+        record = _stub_tile_responses(monkeypatch, [_StubTileResponse([], status_code=204)])
+
+        with pytest.raises(requests.HTTPError, match="returned HTTP 204$"):
+            self._download(tmp_path / "a-test_dataset.tif")
+
+        assert len(record.requested_urls) == 1
         assert list(tmp_path.iterdir()) == []
 
     def test_rate_limit_is_retried(self, monkeypatch, tmp_path):
         """HTTP 429 answers are retried; after the last attempt, the error names the status."""
-        requested_urls = _stub_tile_responses(monkeypatch, [], status_code=429)
+        record = _stub_tile_responses(
+            monkeypatch, [_StubTileResponse([], status_code=429) for _ in range(3)]
+        )
 
         with pytest.raises(RuntimeError, match="returned HTTP 429 on attempt 3"):
-            self._download(_StubDownloadImage(), tmp_path / "a-test_dataset.tif")
+            self._download(tmp_path / "a-test_dataset.tif")
 
-        assert len(requested_urls) == 3
+        assert len(record.requested_urls) == 3
+        assert record.waits == [1, 2]
         assert list(tmp_path.iterdir()) == []
 
 
@@ -1740,6 +1822,9 @@ class _SymbolicCollection:
     def filterDate(self, start: str, end: str) -> _SymbolicCollection:
         return _SymbolicCollection(f"{self.expression} from {start} to {end}")
 
+    def limit(self, maximum: int) -> _SymbolicCollection:
+        return _SymbolicCollection(f"{self.expression} limited to {maximum}")
+
     def size(self) -> _SymbolicNumber:
         return _SymbolicNumber(f"size of {self.expression}")
 
@@ -1833,32 +1918,30 @@ class TestEmptyDateSelection:
         monkeypatch.setattr(_image, "ee", stub_ee)
 
     @pytest.mark.parametrize(
-        ("dataset_spec", "time_starts", "time_ends", "point_images", "selected_days"),
+        ("dataset_spec", "time_starts", "time_ends", "selection"),
         [
             # The interval that contains 2021-06-15, in the point's UTM zone.
             (
                 {"collection_date_policy": "contains", "use_utm_zone": True},
                 pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
                 pd.DatetimeIndex(["2022-01-01", "2023-01-01"]),
-                "embeddings at point where UTM_ZONE == 26N",
-                "2021-01-01 to 2022-01-01",
+                "embeddings at point where UTM_ZONE == 26N from 2021-01-01 to 2022-01-01",
             ),
             # The nearest start.
             (
                 {"collection_date_policy": "nearest"},
                 pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
                 None,
-                "embeddings at point",
-                "2021-01-01 to 2021-01-02",
+                "embeddings at point from 2021-01-01 to 2021-01-02",
             ),
             # No timestamp index: one day before and after the sample date.
-            ({}, None, None, "embeddings at point", "2021-06-14 to 2021-06-16"),
+            ({}, None, None, "embeddings at point from 2021-06-14 to 2021-06-16"),
         ],
     )
     def test_point_without_images_gets_a_masked_image(
-        self, dataset_spec, time_starts, time_ends, point_images, selected_days
+        self, dataset_spec, time_starts, time_ends, selection
     ):
-        """The check counts the point's images on every date; the image is the first selected one."""
+        """The check looks for one image at the point; the image is the first selected one."""
         image = _image._build_image(
             {"collection": "embeddings", "bands": ["A00", "A01"], **dataset_spec},
             date=pd.Timestamp("2021-06-15"),
@@ -1869,12 +1952,12 @@ class TestEmptyDateSelection:
             lon=-30.0,
         )
 
-        # The condition counts the images at the point before the date filter.
-        # When the point has images, but none on the selected days, the first
-        # selected image is null, and the point's request fails.
-        selection = f"{point_images} from {selected_days}"
+        # The condition looks for an image at the point before the UTM-zone
+        # and date filters. When the point has images, but these filters
+        # remove all of them, the first selected image is null, and the
+        # point's request fails.
         assert image.expression == (
-            f"(if size of {point_images} > 0 then first of {selection} "
+            f"(if size of embeddings at point limited to 1 > 0 then first of {selection} "
             f"else (first of embeddings) masked to 0).select(['A00', 'A01'])"
         )
 

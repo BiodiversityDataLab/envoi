@@ -158,7 +158,7 @@ Update this document when you add a module or change the adapter interface.
 | `adapters/earth_engine/adapter.py` | `GeeRasterAdapter`. Detects the asset type, checks the native scale, runs per-point work in a `ThreadPoolExecutor`, composes the sibling helpers, and builds the per-dataset metadata. Caches collection-level state for the lifetime of the adapter instance (see "GEE image building pipeline"). |
 | `adapters/earth_engine/_image.py` | GEE initialization on first use (calls `auth.init_gee()` when Earth Engine is not yet initialized) and the session-pool patch, the collection timestamp index, `nearest` / `contains` / `mosaic` image selection, derived-band registration (`KNOWN_DERIVED_BANDS`: slope, aspect), and the central `_build_image` pipeline, which also builds the companion image for circular aspect statistics (`circular_aspect=True`: the sine and cosine of the aspect, without flat pixels). |
 | `adapters/earth_engine/_reducers.py` | Server-side reducer registry, `_build_combined_reducer` (so all statistics for a point resolve in one round-trip), `reduceRegion` result parsing (single-band, multi-band, per-class histogram), the circular mean, standard deviation, and variance of `aspect` (`_circular_aspect_statistics`), and the per-band coverage summary. |
-| `adapters/earth_engine/_tiles.py` | Size guard for synchronous downloads (`_check_tile_size`) and the retrying tile downloader (`_download_tile_via_url`, which wraps `ee.Image.getDownloadURL` + `requests` with exponential backoff for 429 / 5xx responses and connection errors, raises other HTTP errors at once, writes each tile through a temporary file so that a failed download leaves no file, and requests the exact tile grid with `crs_transform` and `dimensions`). |
+| `adapters/earth_engine/_tiles.py` | Size guard for synchronous downloads (`_check_tile_size`) and the retrying tile downloader (`_download_tile_via_url`, which wraps `ee.Image.getDownloadURL` + `requests` with exponential backoff for 429 / 5xx responses and connection errors, raises any status other than 200 at once with Earth Engine's error message, writes each tile through a temporary file, and leaves no file (also no tile of an earlier run) when a download fails, and requests the exact tile grid with `crs_transform` and `dimensions`). |
 | `reducers.py` | Python-side reducer registry (mean, median, min, max, sum, std, var, count, mode, class_count, class_fraction, q05..q95), used by the local adapter. Also `list_reducers()` (public) and `validate_reducers()`, which warns about reducer / `data_type` mismatches such as `mean` on a categorical raster. `point` is not in the registry; the adapters handle it. |
 | `qc.py` | Builds per-dataset QC columns from the adapters' meta dicts (core flags, plus date, CRS, per-band coverage, and the error of failed points where available), warns when points fall below `min_coverage_pct`, and splits the merged DataFrame into the stats and QC tables. Also formats the error text of a failed point for both adapters (`format_point_error`), and counts failed points for the sidecar (`summarize_point_errors`). |
 | `metadata.py` | Writes the sidecar JSON (`run` / `config` / `datasets` / optional `warnings`) and provides the summaries that adapters put into it (`summarize_date_info`, `summarize_tile_export`). |
@@ -234,11 +234,12 @@ For each point: _build_image(dataset_spec, date, geometry, ...)
                              sample date (±1 day for "nearest", [date, date + 1 day] for
                              "contains"), or a mosaic of the whole collection when there is
                              no date
-          no image at the -> when the collection has no image at the point on any date (the
-          point              size check is before filterDate): the first image of the
-                             collection with every pixel masked (ee.Algorithms.If in the
-                             point's request), so the point has no data and no error. When the
-                             point has images, but none on the selected dates, .first() stays
+          no image at the -> when the collection has no image at the point on any date
+          point              (limit(1).size() after filterBounds, before the UTM-zone and
+                             date filters): the first image of the collection with every
+                             pixel masked (ee.Algorithms.If in the point's request), so the
+                             point has no data and no error. When the point has images, but
+                             the UTM-zone or date filter removes all of them, .first() stays
                              null, and the point is a failed point
     _apply_derived_bands                  <- slope, aspect (KNOWN_DERIVED_BANDS)
     select(bands + derived bands)         <- derived bands only when no bands are set;

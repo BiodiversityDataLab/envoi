@@ -75,7 +75,8 @@ These decisions came from the review of the extraction pipeline (branch `pipelin
   - The adapters record the error text (`"<exception type>: <message>"` on one line, at most 500 characters, from `qc.format_point_error`) and the exception in the point's meta dict.
     A failed point has null statistics and adds no statistic column. A point outside the extent is not a failed point.
   - For an Earth Engine collection that selects one image for each point (`nearest` or `contains`), a point where the collection has no image at its location, on any date, gets a fully masked image: it is a point without data and has no error.
-    A point whose location has images, but none on the selected dates, stays a failed point, so problems of the date selection stay visible.
+    A point whose location has images, but none after the selection filters (the selected dates, or the UTM zone of `use_utm_zone`), stays a failed point, so problems of the image selection stay visible.
+    The check counts the images after `filterBounds` only, and stops at the first image (`limit(1)`).
   - `extract()` reports failed points in the QC column `{dataset}_error_{N}m` (or `{dataset}_error_point`), in an `error` column of the tile manifest, and in the sidecar fields `n_errors` and `ids_errors` of each quality summary.
     Each column exists only when a point of that batch failed. The two sidecar fields are always present.
     `quality.tiles.n_failed` keeps its meaning: the number of tiles that were not exported for any reason.
