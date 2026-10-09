@@ -3,14 +3,18 @@ from __future__ import annotations
 from contextlib import nullcontext
 from subprocess import CompletedProcess
 
+import pandas as pd
 import pytest
 
 from envoi_webapp import app
 from envoi_webapp.app import (
     ALL_DATASET_TYPES,
     DATASET_CATALOG_URL,
+    POINTS_CACHE_KEY,
+    RESULTS_DELETED_MESSAGE,
     _apply_pending_dataset_remove,
     _apply_row_output_type,
+    _archive_download,
     _choose_output_directory,
     _dataset_display_name,
     _dataset_names_for_type,
@@ -18,6 +22,9 @@ from envoi_webapp.app import (
     _dataset_type,
     _escape_applescript_string,
     _escape_powershell_string,
+    _hosted_notice,
+    _job_progress,
+    _load_uploaded_points,
     _ordered_dataset_types,
     _progress_segments,
     _render_dataset_rows,
@@ -25,6 +32,7 @@ from envoi_webapp.app import (
     _type_option_label,
     _validate_dataset_rows,
     _validate_form,
+    _warning_count_text,
 )
 from envoi_webapp.helpers import (
     RASTER_OUTPUT,
@@ -32,6 +40,8 @@ from envoi_webapp.helpers import (
     DatasetSelection,
     build_run_config,
 )
+from envoi_webapp.jobs import _reset_job_manager_for_tests
+from envoi_webapp.settings import MODE_VARIABLE, WORKSPACE_VARIABLE, HostedLimits
 
 
 class _FakeStreamlit:
@@ -861,3 +871,280 @@ def test_render_dataset_rows_rerun_keeps_types_and_clears_only_changed_row(monke
     ]
     assert rerun_state["dataset_rows"][0] == _tabular_row("dem")
     assert rerun_state["stats_select_1_0_dem"] == ["mean"]
+
+
+# ---------------------------------------------------------------------------
+# Hosted limits in the form, uploads, and jobs
+# ---------------------------------------------------------------------------
+
+
+def _points(row_count: int) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "occurrenceID": [f"p{index}" for index in range(row_count)],
+            "decimalLatitude": [59.0] * row_count,
+            "decimalLongitude": [18.0] * row_count,
+        }
+    )
+
+
+def _raster_row(window_sizes: str) -> dict:
+    return {
+        **app._empty_dataset_row(),
+        "output_type": RASTER_OUTPUT,
+        "dataset": "dem",
+        "window_sizes": window_sizes,
+    }
+
+
+def _validate_hosted_form(dataset_rows: list[dict], limits: HostedLimits):
+    return _validate_form(
+        points_df=_points(2),
+        points_error=None,
+        input_crs="EPSG:4326",
+        credentials_bytes=None,
+        output_dir=None,
+        dataset_rows=dataset_rows,
+        catalog={"dem": {"display_name": "Elevation"}},
+        widget_version=0,
+        limits=limits,
+    )
+
+
+class TestHostedFormValidation:
+    def test_limit_messages_follow_the_form_issues_and_name_the_row(self):
+        """A valid form above a hosted limit gets one "Server limit" issue per limit."""
+        validation = _validate_hosted_form(
+            [_raster_row("100"), _raster_row("3000")], HostedLimits(max_raster_window_m=2000)
+        )
+
+        limit_issues = [
+            issue.message for issue in validation.issues if issue.message.startswith("Server")
+        ]
+        assert limit_issues == [
+            (
+                "Server limit — Data-product row 2 (dem): the window size 3,000 m is larger "
+                "than the limit of 2,000 m for raster output. Use smaller window sizes."
+            )
+        ]
+
+    def test_limits_are_not_checked_while_a_row_has_issues(self):
+        """With an invalid row, the limit check waits, so its row numbers cannot be wrong."""
+        validation = _validate_hosted_form(
+            [_raster_row(""), _raster_row("3000")], HostedLimits(max_raster_window_m=2000)
+        )
+
+        assert [issue.message for issue in validation.issues] == [
+            "Step 2 — Upload an Earth Engine service-account JSON key.",
+            "Step 4 — Data product “Elevation”: enter at least one sampling-window size.",
+        ]
+
+    def test_hosted_form_has_no_output_folder_issue(self):
+        """Hosted mode passes no output folder, so step 3 has nothing to check."""
+        validation = _validate_hosted_form([_raster_row("100")], HostedLimits())
+
+        assert not any(issue.message.startswith("Step 3") for issue in validation.issues)
+
+
+class _FakeUpload:
+    """Stand-in for Streamlit's ``UploadedFile``."""
+
+    def __init__(self, file_id: str, content: bytes):
+        self.file_id = file_id
+        self.size = len(content)
+        self._content = content
+
+    def getvalue(self) -> bytes:
+        return self._content
+
+
+_CSV_BYTES = b"occurrenceID,decimalLatitude,decimalLongitude\na,59.1,18.1\n"
+
+
+class TestUploadedPoints:
+    def _count_parses(self, monkeypatch) -> list:
+        parsed = []
+
+        def fake_read(upload):
+            parsed.append(upload.file_id)
+            return _points(1)
+
+        monkeypatch.setattr(app, "read_points_csv", fake_read)
+        return parsed
+
+    def test_same_file_is_parsed_once(self, monkeypatch):
+        """A rerun with the same uploaded file uses the kept result and does not parse again."""
+        parsed = self._count_parses(monkeypatch)
+        fake_st = _FakeStreamlit(_SessionState())
+
+        first = _load_uploaded_points(fake_st, _FakeUpload("file-1", _CSV_BYTES), None)
+        second = _load_uploaded_points(fake_st, _FakeUpload("file-1", _CSV_BYTES), None)
+
+        assert parsed == ["file-1"]
+        assert second[0] is first[0]
+        assert second[1].row_count == 1
+        assert second[2] is None
+
+    def test_new_file_is_parsed_and_removed_upload_clears_the_cache(self, monkeypatch):
+        """Another file is parsed again, and no upload removes the kept result."""
+        parsed = self._count_parses(monkeypatch)
+        fake_st = _FakeStreamlit(_SessionState())
+
+        _load_uploaded_points(fake_st, _FakeUpload("file-1", _CSV_BYTES), None)
+        _load_uploaded_points(fake_st, _FakeUpload("file-2", _CSV_BYTES), None)
+        assert parsed == ["file-1", "file-2"]
+
+        assert _load_uploaded_points(fake_st, None, None) == (None, None, None)
+        assert POINTS_CACHE_KEY not in fake_st.session_state
+
+    def test_hosted_upload_above_the_limits_is_not_parsed(self, monkeypatch):
+        """A file above the hosted size limit gets the limit message and is never parsed."""
+        parsed = self._count_parses(monkeypatch)
+        fake_st = _FakeStreamlit(_SessionState())
+
+        points_df, validation, error = _load_uploaded_points(
+            fake_st, _FakeUpload("file-1", _CSV_BYTES), HostedLimits(max_upload_bytes=10)
+        )
+
+        assert parsed == []
+        assert points_df is None and validation is None
+        assert error.startswith("The file is ")
+
+    def test_unreadable_file_gives_the_error_message(self, monkeypatch):
+        """A file that fails to parse gives its error as a message for the user."""
+
+        def failing_read(upload):
+            raise ValueError("Could not determine delimiter")
+
+        monkeypatch.setattr(app, "read_points_csv", failing_read)
+        fake_st = _FakeStreamlit(_SessionState())
+
+        assert _load_uploaded_points(fake_st, _FakeUpload("file-1", b"x"), None) == (
+            None,
+            None,
+            "Could not determine delimiter",
+        )
+
+
+def _progress_message(window_size_m: int, completed: int, total: int) -> dict:
+    return {
+        "type": "progress",
+        "batch_id": "extract_01_dem",
+        "dataset": "dem",
+        "window_size_m": window_size_m,
+        "mode": TABULAR_OUTPUT,
+        "completed": completed,
+        "total": total,
+        "unit": "points",
+    }
+
+
+class TestJobProgress:
+    def test_no_progress_yet(self):
+        """Before the first progress message, the bar is empty and says that the job starts."""
+        segments = {("extract_01_dem", "dem", 0, TABULAR_OUTPUT): 4}
+
+        assert _job_progress(segments, ()) == (0.0, "Starting extraction")
+
+    def test_fraction_counts_every_segment_and_text_names_the_latest(self):
+        """The fraction covers all segments, and the text names the segment that reported last."""
+        segments = {
+            ("extract_01_dem", "dem", 0, TABULAR_OUTPUT): 4,
+            ("extract_01_dem", "dem", 500, TABULAR_OUTPUT): 4,
+        }
+        progress = (_progress_message(0, 4, 4), _progress_message(500, 2, 4))
+
+        assert _job_progress(segments, progress) == (0.75, "dem | 500 m | 2/4 points")
+
+    def test_point_segment_text(self):
+        """The point value (window size 0) is called "point" in the text."""
+        segments = {("extract_01_dem", "dem", 0, TABULAR_OUTPUT): 2}
+
+        assert _job_progress(segments, (_progress_message(0, 1, 2),)) == (
+            0.5,
+            "dem | point | 1/2 points",
+        )
+
+
+@pytest.mark.parametrize(
+    ("warning_count", "expected"),
+    [
+        (0, "No warnings in the run log."),
+        (1, "1 warning in the run log."),
+        (12345, "12,345 warnings in the run log."),
+    ],
+)
+def test_warning_count_text_calls_records_warnings(warning_count, expected):
+    """The run-log count reads as warnings, with a thousands separator."""
+    assert _warning_count_text(warning_count) == expected
+
+
+def test_hosted_notice_states_the_limits_it_is_given():
+    """The notice takes its numbers from the limits, so it always matches them."""
+    notice = _hosted_notice(
+        HostedLimits(max_input_rows=500, max_concurrent_jobs=3, retention_after_download_s=300)
+    )
+
+    assert "and 500 rows" in notice
+    assert "at most 3 at a time on the server" in notice
+    assert "deleted 5 minutes after the first download" in notice
+    assert "data products with many bands" in notice
+    assert "points file stays in the server's memory for this browser session" in notice
+    assert "the results contain the IDs and coordinates of your points" in notice
+
+
+class _DownloadRecorder:
+    def __init__(self):
+        self.downloaded: list[str] = []
+
+    def mark_downloaded(self, job_id: str) -> None:
+        self.downloaded.append(job_id)
+
+
+class TestArchiveDownload:
+    def test_returns_the_archive_and_records_the_click(self, tmp_path):
+        """A click records the download for the retention time and returns the archive bytes."""
+        archive_path = tmp_path / "envoi-results.zip"
+        archive_path.write_bytes(b"archive bytes")
+        manager = _DownloadRecorder()
+
+        read_archive = _archive_download(manager, "job-1", archive_path)
+
+        assert manager.downloaded == []
+        assert read_archive() == b"archive bytes"
+        assert manager.downloaded == ["job-1"]
+
+    def test_missing_archive_raises_a_fixed_message_without_the_path(self, tmp_path):
+        """A deleted archive gives no empty file, and the error names no server path."""
+        archive_path = tmp_path / "workspace" / "envoi-results.zip"
+        read_archive = _archive_download(_DownloadRecorder(), "job-1", archive_path)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            read_archive()
+
+        assert str(excinfo.value) == RESULTS_DELETED_MESSAGE
+        assert excinfo.value.__context__ is None
+        assert excinfo.value.__cause__ is None
+
+
+@pytest.fixture
+def no_process_job_manager():
+    """Start and end the test without a job manager of the process, so no other test gets it."""
+    _reset_job_manager_for_tests()
+    yield
+    _reset_job_manager_for_tests()
+
+
+def test_get_job_manager_keeps_the_manager_when_a_client_clears_the_cache(
+    monkeypatch, tmp_path, no_process_job_manager
+):
+    """A cleared Streamlit resource cache ("Clear cache") does not replace the job manager."""
+    import streamlit as st
+
+    monkeypatch.delenv(MODE_VARIABLE, raising=False)
+    monkeypatch.setenv(WORKSPACE_VARIABLE, str(tmp_path))
+
+    first_manager = app.get_job_manager()
+    st.cache_resource.clear()
+
+    assert app.get_job_manager() is first_manager

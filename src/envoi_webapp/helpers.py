@@ -4,8 +4,8 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+import urllib.parse
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,10 +14,7 @@ import pandas as pd
 from pyproj import CRS
 from pyproj.exceptions import CRSError
 
-from envoi import extract as envoi_extract
-from envoi import init_gee as envoi_init_gee
 from envoi._input_validation import _validate_sample_ids
-from envoi.progress import ProgressCallback
 from envoi.reducers import CATEGORICAL_ONLY_REDUCERS, CONTINUOUS_ONLY_REDUCERS
 
 GBIF_REQUIRED_COLUMNS = ("occurrenceID", "decimalLatitude", "decimalLongitude")
@@ -248,48 +245,50 @@ def build_run_config(rows: Sequence[DatasetSelection]) -> list[dict]:
 
 
 def validate_service_account_json(raw_bytes: bytes) -> dict:
-    """Validate the minimum shape of a Google service-account key JSON."""
+    """Validate the minimum shape of a Google service-account key JSON.
+
+    The key must have ``"type": "service_account"`` and the fields
+    ``client_email``, ``private_key``, and ``token_uri``. Keys that Google
+    issues have all of them. Without ``token_uri``, Earth Engine cannot use the
+    key. The error message names missing fields, never their values.
+    """
 
     if not raw_bytes:
         raise ValueError("Earth Engine service account key JSON is required.")
 
+    # The decode and parse errors keep the full key text (UnicodeDecodeError.object,
+    # JSONDecodeError.doc). Raise after the except block, so the new error has no
+    # __context__ that carries the key ("raise ... from None" would still set it).
+    key_is_unreadable = False
     try:
         data = json.loads(raw_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("Invalid service account JSON.") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        key_is_unreadable = True
+    if key_is_unreadable:
+        raise ValueError("Invalid service account JSON.")
 
     if not isinstance(data, dict):
         raise ValueError("Service account key JSON must be an object.")
 
-    required = {"type", "client_email", "private_key"}
+    required = {"type", "client_email", "private_key", "token_uri"}
     missing = sorted(required - set(data.keys()))
     if data.get("type") != "service_account" or missing:
-        raise ValueError("The uploaded JSON is not a valid Google service account key.")
+        missing_text = f" Missing field(s): {', '.join(missing)}." if missing else ""
+        raise ValueError(
+            "The uploaded JSON is not a valid Google service account key." + missing_text
+        )
 
     return data
 
 
-@contextmanager
-def temporary_service_account_file(raw_bytes: bytes) -> Iterator[Path]:
-    """Write credentials to a private temp file for one run, then delete it."""
-
-    validate_service_account_json(raw_bytes)
-    fd, path_string = tempfile.mkstemp(prefix="envoi-ee-", suffix=".json")
-    path = Path(path_string)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(raw_bytes)
-        os.chmod(path, 0o600)
-        yield path
-    finally:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-
-
 def redact_credential_secrets(message: str, raw_credential_bytes: bytes | None) -> str:
-    """Remove service-account secret values from a user-facing error message."""
+    """Remove service-account secret values from a user-facing error message.
+
+    The removed values are the full key text, the ``private_key`` and each of
+    its base64 lines, the ``private_key_id``, the ``client_email`` (also in its
+    URL-encoded form, as in ``client_x509_cert_url``), and the
+    ``client_x509_cert_url``. Each value becomes ``[redacted]``.
+    """
 
     if raw_credential_bytes is None:
         return message
@@ -304,7 +303,7 @@ def redact_credential_secrets(message: str, raw_credential_bytes: bytes | None) 
         data = None
 
     if isinstance(data, dict):
-        for key in ("private_key", "private_key_id", "client_email"):
+        for key in ("private_key", "private_key_id", "client_email", "client_x509_cert_url"):
             value = data.get(key)
             if isinstance(value, str) and value:
                 secret_values.append(value)
@@ -314,42 +313,11 @@ def redact_credential_secrets(message: str, raw_credential_bytes: bytes | None) 
                         for line in value.splitlines()
                         if line.strip() and not line.startswith("-----")
                     )
+                elif key == "client_email":
+                    # The certificate URL of a key from Google holds the email
+                    # with "@" as "%40". An error text can quote that URL.
+                    secret_values.append(urllib.parse.quote(value, safe=""))
 
     for secret in sorted(set(secret_values), key=len, reverse=True):
         redacted = redacted.replace(secret, "[redacted]")
     return redacted
-
-
-def run_extraction(
-    points: pd.DataFrame,
-    dataset_rows: Sequence[DatasetSelection],
-    output_dir: str | Path,
-    input_crs: str,
-    credentials_json: bytes,
-    *,
-    progress_callback: ProgressCallback | None = None,
-    init_gee_func: Callable = envoi_init_gee,
-    extract_func: Callable = envoi_extract,
-):
-    """Validate web inputs, initialize Earth Engine, and run envoi.extract()."""
-
-    validate_points_dataframe(points)
-    normalized_crs = normalize_crs(input_crs)
-    validate_wgs84_ranges(points, normalized_crs)
-    resolved_output_dir = validate_output_dir(output_dir)
-    config = build_run_config(dataset_rows)
-
-    with temporary_service_account_file(credentials_json) as credentials_path:
-        init_gee_func(credentials_path)
-        return extract_func(
-            points,
-            config,
-            output_dir=resolved_output_dir,
-            input_crs=normalized_crs,
-            id_column="occurrenceID",
-            latitude_column="decimalLatitude",
-            longitude_column="decimalLongitude",
-            date_column="eventDate",
-            quiet=True,
-            progress_callback=progress_callback,
-        )

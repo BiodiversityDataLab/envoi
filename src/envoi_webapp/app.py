@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import subprocess
 import sys
 from base64 import b64encode
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -18,39 +20,60 @@ import pandas as pd
 from envoi import list_datasets, list_reducers
 from envoi.catalog_docs import CATEGORY_ORDER as DATASET_TYPE_ORDER
 from envoi.catalog_docs import UNCATEGORISED_LABEL
-from envoi.progress import ProgressEvent
 
 try:
     from .helpers import (
         RASTER_OUTPUT,
         TABULAR_OUTPUT,
+        CsvValidationResult,
         DatasetSelection,
         build_run_config,
         normalize_crs,
         parse_window_sizes,
         permissible_statistics_for_dataset,
         read_points_csv,
-        redact_credential_secrets,
-        run_extraction,
+        validate_output_dir,
         validate_points_dataframe,
         validate_service_account_json,
         validate_wgs84_ranges,
+    )
+    from .job_protocol import JobSnapshot, JobState, ProgressMessage
+    from .jobs import JobManager, JobRejected, get_job_manager, key_hash
+    from .settings import (
+        HostedLimits,
+        WebappSettings,
+        check_hosted_limits,
+        check_upload,
+        format_bytes,
+        format_minutes,
+        load_settings,
     )
 except ImportError:
     from envoi_webapp.helpers import (
         RASTER_OUTPUT,
         TABULAR_OUTPUT,
+        CsvValidationResult,
         DatasetSelection,
         build_run_config,
         normalize_crs,
         parse_window_sizes,
         permissible_statistics_for_dataset,
         read_points_csv,
-        redact_credential_secrets,
-        run_extraction,
+        validate_output_dir,
         validate_points_dataframe,
         validate_service_account_json,
         validate_wgs84_ranges,
+    )
+    from envoi_webapp.job_protocol import JobSnapshot, JobState, ProgressMessage
+    from envoi_webapp.jobs import JobManager, JobRejected, get_job_manager, key_hash
+    from envoi_webapp.settings import (
+        HostedLimits,
+        WebappSettings,
+        check_hosted_limits,
+        check_upload,
+        format_bytes,
+        format_minutes,
+        load_settings,
     )
 
 # Adjust these values to tune the Streamlit page gutters.
@@ -68,6 +91,34 @@ THEME_PRIMARY_COLOR = STAT_TAG_BACKGROUND
 DATASET_CATALOG_URL = "https://github.com/BiodiversityDataLab/envoi/blob/main/docs/datasets.md"
 VALIDATION_ERROR_COLOR = "#d32f2f"
 ALL_DATASET_TYPES = "__all_dataset_types__"
+# Installation of envoi for the local web app and the Python package. The
+# hosted notice points users with larger runs here.
+LOCAL_INSTALL_URL = "https://github.com/BiodiversityDataLab/envoi#browser-based-user-interface"
+
+# Session-state keys of the extraction job of one browser session. The session
+# keeps only the job ID and a random session token. The job manager keeps the
+# job itself, so the job outlives a rerun of the page.
+SESSION_TOKEN_KEY = "_job_session_token"
+JOB_ID_KEY = "_job_id"
+# The progress segments of the job (from _progress_segments), for the progress bar.
+JOB_SEGMENTS_KEY = "_job_segments"
+# Local mode: the absolute output folder of the job, for the output paths.
+JOB_OUTPUT_DIR_KEY = "_job_output_dir"
+# The job manager's rejection of the last run click: (message, reason, key
+# hash). The key hash is set only for the reason "key". The rejection stays
+# until the next run click, so that "Cancel the earlier job" can be clicked.
+JOB_REJECTION_KEY = "_job_rejection"
+# A message that the page shows once, after "Cancel the earlier job".
+JOB_NOTICE_KEY = "_job_notice"
+# The parsed upload of section 1: (file_id, points, validation, error message).
+# A rerun then does not parse the same file again.
+POINTS_CACHE_KEY = "_points_upload"
+
+# The running-job fragment asks the job manager for the status this often, in
+# seconds. Each request is also the heartbeat for the hosted abandon time-out.
+JOB_POLL_INTERVAL_S = 2
+JOB_LOST_MESSAGE = "The job state is lost. Start the extraction again."
+RESULTS_DELETED_MESSAGE = "The results were deleted after the retention time."
 
 
 @dataclass(frozen=True)
@@ -372,10 +423,61 @@ def _render_header(st) -> None:
         )
 
 
-def _read_uploaded_csv(uploaded_file) -> pd.DataFrame | None:
+def _load_uploaded_points(
+    st, uploaded_file, limits: HostedLimits | None
+) -> tuple[pd.DataFrame | None, CsvValidationResult | None, str | None]:
+    """Parse and validate the uploaded points CSV once per uploaded file.
+
+    In hosted mode, :func:`check_upload` checks the size and the line count of
+    the raw bytes first, and a file that fails is not parsed. The outcome is
+    kept in ``st.session_state`` under the file's ``file_id``, so a rerun of the
+    page does not parse the same file again. Removing the upload removes the
+    kept outcome.
+
+    Args:
+        st: The Streamlit module.
+        uploaded_file: The value of the "Location CSV" uploader, or None.
+        limits: The hosted limits, or None in local mode.
+
+    Returns:
+        ``(points, validation, error)``: the parsed points and their validation
+        result, or None and None with a message for the user. All three are
+        None when no file is uploaded.
+    """
     if uploaded_file is None:
-        return None
-    return read_points_csv(uploaded_file)
+        st.session_state.pop(POINTS_CACHE_KEY, None)
+        return None, None, None
+
+    cached = st.session_state.get(POINTS_CACHE_KEY)
+    if cached is not None and cached[0] == uploaded_file.file_id:
+        return cached[1], cached[2], cached[3]
+
+    points_df: pd.DataFrame | None = None
+    validation: CsvValidationResult | None = None
+    points_error: str | None = None
+    upload_messages = (
+        check_upload(uploaded_file.size, uploaded_file.getvalue(), limits)
+        if limits is not None
+        else []
+    )
+    if upload_messages:
+        points_error = " ".join(upload_messages)
+    else:
+        try:
+            points_df = read_points_csv(uploaded_file)
+            validation = validate_points_dataframe(points_df)
+        # Broad catch: pandas raises many error types for a file that is not a
+        # readable CSV. Each one becomes a message for the user, not a crash.
+        except Exception as exc:
+            points_df, validation, points_error = None, None, str(exc)
+
+    st.session_state[POINTS_CACHE_KEY] = (
+        uploaded_file.file_id,
+        points_df,
+        validation,
+        points_error,
+    )
+    return points_df, validation, points_error
 
 
 def _is_wsl() -> bool:
@@ -1062,12 +1164,32 @@ def _validate_form(
     points_error: str | None,
     input_crs: str,
     credentials_bytes: bytes | None,
-    output_dir: str,
+    output_dir: str | None,
     dataset_rows: list[dict],
     catalog: dict[str, dict[str, Any]],
     widget_version: int,
+    limits: HostedLimits | None = None,
 ) -> _FormValidation:
-    """Collect form errors in step order without running the extraction."""
+    """Collect form errors in step order without running the extraction.
+
+    Args:
+        points_df: The parsed points, or None when the upload is missing or bad.
+        points_error: The message for a bad upload, or None.
+        input_crs: The CRS text of step 1.
+        credentials_bytes: The uploaded key, or None.
+        output_dir: The output folder text of step 3. None in hosted mode, which
+            has no output-folder field.
+        dataset_rows: The data-product rows of step 4.
+        catalog: The dataset catalog.
+        widget_version: The widget version of the data-product rows.
+        limits: The hosted limits, or None in local mode. The limit checks run
+            only when every data-product row is valid, so that the row numbers
+            in their messages match the rows of the form.
+
+    Returns:
+        The issues in step order, the valid data-product selections, and the
+        normalized CRS.
+    """
 
     issues: list[_ValidationIssue] = []
     normalized_crs = ""
@@ -1110,8 +1232,8 @@ def _validate_form(
         except ValueError as exc:
             issues.append(_ValidationIssue(f"Step 2 — {exc}", ("credentials_json",)))
 
-    # Step 3: output directory.
-    if not output_dir.strip():
+    # Step 3: output directory (local mode only).
+    if output_dir is not None and not output_dir.strip():
         issues.append(
             _ValidationIssue(
                 "Step 3 — Enter an output directory.",
@@ -1122,6 +1244,14 @@ def _validate_form(
     # Step 4: data-product rows, each with its own output type.
     dataset_issues, selections = _validate_dataset_rows(dataset_rows, catalog, widget_version)
     issues.extend(dataset_issues)
+
+    # Hosted limits. check_hosted_limits() numbers the rows by their position
+    # in ``selections``, which matches the form only when no row was skipped.
+    if limits is not None and points_df is not None and not dataset_issues:
+        issues.extend(
+            _ValidationIssue(f"Server limit — {message}", ())
+            for message in check_hosted_limits(points_df, selections, limits)
+        )
 
     return _FormValidation(tuple(issues), tuple(selections), normalized_crs)
 
@@ -1178,6 +1308,445 @@ def _progress_segments(
     return segments
 
 
+def _job_progress(
+    expected_segments: dict[tuple[str, str, int, str], int],
+    progress: Sequence[ProgressMessage],
+) -> tuple[float, str]:
+    """Return the fraction done and the progress-bar text of a running job.
+
+    Args:
+        expected_segments: The segments of the job from :func:`_progress_segments`,
+            each with the number of points as its expected total.
+        progress: The latest progress message of each segment, in the order in
+            which the segments first reported (``JobSnapshot.progress``). A
+            message replaces the expected total of its segment with the real one.
+
+    Returns:
+        ``(fraction, text)``: the fraction of all segments that is done, from 0
+        to 1, and a text about the segment that reported last.
+    """
+    segment_totals = dict(expected_segments)
+    completed_by_segment: dict[tuple[str, str, int, str], int] = {}
+    for message in progress:
+        segment_key = (
+            message["batch_id"],
+            message["dataset"],
+            message["window_size_m"],
+            message["mode"],
+        )
+        segment_totals[segment_key] = max(message["total"], 1)
+        completed_by_segment[segment_key] = message["completed"]
+
+    total = sum(segment_totals.values()) or 1
+    completed = sum(
+        min(completed_by_segment.get(segment_key, 0), segment_total)
+        for segment_key, segment_total in segment_totals.items()
+    )
+    fraction = min(1.0, completed / total)
+    if not progress:
+        return fraction, "Starting extraction"
+
+    latest = progress[-1]
+    window_text = "point" if latest["window_size_m"] == 0 else f"{latest['window_size_m']} m"
+    return fraction, (
+        f"{latest['dataset']} | {window_text} | "
+        f"{latest['completed']}/{latest['total']} {latest['unit']}"
+    )
+
+
+def _warning_count_text(warning_count: int) -> str:
+    """Return the number of run-log records as a text for the user.
+
+    For example ``"3 warnings in the run log."``. envoi can report one warning
+    per input row (for example for incomplete dates), so the count can be
+    large. The text calls the records warnings, not errors.
+    """
+    if warning_count == 0:
+        return "No warnings in the run log."
+    noun = "warning" if warning_count == 1 else "warnings"
+    return f"{warning_count:,} {noun} in the run log."
+
+
+def _hosted_notice(limits: HostedLimits) -> str:
+    """Return the hosted-mode notice about the key, the data, the limits, and downloads (R19).
+
+    The numbers come from ``limits``, so the notice always states the limits
+    that the web app applies.
+    """
+    data_handling = [
+        (
+            "**Your key** stays in the server's memory for this browser session only. "
+            "It is never written to disk."
+        ),
+        (
+            "**Your points and the results** stay on the server's disk only while they are "
+            f"needed. The results are deleted {format_minutes(limits.retention_after_download_s)} "
+            "after the first download, or at the latest "
+            f"{format_minutes(limits.max_retention_s)} after the extraction ends. Like your "
+            "key, the uploaded points file stays in the server's memory for this browser "
+            "session, and the results contain the IDs and coordinates of your points."
+        ),
+        (
+            "**Keep this page open and visible** while an extraction runs. If the page is "
+            "closed or the computer sleeps, the extraction stops after "
+            f"{format_minutes(limits.abandon_timeout_s)}."
+        ),
+        "**A server restart** stops running extractions and deletes all results.",
+        (
+            "**Downloads** go to the download folder of your browser. Most browsers can be "
+            "set to ask where to save each download."
+        ),
+        (
+            "**For larger runs**, or to write the results straight into a folder, "
+            f"[install envoi]({LOCAL_INSTALL_URL}) and use the local web app or the Python "
+            "package."
+        ),
+    ]
+    service_limits = [
+        (
+            f"CSV file: at most {format_bytes(limits.max_upload_bytes)} and "
+            f"{limits.max_input_rows:,} rows."
+        ),
+        f"At most {limits.max_dataset_rows} data products per extraction.",
+        (
+            f"Tabular rows: at most {limits.tabular_request_budget:,} points × window sizes "
+            "(the point value counts as one window size), and windows of at most "
+            f"{limits.max_tabular_window_m:,} m."
+        ),
+        (
+            f"Raster rows: at most {limits.raster_tile_budget:,} points × window sizes, and "
+            f"windows of at most {limits.max_raster_window_m:,} m."
+        ),
+        (
+            f"Each extraction: at most {format_minutes(limits.max_run_time_s)} and "
+            f"{format_bytes(limits.max_workspace_bytes)} of results. Raster tiles of data "
+            "products with many bands (for example satellite embeddings) are large, so use "
+            "fewer points or smaller windows for them."
+        ),
+        (
+            "One extraction at a time per page and per key, and at most "
+            f"{limits.max_concurrent_jobs} at a time on the server."
+        ),
+    ]
+    return "\n".join(
+        [
+            "**How this service handles your data**",
+            "",
+            *(f"- {line}" for line in data_handling),
+            "",
+            "**Limits of this service**",
+            "",
+            *(f"- {line}" for line in service_limits),
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Extraction jobs
+# ---------------------------------------------------------------------------
+
+
+def _archive_download(manager: JobManager, job_id: str, archive_path: Path) -> Callable[[], bytes]:
+    """Return the function that "Download results" calls to get the ZIP archive.
+
+    Streamlit calls the function when the user clicks the button, in a separate
+    thread and without a rerun of the page. The function records the click with
+    :meth:`JobManager.mark_downloaded`, which starts the retention time after
+    the first download, and returns the archive bytes.
+
+    When the archive cannot be read (the retention time ended between the page
+    update and the click), the function raises ``RuntimeError`` with
+    :data:`RESULTS_DELETED_MESSAGE`. Streamlit catches it, logs it, and shows
+    "Failed to generate file for download" below the button. The user never
+    gets an empty or partial file, and the next rerun of the page shows that
+    the results were deleted.
+    """
+
+    def read_archive() -> bytes:
+        manager.mark_downloaded(job_id)
+        try:
+            return archive_path.read_bytes()
+        except OSError:
+            pass
+        # Raised outside the except block, so that the server log shows no
+        # chained error with the path of the job workspace.
+        raise RuntimeError(RESULTS_DELETED_MESSAGE)
+
+    return read_archive
+
+
+def _clear_job(st) -> None:
+    """Remove the job of this session from ``st.session_state``."""
+    for key in (JOB_ID_KEY, JOB_SEGMENTS_KEY, JOB_OUTPUT_DIR_KEY):
+        st.session_state.pop(key, None)
+
+
+def _submit_job(
+    st,
+    manager: JobManager,
+    settings: WebappSettings,
+    validation: _FormValidation,
+    points_df: pd.DataFrame,
+    credentials_bytes: bytes,
+    output_dir: str | None,
+) -> None:
+    """Start a job for a valid form, keep its ID in the session, and rerun the page.
+
+    The rerun shows the running job and disables the run button. A rejection
+    by the job manager (:class:`JobRejected`) is kept in the session until the
+    next run click. A bad output folder (local mode) or a key that the job
+    manager cannot read is shown as a form error.
+
+    Args:
+        st: The Streamlit module.
+        manager: The job manager.
+        settings: The web-app settings.
+        validation: The form validation, without issues.
+        points_df: The parsed points.
+        credentials_bytes: The uploaded key.
+        output_dir: The output folder text in local mode, None in hosted mode.
+    """
+    run_configs = build_run_config(list(validation.selections))
+
+    # Local mode: create the output folder now, and check that it is writable.
+    # Hosted mode: the job manager chooses the folder.
+    output_folder: Path | None = None
+    if not settings.is_hosted:
+        try:
+            output_folder = validate_output_dir(output_dir)
+        except (ValueError, OSError) as exc:
+            _render_validation_issues(st, (_ValidationIssue(f"Step 3 — {exc}", ("output_dir",)),))
+            return
+
+    try:
+        job_id = manager.submit(
+            session_token=st.session_state[SESSION_TOKEN_KEY],
+            points=points_df,
+            run_configs=run_configs,
+            input_crs=validation.normalized_crs,
+            credentials_json=credentials_bytes,
+            output_dir=output_folder,
+        )
+    except JobRejected as rejection:
+        # For a running job with the same key, keep the hash of the key, so that
+        # "Cancel the earlier job" can cancel it without the key itself.
+        rejected_key_hash = key_hash(credentials_bytes) if rejection.reason == "key" else None
+        st.session_state[JOB_REJECTION_KEY] = (str(rejection), rejection.reason, rejected_key_hash)
+        return
+    # The key is not UTF-8 text or not a JSON object. The message has no key material.
+    except ValueError as exc:
+        _render_validation_issues(st, (_ValidationIssue(f"Step 2 — {exc}", ("credentials_json",)),))
+        return
+
+    st.session_state[JOB_ID_KEY] = job_id
+    st.session_state[JOB_SEGMENTS_KEY] = _progress_segments(run_configs, len(points_df))
+    st.session_state[JOB_OUTPUT_DIR_KEY] = output_folder
+    st.rerun()
+
+
+def _render_job_rejection(st, manager: JobManager) -> None:
+    """Show the kept job rejection, and "Cancel the earlier job" for a rejection by key.
+
+    A session that uploaded the key of a running job may cancel that job, for
+    example after a page reload lost the link to it. Before that, the page
+    shows once the notice that the cancel left.
+    """
+    notice = st.session_state.pop(JOB_NOTICE_KEY, None)
+    if notice is not None:
+        st.info(notice)
+
+    rejection = st.session_state.get(JOB_REJECTION_KEY)
+    if rejection is None:
+        return
+    message, _reason, rejected_key_hash = rejection
+    st.warning(message)
+    if rejected_key_hash is not None and st.button(
+        "Cancel the earlier job", key="cancel_earlier_job"
+    ):
+        with st.spinner("Stopping the earlier extraction..."):
+            cancelled = manager.cancel_for_key(rejected_key_hash)
+        st.session_state.pop(JOB_REJECTION_KEY, None)
+        st.session_state[JOB_NOTICE_KEY] = (
+            "The earlier extraction was cancelled. "
+            if cancelled
+            else "The earlier extraction had already ended. "
+        ) + "Click “Extract selected data” to start your extraction."
+        st.rerun()
+
+
+def _render_running_job(st, manager: JobManager, job_id: str) -> None:
+    """Show the progress of the running job and "Cancel", updated every 2 seconds.
+
+    A fragment reruns only this part of the page. Each rerun asks the job
+    manager for the status, which is also the job's heartbeat. When the job
+    has ended, the fragment reruns the whole page, which then shows the result
+    and enables the run button again.
+    """
+    expected_segments = st.session_state.get(JOB_SEGMENTS_KEY, {})
+
+    @st.fragment(run_every=JOB_POLL_INTERVAL_S)
+    def show_running_job() -> None:
+        snapshot = manager.snapshot(job_id)
+        if snapshot is None or snapshot.state.is_final:
+            st.rerun(scope="app")
+        fraction, text = _job_progress(expected_segments, snapshot.progress)
+        st.progress(fraction, text=text)
+        if snapshot.progress:
+            st.caption(f"Current batch: {snapshot.progress[-1]['batch_id']}")
+        if st.button("Cancel", key="cancel_job"):
+            with st.spinner("Stopping the extraction..."):
+                manager.cancel(job_id)
+            st.rerun(scope="app")
+
+    show_running_job()
+
+
+def _render_succeeded_job(
+    st, manager: JobManager, settings: WebappSettings, snapshot: JobSnapshot
+) -> None:
+    """Show a succeeded job: the warning count, and the download (hosted) or the paths (local)."""
+    result = snapshot.result
+    st.success("Extraction complete.")
+    st.info(_warning_count_text(result["warning_count"]))
+    if settings.is_hosted:
+        if not snapshot.archive_available:
+            st.info(RESULTS_DELETED_MESSAGE)
+            return
+        limits = settings.limits
+        archive_path = Path(result["archive"])
+        st.download_button(
+            "Download results",
+            data=_archive_download(manager, snapshot.job_id, archive_path),
+            file_name=archive_path.name,
+            mime="application/zip",
+            on_click="ignore",
+            type="primary",
+            key="download_results",
+        )
+        st.caption(
+            "The ZIP file holds the outputs and the run log. Results are deleted "
+            f"{format_minutes(limits.retention_after_download_s)} after the first download, "
+            f"or {format_minutes(limits.max_retention_s)} after the job ended."
+        )
+        return
+
+    # Local mode: the worker gives the output paths relative to the output folder.
+    output_folder = Path(st.session_state[JOB_OUTPUT_DIR_KEY])
+    st.write("Outputs")
+    for output_key, relative_path in result["outputs"].items():
+        st.code(f"{output_key}: {output_folder / relative_path}")
+    st.code(f"run log: {output_folder / result['run_log']}")
+
+
+def _render_failed_job(st, snapshot: JobSnapshot) -> None:
+    """Show a failed job: the message, the warning count, and the last lines of the run log.
+
+    The worker removed key material from the message and the lines. In hosted
+    mode the job workspace is already deleted, so the page names no run-log file.
+    """
+    error = snapshot.error
+    st.error(f"The extraction failed. {error['message']}")
+    if error["warning_count"]:
+        st.info(_warning_count_text(error["warning_count"]))
+    if error["run_log_tail"]:
+        st.write("Last lines of the run log:")
+        st.code("\n".join(error["run_log_tail"]), language=None)
+
+
+def _render_job(
+    st,
+    manager: JobManager,
+    settings: WebappSettings,
+    job_id: str,
+    snapshot: JobSnapshot | None,
+) -> None:
+    """Show the job of this session: its progress while it runs, or its end state.
+
+    Each end state, and a job that the job manager does not know (for example
+    after it forgot an old job), gets "Clear results". It discards the job (in
+    hosted mode, the results are deleted) and removes it from the session.
+    """
+    if snapshot is not None and snapshot.state is JobState.RUNNING:
+        _render_running_job(st, manager, job_id)
+        return
+
+    if snapshot is None:
+        st.warning(JOB_LOST_MESSAGE)
+    elif snapshot.state is JobState.SUCCEEDED:
+        _render_succeeded_job(st, manager, settings, snapshot)
+    elif snapshot.state is JobState.FAILED:
+        _render_failed_job(st, snapshot)
+    else:
+        # Cancelled or stopped by a limit: the job manager stopped the worker
+        # before it could write its run log, so only the reason is known.
+        st.warning(snapshot.stop_reason or "The extraction was stopped.")
+
+    if st.button("Clear results", key="clear_results"):
+        manager.discard(job_id)
+        _clear_job(st)
+        st.rerun()
+
+
+def _render_run_section(
+    st,
+    *,
+    settings: WebappSettings,
+    catalog: dict[str, dict[str, Any]],
+    points_df: pd.DataFrame | None,
+    points_error: str | None,
+    input_crs: str,
+    credentials_bytes: bytes | None,
+    output_dir: str | None,
+) -> None:
+    """Render the run button, the form errors, and the job of this session (section 5).
+
+    The run button is disabled while the session's job runs. A configuration
+    error of the job manager replaces the whole section, so that no job starts.
+    """
+    # The one job manager of this server process (jobs.get_job_manager()). It
+    # is not in the Streamlit cache, so a client's "Clear cache" cannot replace
+    # it. Tests replace app.get_job_manager with a fake manager.
+    try:
+        manager = get_job_manager()
+    except ValueError as exc:
+        st.error(f"The web app cannot run extractions. {exc}")
+        return
+
+    # The status of the session's job decides whether the run button is active.
+    # Each status request is also the job's heartbeat.
+    job_id = st.session_state.get(JOB_ID_KEY)
+    snapshot = manager.snapshot(job_id) if job_id is not None else None
+    job_running = snapshot is not None and snapshot.state is JobState.RUNNING
+
+    run_button = st.button(
+        "Extract selected data",
+        type="primary",
+        disabled=job_running,
+        key="run_extraction_button",
+    )
+    if run_button:
+        st.session_state.pop(JOB_REJECTION_KEY, None)
+        validation = _validate_form(
+            points_df=points_df,
+            points_error=points_error,
+            input_crs=input_crs,
+            credentials_bytes=credentials_bytes,
+            output_dir=output_dir,
+            dataset_rows=list(st.session_state.get("dataset_rows", [])),
+            catalog=catalog,
+            widget_version=int(st.session_state.get("_dataset_widget_version", 0)),
+            limits=settings.limits,
+        )
+        if validation.issues:
+            _render_validation_issues(st, validation.issues)
+        else:
+            _submit_job(st, manager, settings, validation, points_df, credentials_bytes, output_dir)
+    _render_job_rejection(st, manager)
+
+    if job_id is not None:
+        _render_job(st, manager, settings, job_id, snapshot)
+
+
 def _render_footer(st) -> None:
     st.markdown(
         """
@@ -1206,9 +1775,20 @@ def render_app() -> None:
     _inject_css(st)
     _render_header(st)
 
+    # The mode and, in hosted mode, the limits. Invalid settings stop the page
+    # here, so that no form appears in the wrong mode (for example an
+    # output-folder field on a public server).
+    try:
+        settings = load_settings()
+    except ValueError as exc:
+        st.error(f"The web app is not configured correctly. {exc}")
+        _render_footer(st)
+        return
+    # The job manager allows one running job per session token.
+    if SESSION_TOKEN_KEY not in st.session_state:
+        st.session_state[SESSION_TOKEN_KEY] = secrets.token_urlsafe(16)
+
     catalog = _dataset_catalog()
-    points_df: pd.DataFrame | None = None
-    points_error: str | None = None
 
     st.subheader("1. Upload location data")
     st.write(
@@ -1222,20 +1802,17 @@ def render_app() -> None:
         accept_multiple_files=False,
         key="location_csv",
     )
-    if uploaded_csv is not None:
-        try:
-            points_df = _read_uploaded_csv(uploaded_csv)
-            if points_df is not None:
-                validation = validate_points_dataframe(points_df)
-                st.success(
-                    f"Loaded {validation.row_count} rows. "
-                    f"Date column present: {'yes' if validation.has_date else 'no'}."
-                )
-                st.dataframe(points_df.head(20), width="stretch")
-        except Exception as exc:
-            points_error = str(exc)
-            st.error(points_error)
-            points_df = None
+    points_df, points_validation, points_error = _load_uploaded_points(
+        st, uploaded_csv, settings.limits
+    )
+    if points_validation is not None:
+        st.success(
+            f"Loaded {points_validation.row_count} rows. "
+            f"Date column present: {'yes' if points_validation.has_date else 'no'}."
+        )
+        st.dataframe(points_df.head(20), width="stretch")
+    elif points_error is not None:
+        st.error(points_error)
 
     crs_cols = st.columns([0.34, 0.66])
     crs_mode = crs_cols[0].selectbox(
@@ -1256,9 +1833,10 @@ def render_app() -> None:
     st.subheader("2. Add Earth Engine credentials")
     st.markdown(
         """
-        Upload your Google Earth Engine service account JSON key. The key is only
-        written to a temporary local file during extraction, then deleted when the
-        run finishes. If you do not have a service account yet, follow the
+        Upload your Google Earth Engine service account JSON key. The web app keeps
+        the key in memory for this browser session only and never writes it to disk.
+        Each extraction runs in a separate process that uses only your key. If you do
+        not have a service account yet, follow the
         <a href="https://developers.google.com/earth-engine/guides/service_account" target="_blank">Earth Engine service account setup guide</a>.
         """,
         unsafe_allow_html=True,
@@ -1271,22 +1849,29 @@ def render_app() -> None:
     )
     credentials_bytes = credentials_file.getvalue() if credentials_file is not None else None
 
-    st.subheader("3. Choose output settings")
-    if "output_dir" not in st.session_state:
-        st.session_state.output_dir = str(Path("~/envoi_outputs").expanduser())
-    if "_pending_output_dir" in st.session_state:
-        st.session_state.output_dir = st.session_state.pop("_pending_output_dir")
-    output_cols = st.columns([0.78, 0.22], vertical_alignment="bottom")
-    output_dir = output_cols[0].text_input("Output directory", key="output_dir")
-    if output_cols[1].button("Browse..."):
-        try:
-            selected_dir = _choose_output_directory(output_dir)
-        except RuntimeError as exc:
-            st.warning(str(exc))
-        else:
-            if selected_dir:
-                st.session_state._pending_output_dir = selected_dir
-                st.rerun()
+    # Hosted mode has no output-folder field: the user downloads the results,
+    # and no widget accepts a server path.
+    output_dir: str | None = None
+    if settings.is_hosted:
+        st.subheader("3. Results and your data")
+        st.info(_hosted_notice(settings.limits))
+    else:
+        st.subheader("3. Choose output settings")
+        if "output_dir" not in st.session_state:
+            st.session_state.output_dir = str(Path("~/envoi_outputs").expanduser())
+        if "_pending_output_dir" in st.session_state:
+            st.session_state.output_dir = st.session_state.pop("_pending_output_dir")
+        output_cols = st.columns([0.78, 0.22], vertical_alignment="bottom")
+        output_dir = output_cols[0].text_input("Output directory", key="output_dir")
+        if output_cols[1].button("Browse..."):
+            try:
+                selected_dir = _choose_output_directory(output_dir)
+            except RuntimeError as exc:
+                st.warning(str(exc))
+            else:
+                if selected_dir:
+                    st.session_state._pending_output_dir = selected_dir
+                    st.rerun()
 
     st.subheader("4. Select data products")
     st.markdown(
@@ -1299,70 +1884,26 @@ def render_app() -> None:
     _render_dataset_rows(st, catalog)
 
     st.subheader("5. Run extraction")
-    st.write(
-        "The final outputs, data quality checks, and metadata are written to the output directory "
-        "chosen in step 3."
-    )
-    run_button = st.button("Extract selected data", type="primary")
-    if run_button:
-        validation = _validate_form(
-            points_df=points_df,
-            points_error=points_error,
-            input_crs=input_crs,
-            credentials_bytes=credentials_bytes,
-            output_dir=output_dir,
-            dataset_rows=list(st.session_state.get("dataset_rows", [])),
-            catalog=catalog,
-            widget_version=int(st.session_state.get("_dataset_widget_version", 0)),
+    if settings.is_hosted:
+        st.write(
+            "The final outputs, data quality checks, metadata, and a run log are packed into "
+            "one ZIP file. A download button appears here when the extraction is complete."
         )
-        if validation.issues:
-            _render_validation_issues(st, validation.issues)
-        else:
-            progress_bar = st.progress(0, text="Starting extraction")
-            status = st.empty()
-            completed_by_segment: dict[tuple[str, str, int, str], int] = {}
-
-            try:
-                selections = list(validation.selections)
-                config = build_run_config(selections)
-                expected_segments = _progress_segments(config, len(points_df))
-
-                def handle_progress(event: ProgressEvent) -> None:
-                    key = (event.batch_id, event.dataset, event.window_size_m, event.mode)
-                    expected_segments[key] = max(event.total, 1)
-                    completed_by_segment[key] = event.completed
-                    total = sum(expected_segments.values()) or 1
-                    completed = sum(
-                        min(completed_by_segment.get(segment_key, 0), segment_total)
-                        for segment_key, segment_total in expected_segments.items()
-                    )
-                    fraction = min(1.0, completed / total)
-                    progress_bar.progress(
-                        fraction,
-                        text=(
-                            f"{event.dataset} | "
-                            f"{'point' if event.window_size_m == 0 else f'{event.window_size_m} m'} | "
-                            f"{event.completed}/{event.total} {event.unit}"
-                        ),
-                    )
-                    status.info(f"Current batch: {event.batch_id}")
-
-                outputs = run_extraction(
-                    points_df,
-                    selections,
-                    output_dir,
-                    validation.normalized_crs,
-                    credentials_bytes,
-                    progress_callback=handle_progress,
-                )
-                progress_bar.progress(1.0, text="Extraction complete")
-                status.success("Extraction complete.")
-                st.write("Outputs")
-                for key, value in outputs.items():
-                    st.code(f"{key}: {value}")
-            except Exception as exc:
-                safe_message = redact_credential_secrets(str(exc), credentials_bytes)
-                st.error(safe_message)
+    else:
+        st.write(
+            "The final outputs, data quality checks, metadata, and a run log are written to "
+            "the output directory chosen in step 3."
+        )
+    _render_run_section(
+        st,
+        settings=settings,
+        catalog=catalog,
+        points_df=points_df,
+        points_error=points_error,
+        input_crs=input_crs,
+        credentials_bytes=credentials_bytes,
+        output_dir=output_dir,
+    )
 
     _render_footer(st)
 

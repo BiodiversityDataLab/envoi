@@ -265,8 +265,14 @@ class JobSnapshot:
     progress: tuple[ProgressMessage, ...] = ()
     # The worker's "done" message. Set only when the state is SUCCEEDED.
     result: DoneMessage | None = None
-    # The worker's "error" message. None when the worker sent none.
+    # The worker's "error" message. When the worker process ended or could not
+    # start without an "error" message, the job manager sets one with a general
+    # text and no run-log lines. None when the job did not fail.
     error: ErrorMessage | None = None
     # Text for the user that says why the job manager ended the job (a cancel
     # or a limit). None when the worker ended by itself.
     stop_reason: str | None = None
+    # True while the ZIP archive of a succeeded hosted job can be downloaded.
+    # False in local mode (no archive), and after the job manager deleted the
+    # job workspace at the end of the retention time.
+    archive_available: bool = False

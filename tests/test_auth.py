@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import traceback
+import urllib.parse
 
 import ee
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from envoi.auth import ENV_VAR, init_gee
 
@@ -17,6 +20,10 @@ _FAKE_PRIVATE_KEY = (
 )
 _FAKE_PRIVATE_KEY_ID = "fake-private-key-id-for-leak-test"
 _FAKE_CLIENT_EMAIL = "leak-test@fake-project.iam.gserviceaccount.com"
+_FAKE_CERT_URL = (
+    "https://www.googleapis.com/robot/v1/metadata/x509/"
+    "leak-test%40fake-project.iam.gserviceaccount.com"
+)
 
 # Returned by the fake ee.ServiceAccountCredentials, so a test can check that
 # init_gee() gives the same object to ee.Initialize().
@@ -32,6 +39,7 @@ def _fake_key(**changes) -> dict:
         "client_email": _FAKE_CLIENT_EMAIL,
         "client_id": "123456789",
         "token_uri": "https://oauth2.googleapis.com/token",
+        "client_x509_cert_url": _FAKE_CERT_URL,
     }
     key.update(changes)
     return key
@@ -47,7 +55,8 @@ def _key_material(key_text: str) -> list[str]:
     """Return each part of a key that an error must not contain.
 
     The parts are the full key text, the private key, each body line of the
-    private key, the private key ID, and the client email.
+    private key, the private key ID, the client email (also URL-encoded), and
+    the certificate URL.
     """
     material = [key_text]
     try:
@@ -55,7 +64,15 @@ def _key_material(key_text: str) -> list[str]:
     except ValueError:
         return material
     private_key = key["private_key"]
-    material.extend([private_key, key["private_key_id"], key["client_email"]])
+    material.extend(
+        [
+            private_key,
+            key["private_key_id"],
+            key["client_email"],
+            urllib.parse.quote(key["client_email"], safe=""),
+            key["client_x509_cert_url"],
+        ]
+    )
     material.extend(
         line.strip()
         for line in private_key.splitlines()
@@ -67,8 +84,6 @@ def _key_material(key_text: str) -> list[str]:
 @pytest.fixture(scope="module")
 def generated_private_key() -> str:
     """A new 2048-bit RSA private key in PKCS#8 PEM, the format of Google's keys."""
-    rsa = pytest.importorskip("cryptography.hazmat.primitives.asymmetric.rsa")
-    serialization = pytest.importorskip("cryptography.hazmat.primitives.serialization")
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     return private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -176,33 +191,9 @@ class TestInvalidKeyErrorsContainNoKeyMaterial:
 
         monkeypatch.setattr(ee, "Initialize", fail)
 
-    @pytest.mark.parametrize(
-        "key_case",
-        [
-            "generated_key_without_token_uri",
-            "generated_key_truncated",
-            "garbage_private_key",
-            "not_json",
-        ],
-    )
-    def test_error_contains_no_key_material(self, generated_private_key, key_case):
-        """The ValueError, its cause, its context, and its traceback contain no key material."""
-        # Build the invalid key, in each of the three accepted forms.
-        if key_case == "generated_key_without_token_uri":
-            key_text = json.dumps(_key_without_token_uri(generated_private_key))
-            credentials_json = key_text
-        elif key_case == "generated_key_truncated":
-            truncated_private_key = generated_private_key[: len(generated_private_key) // 2]
-            key_text = json.dumps(_fake_key(private_key=truncated_private_key))
-            credentials_json = key_text.encode("utf-8")
-        elif key_case == "garbage_private_key":
-            key = _fake_key()
-            key_text = json.dumps(key)
-            credentials_json = key
-        else:
-            key_text = f"private key {_FAKE_PRIVATE_KEY_LINES[0]} for {_FAKE_CLIENT_EMAIL}"
-            credentials_json = key_text
-
+    @staticmethod
+    def _assert_error_contains_no_key_material(credentials_json, key_text: str) -> None:
+        """Check that the ValueError, its cause, its context, and its traceback hold no key."""
         with pytest.raises(ValueError, match="not a valid Google service account key") as exc_info:
             init_gee(credentials_json=credentials_json)
 
@@ -221,10 +212,39 @@ class TestInvalidKeyErrorsContainNoKeyMaterial:
             *_FAKE_PRIVATE_KEY_LINES,
             _FAKE_PRIVATE_KEY_ID,
             _FAKE_CLIENT_EMAIL,
+            urllib.parse.quote(_FAKE_CLIENT_EMAIL, safe=""),
+            _FAKE_CERT_URL,
         }
         for secret in secrets:
             for error_text in error_texts:
                 assert secret not in error_text
+
+    @pytest.mark.parametrize("key_case", ["without_token_uri", "truncated"])
+    def test_generated_key_error_contains_no_key_material(self, generated_private_key, key_case):
+        """For a real key without token_uri or truncated, the error holds no key material."""
+        # Text and bytes forms, with a real private key.
+        if key_case == "without_token_uri":
+            key_text = json.dumps(_key_without_token_uri(generated_private_key))
+            credentials_json = key_text
+        else:
+            truncated_private_key = generated_private_key[: len(generated_private_key) // 2]
+            key_text = json.dumps(_fake_key(private_key=truncated_private_key))
+            credentials_json = key_text.encode("utf-8")
+
+        self._assert_error_contains_no_key_material(credentials_json, key_text)
+
+    @pytest.mark.parametrize("key_case", ["garbage_private_key", "not_json"])
+    def test_static_key_error_contains_no_key_material(self, key_case):
+        """For a garbage private key or text that is not JSON, the error holds no key material."""
+        if key_case == "garbage_private_key":
+            key = _fake_key()
+            key_text = json.dumps(key)
+            credentials_json = key
+        else:
+            key_text = f"private key {_FAKE_PRIVATE_KEY_LINES[0]} for {_FAKE_CLIENT_EMAIL}"
+            credentials_json = key_text
+
+        self._assert_error_contains_no_key_material(credentials_json, key_text)
 
 
 class TestCredentialsPath:

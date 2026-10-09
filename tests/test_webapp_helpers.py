@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import io
 import json
-import stat
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -18,8 +16,6 @@ from envoi_webapp.helpers import (
     permissible_statistics_for_dataset,
     read_points_csv,
     redact_credential_secrets,
-    run_extraction,
-    temporary_service_account_file,
     validate_output_dir,
     validate_points_dataframe,
     validate_service_account_json,
@@ -45,6 +41,11 @@ def _credential_bytes() -> bytes:
             "private_key": "-----BEGIN PRIVATE KEY-----\nPRIVATEKEY\n-----END PRIVATE KEY-----\n",
             "client_email": "svc@example.iam.gserviceaccount.com",
             "client_id": "123",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_x509_cert_url": (
+                "https://www.googleapis.com/robot/v1/metadata/x509/"
+                "svc%40example.iam.gserviceaccount.com"
+            ),
         }
     ).encode("utf-8")
 
@@ -306,31 +307,42 @@ def test_validate_service_account_json_rejects_bad_shape():
         validate_service_account_json(b'{"type": "authorized_user"}')
 
 
-def test_temporary_service_account_file_exists_during_context_and_is_private():
-    payload = _credential_bytes()
-
-    with temporary_service_account_file(payload) as path:
-        assert path.exists()
-        mode = stat.S_IMODE(path.stat().st_mode)
-        assert mode == 0o600
-        assert json.loads(path.read_text())["private_key_id"] == "private-key-id"
-
-    assert not path.exists()
+def test_validate_service_account_json_accepts_a_complete_key():
+    """A key with type, client_email, private_key, and token_uri passes and is returned."""
+    assert validate_service_account_json(_credential_bytes())["client_email"] == (
+        "svc@example.iam.gserviceaccount.com"
+    )
 
 
-def test_temporary_service_account_file_is_deleted_after_failure():
-    payload = _credential_bytes()
-    path_seen: Path | None = None
+def test_validate_service_account_json_rejects_a_key_without_token_uri():
+    """A key without token_uri is rejected, and the message names the field but no key values."""
+    key = json.loads(_credential_bytes())
+    del key["token_uri"]
 
-    with (
-        pytest.raises(RuntimeError, match="boom"),
-        temporary_service_account_file(payload) as path,
-    ):
-        path_seen = path
-        raise RuntimeError("boom")
+    with pytest.raises(ValueError, match="Missing field\\(s\\): token_uri") as excinfo:
+        validate_service_account_json(json.dumps(key).encode("utf-8"))
 
-    assert path_seen is not None
-    assert not path_seen.exists()
+    assert "PRIVATEKEY" not in str(excinfo.value)
+    assert "svc@example.iam.gserviceaccount.com" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "raw_key",
+    [
+        # Cut-off JSON: JSONDecodeError keeps the whole text in .doc.
+        _credential_bytes()[:-2],
+        # Not UTF-8: UnicodeDecodeError keeps the whole bytes in .object.
+        b"\xff" + _credential_bytes(),
+    ],
+    ids=["cut_off_json", "not_utf8"],
+)
+def test_validate_service_account_json_error_has_no_chained_key_text(raw_key):
+    """An unreadable key gives an error with no cause or context, so no chain carries the key."""
+    with pytest.raises(ValueError, match="Invalid service account JSON") as excinfo:
+        validate_service_account_json(raw_key)
+
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
 
 
 def test_redact_credential_secrets_removes_key_material():
@@ -347,51 +359,14 @@ def test_redact_credential_secrets_removes_key_material():
     assert payload.decode("utf-8") not in safe_message
 
 
-def test_run_extraction_initializes_gee_with_temp_key_and_passes_expected_args(tmp_path):
+def test_redact_credential_secrets_removes_the_encoded_email_and_certificate_url():
+    """The URL-encoded client email and the certificate URL are redacted too."""
     payload = _credential_bytes()
-    init_paths: list[Path] = []
-    captured: dict = {}
-
-    def fake_init(credentials_path):
-        path = Path(credentials_path)
-        assert path.exists()
-        init_paths.append(path)
-
-    def fake_extract(df, config, **kwargs):
-        assert init_paths[-1].exists()
-        captured["df"] = df
-        captured["config"] = config
-        captured["kwargs"] = kwargs
-        return {"extract_01_dem": kwargs["output_dir"] / "extract_01_dem.csv"}
-
-    outputs = run_extraction(
-        _points_df(),
-        [
-            DatasetSelection(
-                dataset="dem",
-                output_type=TABULAR_OUTPUT,
-                window_sizes=(100,),
-                statistics=("mean",),
-            ),
-            DatasetSelection(dataset="dem", output_type=RASTER_OUTPUT, window_sizes=(200,)),
-        ],
-        tmp_path / "outputs",
-        "EPSG:4326",
-        payload,
-        init_gee_func=fake_init,
-        extract_func=fake_extract,
+    message = (
+        "certificate https://www.googleapis.com/robot/v1/metadata/x509/"
+        "svc%40example.iam.gserviceaccount.com, account svc%40example.iam.gserviceaccount.com"
     )
 
-    assert outputs["extract_01_dem"].name == "extract_01_dem.csv"
-    assert [run_config["batch_id"] for run_config in captured["config"]] == [
-        "extract_01_dem",
-        "extract_02_dem",
-    ]
-    assert [run_config["settings"]["output_type"] for run_config in captured["config"]] == [
-        "tabular",
-        "raster",
-    ]
-    assert captured["kwargs"]["input_crs"] == "EPSG:4326"
-    assert captured["kwargs"]["id_column"] == "occurrenceID"
-    assert captured["kwargs"]["quiet"] is True
-    assert init_paths and not init_paths[0].exists()
+    safe_message = redact_credential_secrets(message, payload)
+
+    assert safe_message == "certificate [redacted], account [redacted]"

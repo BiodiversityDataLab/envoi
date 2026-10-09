@@ -253,3 +253,4 @@ class TestJobSnapshot:
         assert snapshot.result is None
         assert snapshot.error is None
         assert snapshot.stop_reason is None
+        assert snapshot.archive_available is False
