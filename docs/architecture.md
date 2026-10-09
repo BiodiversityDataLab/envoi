@@ -148,12 +148,12 @@ Update this document when you add a module or change the adapter interface.
 | `_config_parsing.py` | Run-config validation. Defines `RunSettings`, normalizes a dict / list / YAML path into a list of run configs (`_as_config_list`), parses one raw dict into `RunSettings` (`_parse_run_config`), parses all run configs of a call and rejects duplicate `batch_id` values (`_parse_run_configs`), and resolves the reducer list for a dataset's `data_type` (`_resolve_stats_for_dataset`). Expands the dataset-entry shorthand (string / `{name: [bands]}` / `{name: {bands: [...]}}`), rejects unsafe `batch_id` values, and rejects derived bands for local datasets. |
 | `_output_assembly.py` | Tabular-output post-processing. Turns per-point `(stats_dict, meta_dict)` results into named columns (including the per-class `class_count` / `class_fraction` expansion), rounds stat columns, restores the user's column names, records the bands each dataset actually used for the sidecar, and writes the CSV / Parquet file. |
 | `_filenames.py` | Portable output names. `build_tile_filenames` and `sanitize_filename_component` turn sample IDs into names that use only `[A-Za-z0-9._-]`, adding a hash suffix to rewritten IDs. `is_safe_path_component` rejects unsafe `batch_id` values and dataset keys. Both adapters use it, so tiles are named identically. |
-| `catalog.py` | Loads and validates catalog YAMLs (built-in `ee_catalog.yml` and datasets registered through `update_catalog()`), caches `defaults.yml`, exposes `list_datasets()` / `reset_catalog()`, and auto-detects CRS, resolution, nodata, and band count for local rasters through rasterio (`resolution_m` in metres, from `geo.pixel_size_m()`). Earth Engine asset inspection happens in the GEE adapter, not here. |
+| `catalog.py` | Loads and validates catalogs (built-in `ee_catalog.yml` and datasets registered through `update_catalog()`, including that each `data_source` has a registered adapter), caches `defaults.yml`, exposes `list_datasets()` / `reset_catalog()`, and, for catalog files (not dicts), auto-detects CRS, resolution, nodata, and band count for local rasters through rasterio (`resolution_m` in metres, from `geo.pixel_size_m()`). Earth Engine asset inspection happens in the GEE adapter, not here. |
 | `catalog_docs.py` | Renders catalog entries as a Markdown document (theme sections, summary tables, per-dataset details). Exposed as `catalog_markdown()`. `scripts/generate_dataset_docs.py` uses it to regenerate `docs/datasets.md`. |
 | `geo.py` | UTM helpers: `get_utm_crs()` (both adapters build metre-accurate windows with it), `get_utm_zone_label()` (the GEE `use_utm_zone` filter), and `build_tile_crs_zones()` (tile CRS metadata in the GEE adapter). The tile grid of both adapters: `tile_pixel_count()` (pixels per side, also used by the GEE tile-size check) and `tile_top_left()` (tile corners on the pixel grid, with the point's pixel at the centre for odd sizes). `pixel_size_m()` converts a local raster's pixel width from CRS units to metres. |
 | `progress.py` | `ProgressEvent` (public) and the low-level `(completed, total)` callback that adapters call through `emit_progress_step()`. Independent of the `quiet` progress bars. |
 | `adapters/__init__.py` | Adapter registry. Maps `data_source` strings (`earth_engine`, `local`) to adapter classes through `register()` / `get_adapter()`. Imports the built-in adapters so they register themselves. |
-| `adapters/base.py` | `BaseAdapter`: the context-manager lifecycle (`close()`, `__enter__` / `__exit__`) and the shared method signatures. See "Adapter interface". |
+| `adapters/base.py` | `BaseAdapter`, which declares the members that `extract()` uses and nothing else: `fetch_stats_batch`, `export_tiles`, and `build_dataset_meta` (with their shared signatures), and the context-manager lifecycle (`close()`, `__enter__` / `__exit__`). See "Adapter interface". |
 | `adapters/local_adapter.py` | Local raster adapter. Reads GeoTIFFs through rasterio, crops a UTM-zone square around each point, supports per-band nodata (including NaN), widens a statistics window smaller than one native pixel to two pixels (as the GEE adapter does), and exports tiles at native resolution, or resampled onto the shared UTM tile grid of `geo.py` with `rasterio.warp.reproject` for parity with GEE. |
 | `adapters/earth_engine/adapter.py` | `GeeRasterAdapter`. Detects the asset type, checks the native scale, runs per-point work in a `ThreadPoolExecutor`, composes the sibling helpers, and builds the per-dataset metadata. Caches collection-level state for the lifetime of the adapter instance (see "GEE image building pipeline"). |
 | `adapters/earth_engine/_image.py` | GEE initialization on first use (calls `auth.init_gee()` when Earth Engine is not yet initialized) and the session-pool patch, the collection timestamp index, `nearest` / `contains` / `mosaic` image selection, derived-band registration (`KNOWN_DERIVED_BANDS`: slope, aspect), and the central `_build_image` pipeline. |
@@ -178,12 +178,11 @@ Update this document when you add a module or change the adapter interface.
 | `export_tiles(lats, lons, window_m, output_dir, *, ids=None, dates=None, dataset_name="dataset", resample_m=None, filename_suffix=None, progress_desc=None, disable_progress=False, progress_callback=None)` | raster | `(paths, meta_list)`, one entry for each point. Tiles go to `output_dir/<dataset_name>/`. `paths[i]` is `None` when no tile was written for that point (failed export, point outside the extent, or no pixels). |
 | `build_dataset_meta(spec, meta_list=None, exported_paths=None, quality=None, lats=None, lons=None)` | both modes | The dataset's entry in the sidecar's `datasets` section: source information, native CRS and resolution, band names, date-selection summary, and quality statistics. |
 
-Both adapters implement these with identical signatures. Notes:
+`BaseAdapter` declares these members, and nothing else. Both adapters implement them with identical signatures.
+`tests/test_adapters.py` checks the parameter names, kinds, and defaults of each registered adapter against `BaseAdapter`. Notes:
 
-- `export_tiles` is not declared on `BaseAdapter`. Each adapter defines it.
-- `BaseAdapter` also declares `fetch_values` (raw pixels for one window) and `fetch_batch` (a loop over `fetch_values`).
-  Only `LocalRasterAdapter` implements `fetch_values`, and it uses it internally. The GEE adapter implements neither,
-  and nothing in envoi calls `fetch_batch`.
+- `LocalRasterAdapter.fetch_values` (raw pixels for one window) is not part of the interface.
+  Only the local adapter has it, and it uses it internally.
 - The `"point"` reducer samples the exact pixel at each `(lat, lon)` and merges the result into the same `stats_dict` as the window reducers.
   GEE resolves both in one `getInfo()` round-trip per point. The local adapter reads the window, then samples the pixel with `src.sample()` on the same open dataset.
 - A failure for one point gives that point an empty result instead of stopping the batch. See "Failures for single points" in `docs/coding_guidelines.md`.
@@ -201,7 +200,8 @@ Both adapters implement these with identical signatures. Notes:
   and returns it for the sidecar's `warnings`. `qc.py` adds the `<dataset>_error_<N>m` QC column, `_write_tile_manifest`
   adds the manifest's `error` column, and both modes add `n_errors` and `ids_errors` to the sidecar's quality summaries.
 - Each adapter module registers itself at the end with `register("<data_source>", AdapterClass)`.
-  `get_adapter()` raises `KeyError` for an unknown `data_source`.
+  `update_catalog()` and catalog loading raise `CatalogError` for a `data_source` without a registered adapter.
+  `get_adapter()` raises `ValueError` for an unknown `data_source`, as a last check.
 
 ## GEE image building pipeline
 

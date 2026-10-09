@@ -202,6 +202,40 @@ class TestUpdateAndResetCatalog:
 
 
 # ------------------------------------------------------------------
+# Unknown data_source — rejected when a catalog is registered or loaded.
+# ------------------------------------------------------------------
+
+
+class TestUnknownDataSource:
+    """A ``data_source`` without a registered adapter fails before ``extract()`` runs."""
+
+    def test_update_catalog_dict_raises_and_registers_nothing(self):
+        """A dict entry with an unknown ``data_source`` raises and is not registered."""
+        dataset_entry = {"data_source": "gee", "path": "USGS/GTOPO30", "data_type": "continuous"}
+
+        expected_message = "datasets.x: unknown data_source 'gee'"
+        with pytest.raises(CatalogError, match=expected_message) as error_info:
+            update_catalog({"datasets": {"x": dataset_entry}})
+
+        assert "earth_engine, local" in str(error_info.value)
+        assert "x" not in load_catalogs()["datasets"]
+
+    def test_load_catalog_file_raises(self, tmp_path):
+        """A YAML entry with an unknown ``data_source`` raises ``CatalogError``."""
+        catalog_path = tmp_path / "catalog.yml"
+        catalog_path.write_text(
+            yaml.safe_dump({"datasets": {"my_dem": {"data_source": "gdal", "path": "dem.tif"}}}),
+            encoding="utf-8",
+        )
+
+        expected_message = "datasets.my_dem: unknown data_source 'gdal'"
+        with pytest.raises(CatalogError, match=expected_message) as error_info:
+            load_catalog(catalog_path)
+
+        assert "earth_engine, local" in str(error_info.value)
+
+
+# ------------------------------------------------------------------
 # load_catalogs — merge precedence and source-flattening.
 # ------------------------------------------------------------------
 

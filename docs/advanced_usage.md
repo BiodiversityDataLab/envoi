@@ -209,7 +209,7 @@ update_catalog({
 
 **Precedence.** User-registered datasets override built-ins with the same name. This is intentional: you can swap an upstream catalog entry for a higher-resolution local copy without renaming every downstream config that references it. Re-registering the same name later overwrites the earlier definition.
 
-**Auto-detection for local rasters.** For `data_source: local` entries, envoi reads the file with rasterio at registration time and fills in CRS, native pixel size (`resolution_m`, in metres also for rasters whose CRS is in degrees or feet), nodata values, and band count automatically — you only need to provide `data_source` and `path`. Set `data_type: categorical` explicitly if the raster is a class map; local entries default to `continuous` otherwise.
+**Auto-detection for local rasters.** For `data_source: local` entries, you only need to provide `data_source` and `path`. When an extraction opens the file, envoi reads the CRS, native pixel size, nodata values, and band count from it with rasterio. When you register a YAML file, envoi also reads each local raster at registration time and adds the missing `crs`, `resolution_m` (in metres also for rasters whose CRS is in degrees or feet), `nodata`, and `band_count` to its catalog entry, which `list_datasets("full")` shows. Entries that you register as a dict are stored without this step. Set `data_type: categorical` explicitly if the raster is a class map; local entries default to `continuous` otherwise.
 
 **Resetting the catalog.** Call `reset_catalog()` to drop everything registered at runtime and revert to the built-in catalog alone. Mostly useful in tests or notebooks where you want a clean slate between cells.
 

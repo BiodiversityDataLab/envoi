@@ -101,9 +101,11 @@ Each subclasses `BaseAdapter`. `docs/architecture.md` lists the method contract.
 Interface and registration:
 - Keep method signatures identical across adapters. **[Contract]**
   To add a keyword, add it to `BaseAdapter` and both adapters in the same change. Check every caller first.
+  `tests/test_adapters.py` compares the parameter names, kinds, and defaults of each adapter with `BaseAdapter`.
 - Return one `(stats_dict, meta_dict)` pair per input point, in input order. **[Contract]**
   The GEE adapter finishes requests out of order and writes each result back to its input index.
 - Register the adapter at the end of its module with `_register("<data_source>", AdapterClass)`, and import the module in `adapters/__init__.py`.
+  Catalog validation in `catalog.py` accepts only a `data_source` that has a registered adapter.
 - If only one source supports a feature, reject it for the other source with a clear `ValueError`.
   Example: `_config_parsing.py` rejects the GEE-only derived bands (`slope`, `aspect`) for local datasets.
 
@@ -167,7 +169,7 @@ Examples are Earth Engine reducers, rasterio windows, image selection by date, b
 Do not add a setting for every implementation detail.
 
 - User-registered catalog entries override built-in entries with the same name. **[Contract]**
-- GEE asset type detection and local raster metadata detection live in `catalog.py`.
+- Local raster metadata detection lives in `catalog.py`. GEE asset type detection runs in `GeeRasterAdapter.__post_init__`.
 - GEE datasets identify bands by name (`DEM`, `B4`). Local rasters use integer band indices that start at 1.
 
 Parsed settings (model: `RunSettings` in `_config_parsing.py`):
@@ -210,7 +212,7 @@ Coordinates and windows:
 - `_validate_and_reproject_crs` reprojects coordinates from `input_crs` to WGS84.
   The output keeps the user's original coordinates and adds `_wgs84` columns. **[Contract]**
 - Check the coordinate order at every call. `get_utm_crs(lon, lat)` and `pyproj` transformers with `always_xy=True` take longitude first.
-  Adapter methods (`fetch_values`, `fetch_stats_batch`, `export_tiles`) take latitude first.
+  Adapter methods (`fetch_stats_batch`, `export_tiles`, and `LocalRasterAdapter.fetch_values`) take latitude first.
 - `window_size_m` is the side length of a square window in metres, not a radius. **[Contract]**
 - Build metric windows in each point's UTM zone through `geo.py`. Do not compute distances in degrees.
 - For a geographic change, also check both hemispheres, longitudes near ±180°,
