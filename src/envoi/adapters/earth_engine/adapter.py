@@ -3,7 +3,7 @@
 
 The free-function helpers used by this class live in the sibling modules:
 
-* ``_image`` — GEE init, geometry snapping, timestamp resolution, derived bands,
+* ``_image`` — GEE init, timestamp resolution, derived bands,
   per-point ``ee.Image`` construction (``_build_image``).
 * ``_reducers`` — combined-reducer assembly + result parsing + per-band
   coverage summary.
@@ -30,7 +30,7 @@ from tqdm.auto import tqdm
 
 from ..._filenames import build_tile_filenames
 from ...catalog import load_defaults
-from ...geo import build_tile_crs_zones, get_utm_crs
+from ...geo import build_tile_crs_zones, get_utm_crs, tile_pixel_count, tile_top_left
 from ...metadata import summarize_date_info, summarize_tile_export
 from ...progress import ProgressStepCallback, emit_progress_step
 from ...qc import format_point_error
@@ -41,7 +41,6 @@ from ._image import (
     _find_nearest_timestamp,
     _get_collection_time_bounds,
     _is_mosaic_date_policy,
-    _snap_to_grid,
 )
 from ._reducers import (
     _CLASS_COUNT_KEY_RE,
@@ -1129,44 +1128,46 @@ class GeeRasterAdapter(BaseAdapter):
         date=None,
         resample_m: float | None = None,
     ):
-        """Export a GeoTIFF tile for one point with pixel-grid-snapped window.
+        """Export a GeoTIFF tile for one point, on a pixel grid in its UTM zone.
 
-        Snapping the centre coordinate to the nearest pixel grid multiple
-        ensures all exported tiles have identical dimensions.
-
-        If resample_m is set, the tile is exported at that resolution instead
-        of the native image resolution — all tiles will be exactly
-        round(window_m / resample_m) × round(window_m / resample_m) pixels.
+        The tile has n × n pixels, with n = :func:`~envoi.geo.tile_pixel_count`
+        (``window_m`` / pixel size, rounded to the nearest whole number with
+        ties rounded up, at least 1). The pixel size is ``resample_m`` when it
+        is set, otherwise the image's native scale. The tile edges lie on
+        multiples of the pixel size (:func:`~envoi.geo.tile_top_left`): for
+        odd n, the pixel that contains the point is the centre pixel; for even
+        n, the tile centre is the grid line nearest to the point. The local
+        adapter uses the same grid when ``resample_m`` is set.
         """
         img = self._get_image(date, lat=lat, lon=lon)
         # Use resample_m as the export scale when provided; fall back to native.
         scale_m = float(resample_m) if resample_m is not None else self._get_scale_value(img)
         utm = get_utm_crs(lon, lat)
 
-        # Project to UTM, snap to pixel grid, compute window corners
+        # Project the point to its UTM zone (x first), then compute the tile's
+        # pixel count and its corners on the pixel grid.
         from pyproj import Transformer
 
         transformer = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
-        cx, cy = transformer.transform(lon, lat)
-        cx = _snap_to_grid(cx, scale_m)
-        cy = _snap_to_grid(cy, scale_m)
-
-        # Snap half-window to nearest whole pixel count so output dimensions
-        # are consistent across points (window_m is approximate, not exact).
-        half_pixels = max(1, round(window_m / 2 / scale_m))
-        half_m = half_pixels * scale_m
-        region = ee.Geometry.Rectangle(
-            [cx - half_m, cy - half_m, cx + half_m, cy + half_m],
-            proj=ee.Projection(utm),
-            geodesic=False,
-        )
+        point_x_m, point_y_m = transformer.transform(lon, lat)
+        n_pixels = tile_pixel_count(window_m, scale_m)
+        tile_left_m, tile_top_m = tile_top_left(point_x_m, point_y_m, n_pixels, scale_m)
 
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Request the exact pixel grid (transform and dimensions), not a region
+        # and a scale. With a region, Earth Engine adds every pixel that the
+        # region touches, so rounding at the region edges can add a row or a
+        # column (seen live on 2026-10-09 with the 30.92 m native scale of
+        # the GLO-30 DEM: 7 × 7 pixels, or 7 rows of 6 pixels, instead of 6 × 6).
         # export_tiles has already checked the tile size once for the batch.
         _download_tile_via_url(
-            img, region=region, scale_m=scale_m, crs=utm, output_path=output_path
+            img,
+            crs=utm,
+            crs_transform=[scale_m, 0.0, tile_left_m, 0.0, -scale_m, tile_top_m],
+            dimensions=f"{n_pixels}x{n_pixels}",
+            output_path=output_path,
         )
         return output_path
 
@@ -1225,8 +1226,11 @@ class GeeRasterAdapter(BaseAdapter):
     ) -> tuple[list[Path | None], list[dict]]:
         """Export GeoTIFF tiles for many points in parallel (Mode 2).
 
-        If resample_m is set, all tiles are exported at that resolution so they
-        are exactly round(window_m / resample_m) × round(window_m / resample_m) pixels.
+        Each tile has n × n pixels, where n is ``window_m`` divided by the
+        pixel size, rounded to the nearest whole number with ties rounded up
+        (at least 1). If resample_m is set, it is the pixel size, so every tile
+        has the same size. For odd n, the pixel that contains the point is the
+        centre pixel. See :meth:`_export_single` for the pixel grid.
 
         ``filename_suffix`` is inserted before the .tif extension so multi-
         window runs can place every window's tiles in the same folder

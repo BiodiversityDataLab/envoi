@@ -5,7 +5,6 @@ This collects, in one place:
 
 * GEE SDK initialisation (only when Earth Engine is not yet initialized) and
   session-pool tuning (once per process).
-* Pixel-grid snapping for export window alignment.
 * Collection timestamp fetching and nearest / contains date selection.
 * Derived-band registration (slope, aspect, ...) and computation.
 * The central ``_build_image`` pipeline: load → spatial filter → date select →
@@ -107,25 +106,6 @@ def _ensure_gee_init() -> None:
     if not _session_pool_patched:
         _patch_ee_session_pool(50)
         _session_pool_patched = True
-
-
-# ---------------------------------------------------------------------------
-# Geometry helpers  (pixel-grid snapping)
-# UTM helpers live in ``geo.get_utm_crs`` / ``geo.get_utm_zone_label``
-# so both adapters share one implementation.
-# ---------------------------------------------------------------------------
-
-
-def _snap_to_grid(coord: float, scale: float) -> float:
-    """Snap a UTM coordinate (metres) to the nearest pixel grid multiple of scale.
-
-    Ensures GEE export windows align with the pixel grid, preventing
-    inconsistent image sizes across points.
-    """
-    remainder = coord % scale
-    if remainder < scale / 2:
-        return int(coord / scale) * scale
-    return int((coord + scale) / scale) * scale
 
 
 # ---------------------------------------------------------------------------

@@ -439,6 +439,16 @@ class TestCheckTileSize:
         with pytest.raises(ValueError):
             _check_tile_size(band_count=200, **kwargs)
 
+    def test_estimate_uses_the_exported_pixel_count_with_ties_rounded_up(self):
+        # The check must use the tile size that the export requests
+        # (geo.tile_pixel_count, ties rounded up). 2896.5 pixels per side
+        # gives a 2897 × 2897 tile: 2897² × 4 bytes is just over the 32 MiB
+        # limit, while 2896² × 4 bytes (Python's round(), ties to even) is
+        # just under it.
+        assert 2896**2 * 4 <= GEE_SYNC_LIMIT_BYTES < 2897**2 * 4
+        with pytest.raises(ValueError, match="too large"):
+            _check_tile_size(window_m=2896.5, scale_m=1, band_count=1, dataset_name="tie_rounding")
+
 
 class TestIsMosaicDatePolicy:
     """The ``collection_date_policy: mosaic`` switch, read from a catalog entry.

@@ -17,7 +17,7 @@ from shapely.geometry import box, mapping
 from tqdm.auto import tqdm
 
 from .._filenames import build_tile_filenames
-from ..geo import get_utm_crs
+from ..geo import get_utm_crs, pixel_size_m, tile_pixel_count, tile_top_left
 from ..metadata import summarize_tile_export
 from ..progress import ProgressStepCallback, emit_progress_step
 from ..qc import format_point_error
@@ -74,6 +74,9 @@ class LocalRasterAdapter(BaseAdapter):
         # interpreter. Re-raise so the original error reaches the caller.
         try:
             self.raster_crs = self.src.crs
+            # Native pixel width in metres, or None for a CRS without a
+            # length unit. Used for the sidecar and for sub-pixel windows.
+            self._native_pixel_size_m = pixel_size_m(self.raster_crs, self.src.res[0])
 
             # Determine which bands to read. If the user specifies "bands" in the
             # catalog (a single int or list of ints), use that. Otherwise default
@@ -497,9 +500,12 @@ class LocalRasterAdapter(BaseAdapter):
         # affine, then bounds-check on the pixel grid. This works for any
         # affine — including rotated/skewed transforms where the raster's
         # axis-aligned bounding box would falsely include points that lie
-        # outside the actual raster footprint. ``~transform * (x, y)`` is
-        # the rasterio idiom for the forward Affine inverse.
-        pixel_col, pixel_row = ~self.src.transform * (raster_x, raster_y)
+        # outside the actual raster footprint. The coefficients are applied
+        # by hand: affine 3 deprecates ``~transform * (x, y)``, and affine 2
+        # has no ``@`` operator, so this form works with both.
+        inverse = ~self.src.transform
+        pixel_col = inverse.a * raster_x + inverse.b * raster_y + inverse.c
+        pixel_row = inverse.d * raster_x + inverse.e * raster_y + inverse.f
         if not (0 <= pixel_row < self.src.height and 0 <= pixel_col < self.src.width):
             return _missing()
 
@@ -561,7 +567,10 @@ class LocalRasterAdapter(BaseAdapter):
 
         - **window** — runs only when *window_reducer_fns* is non-empty.
           Reads the buffered window via :meth:`fetch_values` and applies
-          each Python-side reducer to the valid pixels.
+          each Python-side reducer to the valid pixels. A window smaller than
+          one native pixel is read as a window of two native pixels, as on
+          the GEE adapter. The meta dict keeps the requested ``window_m``,
+          and its coverage describes the window that was read.
         - **point** — runs only when *want_point* is True. Samples the
           exact pixel containing (lat, lon) via ``self.src.sample()``.
 
@@ -586,7 +595,16 @@ class LocalRasterAdapter(BaseAdapter):
 
         # ---- window branch ----
         if window_reducer_fns:
-            window_values, meta = self.fetch_values(lat, lon, window_m, return_meta=True)
+            # A window smaller than one native pixel can contain no pixel
+            # centre, so it would give no pixels. Widen it to two native
+            # pixels, as the Earth Engine adapter does. The coverage then
+            # describes the widened window; meta keeps the requested window.
+            # Without a pixel size in metres (no length unit), do not widen.
+            read_window_m = window_m
+            if self._native_pixel_size_m is not None and window_m < self._native_pixel_size_m:
+                read_window_m = int(self._native_pixel_size_m * 2)
+            window_values, meta = self.fetch_values(lat, lon, read_window_m, return_meta=True)
+            meta["window_m"] = int(window_m)
             window_values = np.asarray(window_values)
             if is_multiband and window_values.ndim == 2:
                 # window_values shape: (n_bands, n_valid_pixels)
@@ -758,11 +776,15 @@ class LocalRasterAdapter(BaseAdapter):
         """Crop and save a GeoTIFF window centred on each point.
 
         If resample_m is set, the output tile is written at exactly resample_m
-        metres/pixel in the point's UTM zone, with the pixel grid snapped to the
-        nearest resample_m multiple — the same algorithm the GEE adapter uses.
-        This means local and GEE tiles for the same point at the same resample_m
-        are spatially aligned and directly comparable. Without resample_m, the
-        tile is written in the source raster's native CRS at native resolution.
+        metres/pixel in the point's UTM zone, with n × n pixels, where n is
+        ``window_m / resample_m`` rounded to the nearest whole number with ties
+        rounded up (at least 1). The tile corners lie on multiples of
+        resample_m, and for odd n the pixel that contains the point is the
+        centre pixel (``geo.tile_pixel_count`` and ``geo.tile_top_left``, which
+        the GEE adapter also uses). This means local and GEE tiles for the same
+        point at the same resample_m are spatially aligned and directly
+        comparable. Without resample_m, the tile is written in the source
+        raster's native CRS at native resolution.
 
         ``filename_suffix`` is inserted before the .tif extension so multi-
         window runs can place every window's tiles in the same folder
@@ -797,7 +819,7 @@ class LocalRasterAdapter(BaseAdapter):
         # raster-mode QC summary can report which tiles failed and why.
         tile_metas: list[dict] = []
 
-        n_pixels = max(1, round(window_m / resample_m)) if resample_m is not None else None
+        n_pixels = tile_pixel_count(window_m, resample_m) if resample_m is not None else None
 
         # Build every tile filename up front, using the same shared helper as
         # the Earth Engine adapter so both sources name their tiles
@@ -864,27 +886,24 @@ class LocalRasterAdapter(BaseAdapter):
                 tile_nodata = meta_nodata
 
             if n_pixels is not None:
-                # Build the output grid in the point's UTM zone, snapped to the
-                # resample_m pixel boundary — matching GEE adapter behaviour exactly.
-                # Two things must agree with GEE for tiles to be spatially comparable:
+                # Build the output grid in the point's UTM zone with the
+                # shared tile helpers, as the GEE adapter does, so that local
+                # and GEE tiles of the same point are spatially comparable:
                 #   1. Pixel size = resample_m (not native-span / n_pixels, which varies
                 #      per point because rio_mask snaps to native pixel boundaries).
-                #   2. Grid origin = center snapped to resample_m, then shifted by half
-                #      the window extent — the same formula GEE's _snap_to_grid uses.
+                #   2. Corners on multiples of resample_m, with the point's pixel
+                #      at the centre for odd n_pixels (geo.tile_top_left).
                 utm_crs = get_utm_crs(lon, lat)
                 utm_transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-                cx_utm, cy_utm = utm_transformer.transform(lon, lat)
-                # Snap centre to nearest resample_m multiple (mirrors GEE's _snap_to_grid).
-                cx_snapped = round(cx_utm / resample_m) * resample_m
-                cy_snapped = round(cy_utm / resample_m) * resample_m
-                half_m = (n_pixels // 2) * resample_m
+                point_x_m, point_y_m = utm_transformer.transform(lon, lat)
+                tile_left_m, tile_top_m = tile_top_left(point_x_m, point_y_m, n_pixels, resample_m)
                 destination_transform = Affine(
                     resample_m,
                     0.0,
-                    cx_snapped - half_m,
+                    tile_left_m,
                     0.0,
                     -resample_m,
-                    cy_snapped + half_m,
+                    tile_top_m,
                 )
                 # Reproject directly from the open source dataset rather than from the
                 # polygon-masked window_array. The polygon mask sets edge pixels to NaN
@@ -995,10 +1014,13 @@ class LocalRasterAdapter(BaseAdapter):
         if spec.get("data_type"):
             meta["data_type"] = spec["data_type"]
 
-        # Native CRS and resolution from the already-open rasterio dataset.
+        # Native CRS and pixel width in metres (converted from degrees or feet
+        # when the CRS uses them; None for a CRS without a length unit).
         meta["native_crs"] = str(self.raster_crs)
-        if hasattr(self.src, "res"):
-            meta["native_spatial_resolution_m"] = round(float(self.src.res[0]), 2)
+        native_pixel_size_m = self._native_pixel_size_m
+        meta["native_spatial_resolution_m"] = (
+            round(native_pixel_size_m, 2) if native_pixel_size_m is not None else None
+        )
 
         # For local rasters, tiles are exported in the file's native CRS
         # (unlike GEE, where each tile uses its own UTM zone).

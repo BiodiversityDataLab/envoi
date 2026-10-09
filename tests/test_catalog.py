@@ -8,7 +8,11 @@ through the full extract() pipeline.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
+import rasterio
+import yaml
+from rasterio.transform import from_origin
 
 from envoi import list_datasets, reset_catalog, update_catalog
 from envoi.catalog import (
@@ -349,3 +353,77 @@ class TestListDatasets:
         # caller can fix the typo without reading the source.
         with pytest.raises(ValueError, match="verbosity must be one of"):
             list_datasets("verbose")
+
+
+# ------------------------------------------------------------------
+# Local raster inspection — resolution_m in metres
+# ------------------------------------------------------------------
+
+
+def _write_one_band_raster(path, crs: str, pixel_width: float) -> None:
+    """Write a 10 × 10 float32 raster with square pixels of ``pixel_width`` CRS units."""
+    random_generator = np.random.default_rng(seed=21)
+    pixel_values = random_generator.uniform(0.0, 100.0, (10, 10)).astype(np.float32)
+    # Origins inside the valid range of each CRS; the values do not matter.
+    origin_x, origin_y = (18.0, 63.0) if crs == "EPSG:4326" else (500_000.0, 1_000_000.0)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=10,
+        width=10,
+        count=1,
+        dtype="float32",
+        crs=crs,
+        transform=from_origin(origin_x, origin_y, pixel_width, pixel_width),
+    ) as dst:
+        dst.write(pixel_values, 1)
+
+
+def _load_local_catalog_file(tmp_path, dataset_spec: dict) -> dict:
+    """Write a catalog YAML with one local dataset, load it, and return the dataset's entry.
+
+    A catalog file runs the local raster inspection (``load_catalog``).
+    """
+    catalog_path = tmp_path / "catalog.yml"
+    catalog_path.write_text(
+        yaml.safe_dump({"datasets": {"inspected": dataset_spec}}), encoding="utf-8"
+    )
+    return load_catalog(catalog_path)["datasets"]["inspected"]
+
+
+class TestLocalRasterResolution:
+    """``resolution_m`` that local raster inspection fills in is in metres for every CRS."""
+
+    @pytest.mark.parametrize(
+        ("crs", "pixel_width", "expected_resolution_m"),
+        [
+            # Geographic: 0.001° × 111 319.49 m per degree (one degree at the equator).
+            ("EPSG:4326", 0.001, 111.31949),
+            # Projected in metres: unchanged.
+            ("EPSG:32634", 30.0, 30.0),
+            # Projected in US survey feet: 1 ft = 1200 / 3937 m (about 0.3048 m).
+            ("EPSG:2263", 100.0, 100.0 * 1200 / 3937),
+        ],
+    )
+    def test_resolution_m_is_in_metres(self, tmp_path, crs, pixel_width, expected_resolution_m):
+        """The auto-detected ``resolution_m`` is the pixel width converted to metres."""
+        raster_path = tmp_path / "raster.tif"
+        _write_one_band_raster(raster_path, crs, pixel_width)
+
+        dataset_entry = _load_local_catalog_file(
+            tmp_path, {"data_source": "local", "path": str(raster_path)}
+        )
+
+        assert dataset_entry["resolution_m"] == pytest.approx(expected_resolution_m)
+
+    def test_resolution_m_from_the_catalog_is_kept(self, tmp_path):
+        """A ``resolution_m`` set in the catalog entry is not replaced."""
+        raster_path = tmp_path / "raster.tif"
+        _write_one_band_raster(raster_path, "EPSG:4326", 0.001)
+
+        dataset_entry = _load_local_catalog_file(
+            tmp_path, {"data_source": "local", "path": str(raster_path), "resolution_m": 100}
+        )
+
+        assert dataset_entry["resolution_m"] == 100

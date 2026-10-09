@@ -115,3 +115,17 @@ These decisions came from the review of the extraction pipeline (branch `pipelin
   - The circular mean only (with linear `std` and `var`): `std` and `var` of directions that cross north are also wrong.
   - New derived bands for northness and eastness (cos and sin of aspect): useful, but a new feature with new columns. It does not correct the existing `aspect` statistics.
   - Hidden extra bands in the main image: multi-band reductions and tile exports would include them.
+
+### Tile size
+
+- **Decision:** both adapters build a raster tile with n = max(1, floor(`window_size_m` / pixel size + 0.5)) pixels per side: the rule that the README states, round(window / pixel), with ties rounded up.
+  - The pixel size is `resample_m` when it is set. Without it, Earth Engine tiles use the native scale. Local tiles without `resample_m` keep the source raster's own grid.
+  - The tile corners lie on multiples of the pixel size in the point's UTM zone. When n is odd, the pixel that contains the point is the centre pixel. When n is even, the tile centre is the grid line nearest to the point.
+  - One pair of helpers in `geo.py` (`tile_pixel_count`, `tile_top_left`) computes n and the corners for both adapters, and the Earth Engine tile-size check uses the same n.
+  - The Earth Engine adapter requests the exact pixel grid from `getDownloadURL` (`crs`, `crs_transform`, and `dimensions`), not a region and a scale. With a region, Earth Engine adds every pixel that the region touches: a live check on 2026-10-09 gave tiles of 7 × 7 pixels and of 7 rows of 6 pixels instead of 6 × 6 at the 30.92 m native scale of the GLO-30 DEM. On the same grid, the pixel values are the same with both requests.
+- **Reason:** the two adapters used different rules. Earth Engine tiles always had an even size, 2 · round(window / (2 · pixel)) (6 × 6 for 200 m at 30 m). Local tiles had round(window / pixel) pixels (7 × 7), and for odd sizes the point was in the centre pixel for only about one point in four.
+  The README rule gives the size closest to the requested window, and a centre pixel that contains the point. It keeps a fixed size for each window and pixel size, and the alignment on one pixel grid, which CNN inputs and comparisons between data sources need.
+  Ties round up: Python's `round()` rounds a tie to the even number (`round(2.5)` is 2), so a tie would round down or up depending on the number.
+- **Rejected:**
+  - The even rule 2 · round(window / (2 · pixel)) in both adapters: Earth Engine tiles would not change, but the tile side would differ from the window by up to one pixel, and the point would be at a pixel corner, not inside a centre pixel.
+  - Document the difference between the adapters only: tiles from the two data sources would not be comparable.

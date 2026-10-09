@@ -519,6 +519,94 @@ class TestTileSizeCheck:
         assert exported_points == []
 
 
+# ------------------------------------------------------------------
+# _export_single — the pixel grid of one tile
+# ------------------------------------------------------------------
+
+
+def _record_tile_downloads(monkeypatch) -> list[dict]:
+    """Replace the tile download with a recorder; return the list of recorded calls."""
+    recorded_downloads: list[dict] = []
+
+    def record_download(image, **download_arguments):
+        recorded_downloads.append({"image": image, **download_arguments})
+
+    monkeypatch.setattr(adapter_module, "_download_tile_via_url", record_download)
+    return recorded_downloads
+
+
+def _nearest_grid_line(coordinate_m: float, pixel_m: float) -> float:
+    """Return the multiple of ``pixel_m`` nearest to ``coordinate_m``."""
+    below = math.floor(coordinate_m / pixel_m) * pixel_m
+    above = below + pixel_m
+    return below if coordinate_m - below < above - coordinate_m else above
+
+
+class TestExportSingleTileGrid:
+    """``_export_single`` requests the exact n × n pixel grid, not a region and a scale."""
+
+    # A point near Uppsala, in UTM zone 33N.
+    _LAT, _LON = 59.85, 17.63
+
+    def _point_utm(self) -> tuple[float, float]:
+        from pyproj import Transformer
+
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32633", always_xy=True)
+        return to_utm.transform(self._LON, self._LAT)
+
+    def test_odd_size_with_resample_m(self, monkeypatch, tmp_path):
+        """200 m at resample_m=30: a 7 × 7 grid whose centre pixel contains the point."""
+        stub_image = _StubImage(["B1"])
+        adapter = _make_offline_adapter(_get_image=lambda date=None, lat=None, lon=None: stub_image)
+        recorded_downloads = _record_tile_downloads(monkeypatch)
+        output_path = tmp_path / "tiles" / "a-test_dataset.tif"
+
+        returned_path = adapter._export_single(
+            self._LAT, self._LON, 200, output_path, None, resample_m=30
+        )
+
+        point_x, point_y = self._point_utm()
+        # The point's pixel starts at floor(x / 30) · 30 (west edge) and ends at
+        # (floor(y / 30) + 1) · 30 (north edge). Three pixels lie on each side.
+        expected_west = (math.floor(point_x / 30) - 3) * 30
+        expected_north = (math.floor(point_y / 30) + 1 + 3) * 30
+        assert returned_path == output_path
+        assert output_path.parent.is_dir()
+        [download] = recorded_downloads
+        assert set(download) == {"image", "crs", "crs_transform", "dimensions", "output_path"}
+        assert download["image"] is stub_image
+        assert download["crs"] == "EPSG:32633"
+        assert download["crs_transform"] == pytest.approx(
+            [30.0, 0.0, expected_west, 0.0, -30.0, expected_north]
+        )
+        assert download["dimensions"] == "7x7"
+        assert download["output_path"] == output_path
+
+    def test_even_size_at_the_native_scale(self, monkeypatch, tmp_path):
+        """200 m at a native scale of 10 m: a 20 × 20 grid centred on the nearest grid lines."""
+        stub_image = _StubImage(["B1"])
+        adapter = _make_offline_adapter(
+            _get_image=lambda date=None, lat=None, lon=None: stub_image,
+            _get_scale_value=lambda image: 10.0,
+        )
+        recorded_downloads = _record_tile_downloads(monkeypatch)
+        output_path = tmp_path / "a-test_dataset.tif"
+
+        adapter._export_single(self._LAT, self._LON, 200, output_path, None, resample_m=None)
+
+        point_x, point_y = self._point_utm()
+        expected_west = _nearest_grid_line(point_x, 10.0) - 10 * 10.0
+        expected_north = _nearest_grid_line(point_y, 10.0) + 10 * 10.0
+        [download] = recorded_downloads
+        assert set(download) == {"image", "crs", "crs_transform", "dimensions", "output_path"}
+        assert download["image"] is stub_image
+        assert download["crs"] == "EPSG:32633"
+        assert download["crs_transform"] == pytest.approx(
+            [10.0, 0.0, expected_west, 0.0, -10.0, expected_north]
+        )
+        assert download["dimensions"] == "20x20"
+
+
 class TestBandNameCache:
     """``_get_band_name`` caches the band information only after a successful request."""
 

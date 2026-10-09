@@ -17,6 +17,7 @@ I/O even when this file is part of the collection.
 from __future__ import annotations
 
 import json
+import math
 
 import pandas as pd
 import pytest
@@ -26,6 +27,7 @@ from _gee_helpers import SWEDEN_SAMPLE_DF, gee_credentials_available
 from envoi import reset_catalog, update_catalog
 from envoi.catalog import BUILTIN_EE_CATALOG, load_catalogs
 from envoi.extract import extract
+from envoi.geo import get_utm_crs, tile_pixel_count
 
 # Apply two markers to every test in this module:
 #   * ``gee`` — selectable via ``pytest -m gee`` / ``pytest -m 'not gee'``.
@@ -424,9 +426,13 @@ class TestRasterExport:
         assert len(exported_tifs) == len(SWEDEN_SAMPLE_DF)
         # And every tile must actually contain data (not just be a header).
         # Catches silent failures where the request returned an empty image.
+        # Without resample_m, the tile pixel size is the native scale (about
+        # 30.92 m), and every tile has n × n pixels (6 × 6 for 200 m). A
+        # request by region and scale gave an extra row or column at some points.
         for tif_path in exported_tifs:
             with rasterio.open(tif_path) as src:
-                assert src.width > 0 and src.height > 0
+                expected_pixels = tile_pixel_count(200, src.res[0])
+                assert (src.width, src.height) == (expected_pixels, expected_pixels)
                 assert src.count >= 1
 
     def test_tiles_worldcover_resample(self, tmp_path):
@@ -450,6 +456,49 @@ class TestRasterExport:
             with rasterio.open(tif_path) as src:
                 assert src.width == expected_pixels_per_side
                 assert src.height == expected_pixels_per_side
+
+    def test_odd_tile_has_the_point_in_its_centre_pixel(self, tmp_path):
+        """A 200 m tile at resample_m=30 is 7 × 7, with the point in its centre pixel (3, 3)."""
+        from pyproj import Transformer
+
+        one_point_df = SWEDEN_SAMPLE_DF.iloc[[0]]
+        update_catalog(_make_catalog(("dem_aster", "projects/sat-io/open-datasets/ASTER/GDEM")))
+        try:
+            extract(
+                one_point_df,
+                {
+                    "batch_id": "odd_tile",
+                    "datasets": ["dem_aster"],
+                    "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 30},
+                },
+                output_dir=tmp_path,
+            )
+        finally:
+            reset_catalog()
+
+        lat = one_point_df["decimalLatitude"].iloc[0]
+        lon = one_point_df["decimalLongitude"].iloc[0]
+        utm_crs = get_utm_crs(lon, lat)
+        point_x, point_y = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True).transform(
+            lon, lat
+        )
+        sample_id = one_point_df["occurrenceID"].iloc[0]
+        with rasterio.open(
+            tmp_path / "odd_tile" / "dem_aster" / f"{sample_id}-dem_aster.tif"
+        ) as src:
+            assert (src.width, src.height) == (7, 7)
+            assert src.crs.to_epsg() == int(utm_crs.split(":")[1])
+            tile_transform = src.transform
+
+        # 30 m pixels, corners on multiples of 30 m, and the point in pixel (3, 3),
+        # counted from the tile's top-left corner.
+        assert tile_transform.a == pytest.approx(30.0)
+        assert tile_transform.e == pytest.approx(-30.0)
+        assert tile_transform.c / 30 == pytest.approx(round(tile_transform.c / 30))
+        assert tile_transform.f / 30 == pytest.approx(round(tile_transform.f / 30))
+        column = math.floor((point_x - tile_transform.c) / 30.0)
+        row = math.floor((tile_transform.f - point_y) / 30.0)
+        assert (column, row) == (3, 3)
 
     def test_raster_metadata_sidecar(self, tmp_path):
         """Raster export writes a sidecar metadata JSON with native CRS/scale.

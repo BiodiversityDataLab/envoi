@@ -1089,6 +1089,41 @@ class TestRaster:
                 assert src.width == expected_pixels
                 assert src.height == expected_pixels
 
+    def test_odd_resampled_tile_has_the_point_in_its_centre_pixel(self, sample_df, tmp_path):
+        """A 200 m tile at resample_m=30 is 7 × 7, with the point in its centre pixel (3, 3)."""
+        from pyproj import Transformer
+
+        extract(
+            sample_df,
+            {
+                "batch_id": "odd_tiles",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 30},
+            },
+            output_dir=tmp_path,
+        )
+
+        # The points are in UTM zone 34N, the CRS of every tile.
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+        tile_dir = tmp_path / "odd_tiles" / "dem_local"
+        for sample_id, lat, lon in zip(
+            sample_df["occurrenceID"], sample_df["decimalLatitude"], sample_df["decimalLongitude"]
+        ):
+            point_x, point_y = to_utm.transform(lon, lat)
+            with rasterio.open(tile_dir / f"{sample_id}-dem_local.tif") as src:
+                assert (src.width, src.height) == (7, 7)
+                assert src.crs.to_epsg() == 32634
+                tile_transform = src.transform
+
+            # 30 m pixels, corners on multiples of 30 m.
+            assert (tile_transform.a, tile_transform.e) == (30.0, -30.0)
+            assert tile_transform.c / 30 == pytest.approx(round(tile_transform.c / 30))
+            assert tile_transform.f / 30 == pytest.approx(round(tile_transform.f / 30))
+            # Column and row of the point, counted from the tile's top-left corner.
+            column = math.floor((point_x - tile_transform.c) / 30.0)
+            row = math.floor((tile_transform.f - point_y) / 30.0)
+            assert (column, row) == (3, 3)
+
     def test_raster_metadata_json(self, sample_df, tmp_path):
         """Raster output writes a sidecar metadata JSON."""
         extract(
@@ -2191,6 +2226,252 @@ class TestPointSampleNonFinitePixels:
         assert values_without_finite_band == {"b1": None, "b2": None}
         assert meta_without_finite_band["in_extent"] is False
         assert meta_without_finite_band["n_pixels"] == 0
+
+
+# ------------------------------------------------------------------
+# Windows smaller than one pixel, and pixel sizes in metres
+# ------------------------------------------------------------------
+
+# One point in UTM zone 34N (the first point of sample_df).
+_SUB_PIXEL_POINT = pd.DataFrame(
+    {
+        "occurrenceID": ["corner_point"],
+        "decimalLatitude": [62.976878],
+        "decimalLongitude": [18.026823],
+    }
+)
+
+
+def _write_coarse_raster_near_a_pixel_corner(path: Path) -> np.ndarray:
+    """Write a 10 × 10 float32 UTM 34N raster with 100 m pixels around ``_SUB_PIXEL_POINT``.
+
+    The point lies 10 m east of a pixel column edge and 10 m south of a pixel
+    row edge, inside pixel (row 5, column 5). The nearest pixel centres are
+    40 m and 60 m away in each direction, so a 50 m window contains no pixel
+    centre. A window of two pixels (200 m) contains the centres of rows 4-5
+    and columns 4-5. Returns the written array (rows, columns).
+    """
+    from pyproj import Transformer
+
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+    point_x, point_y = to_utm.transform(
+        _SUB_PIXEL_POINT["decimalLongitude"][0], _SUB_PIXEL_POINT["decimalLatitude"][0]
+    )
+    west, north = point_x - 10.0 - 500.0, point_y + 10.0 + 500.0
+    transform = from_bounds(west, north - 1000.0, west + 1000.0, north, 10, 10)
+
+    random_generator = np.random.default_rng(seed=20)
+    pixel_values = random_generator.uniform(100.0, 200.0, (10, 10)).astype(np.float32)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=10,
+        width=10,
+        count=1,
+        dtype="float32",
+        crs="EPSG:32634",
+        transform=transform,
+    ) as dst:
+        dst.write(pixel_values, 1)
+    return pixel_values
+
+
+class TestWindowSmallerThanOnePixel:
+    """A local window smaller than one native pixel is widened to two pixels, as on GEE."""
+
+    def test_window_gets_the_pixels_of_a_two_pixel_window(self, tmp_path):
+        """A 50 m window at 100 m pixels gives the four pixels around the point, named 50m."""
+        raster_path = tmp_path / "coarse.tif"
+        pixel_values = _write_coarse_raster_near_a_pixel_corner(raster_path)
+        update_catalog({"datasets": {"coarse": {"data_source": "local", "path": str(raster_path)}}})
+
+        outputs = extract(
+            _SUB_PIXEL_POINT,
+            {
+                "batch_id": "sub_pixel",
+                "datasets": ["coarse"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean", "count"],
+                    "window_size_m": 50,
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        stats_df = pd.read_csv(outputs["sub_pixel"])
+        qc_df = pd.read_csv(tmp_path / "sub_pixel_qc.csv")
+        sidecar = json.loads((tmp_path / "sub_pixel_metadata.json").read_text())
+        expected_mean = float(pixel_values[4:6, 4:6].astype(float).mean())
+        assert stats_df.loc[0, "coarse_mean_50m"] == pytest.approx(expected_mean)
+        assert stats_df.loc[0, "coarse_count_50m"] == 4
+        assert qc_df.loc[0, "coarse_in_extent_50m"]
+        assert qc_df.loc[0, "coarse_n_pixels_50m"] == 4
+        assert qc_df.loc[0, "coarse_coverage_pct_50m"] > 0
+        # The outputs keep the requested window, not the widened one.
+        assert sidecar["config"]["window_size_m"] == 50
+        assert set(sidecar["datasets"]["coarse"]["quality"]) == {"50m"}
+        assert sidecar["datasets"]["coarse"]["native_spatial_resolution_m"] == 100.0
+
+    def test_meta_keeps_the_requested_window(self, tmp_path):
+        """The adapter reads a 200 m window but reports ``window_m`` 50."""
+        from envoi.adapters.local_adapter import LocalRasterAdapter
+
+        raster_path = tmp_path / "coarse.tif"
+        _write_coarse_raster_near_a_pixel_corner(raster_path)
+
+        with LocalRasterAdapter({"path": str(raster_path), "bands": 1}) as adapter:
+            [(stats, meta)] = adapter.fetch_stats_batch(
+                _SUB_PIXEL_POINT["decimalLatitude"],
+                _SUB_PIXEL_POINT["decimalLongitude"],
+                50,
+                ["count"],
+                disable_progress=True,
+            )
+
+        assert stats["count"] == 4
+        assert meta["n_pixels"] == 4
+        assert meta["window_m"] == 50
+
+    def test_window_of_one_pixel_or_more_is_not_widened(self, tmp_path):
+        """A window of one pixel (100 m at 100 m pixels) is read as requested, not widened."""
+        from envoi.adapters.local_adapter import LocalRasterAdapter
+
+        raster_path = tmp_path / "coarse.tif"
+        _write_coarse_raster_near_a_pixel_corner(raster_path)
+
+        with LocalRasterAdapter({"path": str(raster_path), "bands": 1}) as adapter:
+            [(stats, meta)] = adapter.fetch_stats_batch(
+                _SUB_PIXEL_POINT["decimalLatitude"],
+                _SUB_PIXEL_POINT["decimalLongitude"],
+                100,
+                ["count"],
+                disable_progress=True,
+            )
+
+        # The 100 m window reaches 50 m from the point; the nearest centres are 40 m
+        # away in one direction and 60 m in the other, so it holds one pixel centre.
+        # A widened (200 m) window would hold four.
+        assert stats["count"] == 1
+        assert meta["n_pixels"] == 1
+        assert meta["window_m"] == 100
+
+
+class TestNativeResolutionInMetres:
+    """The sidecar field ``native_spatial_resolution_m`` is in metres for every CRS."""
+
+    def test_geographic_raster(self, tmp_path):
+        """A raster with 0.001° pixels reports 111.32 m (111 319.49 m per degree)."""
+        raster_path = tmp_path / "geographic.tif"
+        random_generator = np.random.default_rng(seed=22)
+        pixel_values = random_generator.uniform(0.0, 100.0, (50, 50)).astype(np.float32)
+        # 0.05° × 0.05° around the point (lat 62.98, lon 18.03).
+        transform = from_bounds(18.0, 62.95, 18.05, 63.0, 50, 50)
+        with rasterio.open(
+            raster_path,
+            "w",
+            driver="GTiff",
+            height=50,
+            width=50,
+            count=1,
+            dtype="float32",
+            crs="EPSG:4326",
+            transform=transform,
+        ) as dst:
+            dst.write(pixel_values, 1)
+        update_catalog(
+            {"datasets": {"geographic": {"data_source": "local", "path": str(raster_path)}}}
+        )
+
+        extract(
+            _SUB_PIXEL_POINT,
+            {
+                "batch_id": "geographic_run",
+                "datasets": ["geographic"],
+                "settings": {"output_type": "tabular", "statistics": ["mean"]},
+            },
+            output_dir=tmp_path,
+        )
+
+        sidecar = json.loads((tmp_path / "geographic_run_metadata.json").read_text())
+        assert sidecar["datasets"]["geographic"]["native_spatial_resolution_m"] == 111.32
+
+
+# ------------------------------------------------------------------
+# Point sample without the deprecated affine "*" operator
+# ------------------------------------------------------------------
+
+
+class TestPointSampleWithoutAffineOperator:
+    """The point sample computes pixel coordinates from the inverse transform's coefficients."""
+
+    def test_rotated_raster_gives_the_pixel_of_the_point_without_warnings(self, tmp_path):
+        """On a rotated raster, the point sample reads the right pixel without affine warnings."""
+        from pyproj import Transformer
+        from rasterio.transform import Affine
+
+        from envoi.adapters.local_adapter import LocalRasterAdapter
+
+        # A raster rotated by 30°, with 10 m pixels: x = c + a·col + b·row,
+        # y = f + d·col + e·row. The first point is inside pixel (row 15,
+        # column 12). The second point is inside the raster's axis-aligned
+        # bounding box, but outside its rotated footprint (column -2).
+        pixel_m, angle = 10.0, math.radians(30)
+        a, b = pixel_m * math.cos(angle), pixel_m * math.sin(angle)
+        d, e = pixel_m * math.sin(angle), -pixel_m * math.cos(angle)
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+        point_x, point_y = to_utm.transform(18.026823, 62.976878)
+        c = point_x - (a * 12.3 + b * 15.6)
+        f = point_y - (d * 12.3 + e * 15.6)
+        outside_x, outside_y = c + a * -2.0 + b * 20.0, f + d * -2.0 + e * 20.0
+
+        random_generator = np.random.default_rng(seed=23)
+        pixel_values = random_generator.uniform(100.0, 200.0, (30, 30)).astype(np.float32)
+        raster_path = tmp_path / "rotated.tif"
+        with rasterio.open(
+            raster_path,
+            "w",
+            driver="GTiff",
+            height=30,
+            width=30,
+            count=1,
+            dtype="float32",
+            crs="EPSG:32634",
+            transform=Affine(a, b, c, d, e, f),
+        ) as dst:
+            dst.write(pixel_values, 1)
+
+        # Independent check of the test geometry: the inverse of the 3 × 3
+        # affine matrix maps each point to its (column, row).
+        affine_matrix = np.array([[a, b, c], [d, e, f], [0.0, 0.0, 1.0]])
+        inside_column, inside_row, _ = np.linalg.solve(affine_matrix, [point_x, point_y, 1.0])
+        outside_column, outside_row, _ = np.linalg.solve(affine_matrix, [outside_x, outside_y, 1.0])
+        assert (math.floor(inside_column), math.floor(inside_row)) == (12, 15)
+        assert outside_column < 0 <= outside_row < 30
+        to_wgs84 = Transformer.from_crs("EPSG:32634", "EPSG:4326", always_xy=True)
+        outside_lon, outside_lat = to_wgs84.transform(outside_x, outside_y)
+        corner_xs = [c + a * column + b * row for column in (0, 30) for row in (0, 30)]
+        corner_ys = [f + d * column + e * row for column in (0, 30) for row in (0, 30)]
+        assert min(corner_xs) < outside_x < max(corner_xs)
+        assert min(corner_ys) < outside_y < max(corner_ys)
+
+        # affine 3 warns about "*" with PendingDeprecationWarning (and may move
+        # to DeprecationWarning). The filters apply to warnings that envoi's own
+        # code triggers, not to warnings inside other libraries.
+        with (
+            LocalRasterAdapter({"path": str(raster_path), "bands": 1}) as adapter,
+            warnings.catch_warnings(),
+        ):
+            warnings.filterwarnings("error", category=PendingDeprecationWarning, module=r"envoi\.")
+            warnings.filterwarnings("error", category=DeprecationWarning, module=r"envoi\.")
+            inside_values, inside_meta = adapter._sample_point_single(62.976878, 18.026823)
+            outside_values, outside_meta = adapter._sample_point_single(outside_lat, outside_lon)
+
+        assert inside_values == {"point": pytest.approx(float(pixel_values[15, 12]))}
+        assert inside_meta["in_extent"] is True
+        assert outside_values == {"point": None}
+        assert outside_meta["in_extent"] is False
 
 
 # ------------------------------------------------------------------

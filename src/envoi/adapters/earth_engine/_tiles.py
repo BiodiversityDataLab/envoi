@@ -8,8 +8,8 @@
   ``ee.Image.getDownloadURL`` + ``requests`` with retry logic for transient
   failures.
 
-The adapter still owns ``_export_single`` (which knows how to assemble the
-per-point region) and the thin ``_guard_tile_size`` wrapper (which pulls the
+The adapter still owns ``_export_single`` (which knows how to compute the
+per-point pixel grid) and the thin ``_guard_tile_size`` wrapper (which pulls the
 band count off the live ee.Image before delegating here).
 """
 
@@ -20,6 +20,8 @@ from pathlib import Path
 
 import ee
 import requests
+
+from ...geo import tile_pixel_count
 
 # GEE's synchronous getDownloadURL endpoint refuses responses larger than
 # about 32 MB (the documented limit; some empirical reports place it closer
@@ -56,10 +58,9 @@ def _check_tile_size(
     the problem without reading our source.
     """
     # window_m is the tile side length in metres and scale_m is the pixel
-    # size, so (window_m / scale_m) is the pixel count per side.
-    # max(1, ...) mirrors the pixel floor used when building the export
-    # region — a sub-pixel window still produces a 1×1 raster, not zero.
-    pixels_per_side = max(1, round(window_m / scale_m))
+    # size. tile_pixel_count is the pixel count per side that _export_single
+    # requests, so the estimate matches the real tile.
+    pixels_per_side = tile_pixel_count(window_m, scale_m)
     total_pixels = pixels_per_side * pixels_per_side
 
     # Assume float32 (4 bytes/pixel) as a conservative upper bound. GEE's
@@ -82,9 +83,9 @@ def _check_tile_size(
 def _download_tile_via_url(
     img: ee.Image,
     *,
-    region: ee.Geometry,
-    scale_m: float,
     crs: str,
+    crs_transform: list[float],
+    dimensions: str,
     output_path: Path,
 ) -> None:
     """Download one tile via ``ee.Image.getDownloadURL`` + ``requests``.
@@ -94,15 +95,28 @@ def _download_tile_via_url(
     directly — no zip wrapping, no per-band extraction step. Streams
     the response straight to ``output_path`` with retries for
     transient HTTP errors.
+
+    Args:
+        img: The image to download.
+        crs: CRS of the tile, for example ``"EPSG:32633"``.
+        crs_transform: Affine transform of the tile in ``crs``, in the order
+            ``[x pixel size, 0, west edge, 0, -y pixel size, north edge]``.
+        dimensions: Tile size in pixels, ``"<width>x<height>"``.
+        output_path: Path of the GeoTIFF to write.
     """
     # GEE's getDownloadURL is server-side: it builds the URL synchronously
     # but the URL itself points to a streamed export, so the actual image
     # generation happens during the GET below.
+    # With crs, crs_transform and dimensions, and without region or scale,
+    # Earth Engine returns exactly this rectangle of pixels
+    # (ee.Image._apply_crs_and_affine). Do not add a region or a scale: with
+    # a region, Earth Engine raises an error; with a scale, it resizes the
+    # image to the dimensions instead.
     url = img.getDownloadURL(
         {
-            "scale": scale_m,
-            "region": region,
             "crs": crs,
+            "crs_transform": crs_transform,
+            "dimensions": dimensions,
             "format": "GEO_TIFF",
             "filePerBand": False,
         }

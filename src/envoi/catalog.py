@@ -94,6 +94,8 @@ def _inspect_raster(name: str, spec: dict[str, Any]) -> None:
     try:
         import rasterio
 
+        from .geo import pixel_size_m
+
         with rasterio.open(p) as src:
             if "crs" not in spec:
                 epsg = src.crs.to_epsg()
@@ -104,7 +106,9 @@ def _inspect_raster(name: str, spec: dict[str, Any]) -> None:
                 logger.debug("datasets.%s: auto-detected crs=%s", name, spec["crs"])
 
             if "resolution_m" not in spec:
-                spec["resolution_m"] = abs(src.res[0])
+                # Pixel width in metres, also for a CRS in degrees or feet
+                # (None for a CRS without a length unit).
+                spec["resolution_m"] = pixel_size_m(src.crs, src.res[0])
                 logger.debug(
                     "datasets.%s: auto-detected resolution_m=%s", name, spec["resolution_m"]
                 )
