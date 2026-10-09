@@ -3,7 +3,8 @@
 
 This collects, in one place:
 
-* GEE SDK initialisation (one-time per process) and session-pool tuning.
+* GEE SDK initialisation (only when Earth Engine is not yet initialized) and
+  session-pool tuning (once per process).
 * Pixel-grid snapping for export window alignment.
 * Collection timestamp fetching and nearest / contains date selection.
 * Derived-band registration (slope, aspect, ...) and computation.
@@ -24,10 +25,10 @@ from ...geo import get_utm_zone_label
 
 logger = logging.getLogger(__name__)
 
-# Flag flipped to True the first time _ensure_gee_init() actually initialises
-# the SDK. Kept at module scope so repeated calls across threads / batches are
-# cheap no-ops after the first.
-_gee_initialized = False
+# Set to True the first time _ensure_gee_init() patches the session pool, so
+# that the patch runs only once per process. Kept at module scope so repeated
+# calls across adapters and batches skip it.
+_session_pool_patched = False
 
 
 # ---------------------------------------------------------------------------
@@ -72,23 +73,39 @@ def _patch_ee_session_pool(pool_size: int) -> None:
         )
 
 
-def _ensure_gee_init():
-    """Initialize GEE once per process, skip if already active."""
-    global _gee_initialized
-    if _gee_initialized:
-        return
-    try:
-        ee.Number(1).getInfo()
-        _gee_initialized = True
-    except Exception:
+def _ensure_gee_init() -> None:
+    """Initialize Earth Engine when it is not initialized, and enlarge its connection pool once.
+
+    ``ee.data.is_initialized()`` reads local state and sends no request.
+    An Earth Engine session that is already initialized (by the user, or by an
+    earlier run) is kept as it is. Only when Earth Engine is not initialized does
+    this call ``auth.init_gee()``, which reads envoi's service-account credentials.
+
+    The session-pool patch runs once per process, after initialization.
+
+    Raises:
+        FileNotFoundError: Earth Engine is not initialized and ``init_gee()``
+            finds no credentials file.
+        RuntimeError: Earth Engine is not initialized and refuses the credentials.
+    """
+    global _session_pool_patched
+
+    # Initialize only when needed. A test request (and a new initialization
+    # when it fails) would replace a working session after a temporary
+    # network error, and with it the user's own credentials and project.
+    if not ee.data.is_initialized():
         from ...auth import init_gee
 
         init_gee()
-        _gee_initialized = True
+
     # Size the connection pool generously so parallel workers don't overflow
     # the urllib3 default of 10. Covers the default max_workers (20) and most
     # user overrides without retuning. 50 idle TCP connections is trivial.
-    _patch_ee_session_pool(50)
+    # Earth Engine creates the shared session during initialization, so the
+    # patch must run after it.
+    if not _session_pool_patched:
+        _patch_ee_session_pool(50)
+        _session_pool_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +144,9 @@ def _get_collection_time_bounds(
     times are unique: when several images have the same start, end_times holds
     the latest of their ends.
     Returns (start_times, None) when end times are unavailable (e.g. user-uploaded
-    assets that omit system:time_end). Returns (None, None) only on total failure.
+    assets that omit system:time_end). Returns (None, None) when no image with a
+    start time is left after the filters (for example, no image of the
+    collection intersects ``bounds_geometry``).
     One getInfo() round-trip, done once per dataset.
 
     Parameters
@@ -143,6 +162,13 @@ def _get_collection_time_bounds(
         Additional pre-filter on the collection's time interval. Combined with
         ``bounds_geometry`` so even busy collections (Sentinel-2 over a few
         tiles for many years) stay well within budget.
+
+    Raises
+    ------
+    RuntimeError
+        Earth Engine could not return the timestamps. The exception chains
+        the original error. Every point of the batch needs the timestamps to
+        select its image, so the caller lets this error stop the run.
     """
     try:
         image_collection = ee.ImageCollection(collection_id)
@@ -220,9 +246,20 @@ def _get_collection_time_bounds(
         start_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["start"], unit="ms", origin="unix"))
         end_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["end"], unit="ms", origin="unix"))
         return start_index, end_index
-    except Exception as e:
-        logger.warning("Failed to fetch timestamps for %s: %s", collection_id, e)
-        return None, None
+    # Broad catch that re-raises a clear error: Earth Engine reports unrelated
+    # failures (network, quota, unknown asset) with one exception type.
+    # Without the timestamps, the adapter cannot select the image for each
+    # point's sample date. Continuing would silently give every point
+    # statistics from a mosaic of the most recent images, or from a search
+    # within one day of its sample date, so the run stops here.
+    except Exception as error:
+        raise RuntimeError(
+            f"Earth Engine could not return the image dates of collection "
+            f"'{collection_id}'. envoi needs these dates to select the image for "
+            f"each sample point, so the run stops. Check the collection ID and your "
+            f"network connection, then run the extraction again. "
+            f"Original error: {error}"
+        ) from error
 
 
 def _find_nearest_timestamp(

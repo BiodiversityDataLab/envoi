@@ -160,9 +160,10 @@ class GeeRasterAdapter(BaseAdapter):
             self._native_proj = (
                 ee.ImageCollection(dataset_spec["collection"]).first().select(0).projection()
             )
-            # Optimistically assume timestamps are fetchable; the lazy fetch
-            # flips this to False (and builds a static-mosaic fallback) if
-            # GEE refuses to materialise the timestamp index.
+            # Assume per-point date selection. The lazy timestamp fetch flips
+            # this to False (and builds a static-mosaic fallback) when no
+            # image of the collection intersects the batch's points. A failed
+            # timestamp request stops the run instead.
             self._needs_per_point_date = True
 
             # ...unless the catalog declares the collection has no meaningful
@@ -212,8 +213,8 @@ class GeeRasterAdapter(BaseAdapter):
 
         Called by the public batch methods (``fetch_stats_batch``,
         ``export_tiles``) before any per-point work. Idempotent — subsequent
-        calls return immediately once the index is cached or has been proved
-        unfetchable.
+        calls return immediately once the index is cached, or once the fetch
+        found no image at the batch's points.
 
         Filters the collection by the batch's bounding geometry BEFORE the
         ``aggregate_array`` call so per-tile per-pass collections (e.g.
@@ -221,9 +222,13 @@ class GeeRasterAdapter(BaseAdapter):
         thousand-image index instead of timing out server-side. The ``dates``
         argument is accepted but intentionally NOT used as a filter — see
         the comment below.
+
+        Raises ``RuntimeError`` (from ``_get_collection_time_bounds``) when
+        Earth Engine cannot return the timestamps. Every point needs them,
+        so the error stops the run.
         """
         # Non-collections (single IMAGE assets) have no timestamp axis, and
-        # repeat calls after a successful (or proven-failed) fetch are no-ops.
+        # repeat calls after a completed fetch are no-ops.
         if not self._is_collection or self._timestamps_loaded:
             return
 
@@ -262,10 +267,11 @@ class GeeRasterAdapter(BaseAdapter):
         )
         self._collection_time_starts = start_times
         self._collection_time_ends = end_times
-        # If the filtered fetch still failed, flip back to the static-mosaic
+        # An empty index means that no image of the collection (with a start
+        # time) intersects the batch's points. Flip to the static-mosaic
         # fallback so per-point work doesn't crash trying to read a None
-        # timestamp index. This mirrors the eager-fetch fallback the adapter
-        # used to do in __post_init__ before timestamps went lazy.
+        # timestamp index. A failed request does not reach this line: it
+        # raises in _get_collection_time_bounds and stops the run.
         self._needs_per_point_date = start_times is not None
         if not self._needs_per_point_date:
             self._static_image = _build_image(self._dataset_spec)
@@ -404,8 +410,9 @@ class GeeRasterAdapter(BaseAdapter):
         # Final fallback — a date was provided but neither the per-point
         # branch (no coords) nor the static-image branch (date is None)
         # could handle it. Two real paths reach here:
-        #   1. Collection whose timestamp fetch failed and date is not
-        #      None (server-side date filter with no client-side index).
+        #   1. Collection whose timestamp index is empty (no image intersects
+        #      the batch's points) and date is not None (server-side date
+        #      filter with no client-side index).
         #   2. Collection with timestamps but no coords and date is not
         #      None (per-point date selection without a spatial filter).
         dt = pd.to_datetime(date)
@@ -424,9 +431,13 @@ class GeeRasterAdapter(BaseAdapter):
         """Get the first band name from the image (needed for result parsing).
 
         Side effect: populates ``_cached_band_name``, ``_cached_band_names``,
-        and ``_cached_band_count`` on first call. Other methods
+        and ``_cached_band_count`` on the first successful call. Other methods
         (``_empty_stats_result``, ``_fetch_stats_single``, ``build_dataset_meta``)
         rely on these caches being warm.
+
+        When the bands are not in the config, this asks Earth Engine for the
+        band names. If that request fails, the Earth Engine exception
+        propagates and nothing is cached, so the next call asks again.
         """
         band = self._dataset_spec.get("bands")
         derived = self._dataset_spec.get("derived_bands")
@@ -447,17 +458,16 @@ class GeeRasterAdapter(BaseAdapter):
                 self._cached_band_names = combined
                 self._cached_band_count = len(combined)
             return self._cached_band_name
-        # Fallback: ask GEE (costs one getInfo call, cached after first use)
+        # Fallback: ask GEE (costs one getInfo call, cached after first success).
+        # A failed request raises and caches nothing. Caching a fallback name
+        # would make every later point of the batch parse its result with a
+        # band name and band count that do not match the image.
         if not hasattr(self, "_cached_band_name"):
-            try:
-                names = img.bandNames().getInfo()
-                self._cached_band_name = names[0] if names else "value"
-                self._cached_band_names = names  # full list for metadata
-                self._cached_band_count = len(names)
-            except Exception:
-                self._cached_band_name = "value"
-                self._cached_band_names = []
-                self._cached_band_count = 1
+            names = img.bandNames().getInfo()
+            self._cached_band_names = names  # full list for metadata
+            self._cached_band_count = len(names)
+            # Set last: worker threads read this attribute as "cache is filled".
+            self._cached_band_name = names[0] if names else "value"
         return self._cached_band_name
 
     def _get_scale(self, img):
@@ -1093,16 +1103,7 @@ class GeeRasterAdapter(BaseAdapter):
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # output_path is laid out as <root>/<batch_id>/<dataset_name>/<file>.tif
-        # by export_tiles, so the parent directory's name is the dataset name —
-        # used purely for the error message in _guard_tile_size.
-        dataset_name = output_path.parent.name
-
-        # Fail fast (with actionable guidance) before asking GEE for a URL,
-        # so oversized tiles surface as a clean ValueError instead of an
-        # opaque HTTP 400 from getDownloadURL.
-        self._guard_tile_size(img, window_m=window_m, scale_m=scale_m, dataset_name=dataset_name)
-
+        # export_tiles has already checked the tile size once for the batch.
         _download_tile_via_url(
             img, region=region, scale_m=scale_m, crs=utm, output_path=output_path
         )
@@ -1126,11 +1127,15 @@ class GeeRasterAdapter(BaseAdapter):
         fetch the band count off the GEE image (which requires a live
         adapter), then hands the pure-Python size check to the module-level
         function so the latter stays unit-testable without GEE creds.
+
+        ``export_tiles`` calls it once per batch, before any tile download.
+        Every tile of a batch has the same size and the same bands.
         """
-        # _get_band_name populates _cached_band_count as a side effect. It
-        # may already be warm (export_tiles primes it in line ~1773), but we
-        # call it here so the size guard is self-contained and works even
-        # for callers that didn't go through export_tiles.
+        # _get_band_name populates _cached_band_count as a side effect. It is
+        # usually warm already (export_tiles primes it), but a failed request
+        # is not cached, so this call asks Earth Engine again. If it fails
+        # again, the exception propagates and stops the run: without the band
+        # count, the size of every tile is unknown.
         self._get_band_name(img)
         band_count = getattr(self, "_cached_band_count", 1) or 1
 
@@ -1168,6 +1173,10 @@ class GeeRasterAdapter(BaseAdapter):
 
         Returns ``(paths, meta_list)`` — one entry per input point in each
         list. ``paths[i]`` is ``None`` when the export for that point failed.
+
+        Raises ``ValueError`` before any tile download when the tiles would
+        exceed GEE's synchronous download limit. A failed request for the band
+        names or the native scale also propagates before any download.
         """
         output_dir = Path(output_dir) / dataset_name
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1184,11 +1193,30 @@ class GeeRasterAdapter(BaseAdapter):
         # for why this is deferred from __post_init__ to here.
         self._ensure_collection_timestamps(lats, lons, date_list)
 
+        # The image without point coordinates (see _get_image). The band-name
+        # request and the tile-size check below use it.
+        batch_image = self._get_image()
+
         # Warm the band-name cache so build_dataset_meta can read it later.
+        # Broad catch for a harmless best-effort failure: a failed request is
+        # not cached, and the tile-size check below asks again.
         try:
-            self._get_band_name(self._get_image())
+            self._get_band_name(batch_image)
         except Exception:
             pass
+
+        # Check the tile size once, before any download. Every tile of the
+        # batch has the same size and bands, so an oversized request would
+        # make every tile fail, and the run would end without tiles.
+        # This needs the band count and the export scale. In a raster run, a
+        # failed request for either one stops the run here: it affects every
+        # tile. Do not catch the ValueError of the size check.
+        export_scale_m = (
+            float(resample_m) if resample_m is not None else self._get_scale_value(batch_image)
+        )
+        self._guard_tile_size(
+            batch_image, window_m=window_m, scale_m=export_scale_m, dataset_name=dataset_name
+        )
 
         meta_list = [self._resolve_date_info(d) for d in date_list]
 

@@ -106,7 +106,9 @@ Update this document when you add a module or change the adapter interface.
            |
            +---> [raster]  _process_dataset_raster()
            |       adapter.export_tiles() -> one GeoTIFF for each point
-           |         GEE: getDownloadURL + requests; local: rasterio (native grid, or
+           |         GEE: one tile-size check for the batch (an oversized request
+           |         raises ValueError before any download), then getDownloadURL +
+           |         requests; local: rasterio (native grid, or
            |         rasterio.warp.reproject onto a UTM grid when resample_m is set)
            |       adapter.build_dataset_meta() -> _write_tile_manifest()
            |
@@ -196,6 +198,7 @@ GeeRasterAdapter.__post_init__
 First fetch_stats_batch() / export_tiles() call (collections only)
     timestamp index system:time_start / system:time_end of the images that intersect
                     the batch's points, in one getInfo(). Skipped for the mosaic policy.
+                    A failed request stops the run with RuntimeError.
 
 For each point: _build_image(dataset_spec, date, geometry, ...)
     IMAGE:            ee.Image(path)
@@ -210,9 +213,10 @@ For each point: _build_image(dataset_spec, date, geometry, ...)
                              "contains" the date. Dates outside the collection clamp to the
                              first or last image.
           no sample date  -> the most recent image in the timestamp index
-          no index        -> if the timestamp fetch failed: filterDate around the sample date
-                             (±1 day for "nearest", [date, date + 1 day] for "contains"),
-                             or a mosaic of the whole collection when there is no date
+          no index        -> if no image intersects the batch's points: filterDate around the
+                             sample date (±1 day for "nearest", [date, date + 1 day] for
+                             "contains"), or a mosaic of the whole collection when there is
+                             no date
     _apply_derived_bands                  <- slope, aspect (KNOWN_DERIVED_BANDS)
     select(bands + derived bands)         <- derived bands only when no bands are set;
                                              all bands when neither is set
@@ -229,6 +233,8 @@ State cached on the adapter instance (`extract()` creates one instance per (data
 - Set on the first batch: the collection timestamp index (`_collection_time_starts`, `_collection_time_ends`)
   and the band names and count (`_cached_band_name(s)`, `_cached_band_count`).
   Both are loaded on the main thread before worker threads start.
+  A failed band-name request is not cached. In tabular mode, each point then asks again.
+  In raster mode, the tile-size check asks again and stops the run when that request also fails.
 
 All per-point worker threads share this state. The number of workers comes from the catalog entry's
 `max_workers`, or else from `defaults.yml`.

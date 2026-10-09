@@ -362,3 +362,277 @@ class TestSummarizeDateInfo:
         """Without date information on any point, there is no summary."""
         assert summarize_date_info([{"in_extent": True}, {"in_extent": False}]) is None
         assert summarize_date_info([]) is None
+
+
+# ------------------------------------------------------------------
+# Errors that affect every point stop the run
+# ------------------------------------------------------------------
+
+
+class _StubEarthEngineError(Exception):
+    """An error that only the stubs in this file raise, as a failed Earth Engine request."""
+
+
+class _StubImage:
+    """Stands in for an ``ee.Image``. Its band-name request fails ``failures`` times first."""
+
+    def __init__(self, band_names: list[str], failures: int = 0):
+        self._band_names = band_names
+        self._failures_left = failures
+        self.n_band_name_requests = 0
+
+    def bandNames(self) -> SimpleNamespace:
+        return SimpleNamespace(getInfo=self._request_band_names)
+
+    def _request_band_names(self) -> list[str]:
+        self.n_band_name_requests += 1
+        if self._failures_left > 0:
+            self._failures_left -= 1
+            raise _StubEarthEngineError("stub: band-name request failed")
+        return list(self._band_names)
+
+
+def _tile_export_adapter(**attributes) -> GeeRasterAdapter:
+    """Return an offline adapter for a two-band image asset at 10 m, ready for ``export_tiles``."""
+    adapter_attributes = {
+        "_dataset_spec": {"image": "users/test/image", "bands": ["B1", "B2"]},
+        "_static_image": _StubImage(["B1", "B2"]),
+        "_is_collection": False,
+        "_timestamps_loaded": True,
+        "_needs_per_point_date": False,
+        "_collection_time_starts": None,
+        "_collection_time_ends": None,
+        "scale": 10,
+        "max_workers": 2,
+    }
+    adapter_attributes.update(attributes)
+    return _make_offline_adapter(**adapter_attributes)
+
+
+def _record_tile_exports(adapter: GeeRasterAdapter) -> list[tuple[float, float]]:
+    """Replace the per-point tile export of ``adapter`` with a recorder.
+
+    Returns the list that records the ``(lat, lon)`` of each per-point export.
+    """
+    exported_points: list[tuple[float, float]] = []
+
+    def record_export(lat, lon, window_m, output_path, date=None, resample_m=None):
+        exported_points.append((lat, lon))
+        return output_path
+
+    adapter._export_single = record_export
+    return exported_points
+
+
+def _export_two_tiles(adapter: GeeRasterAdapter, output_dir, window_m: int, resample_m=None):
+    """Call ``export_tiles`` for two points near Uppsala, with the dataset name ``test_dataset``."""
+    return adapter.export_tiles(
+        [59.85, 59.86],
+        [17.63, 17.64],
+        window_m,
+        output_dir,
+        ids=["a", "b"],
+        dataset_name="test_dataset",
+        resample_m=resample_m,
+        disable_progress=True,
+    )
+
+
+class TestTileSizeCheck:
+    """``export_tiles`` checks the tile size once, before any per-point export."""
+
+    @pytest.mark.parametrize(
+        ("window_m", "resample_m", "scale_text"),
+        [
+            (50_000, None, "currently 10.0"),  # 5000 x 5000 pixels at the native 10 m
+            (2_000, 0.5, "currently 0.5"),  # 4000 x 4000 pixels at resample_m
+        ],
+    )
+    def test_oversized_request_stops_before_any_export(
+        self, tmp_path, window_m, resample_m, scale_text
+    ):
+        """An oversized tile request raises the size error, and no per-point export runs."""
+        adapter = _tile_export_adapter()
+        exported_points = _record_tile_exports(adapter)
+
+        with pytest.raises(ValueError, match="too large") as error_info:
+            _export_two_tiles(adapter, tmp_path, window_m, resample_m)
+
+        # The error uses the export scale (resample_m when set) and names the dataset.
+        assert scale_text in str(error_info.value)
+        assert "dataset 'test_dataset'" in str(error_info.value)
+        assert exported_points == []
+        assert list(tmp_path.rglob("*.tif")) == []
+
+    def test_tiles_within_the_limit_are_exported(self, tmp_path):
+        """A tile request within the limit runs one export for each point."""
+        adapter = _tile_export_adapter()
+        exported_points = _record_tile_exports(adapter)
+
+        paths, meta_list = _export_two_tiles(adapter, tmp_path, window_m=200)
+
+        assert sorted(exported_points) == [(59.85, 17.63), (59.86, 17.64)]
+        assert paths == [
+            tmp_path / "test_dataset" / "a-test_dataset.tif",
+            tmp_path / "test_dataset" / "b-test_dataset.tif",
+        ]
+        assert meta_list == [{}, {}]
+
+    def test_size_check_asks_again_after_a_failed_band_request(self, tmp_path):
+        """The size check retries a failed band-name request of the warm-up; the run continues."""
+        image = _StubImage(["B1", "B2"], failures=1)
+        adapter = _tile_export_adapter(
+            _dataset_spec={"image": "users/test/image"}, _static_image=image
+        )
+        exported_points = _record_tile_exports(adapter)
+
+        _export_two_tiles(adapter, tmp_path, window_m=200)
+
+        assert image.n_band_name_requests == 2
+        assert adapter._cached_band_count == 2
+        assert len(exported_points) == 2
+
+    def test_band_request_that_fails_again_stops_the_run(self, tmp_path):
+        """A band-name request that fails in the warm-up and in the size check stops the run."""
+        image = _StubImage(["B1", "B2"], failures=2)
+        adapter = _tile_export_adapter(
+            _dataset_spec={"image": "users/test/image"}, _static_image=image
+        )
+        exported_points = _record_tile_exports(adapter)
+
+        with pytest.raises(_StubEarthEngineError, match="stub: band-name request failed"):
+            _export_two_tiles(adapter, tmp_path, window_m=200)
+
+        assert image.n_band_name_requests == 2
+        assert exported_points == []
+
+
+class TestBandNameCache:
+    """``_get_band_name`` caches the band information only after a successful request."""
+
+    def test_failed_request_is_not_cached(self):
+        """A failed request raises and caches nothing. The next request succeeds and is cached."""
+        image = _StubImage(["B1", "B2"], failures=1)
+        adapter = _make_offline_adapter(_dataset_spec={"image": "users/test/image"})
+
+        with pytest.raises(_StubEarthEngineError, match="stub: band-name request failed"):
+            adapter._get_band_name(image)
+        for attribute_name in ("_cached_band_name", "_cached_band_names", "_cached_band_count"):
+            assert not hasattr(adapter, attribute_name)
+
+        assert adapter._get_band_name(image) == "B1"
+        assert adapter._cached_band_names == ["B1", "B2"]
+        assert adapter._cached_band_count == 2
+
+        # Later calls use the cache and send no request.
+        assert adapter._get_band_name(image) == "B1"
+        assert image.n_band_name_requests == 2
+
+
+class TestEnsureGeeInit:
+    """``_ensure_gee_init`` initializes Earth Engine only when it is not initialized."""
+
+    @pytest.fixture
+    def earth_engine_session(self, monkeypatch):
+        """Record initializations, session-pool patches, and network calls, in call order.
+
+        Earth Engine starts as not initialized. The stub ``init_gee`` initializes it.
+        """
+        session = SimpleNamespace(initialized=False, events=[])
+
+        def fake_init_gee(*args, **kwargs):
+            session.events.append("init_gee")
+            session.initialized = True
+
+        def record_pool_patch(pool_size):
+            session.events.append(f"patch_session_pool({pool_size})")
+
+        def record_network_call(*args, **kwargs):
+            session.events.append("network call")
+            raise AssertionError("An offline test made an Earth Engine network call.")
+
+        monkeypatch.setattr(ee.data, "is_initialized", lambda: session.initialized)
+        monkeypatch.setattr("envoi.auth.init_gee", fake_init_gee)
+        monkeypatch.setattr(_image, "_patch_ee_session_pool", record_pool_patch)
+        # The patch runs once per process: start each test as a new process.
+        monkeypatch.setattr(_image, "_session_pool_patched", False)
+        for function_name in ("getAlgorithms", "computeValue"):
+            monkeypatch.setattr(ee.data, function_name, record_network_call)
+        return session
+
+    def test_initialized_session_is_kept(self, earth_engine_session):
+        """With Earth Engine initialized: no request, no new initialization, and one pool patch."""
+        earth_engine_session.initialized = True
+
+        _image._ensure_gee_init()
+        _image._ensure_gee_init()
+
+        assert earth_engine_session.events == ["patch_session_pool(50)"]
+
+    def test_uninitialized_earth_engine_is_initialized_once(self, earth_engine_session):
+        """Without an initialized session, ``init_gee`` runs once, then the pool patch runs once."""
+        _image._ensure_gee_init()
+        _image._ensure_gee_init()
+
+        assert earth_engine_session.events == ["init_gee", "patch_session_pool(50)"]
+
+
+def _stub_failing_timestamp_request(monkeypatch, request_error: Exception) -> None:
+    """Replace ``ee`` in ``_image`` so the timestamp request raises ``request_error``."""
+
+    class FailingDictionary:
+        """Stands in for ``ee.Dictionary``. ``getInfo`` raises like a failed request."""
+
+        def __init__(self, values: dict):
+            self._values = values
+
+        def getInfo(self) -> dict:
+            raise request_error
+
+    def open_collection(collection_id):
+        return _StubImageCollection({"system:time_start": [], "system:time_end": []})
+
+    stub_ee = SimpleNamespace(ImageCollection=open_collection, Dictionary=FailingDictionary)
+    monkeypatch.setattr(_image, "ee", stub_ee)
+
+
+class TestCollectionTimeBoundsRequestFailure:
+    """A failed timestamp request stops the run. A collection without images does not."""
+
+    def test_failed_request_raises_runtime_error(self, monkeypatch):
+        """The error names the collection, includes the original error, and chains it."""
+        request_error = _StubEarthEngineError("stub: computation timed out")
+        _stub_failing_timestamp_request(monkeypatch, request_error)
+
+        with pytest.raises(RuntimeError, match="collection 'users/test/collection'") as error_info:
+            _get_collection_time_bounds("users/test/collection")
+
+        assert "stub: computation timed out" in str(error_info.value)
+        assert error_info.value.__cause__ is request_error
+
+    def test_collection_without_images_returns_no_index(self, monkeypatch):
+        """A collection with no images at the batch's points gives ``(None, None)`` and no error."""
+        _stub_collection_timestamps(monkeypatch, [], [])
+
+        assert _get_collection_time_bounds("users/test/collection") == (None, None)
+
+    def test_adapter_builds_no_fallback_after_a_failed_request(self, monkeypatch):
+        """The adapter lets the error propagate and does not use the static-mosaic fallback."""
+        request_error = _StubEarthEngineError("stub: computation timed out")
+        _stub_failing_timestamp_request(monkeypatch, request_error)
+        adapter = _make_offline_adapter(
+            _dataset_spec={"collection": "users/test/collection"},
+            _is_collection=True,
+            _timestamps_loaded=False,
+            _needs_per_point_date=True,
+            _static_image=None,
+            _collection_time_starts=None,
+            _collection_time_ends=None,
+        )
+
+        with pytest.raises(RuntimeError, match="stub: computation timed out"):
+            adapter._ensure_collection_timestamps()
+
+        assert adapter._needs_per_point_date is True
+        assert adapter._static_image is None
+        assert adapter._timestamps_loaded is False
