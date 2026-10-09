@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- With `input_crs` set, the reprojected `<lat>_wgs84` and `<lon>_wgs84` columns now come directly after the ID, latitude, longitude and (when present) date columns in both the statistics table and the QC table. Before, they were the last columns. The statistics table also no longer contains the `lat_original` and `lon_original` columns, which were internal copies of your latitude and longitude columns. If a script reads those two columns, read your own latitude and longitude columns instead: they hold the same input-CRS coordinates. If a script selects columns by position, select them by name.
+
+### Fixed
+- Per-class columns of categorical datasets with named bands, such as `lulc_naturallands_2020_classification_class_10_count_200m`, are now `0` (count) or `0.0` (fraction) for points whose window did not contain that class, as other class columns already were. Before, these cells were empty, so an absent class looked like missing data. This affected Earth Engine runs that extract more than one band of a categorical dataset; single-band runs and local rasters were already correct.
+
 ## [0.2.2] — 2026-08-28
 
 ### Added

@@ -155,6 +155,61 @@ class TestTabular:
             result["decimalLongitude_wgs84"], sample_df["decimalLongitude"], atol=1e-6
         )
 
+    def test_input_crs_wgs84_columns_follow_core_columns(self, sample_df, tmp_path):
+        """With input_crs, *_wgs84 columns follow the core columns in both output tables."""
+        from pyproj import Transformer
+
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+        easting, northing = to_utm.transform(
+            sample_df["decimalLongitude"].values, sample_df["decimalLatitude"].values
+        )
+        projected_df = sample_df.copy()
+        projected_df["decimalLongitude"] = easting
+        projected_df["decimalLatitude"] = northing
+
+        outputs = extract(
+            projected_df,
+            {
+                "batch_id": "crs_order",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+            input_crs="EPSG:32634",
+        )
+        stats_df = pd.read_csv(outputs["crs_order"])
+        qc_df = pd.read_csv(tmp_path / "crs_order_qc.csv")
+
+        core_and_wgs84_columns = [
+            "occurrenceID",
+            "decimalLatitude",
+            "decimalLongitude",
+            "eventDate",
+            "decimalLatitude_wgs84",
+            "decimalLongitude_wgs84",
+        ]
+        # The extra input column (n_otu) and the statistics follow the
+        # WGS84 columns in the statistics table.
+        assert list(stats_df.columns) == core_and_wgs84_columns + [
+            "n_otu",
+            "dem_local_mean_100m",
+        ]
+        assert list(qc_df.columns) == core_and_wgs84_columns + [
+            "dem_local_in_extent_100m",
+            "dem_local_n_pixels_100m",
+            "dem_local_had_nodata_100m",
+            "dem_local_coverage_pct_100m",
+            "dem_local_region_crs_100m",
+        ]
+        # The internal copies of the input coordinates are in neither table.
+        for output_df in (stats_df, qc_df):
+            assert "lat_original" not in output_df.columns
+            assert "lon_original" not in output_df.columns
+
     def test_no_input_crs_has_no_wgs84_columns(self, sample_df, tmp_path):
         """Without input_crs (coordinates already WGS84), no *_wgs84 columns
         are added — the output is unchanged from the default behaviour."""
@@ -1790,6 +1845,26 @@ class TestAppendStatColumnsClassFill:
         assert result["lulc_b1_class_20_count_200m"].tolist() == [0, 3]
         # b2_class_10 only appears in row 0; row 1 is zero-filled.
         assert result["lulc_b2_class_10_count_200m"].tolist() == [4, 0]
+
+    def test_named_band_class_columns_filled(self):
+        """Class keys with a named band prefix are zero-filled for rows without that class."""
+        from envoi._output_assembly import _append_stat_columns
+
+        # Earth Engine prefixes class keys with the real band name
+        # ("classification"), not with a generic "b{n}" index.
+        df = pd.DataFrame({"id": ["a", "b"]})
+        stats_results = [
+            ({"classification_class_10_count": 5, "classification_class_10_fraction": 0.25}, {}),
+            ({"classification_class_12_count": 20, "classification_class_12_fraction": 1.0}, {}),
+        ]
+        result = _append_stat_columns(
+            df, "lulc_naturallands_2020", window_size_m=200, stats_results=stats_results
+        )
+        prefix = "lulc_naturallands_2020_classification"
+        assert result[f"{prefix}_class_10_count_200m"].tolist() == [5, 0]
+        assert result[f"{prefix}_class_12_count_200m"].tolist() == [0, 20]
+        assert result[f"{prefix}_class_10_fraction_200m"].tolist() == [0.25, 0.0]
+        assert result[f"{prefix}_class_12_fraction_200m"].tolist() == [0.0, 1.0]
 
 
 # ------------------------------------------------------------------
