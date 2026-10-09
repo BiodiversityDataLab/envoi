@@ -73,7 +73,8 @@ Do not run large extractions unless the user asks.
 - `src/envoi/_filenames.py`: portable output filename construction.
 - `src/envoi/_output_assembly.py` and `metadata.py`: tabular outputs and metadata.
 - `src/envoi/configs/`: bundled dataset catalog and default settings.
-- `src/envoi_webapp/`: Streamlit interface.
+- `src/envoi_webapp/`: Streamlit interface and its job runner (`jobs.py`, `worker.py`), which runs each extraction in a separate worker process.
+- `deploy/serve/`: container image of the hosted web app for SciLifeLab Serve.
 - `tests/`: automated tests and shared fixtures.
 - `examples/`: example configurations and notebook walkthrough.
 - `docs/`: architecture, advanced usage, coding guidelines, and generated dataset reference.

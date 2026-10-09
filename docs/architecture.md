@@ -1,7 +1,8 @@
 # Architecture Overview
 
 This document describes how envoi is put together: which module owns what, how data flows
-through `extract()`, the adapter interface, and how the Earth Engine adapter builds an image.
+through `extract()`, the adapter interface, how the Earth Engine adapter builds an image,
+and how the web app runs extraction jobs.
 For coding conventions, see `docs/coding_guidelines.md`. For user-facing output details
 (column names, return values), see `README.md` and `docs/advanced_usage.md`.
 Update this document when you add a module or change the adapter interface.
@@ -147,10 +148,14 @@ Update this document when you add a module or change the adapter interface.
 | `reducers.py` | Python-side reducer registry (mean, median, min, max, sum, std, var, count, mode, class_count, class_fraction, q05..q95), used by the local adapter. Also `list_reducers()` (public) and `validate_reducers()`, which warns about reducer / `data_type` mismatches such as `mean` on a categorical raster. `point` is not in the registry; the adapters handle it. |
 | `qc.py` | Builds per-dataset QC columns from the adapters' meta dicts (core flags, plus date, CRS, and per-band coverage where available), warns when points fall below `min_coverage_pct`, and splits the merged DataFrame into the stats and QC tables. |
 | `metadata.py` | Writes the sidecar JSON (`run` / `config` / `datasets` / optional `warnings`) and provides the summaries that adapters put into it (`summarize_date_info`, `summarize_tile_export`). |
-| `auth.py` | `init_gee()`: initializes Earth Engine from a service-account JSON, found through `ENVOI_EE_CREDENTIALS`, the user config directory, or `./credentials/` (see `README.md`). |
+| `auth.py` | `init_gee()`: initializes Earth Engine from a service-account JSON key. The key is a file, found through `ENVOI_EE_CREDENTIALS`, the user config directory, or `./credentials/` (see `README.md`), or the key content given as `credentials_json`. With `credentials_json`, there is no file lookup, and an invalid key gives a fixed `ValueError` without a chained exception, because the error of the key parser can contain the key. |
 | `_version.py` | `__version__`. Change it only as part of a release. |
-| `envoi_webapp/app.py` | Streamlit interface, started with `envoi-webapp`. |
-| `envoi_webapp/helpers.py` | Web-app logic without Streamlit: CSV validation, run-config building, temporary credential handling, and the call to `envoi.extract`. Reuses `_validate_sample_ids` and the reducer sets from `reducers.py`. |
+| `envoi_webapp/app.py` | Streamlit interface, started with `envoi-webapp` (local mode) or by `deploy/serve/app.py` in the container image (hosted mode). Validates the form, applies the hosted upload and form limits, submits jobs to the `JobManager`, and shows the progress, "Cancel", and the result. Never calls `ee.Initialize()`. See "Web-app execution model". |
+| `envoi_webapp/helpers.py` | Web-app logic without Streamlit: CSV validation, run-config building (one run config for each data-product row, with that row's output type), service-account key validation, and `redact_credential_secrets()`. Reuses `_validate_sample_ids` and the reducer sets from `reducers.py`. |
+| `envoi_webapp/settings.py` | Reads `ENVOI_WEBAPP_MODE`, `ENVOI_WEBAPP_WORKSPACE`, and `ENVOI_WEBAPP_MAX_JOBS` into `WebappSettings`. `HostedLimits` holds the hosted limits. `check_upload()` and `check_hosted_limits()` check an upload before the parse and a form before a job. |
+| `envoi_webapp/jobs.py` | `JobManager`, one for each server process (`get_job_manager()`): job admission and limits, job workspaces, one worker process for each job, the message channel, "Cancel", the hosted housekeeping thread, and workspace deletion. Keeps only a hash of each key (`key_hash()`). |
+| `envoi_webapp/worker.py` | The worker process (`python -m envoi_webapp.worker`): reads the job request from stdin, calls `init_gee(credentials_json=...)` and `extract()`, writes the run log, makes the ZIP archive in hosted mode, and sends JSON-line messages. Removes key material from stderr, the run log, and error messages. |
+| `envoi_webapp/job_protocol.py` | The data that crosses the process boundary: `JobRequest`, the `progress` / `done` / `error` messages (`encode_message()`, `parse_message()`), `JobState`, and `JobSnapshot`. |
 
 ## Adapter interface
 
@@ -223,3 +228,58 @@ State cached on the adapter instance (`extract()` creates one instance per (data
 
 All per-point worker threads share this state. The number of workers comes from the catalog entry's
 `max_workers`, or else from `defaults.yml`.
+
+## Web-app execution model
+
+The web app (`src/envoi_webapp/`) never runs an extraction in the Streamlit server process.
+`earthengine-api` keeps its credentials in one module-global state object, and `ee.Initialize()` replaces them for all threads of the process.
+Only a process boundary keeps the keys of two users apart. The web app therefore runs each extraction job in its own worker process,
+which initializes Earth Engine with the key of that job only. The server process never calls `ee.Initialize()`, in either mode.
+
+```
+Streamlit server process (one for each app; never calls ee.Initialize())
+  session A --+                        +-- worker process A: init_gee(key A) -> extract() -> run log (-> ZIP)
+  session B --+-- JobManager ----------+-- worker process B: init_gee(key B) -> extract() -> run log (-> ZIP)
+              |   (one for each        |
+              |    server process)     +-- stdin:  pickled JobRequest with the key, then closed
+              |                            stdout: JSON lines (progress, then done or error)
+              |                            stderr: redacted, at most 1 MB, in the job workspace
+              +-- housekeeping thread (hosted mode, every 5 s): run time, workspace size,
+                  abandon time-out, retention
+```
+
+- **Session.** `render_app()` runs top to bottom on each rerun. A session keeps only its job ID and a random session token in `st.session_state`.
+  `jobs.get_job_manager()` gives every session the same `JobManager`, so a job outlives a rerun.
+  It keeps the manager in a module-level variable under a lock, not in the Streamlit resource cache:
+  any browser client can clear that cache for all users, and a new manager would start the hosted limits again from zero.
+- **Start.** `JobManager.submit()` checks the limits and reserves a slot under one lock. Then it creates a job workspace with a random name (128 bits, mode `0o700`)
+  and starts `python -m envoi_webapp.worker` with `subprocess.Popen`. The command line and the environment hold no key.
+  The worker environment has no `ENVOI_EE_CREDENTIALS` or `GOOGLE_APPLICATION_CREDENTIALS`, and it has `PYTHONSAFEPATH=1`
+  (`python -m` would otherwise import modules from the working folder). The working folder is the job workspace.
+- **Message channel.** One channel thread for each job writes the pickled `JobRequest` to the worker's stdin, closes stdin, and drops the bytes.
+  The manager then keeps only a SHA-256 hash of the key (`key_hash()`), for the limit of one job for each key and for `cancel_for_key()`.
+  The worker answers on a copy of its original stdout, with one JSON object per line (`job_protocol.py`).
+  It points file descriptor 1 and `sys.stdout` to stderr, so a `print()` cannot write to the channel.
+- **Key material.** The worker removes key material with `redact_credential_secrets()` from stderr, the run log, and the `error` message.
+  An uncaught exception writes one redacted line, never a traceback. The worker disables core files.
+- **Status.** While a job runs, a Streamlit fragment calls `JobManager.snapshot()` every 2 seconds. Each call is the job's heartbeat for the abandon time-out.
+  When the job has a final state, the fragment reruns the whole page, which then shows the result.
+- **States.** A job is `running`, then gets one final state: `succeeded`, `failed`, `cancelled` (by the user), or `stopped` (by a limit). The first final state wins.
+  "Cancel" and the housekeeping thread set the state first, then stop the process (`terminate()`, and `kill()` after 5 seconds).
+- **Run log.** The worker writes `envoi-run-log-<UTC start time>.txt` into the output folder: the `WARNING` and higher records of the `envoi` logger,
+  and the Python warnings from envoi source files. It is a web-app file. `extract()` does not write it, so the output contract of `extract()` does not change.
+
+Both modes use the same worker and the same job manager. `ENVOI_WEBAPP_MODE` selects the mode.
+
+| | Local mode (default, `envoi-webapp`) | Hosted mode (`ENVOI_WEBAPP_MODE=hosted`, Linux and macOS only) |
+|---|---|---|
+| Output folder | The folder that the user selects. | `<workspace>/outputs/`. The worker then moves the files into a ZIP archive in the workspace, which the user downloads. |
+| Workspace root | A new folder `envoi-webapp-jobs-<random>` (mode `0o700`) for each server process, so that other users of the computer cannot change it. | The fixed folder `envoi-webapp-jobs`. On POSIX, the manager refuses it when it is a symbolic link, belongs to another user, or gives permissions to the group or to others. |
+| Worker `HOME` and temporary folder (`TMPDIR`, `TEMP`, `TMP`, `CPL_TMPDIR`) | Unchanged, so that user installations of pip packages stay importable. | The job workspace. Temporary files of libraries then count toward the workspace size limit and are deleted with the workspace. |
+| Limits | One running job for each session. | `HostedLimits` in `settings.py`: upload, form, run time, workspace size, concurrent jobs (`ENVOI_WEBAPP_MAX_JOBS`), one job for each key, disk budget, and abandon time-out. |
+| Workspace deletion | When the job ends. The workspace holds only a marker file and the worker's stderr file. Files in the user's folder are never deleted. | Failed, cancelled, or stopped job: when the job ends (no partial results). Succeeded job: at the earliest of 10 minutes after the first download click, 30 minutes after the job ended, a new job of the same session, and "Clear results". When the job manager starts: the workspaces that an earlier server process left. |
+
+`ENVOI_WEBAPP_WORKSPACE` sets the parent folder of the workspace root (default: the system temporary folder).
+The manager deletes a workspace only after its worker process has exited.
+Job state is in memory only. A restart of the server process ends all jobs and loses their results.
+The container image in `deploy/serve/` starts the app in hosted mode (see `CONTRIBUTING.md`).
