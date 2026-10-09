@@ -12,8 +12,9 @@
 
 # python:3.12-slim (Debian, Python 3.12.15), pinned by the digest of its
 # multi-platform index (Docker Hub, pushed 2026-10-06). The rasterio and pyproj
-# wheels contain their own GDAL and PROJ, so the image needs no system
-# libraries. Update the digest together with deploy/serve/requirements.txt.
+# wheels contain their own GDAL and PROJ. Their only system library that the
+# slim image lacks is libexpat (installed below). Update the digest together
+# with deploy/serve/requirements.txt.
 FROM python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
 
 LABEL org.opencontainers.image.source="https://github.com/BiodiversityDataLab/envoi" \
@@ -23,6 +24,15 @@ LABEL org.opencontainers.image.source="https://github.com/BiodiversityDataLab/en
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# The GDAL library inside the rasterio wheel loads libexpat.so.1, and the slim
+# image does not have it. Without it, "import rasterio" fails, and the app
+# fails at the first page view (the smoke check found this on 2026-10-09).
+# The other system libraries of the pinned wheels (libc, libgcc, libstdc++,
+# zlib) are in the base image.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
 
 # The pinned dependencies first, so that a change in the source does not
 # repeat this slow step. --no-deps installs exactly the pinned list. The
