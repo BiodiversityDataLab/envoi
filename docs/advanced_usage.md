@@ -43,13 +43,13 @@ outputs = extract(sample_points, [
 ])
 ```
 
-Each entry produces its own output file (or its own folder of raster tiles) and its own JSON metadata sidecar, keyed by `batch_id`. The input DataFrame, the CRS validation step, the date-parsing pass, and (for Earth Engine) the authenticated session are shared across all entries — running a batched list is cheaper than calling `extract()` once per output and avoids per-call startup overhead.
+Each entry produces its own output file (or its own folder of raster tiles) and its own JSON metadata sidecar, keyed by `batch_id`. So every entry needs a different `batch_id`. An entry without `batch_id` gets the name `output<N>`, where N is its position in the list (starting at 1). `extract()` checks every entry before it starts the first one, and stops with an error if two entries have the same `batch_id` or if any entry has an invalid setting. The input DataFrame, the CRS validation step, the date-parsing pass, and (for Earth Engine) the authenticated session are shared across all entries — running a batched list is cheaper than calling `extract()` once per output and avoids per-call startup overhead.
 
 The `outputs` dict returned by `extract()` keys results by `batch_id` for tabular runs (`outputs["terrain_stats"]`) and by `<batch_id>:<dataset>` for raster runs (`outputs["terrain_tiles:dem_copernicus_glo30"]`), so downstream code can pick up either by name without scanning the filesystem.
 
 ## Date-aware extraction
 
-Time-varying Earth Engine ImageCollections (climate reanalyses, satellite vegetation indices, monthly aggregates) only make sense when each point is paired with a date. envoi reads this from the input DataFrame's `eventDate` column whenever it exists, and silently skips the date branch when it doesn't — there's no need to declare upfront whether your run is time-aware.
+Time-varying Earth Engine ImageCollections (climate reanalyses, satellite vegetation indices, monthly aggregates) only make sense when each point is paired with a date. envoi reads this from the input DataFrame's `eventDate` column whenever it exists, and silently skips the date branch when it doesn't — there's no need to declare upfront whether your run is time-aware. If your dates are in a column with another name, pass that name with `date_column=`. envoi does not read a column named `date` unless you pass `date_column="date"`.
 
 ```python
 sample_points = pd.DataFrame({

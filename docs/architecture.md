@@ -75,17 +75,24 @@ Update this document when you add a module or change the adapter interface.
            |     missing (reported under the names the user supplied).
            |  2. Rename user columns to the canonical id/lat/lon/date for the rest of
            |     the pipeline. They are renamed back before output.
+           |     The same rename gives each unmapped input column that has a working-
+           |     column name (id, lat, lon, date, lat_original, lon_original) a
+           |     temporary name from _build_reserved_column_renames(). The output
+           |     tables restore its name.
            |  3. load_defaults() reads configs/defaults.yml (cached per process).
            |  4. _parse_and_validate_dates(): drop rows without a date (with a warning),
            |     accept ISO 8601 intervals, times, time zones, year-only and year-month
            |     values, and reduce each to YYYY-MM-DD.
-           |     _validate_and_reproject_crs(): reproject from input_crs to WGS84 and
+           |     _validate_and_reproject_crs(): reject missing, non-numeric, and
+           |     infinite coordinates, reproject from input_crs to WGS84, and
            |     reject coordinates outside ±90° / ±180°.
            |  5. load_catalogs() merges the built-in catalog with datasets registered
            |     through update_catalog(). User entries override built-in entries.
            |  6. _as_config_list() turns the config into a list of run configs.
-           |  7. For each run config: _parse_run_config() builds a RunSettings.
-           |     Raster mode then runs _validate_sample_ids(), before any adapter exists.
+           |     _parse_run_configs() builds a RunSettings for every run config, and
+           |     rejects duplicate batch_id values, before the first adapter exists.
+           |  7. For each RunSettings: raster mode runs _validate_sample_ids(), before
+           |     the adapters of that run config exist.
            |  8. For each (dataset, window_size) pair:
            |
            +---> [tabular] _process_dataset_tabular()
@@ -128,9 +135,9 @@ Update this document when you add a module or change the adapter interface.
 | Module | Role |
 |---|---|
 | `__init__.py` | The public API (`__all__`): `extract`, `update_catalog`, `list_datasets`, `reset_catalog`, `list_reducers`, `catalog_markdown`, `init_gee`, `CatalogError`, `ProgressEvent`, `__version__`. |
-| `extract.py` | Orchestrator. Renames user columns to canonical names, delegates input validation, parses each run config into `RunSettings`, loops over (dataset, window) pairs, dispatches to the mode helpers (`_process_dataset_tabular`, `_process_dataset_raster`), writes the tile manifest, and assembles the stats and QC tables and the metadata sidecar. Wraps adapter progress updates into public `ProgressEvent`s. |
-| `_input_validation.py` | Validates the input DataFrame: required id/lat/lon columns, sample IDs for raster mode (`_validate_sample_ids`, also used by the web app), GBIF / ISO 8601 date parsing, and CRS reprojection to WGS84 with a coordinate range check. Returns warnings that the orchestrator records in the metadata sidecar. |
-| `_config_parsing.py` | Run-config validation. Defines `RunSettings`, normalizes a dict / list / YAML path into a list of run configs (`_as_config_list`), parses one raw dict into `RunSettings` (`_parse_run_config`), and resolves the reducer list for a dataset's `data_type` (`_resolve_stats_for_dataset`). Expands the dataset-entry shorthand (string / `{name: [bands]}` / `{name: {bands: [...]}}`), rejects unsafe `batch_id` values, and rejects derived bands for local datasets. |
+| `extract.py` | Orchestrator. Renames user columns to canonical names, delegates input validation, parses every run config into `RunSettings` before the first adapter is built, loops over (dataset, window) pairs, dispatches to the mode helpers (`_process_dataset_tabular`, `_process_dataset_raster`), writes the tile manifest, and assembles the stats and QC tables and the metadata sidecar. Wraps adapter progress updates into public `ProgressEvent`s. |
+| `_input_validation.py` | Validates the input DataFrame: required id/lat/lon columns, temporary names for unmapped columns that have a working-column name (`_build_reserved_column_renames`), sample IDs for raster mode (`_validate_sample_ids`, also used by the web app), GBIF / ISO 8601 date parsing, and coordinates: missing, non-numeric, and infinite values are rejected, then CRS reprojection to WGS84 with a coordinate range check. Returns warnings that the orchestrator records in the metadata sidecar. |
+| `_config_parsing.py` | Run-config validation. Defines `RunSettings`, normalizes a dict / list / YAML path into a list of run configs (`_as_config_list`), parses one raw dict into `RunSettings` (`_parse_run_config`), parses all run configs of a call and rejects duplicate `batch_id` values (`_parse_run_configs`), and resolves the reducer list for a dataset's `data_type` (`_resolve_stats_for_dataset`). Expands the dataset-entry shorthand (string / `{name: [bands]}` / `{name: {bands: [...]}}`), rejects unsafe `batch_id` values, and rejects derived bands for local datasets. |
 | `_output_assembly.py` | Tabular-output post-processing. Turns per-point `(stats_dict, meta_dict)` results into named columns (including the per-class `class_count` / `class_fraction` expansion), rounds stat columns, restores the user's column names, records the bands each dataset actually used for the sidecar, and writes the CSV / Parquet file. |
 | `_filenames.py` | Portable output names. `build_tile_filenames` and `sanitize_filename_component` turn sample IDs into names that use only `[A-Za-z0-9._-]`, adding a hash suffix to rewritten IDs. `is_safe_path_component` rejects unsafe `batch_id` values and dataset keys. Both adapters use it, so tiles are named identically. |
 | `catalog.py` | Loads and validates catalog YAMLs (built-in `ee_catalog.yml` and datasets registered through `update_catalog()`), caches `defaults.yml`, exposes `list_datasets()` / `reset_catalog()`, and auto-detects CRS, resolution, nodata, and band count for local rasters through rasterio. Earth Engine asset inspection happens in the GEE adapter, not here. |

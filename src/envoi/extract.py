@@ -9,10 +9,11 @@ import pandas as pd
 from ._config_parsing import (
     RunSettings,
     _as_config_list,
-    _parse_run_config,
+    _parse_run_configs,
     _resolve_stats_for_dataset,
 )
 from ._input_validation import (
+    _build_reserved_column_renames,
     _parse_and_validate_dates,
     _validate_and_reproject_crs,
     _validate_required_columns,
@@ -102,7 +103,7 @@ def extract(
     following structure::
 
         {
-            "batch_id": "terrain",          # used as the output file stem
+            "batch_id": "terrain",          # output file stem; unique within a list
             "datasets": ["dem_copernicus_glo30"],  # one or more dataset names from the catalog
             "settings": {
                 "output_type": "tabular",   # "tabular" or "raster"
@@ -140,7 +141,12 @@ def extract(
         by default, following the GBIF / Darwin Core convention — override the
         names with the ``*_column`` parameters below). An optional date column
         (``eventDate``, YYYY-MM-DD strings) enables nearest-date image selection
-        for time-varying datasets.
+        for time-varying datasets. Every latitude and longitude must be a
+        finite number (text that holds a number is converted); a missing,
+        non-numeric, or infinite value raises ``ValueError``. Other columns
+        appear in the statistics table. An unmapped column named ``id``,
+        ``lat``, ``lon``, ``date``, ``lat_original``, or ``lon_original`` keeps
+        its name there and is not used by envoi.
     config : str, Path, dict, or list
         Output specification — see above. A path string or ``Path`` is loaded as
         YAML before processing.
@@ -168,8 +174,9 @@ def extract(
         Name of the optional input column containing per-row dates.
         Defaults to ``"eventDate"`` (GBIF / Darwin Core). If absent from
         ``df`` the date branch is simply skipped — the extractor never
-        errors on a missing date column. The output tables will use the
-        same name.
+        errors on a missing date column. A column with another name, such
+        as ``date``, is not used as the date column. The output tables will
+        use the same name.
     write_metadata : bool, optional
         Whether to write the auxiliary files alongside the main output(s).
         When ``True`` (the default), the JSON metadata sidecar is written for
@@ -218,6 +225,17 @@ def extract(
         date_column: "date",
     }
     _validate_required_columns(df, id_column, latitude_column, longitude_column)
+
+    # An unmapped input column can have the name of a working column, for
+    # example the "id" column of a Darwin Core file, or a "date" column when
+    # date_column names another column. Give such a column a temporary name in
+    # the same rename. Without this, the rename gives two columns the same name,
+    # or envoi reads the column as its own (an unmapped "date" column would
+    # become the sample date). _restore_user_column_names gives the column its
+    # original name again in the output tables.
+    column_name_map.update(
+        _build_reserved_column_renames(df.columns, mapped_columns=column_name_map.keys())
+    )
     df = df.rename(columns=column_name_map)
 
     # Load project-wide defaults from the bundled configs/defaults.yml once per call.
@@ -229,7 +247,13 @@ def extract(
     # missing or unparseable date column quote the name the caller actually
     # has in their DataFrame, not the canonical internal "date".
     df, dates, date_warnings = _parse_and_validate_dates(df, date_column_name=date_column)
-    df, crs_warnings = _validate_and_reproject_crs(df, input_crs)
+    df, crs_warnings = _validate_and_reproject_crs(
+        df,
+        input_crs,
+        id_column=id_column,
+        latitude_column=latitude_column,
+        longitude_column=longitude_column,
+    )
 
     # Merge the built-in catalogs with any datasets registered via update_catalog().
     # The user catalog is always applied last, so user entries override built-ins.
@@ -246,7 +270,14 @@ def extract(
     # {batch_id: df} dict the caller would have to index into.
     single_config = len(output_configs) == 1 and not isinstance(config, list)
 
-    for idx, run_config in enumerate(output_configs):
+    # Parse and validate the settings of every run config before the first
+    # adapter is built. ValueError is raised for any missing or invalid setting,
+    # and for two run configs with the same batch_id. An error in a later run
+    # config then stops the call before earlier outputs are written or any
+    # Earth Engine quota is used.
+    all_run_settings = _parse_run_configs(output_configs, defaults, catalog_datasets)
+
+    for run_settings in all_run_settings:
         df_copy = df.copy()
 
         # Per-dataset metadata accumulator. Each adapter builds its own entry
@@ -254,9 +285,6 @@ def extract(
         dataset_metas: dict[str, Any] = {}
         warnings_backlog: dict[str, str] = {}
 
-        # Parse and validate all settings from this run's config dict.
-        # ValueError is raised for any missing or invalid setting
-        run_settings = _parse_run_config(run_config, defaults, idx, catalog_datasets)
         batch_id = run_settings.batch_id
         datasets = run_settings.datasets
         output_type = run_settings.output_type
@@ -448,7 +476,6 @@ def extract(
                 write_metadata_sidecar(
                     output_dir,
                     batch_id,
-                    output_type=output_type,
                     n_points=len(df_copy),
                     datasets=dataset_metas,
                     config={
@@ -470,7 +497,6 @@ def extract(
                 write_metadata_sidecar(
                     Path(output_dir) / batch_id,
                     batch_id,
-                    output_type=output_type,
                     n_points=len(df_copy),
                     datasets=dataset_metas,
                     config={

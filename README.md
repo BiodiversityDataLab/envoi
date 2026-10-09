@@ -264,6 +264,8 @@ The machine-readable source, including descriptions, citations, and URLs for eve
 ### Notes
 
 - **Input CRS.** Coordinates in the input DataFrame are assumed to be in **WGS84 (EPSG:4326)**. If yours are in a different CRS, pass `input_crs="EPSG:XXXX"` to `extract()` and envoi reprojects them to WGS84 before extraction.
+- **Coordinates must be numbers.** Every row needs a finite number in the latitude and longitude columns. Text that holds a number, such as `"59.85"`, is accepted. If a value is missing, is other text, or is infinite, `extract()` stops before any extraction with an error that lists the IDs of those rows. Correct or remove those rows first.
+- **Other input columns.** Columns that are not your ID, coordinate, or date columns appear in the statistics table. A column named `id`, `lat`, `lon`, `date`, `lat_original`, or `lon_original` keeps its name there, but envoi does not use it. For example, a `date` column is not the sample date unless you pass `date_column="date"`.
 - **Window units.** `window_size_m` is in meters. Each window is projected into the point's local UTM zone so distances are correct globally.
 - **Data source CRS and resolution.** Both are detected automatically from each dataset — no manual configuration needed.
 - **QC, not failure.** Low pixel coverage is flagged in QC columns rather than raising. Filter on `<dataset>_coverage_pct_<window>m` to drop unreliable rows downstream.

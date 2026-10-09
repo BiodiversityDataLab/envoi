@@ -57,8 +57,10 @@ def _restore_user_column_names(
     """Rename canonical core columns back to the user's original names.
 
     `column_name_map` maps user names → canonical names (e.g. "sample_id" →
-    "id"). We invert it to rename the output back so the user's chosen names
-    round-trip through extract().
+    "id"). It also maps each unmapped input column that has a working-column
+    name to its temporary name (e.g. "id" → "_envoi_input_id", see
+    ``_build_reserved_column_renames``). We invert it to rename the output back
+    so the user's column names round-trip through extract().
     """
     output_rename = {
         canonical: user for user, canonical in column_name_map.items() if user != canonical

@@ -1,20 +1,23 @@
 # src/envoi/_input_validation.py
 """Input-DataFrame validation for :func:`envoi.extract`.
 
-Four concerns, separately invokable:
+Five concerns, separately invokable:
 
 * :func:`_validate_required_columns` — fail fast with an actionable message
   when id / latitude / longitude columns are missing under whichever names
   the user supplied.
+* :func:`_build_reserved_column_renames` — give temporary names to unmapped
+  input columns that have the name of a working column (``id``, ``lat``, ...),
+  so they cannot collide with the columns extract() uses internally.
 * :func:`_validate_sample_ids` — reject blank or duplicated sample IDs before
   raster mode tries to name one output file per point with them.
 * :func:`_parse_and_validate_dates` — accept GBIF / Darwin Core ISO 8601
   flexibility (intervals, time-of-day, timezone suffixes, year-only, year-month)
   and collapse each entry to a YYYY-MM-DD day. Drops rows whose date is null;
   records per-batch warnings instead of raising.
-* :func:`_validate_and_reproject_crs` — reproject to WGS84 when the user
-  declared a non-WGS84 input CRS; raise if any coordinate then sits outside
-  ±90° / ±180°.
+* :func:`_validate_and_reproject_crs` — reject missing, non-numeric, and
+  infinite coordinates; reproject to WGS84 when the user declared a non-WGS84
+  input CRS; raise if any coordinate then sits outside ±90° / ±180°.
 
 Each helper returns the warnings it generated so :func:`extract` can record
 them in the metadata sidecar alongside its main run config.
@@ -23,11 +26,24 @@ them in the metadata sidecar alongside its main run config.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Hashable, Iterable
 
+import numpy as np
 import pandas as pd
 from pyproj import Transformer
 
 from ._filenames import format_id_list
+
+# Column names that extract() uses in its working table: the user's mapped id,
+# latitude, longitude, and date columns are renamed to "id", "lat", "lon", and
+# "date", and _validate_and_reproject_crs adds "lat_original" and
+# "lon_original". An unmapped input column with one of these names would give
+# two columns with the same name, or envoi would read it as its own column
+# (for example, an unmapped "date" column would become the sample date).
+_WORKING_COLUMN_NAMES = frozenset({"id", "lat", "lon", "date", "lat_original", "lon_original"})
+
+# Number of example IDs that a coordinate error message lists.
+_MAX_IDS_IN_MESSAGE = 10
 
 
 def _validate_required_columns(
@@ -51,6 +67,47 @@ def _validate_required_columns(
             f"(and optionally a date column).\n"
             f"Found columns: {sorted(df.columns.tolist())}"
         )
+
+
+def _build_reserved_column_renames(
+    input_columns: Iterable[Hashable],
+    mapped_columns: Iterable[str],
+) -> dict[Hashable, str]:
+    """Return temporary names for unmapped input columns that have a working-column name.
+
+    ``extract()`` renames the user's id, latitude, longitude, and date columns to
+    ``id``, ``lat``, ``lon``, and ``date``, and can add ``lat_original`` and
+    ``lon_original`` (see ``_WORKING_COLUMN_NAMES``). An unmapped input column
+    with one of these names, such as the ``id`` column of a Darwin Core file,
+    must get a different name before that rename. ``extract()`` adds the returned
+    mapping to its column rename, so ``_restore_user_column_names`` gives the
+    column its original name again in the output tables.
+
+    Args:
+        input_columns: Column names of the input dataframe.
+        mapped_columns: The user's id, latitude, longitude, and date column
+            names. These columns become working columns, so they are not moved.
+
+    Returns:
+        A mapping from each colliding input column name to a temporary name
+        that is not an input column name and not a working column name.
+        The mapping is empty when no input column collides.
+    """
+    mapped_column_set = set(mapped_columns)
+    taken_names = set(input_columns) | _WORKING_COLUMN_NAMES
+    temporary_names: dict[Hashable, str] = {}
+    for column in input_columns:
+        if column not in _WORKING_COLUMN_NAMES or column in mapped_column_set:
+            continue
+        # Add a number when the input already has a column with the temporary name.
+        temporary_name = f"_envoi_input_{column}"
+        number = 1
+        while temporary_name in taken_names:
+            number += 1
+            temporary_name = f"_envoi_input_{column}_{number}"
+        taken_names.add(temporary_name)
+        temporary_names[column] = temporary_name
+    return temporary_names
 
 
 def _validate_sample_ids(
@@ -221,15 +278,64 @@ def _parse_and_validate_dates(
 
 
 def _validate_and_reproject_crs(
-    df: pd.DataFrame, input_crs: str | None
+    df: pd.DataFrame,
+    input_crs: str | None,
+    *,
+    id_column: str,
+    latitude_column: str,
+    longitude_column: str,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Reproject coordinates to WGS84 if needed, and raise if any lat/lon are out of range.
+    """Check the coordinates, reproject them to WGS84 if needed, and check their range.
 
-    Returns a tuple of (df, crs_warnings) where crs_warnings is a list of messages
-    about CRS handling (e.g. a reprojection notice) that the caller can record in
-    the output metadata alongside the warnings_backlog.
+    Expects the canonical ``id``, ``lat``, and ``lon`` columns. Changes ``df`` in
+    place: ``lat`` and ``lon`` become numeric (text that holds a number, such as
+    ``"62.5"``, is converted), and with a non-WGS84 ``input_crs`` they hold the
+    WGS84 values and ``lat_original`` / ``lon_original`` keep the input values.
+
+    Args:
+        df: The working dataframe, with the canonical column names.
+        input_crs: The CRS of the input coordinates, or None for WGS84.
+        id_column: The user's ID column name, used in error messages.
+        latitude_column: The user's latitude column name, used in error messages.
+        longitude_column: The user's longitude column name, used in error messages.
+
+    Returns:
+        ``(df, crs_warnings)``, where ``crs_warnings`` lists messages about CRS
+        handling (e.g. a reprojection notice) that the caller records in the
+        metadata sidecar.
+
+    Raises:
+        ValueError: If a latitude or longitude is missing, not a number, or not
+            finite, or if a WGS84 coordinate is outside ±90° / ±180°.
     """
     crs_warnings: list[str] = []
+
+    # Every coordinate must be a finite number before the range check and the
+    # reprojection. Text that is not a number becomes NaN here, so one check
+    # finds missing, non-numeric, and infinite values. Without this check, text
+    # gives an unclear TypeError, infinity gives a misleading "not in WGS84"
+    # error, and NaN fails later inside an adapter or gives empty statistics.
+    latitudes = pd.to_numeric(df["lat"], errors="coerce")
+    longitudes = pd.to_numeric(df["lon"], errors="coerce")
+    invalid_latitude_mask = ~np.isfinite(latitudes.astype("float64"))
+    invalid_longitude_mask = ~np.isfinite(longitudes.astype("float64"))
+    invalid_row_mask = invalid_latitude_mask | invalid_longitude_mask
+    if invalid_row_mask.any():
+        invalid_columns = []
+        if invalid_latitude_mask.any():
+            invalid_columns.append(f"'{latitude_column}'")
+        if invalid_longitude_mask.any():
+            invalid_columns.append(f"'{longitude_column}'")
+        invalid_ids = df.loc[invalid_row_mask, "id"].tolist()
+        raise ValueError(
+            f"Column(s) {' and '.join(invalid_columns)} have a missing, non-numeric, or "
+            f"infinite value in {len(invalid_ids)} row(s). '{id_column}' of these rows: "
+            f"{format_id_list(invalid_ids, limit=_MAX_IDS_IN_MESSAGE)}. Every row needs a "
+            f"finite number in '{latitude_column}' and '{longitude_column}'. Correct or "
+            f"remove these rows."
+        )
+    df["lat"] = latitudes
+    df["lon"] = longitudes
 
     if input_crs is not None:
         input_crs_upper = input_crs.upper()

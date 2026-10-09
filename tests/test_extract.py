@@ -459,6 +459,261 @@ class TestCustomColumnNames:
         assert "dem_local_mean_100m" in result.columns
 
 
+def _tabular_mean_config(batch_id, **extra_settings):
+    """Return a tabular run config for the mean of ``dem_local`` in a 100 m window."""
+    return {
+        "batch_id": batch_id,
+        "datasets": ["dem_local"],
+        "settings": {
+            "output_type": "tabular",
+            "statistics": ["mean"],
+            "window_size_m": 100,
+            **extra_settings,
+        },
+    }
+
+
+def _project_to_utm(sample_df):
+    """Return ``(projected_df, easting, northing)`` with the sample points in EPSG:32634."""
+    from pyproj import Transformer
+
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+    easting, northing = to_utm.transform(
+        sample_df["decimalLongitude"].values, sample_df["decimalLatitude"].values
+    )
+    projected_df = sample_df.copy()
+    projected_df["decimalLongitude"] = easting
+    projected_df["decimalLatitude"] = northing
+    return projected_df, easting, northing
+
+
+# ------------------------------------------------------------------
+# Coordinate validation
+# ------------------------------------------------------------------
+
+
+class TestCoordinateValidation:
+    """Missing, non-numeric, and infinite coordinates stop the run before extraction."""
+
+    @pytest.mark.parametrize(
+        "bad_latitude",
+        [np.nan, None, "not a number", np.inf, -np.inf],
+        ids=["nan", "none", "text", "inf", "minus-inf"],
+    )
+    def test_invalid_latitude_raises(self, sample_df, bad_latitude, tmp_path):
+        """A bad latitude raises ValueError that names the column and the row's ID."""
+        df = sample_df.astype({"decimalLatitude": object})
+        df.loc[1, "decimalLatitude"] = bad_latitude
+
+        with pytest.raises(ValueError, match="missing, non-numeric, or infinite") as error_info:
+            extract(df, _tabular_mean_config("coords"), output_dir=tmp_path)
+
+        message = str(error_info.value)
+        assert "'decimalLatitude'" in message
+        assert "in 1 row(s)" in message
+        assert "'T6WPKD'" in message
+        # The value is not a CRS problem, so the message must not say so.
+        assert "WGS84" not in message
+        assert not any(tmp_path.iterdir())
+
+    def test_invalid_longitude_with_input_crs_raises_before_reprojection(self, sample_df, tmp_path):
+        """A text longitude raises the same ValueError when input_crs is set."""
+        projected_df, _, _ = _project_to_utm(sample_df)
+        projected_df = projected_df.astype({"decimalLongitude": object})
+        projected_df.loc[0, "decimalLongitude"] = "349321,6"
+
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError, match="'decimalLongitude' have a missing, non-numeric"):
+                extract(
+                    projected_df,
+                    _tabular_mean_config("coords"),
+                    output_dir=tmp_path,
+                    input_crs="EPSG:32634",
+                )
+
+        # The reprojection notice comes after the check, so it was never emitted.
+        assert not any("Reprojecting" in str(warning.message) for warning in caught_warnings)
+
+    def test_error_lists_ten_ids_and_the_total_count(self, tmp_path):
+        """With more than ten bad rows, the message lists ten IDs and the total count."""
+        df = pd.DataFrame(
+            {
+                "site": [f"site{number}" for number in range(12)],
+                "y": [62.98] * 12,
+                "x": [np.nan] * 12,
+            }
+        )
+
+        with pytest.raises(ValueError, match=r"in 12 row\(s\)") as error_info:
+            extract(
+                df,
+                _tabular_mean_config("coords"),
+                output_dir=tmp_path,
+                id_column="site",
+                latitude_column="y",
+                longitude_column="x",
+            )
+
+        message = str(error_info.value)
+        assert "Column(s) 'x' have" in message
+        assert "'site' of these rows" in message
+        assert "'site9'" in message
+        assert "'site10'" not in message
+        assert "... and 2 more" in message
+
+    def test_numeric_text_coordinates_give_the_same_result(self, sample_df, tmp_path):
+        """Coordinates stored as text that holds a number give the same statistics."""
+        text_df = sample_df.astype({"decimalLatitude": str, "decimalLongitude": str})
+
+        from_text = extract(
+            text_df,
+            _tabular_mean_config("text", output_file_format="dataframe"),
+            output_dir=tmp_path / "text",
+        )
+        from_numbers = extract(
+            sample_df,
+            _tabular_mean_config("numbers", output_file_format="dataframe"),
+            output_dir=tmp_path / "numbers",
+        )
+
+        pd.testing.assert_frame_equal(from_text, from_numbers)
+
+
+# ------------------------------------------------------------------
+# Input columns with the names of working columns
+# ------------------------------------------------------------------
+
+
+class TestReservedColumnNames:
+    """Unmapped input columns named like envoi's working columns keep their names and values."""
+
+    def test_extra_working_column_names_keep_their_names_and_values(self, sample_df, tmp_path):
+        """Extra id, lat, lon, date, lat_original, and lon_original columns do not change the run."""
+        number_of_points = len(sample_df)
+        extra_columns = {
+            "id": [f"dwc-{number}" for number in range(number_of_points)],
+            "lat": [1.5 + number for number in range(number_of_points)],
+            "lon": [-1.5 - number for number in range(number_of_points)],
+            "date": [f"visit {number}" for number in range(number_of_points)],
+            "lat_original": [0.25 * number for number in range(number_of_points)],
+            "lon_original": [0.5 * number for number in range(number_of_points)],
+        }
+
+        outputs = extract(
+            sample_df.assign(**extra_columns),
+            _tabular_mean_config("extra"),
+            output_dir=tmp_path / "extra",
+        )
+        baseline_outputs = extract(
+            sample_df,
+            _tabular_mean_config("baseline"),
+            output_dir=tmp_path / "baseline",
+        )
+        stats_df = pd.read_csv(outputs["extra"])
+        baseline_stats_df = pd.read_csv(baseline_outputs["baseline"])
+        qc_df = pd.read_csv(tmp_path / "extra" / "extra_qc.csv")
+        baseline_qc_df = pd.read_csv(tmp_path / "baseline" / "baseline_qc.csv")
+
+        # The extra columns keep their names, positions, and values.
+        assert list(stats_df.columns) == [
+            "occurrenceID",
+            "decimalLatitude",
+            "decimalLongitude",
+            "eventDate",
+            "n_otu",
+            *extra_columns,
+            "dem_local_mean_100m",
+        ]
+        for column, values in extra_columns.items():
+            assert stats_df[column].tolist() == values
+
+        # The run used the mapped columns only: everything else is identical
+        # to a run without the extra columns, and the QC table has none of them.
+        pd.testing.assert_frame_equal(stats_df.drop(columns=list(extra_columns)), baseline_stats_df)
+        pd.testing.assert_frame_equal(qc_df, baseline_qc_df)
+
+    def test_extra_original_coordinate_columns_with_input_crs(self, sample_df, tmp_path):
+        """With input_crs, extra lat_original and lon_original columns do not replace the input."""
+        projected_df, easting, northing = _project_to_utm(sample_df)
+        extra_columns = {
+            "lat_original": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "lon_original": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        }
+
+        outputs = extract(
+            projected_df.assign(**extra_columns),
+            _tabular_mean_config("crs_extra"),
+            output_dir=tmp_path,
+            input_crs="EPSG:32634",
+        )
+        result = pd.read_csv(outputs["crs_extra"])
+
+        np.testing.assert_allclose(result["decimalLatitude"], northing)
+        np.testing.assert_allclose(result["decimalLongitude"], easting)
+        np.testing.assert_allclose(
+            result["decimalLatitude_wgs84"], sample_df["decimalLatitude"], atol=1e-6
+        )
+        np.testing.assert_allclose(
+            result["decimalLongitude_wgs84"], sample_df["decimalLongitude"], atol=1e-6
+        )
+        for column, values in extra_columns.items():
+            assert result[column].tolist() == values
+
+    def test_unmapped_date_column_is_not_the_sample_date(self, sample_df, tmp_path):
+        """Without eventDate, an extra date column is kept but not used as the sample date."""
+        # The values are not dates: if envoi parsed them, the run would raise.
+        visit_labels = [f"visit {number}" for number in range(len(sample_df))]
+        df = sample_df.drop(columns=["eventDate"]).assign(date=visit_labels)
+
+        result = extract(
+            df,
+            _tabular_mean_config("extra_date", output_file_format="dataframe"),
+            output_dir=tmp_path,
+        )
+
+        assert result["date"].tolist() == visit_labels
+        assert "eventDate" not in result.columns
+        # The run behaves as a run without a date column, and the sidecar says so.
+        meta = json.loads((tmp_path / "extra_date_metadata.json").read_text())
+        assert "No 'eventDate' column found" in meta["warnings"]["date_parsing"]
+
+    def test_date_column_override_uses_a_date_column(self, sample_df, tmp_path):
+        """With date_column="date", the date column is the sample date."""
+        df = sample_df.rename(columns={"eventDate": "date"})
+
+        result = extract(
+            df,
+            _tabular_mean_config("mapped_date", output_file_format="dataframe"),
+            output_dir=tmp_path,
+            date_column="date",
+        )
+
+        assert result["date"].tolist() == sample_df["eventDate"].tolist()
+        meta = json.loads((tmp_path / "mapped_date_metadata.json").read_text())
+        assert "date_parsing" not in meta.get("warnings", {})
+
+    def test_raster_mode_names_tiles_after_the_mapped_id_column(self, sample_df, tmp_path):
+        """In raster mode, an extra id column does not replace the mapped ID column."""
+        df = sample_df.assign(id=["same"] * len(sample_df))
+
+        extract(
+            df,
+            {
+                "batch_id": "extra_id_tiles",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            output_dir=tmp_path,
+        )
+
+        tile_dir = tmp_path / "extra_id_tiles" / "dem_local"
+        manifest = pd.read_csv(tile_dir / "tiles_manifest.csv")
+        assert manifest["occurrenceID"].tolist() == sample_df["occurrenceID"].tolist()
+        for occurrence_id in sample_df["occurrenceID"]:
+            assert (tile_dir / f"{occurrence_id}-dem_local.tif").exists()
+
+
 # ------------------------------------------------------------------
 # GBIF / Darwin Core eventDate parsing
 # ------------------------------------------------------------------
@@ -1046,6 +1301,113 @@ class TestErrors:
                 },
                 output_dir=tmp_path,
             )
+
+
+class TestRunConfigValidation:
+    """Every run config is checked before the first adapter is built."""
+
+    def test_duplicate_batch_id_raises_before_any_output(self, sample_df, tmp_path):
+        """Two run configs with the same batch_id raise, and nothing is written."""
+        with pytest.raises(ValueError, match=r"Duplicate batch_id value\(s\) \['terrain'\]"):
+            extract(
+                sample_df,
+                [_tabular_mean_config("terrain"), _tabular_mean_config("terrain")],
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    def test_default_batch_id_that_matches_an_explicit_one_raises(self, sample_df, tmp_path):
+        """The default name of the second run config, 'output2', collides with an explicit one."""
+        config_without_batch_id = _tabular_mean_config("unused")
+        del config_without_batch_id["batch_id"]
+
+        with pytest.raises(ValueError, match=r"Duplicate batch_id value\(s\) \['output2'\]"):
+            extract(
+                sample_df,
+                [_tabular_mean_config("output2"), config_without_batch_id],
+                output_dir=tmp_path,
+            )
+
+    def test_invalid_second_run_config_raises_before_any_output(self, sample_df, tmp_path):
+        """An invalid setting in the second run config stops the call before the first runs."""
+        with pytest.raises(ValueError, match="Output 'second': invalid min_coverage_pct"):
+            extract(
+                sample_df,
+                [
+                    _tabular_mean_config("first"),
+                    _tabular_mean_config("second", min_coverage_pct="50"),
+                ],
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    @pytest.mark.parametrize(
+        "resample_m",
+        ["30", True, float("nan"), float("inf"), 0, -5],
+        ids=["text", "bool", "nan", "inf", "zero", "negative"],
+    )
+    def test_invalid_resample_m_raises(self, sample_df, resample_m, tmp_path):
+        """resample_m must be a positive, finite number that is not a bool."""
+        with pytest.raises(ValueError, match="Output 'tiles': invalid resample_m"):
+            extract(
+                sample_df,
+                {
+                    "batch_id": "tiles",
+                    "datasets": ["dem_local"],
+                    "settings": {
+                        "output_type": "raster",
+                        "window_size_m": 200,
+                        "resample_m": resample_m,
+                    },
+                },
+                output_dir=tmp_path,
+            )
+
+    def test_numpy_resample_m_is_accepted(self, sample_df, tmp_path):
+        """A NumPy float resample_m runs and the sidecar records it as a plain number."""
+        extract(
+            sample_df,
+            {
+                "batch_id": "tiles",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "raster",
+                    "window_size_m": 200,
+                    "resample_m": np.float32(30),
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        meta = json.loads((tmp_path / "tiles" / "tiles_metadata.json").read_text())
+        assert meta["config"]["resample_m"] == 30.0
+        with rasterio.open(tmp_path / "tiles" / "dem_local" / "T2T1DJ-dem_local.tif") as src:
+            assert src.res == (30.0, 30.0)
+
+    @pytest.mark.parametrize(
+        "min_coverage_pct",
+        ["50", None, True, float("nan"), -1, 101],
+        ids=["text", "none", "bool", "nan", "below-range", "above-range"],
+    )
+    def test_invalid_min_coverage_pct_raises(self, sample_df, min_coverage_pct, tmp_path):
+        """min_coverage_pct must be a finite number from 0 to 100 that is not a bool."""
+        with pytest.raises(ValueError, match="Output 'coverage': invalid min_coverage_pct"):
+            extract(
+                sample_df,
+                _tabular_mean_config("coverage", min_coverage_pct=min_coverage_pct),
+                output_dir=tmp_path,
+            )
+
+    def test_numpy_min_coverage_pct_is_accepted(self, sample_df, tmp_path):
+        """A NumPy integer min_coverage_pct runs and the sidecar records it as a plain number."""
+        extract(
+            sample_df,
+            _tabular_mean_config("coverage", min_coverage_pct=np.int64(50)),
+            output_dir=tmp_path,
+        )
+
+        meta = json.loads((tmp_path / "coverage_metadata.json").read_text())
+        assert meta["config"]["min_coverage_pct"] == 50
 
 
 # ------------------------------------------------------------------

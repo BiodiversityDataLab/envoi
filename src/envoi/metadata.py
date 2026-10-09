@@ -51,7 +51,6 @@ def write_metadata_sidecar(
     out_dir: str | Path,
     group_name: str,
     *,
-    output_type: str,
     n_points: int,
     datasets: dict,
     config: dict,
