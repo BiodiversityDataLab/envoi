@@ -46,6 +46,7 @@ from ._image import (
 from ._reducers import (
     _CLASS_COUNT_KEY_RE,
     _build_combined_reducer,
+    _circular_aspect_statistics,
     _dedupe_categorical_for_ee,
     _extract_count_from_reduce_result,
     _extract_per_band_counts,
@@ -330,7 +331,9 @@ class GeeRasterAdapter(BaseAdapter):
     # Image resolution  (which ee.Image to sample, plus its band/scale)
     # ------------------------------------------------------------------
 
-    def _get_image(self, date=None, lat=None, lon=None) -> ee.Image:
+    def _get_image(
+        self, date=None, lat=None, lon=None, *, circular_aspect: bool = False
+    ) -> ee.Image:
         """Return the ee.Image to sample, building per-point if needed.
 
         For IMAGE assets the pre-built static image is always returned,
@@ -344,6 +347,13 @@ class GeeRasterAdapter(BaseAdapter):
           or for global probes)
         - no date + coords → per-point most-recent image
         - no date + no coords → most-recent image, cached on first call
+
+        With ``circular_aspect=True``, returns the companion image for the
+        circular aspect statistics (``sin`` and ``cos`` bands, see
+        ``_build_image``), selected by the same rules. This image is built
+        for each call and never read from or written to ``_static_image``.
+        Building it sends no request: Earth Engine evaluates it only in the
+        point's ``reduceRegion`` request.
         """
         # Per-point branch has priority for collections that need spatial
         # filtering (e.g. tiled DEM collections). When coordinates are given,
@@ -364,6 +374,7 @@ class GeeRasterAdapter(BaseAdapter):
                 geometry=ee.Geometry.Point([lon, lat]),
                 lat=lat,
                 lon=lon,
+                circular_aspect=circular_aspect,
             )
 
         if self._needs_per_point_date and lat is not None and lon is not None:
@@ -379,6 +390,7 @@ class GeeRasterAdapter(BaseAdapter):
                 collection_time_ends=self._collection_time_ends,
                 lat=lat,
                 lon=lon,
+                circular_aspect=circular_aspect,
             )
 
         # IMAGE assets or already-cached no-coords fallback.
@@ -387,7 +399,9 @@ class GeeRasterAdapter(BaseAdapter):
         # no-coords call returns the same most-recent global image, which is
         # safe for band-name probing and global tile-export, but never for
         # per-point sampling (the per-point branch above runs first).
-        if date is None and self._static_image is not None:
+        # The circular aspect image is never cached: it continues to the
+        # branches below, which build it from the same dataset spec.
+        if not circular_aspect and date is None and self._static_image is not None:
             return self._static_image
 
         # Collection with no date and no coords: build (and cache) a global
@@ -400,13 +414,16 @@ class GeeRasterAdapter(BaseAdapter):
                 self._dataset_spec.get("collection"),
                 most_recent.strftime("%Y-%m-%d"),
             )
-            self._static_image = _build_image(
+            most_recent_image = _build_image(
                 self._dataset_spec,
                 date=most_recent,
                 collection_time_starts=self._collection_time_starts,
                 collection_time_ends=self._collection_time_ends,
+                circular_aspect=circular_aspect,
             )
-            return self._static_image
+            if not circular_aspect:
+                self._static_image = most_recent_image
+            return most_recent_image
 
         # Final fallback — a date was provided but neither the per-point
         # branch (no coords) nor the static-image branch (date is None)
@@ -416,7 +433,12 @@ class GeeRasterAdapter(BaseAdapter):
         #      filter with no client-side index).
         #   2. Collection with timestamps but no coords and date is not
         #      None (per-point date selection without a spatial filter).
-        dt = pd.to_datetime(date)
+        # The circular aspect image also reaches here without a date, in
+        # place of the static image. date None stays None (pd.to_datetime
+        # would give NaT, which _build_image reads as a date), so
+        # _build_image loads an IMAGE asset as the static image does, and
+        # mosaics a collection without date selection.
+        dt = pd.to_datetime(date) if date is not None else None
         geom = ee.Geometry.Point([lon, lat]) if lat is not None else None
         return _build_image(
             self._dataset_spec,
@@ -426,6 +448,7 @@ class GeeRasterAdapter(BaseAdapter):
             collection_time_ends=self._collection_time_ends,
             lat=lat,
             lon=lon,
+            circular_aspect=circular_aspect,
         )
 
     def _get_band_name(self, img: ee.Image) -> str:
@@ -695,18 +718,24 @@ class GeeRasterAdapter(BaseAdapter):
     ):
         """Compute server-side stats for a single point via reduceRegion.
 
-        Two reductions are issued together as a single ``ee.Dictionary``
+        Up to three reductions are issued together as a single ``ee.Dictionary``
         and resolved with one ``getInfo()`` round-trip:
 
         - **window** — runs only when *combined_reducer* is provided. The
           user's reducers are combined with ``ee.Reducer.count()`` for QC,
           and ``reduceRegion`` is applied over the buffered square region.
+        - **aspect_circular** — runs only when the derived ``aspect`` band is
+          reduced and ``mean``, ``std``, or ``var`` is a window reducer. It
+          reduces the sine and cosine of the aspect of the non-flat pixels
+          over the same region, and the circular values replace the linear
+          ``mean``, ``std``, and ``var`` of aspect
+          (see ``_circular_aspect_statistics``).
         - **point** — runs only when *want_point* is True. ``Reducer.first()``
           is applied over an ``ee.Geometry.Point`` at the exact (lat, lon)
           to fetch the value of the pixel containing the point.
 
-        When both branches run, GEE evaluates them in parallel server-side
-        so callers pay one round-trip for both. Returns a single
+        GEE evaluates the branches in parallel server-side, so callers pay
+        one round-trip for all of them. Returns a single
         ``(stats_dict, meta_dict)`` tuple with merged keys:
         - window keys: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
         - point  keys: ``"point"``  (single band) or ``{band}_point``     (multi-band)
@@ -754,7 +783,29 @@ class GeeRasterAdapter(BaseAdapter):
         else:
             img_to_reduce = img.select(band_name)
 
-        # Build up to two server-side reductions into a single ee.Dictionary.
+        # With "count" as the only window reducer, no QC count is combined
+        # with it, and Earth Engine names the output of a single reducer by
+        # the band name only ({"elevation": 247}), not "{band}_count".
+        count_only = list(reducer_names) == ["count"]
+
+        # Aspect is a direction, so its mean, std and var must be circular
+        # statistics: the linear mean of 350° and 10° is 180° (south), not 0°
+        # (north). They come from a companion image of the sine and cosine of
+        # the aspect (see _build_image), reduced in the same request. Only the
+        # derived aspect band qualifies: it is reduced when the run is
+        # multi-band (_build_image keeps every derived band) or when it is
+        # the single band.
+        derived_bands = self._dataset_spec.get("derived_bands") or []
+        derived_band_names = [derived_bands] if isinstance(derived_bands, str) else derived_bands
+        aspect_is_reduced = "aspect" in derived_band_names and (multiband or band_name == "aspect")
+        circular_reducer_names = [
+            reducer_name for reducer_name in ("mean", "std", "var") if reducer_name in reducer_names
+        ]
+        want_circular_aspect = (
+            combined_reducer is not None and aspect_is_reduced and bool(circular_reducer_names)
+        )
+
+        # Build up to three server-side reductions into a single ee.Dictionary.
         # GEE evaluates them in parallel and we pay one HTTP round-trip total.
         branches: dict[str, ee.Dictionary] = {}
 
@@ -778,6 +829,19 @@ class GeeRasterAdapter(BaseAdapter):
                 bestEffort=True,
             )
 
+        if want_circular_aspect:
+            # Circular aspect branch: mean sine, mean cosine, and the number of
+            # non-flat pixels, over the same region and grid as the window
+            # branch. Output keys: sin_mean, sin_count, cos_mean, cos_count.
+            circular_aspect_image = self._get_image(date, lat=lat, lon=lon, circular_aspect=True)
+            branches["aspect_circular"] = circular_aspect_image.reduceRegion(
+                reducer=ee.Reducer.mean().combine(reducer2=ee.Reducer.count(), sharedInputs=True),
+                geometry=region,
+                scale=native_m,
+                crs=utm_crs,
+                bestEffort=True,
+            )
+
         if want_point:
             # Point branch: exact pixel value at lat/lon. One pixel only —
             # no need for bestEffort. Output keys are bare band names.
@@ -788,7 +852,7 @@ class GeeRasterAdapter(BaseAdapter):
                 crs=utm_crs,
             )
 
-        # Single round-trip — both branches resolved server-side.
+        # Single round-trip — all branches resolved server-side.
         full_result = ee.Dictionary(branches).getInfo() or {}
 
         # ---- parse window branch ----
@@ -798,12 +862,16 @@ class GeeRasterAdapter(BaseAdapter):
         if combined_reducer is not None:
             window_raw = full_result.get("window") or {}
             if multiband:
-                window_stats = _parse_multiband_result(window_raw, reducer_names, suffixes)
+                window_stats = _parse_multiband_result(
+                    window_raw, reducer_names, suffixes, count_only=count_only
+                )
                 # Collect per-band counts for individual coverage reporting.
-                per_band_counts = _extract_per_band_counts(window_raw)
+                per_band_counts = _extract_per_band_counts(window_raw, count_only=count_only)
             else:
                 window_stats = _parse_reduce_result(window_raw, band_name, reducer_names, suffixes)
-            valid_count = _extract_count_from_reduce_result(window_raw, band_name, multiband)
+            valid_count = _extract_count_from_reduce_result(
+                window_raw, band_name, multiband, count_only=count_only
+            )
 
             # ---- categorical post-process ----
             # We always ask GEE for `class_count` (frequencyHistogram) when
@@ -858,6 +926,26 @@ class GeeRasterAdapter(BaseAdapter):
 
         # Merged stats dict — window keys first, then point keys.
         stats = {**window_stats, **point_stats}
+
+        # ---- circular aspect statistics ----
+        # Replace the linear aspect mean, std and var that the user asked for
+        # with the circular values: "mean"/"std"/"var" when aspect is the
+        # single band, "aspect_mean"/... when the run is multi-band. Only keys
+        # that exist are replaced, so the set of columns does not change. The
+        # other statistics of aspect stay linear. The QC values below read
+        # window_stats, which keeps the linear values, so QC does not change.
+        if want_circular_aspect:
+            circular_raw = full_result.get("aspect_circular") or {}
+            circular_values = _circular_aspect_statistics(
+                circular_raw.get("sin_mean"),
+                circular_raw.get("cos_mean"),
+                circular_raw.get("sin_count"),
+            )
+            key_prefix = "aspect_" if multiband else ""
+            for reducer_name in circular_reducer_names:
+                stat_key = f"{key_prefix}{reducer_name}"
+                if stat_key in stats:
+                    stats[stat_key] = circular_values[reducer_name]
 
         # ---- QC meta ----
         # When the window branch ran we have a real valid-pixel count from

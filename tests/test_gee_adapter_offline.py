@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 from types import SimpleNamespace
 
 import ee
@@ -937,3 +938,466 @@ class TestFailedPointsThroughExtract:
             error_info.value
         )
         assert error_info.value.__cause__ is raised_errors[0]
+
+
+# ------------------------------------------------------------------
+# Statistics of one point — count-only runs and circular aspect statistics
+# ------------------------------------------------------------------
+
+
+class _StubReducer:
+    """Stands in for an ``ee.Reducer``. Its name records the reducers combined into it."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def combine(self, reducer2, sharedInputs=False):
+        return _StubReducer(f"{self.name}+{reducer2.name}")
+
+
+class _StubStatisticsImage:
+    """Stands in for the ``ee.Image`` of one point. ``reduceRegion`` returns a record of its call."""
+
+    def __init__(self, label: str):
+        self.label = label
+
+    def select(self, band_name: str) -> _StubStatisticsImage:
+        return _StubStatisticsImage(f"{self.label}.select({band_name})")
+
+    def reduceRegion(self, **arguments) -> dict:
+        return {"image": self.label, **arguments}
+
+
+def _statistics_adapter(dataset_spec: dict) -> GeeRasterAdapter:
+    """Return an offline adapter for an image asset at 10 m, with extra dataset-spec keys."""
+    return _make_offline_adapter(
+        _dataset_spec={"image": "users/test/dem", **dataset_spec},
+        _collection_time_starts=None,
+        _collection_time_ends=None,
+        crs="EPSG:4326",
+        scale=10,
+    )
+
+
+def _stub_statistics_request(monkeypatch, adapter, branch_results: dict[str, dict]) -> list[dict]:
+    """Replace the Earth Engine objects that ``_fetch_stats_single`` uses with stubs.
+
+    The point's request returns the entries of ``branch_results`` for the
+    branches that the request contains. ``_get_image`` gives the image
+    ``main``, or ``circular`` for the circular aspect image. Returns a list
+    that records the branches of each request: branch name to the record of
+    its ``reduceRegion`` call.
+    """
+    recorded_requests: list[dict] = []
+
+    class _RecordingDictionary:
+        def __init__(self, branches: dict):
+            self._branches = branches
+            recorded_requests.append(branches)
+
+        def getInfo(self) -> dict:
+            return {branch_name: branch_results[branch_name] for branch_name in self._branches}
+
+    stub_ee = SimpleNamespace(
+        Dictionary=_RecordingDictionary,
+        Reducer=SimpleNamespace(
+            mean=lambda: _StubReducer("mean"), count=lambda: _StubReducer("count")
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "ee", stub_ee)
+    adapter._make_region = lambda lat, lon, window_m: f"square of {window_m} m"
+    adapter._get_image = lambda date=None, lat=None, lon=None, circular_aspect=False: (
+        _StubStatisticsImage("circular" if circular_aspect else "main")
+    )
+    return recorded_requests
+
+
+def _fetch_point_statistics(adapter, reducer_names: list[str], suffixes: list[str]):
+    """Run ``_fetch_stats_single`` for one point near Uppsala with a 200 m window."""
+    return adapter._fetch_stats_single(
+        59.85, 17.63, 200, _StubReducer("user reducers"), reducer_names, suffixes
+    )
+
+
+def _mean_sin_and_cos(directions_deg: list[float]) -> tuple[float, float]:
+    """Return the mean sine and mean cosine of directions in degrees."""
+    radians = [math.radians(direction) for direction in directions_deg]
+    return (
+        sum(math.sin(angle) for angle in radians) / len(radians),
+        sum(math.cos(angle) for angle in radians) / len(radians),
+    )
+
+
+# Pixels that face 350° and 10°: circular mean 0° (north), circular standard
+# deviation sqrt(-2 ln cos 10°) in degrees. The linear mean would be 180°.
+_NORTH_MEAN_SIN, _NORTH_MEAN_COS = _mean_sin_and_cos([350.0, 10.0])
+_NORTH_STD_DEG = math.degrees(math.sqrt(-2.0 * math.log(math.cos(math.radians(10.0)))))
+_NORTH_CIRCULAR_RESULT = {
+    "sin_mean": _NORTH_MEAN_SIN,
+    "sin_count": 390,
+    "cos_mean": _NORTH_MEAN_COS,
+    "cos_count": 390,
+}
+
+
+def _distance_from_north_deg(direction_deg: float) -> float:
+    """Return the shortest distance between a direction and north (0°) on the circle."""
+    return min(direction_deg % 360.0, 360.0 - direction_deg % 360.0)
+
+
+class TestCountOnlyStatistics:
+    """A run whose only window statistic is ``count`` gives correct counts and QC values."""
+
+    def test_single_band_count_only_gives_qc_counts(self, monkeypatch):
+        """Single band: the bare band key is the count, and n_pixels and coverage use it."""
+        adapter = _statistics_adapter({"bands": "DEM"})
+        _stub_statistics_request(monkeypatch, adapter, {"window": {"DEM": 380}})
+
+        stats, meta = _fetch_point_statistics(adapter, ["count"], ["_count"])
+
+        assert stats == {"count": 380}
+        assert (meta["in_extent"], meta["n_pixels"], meta["had_nodata"]) == (True, 380, True)
+        # 380 of the 400 pixels of 10 m in a 200 m window.
+        assert meta["coverage_pct"] == pytest.approx(95.0)
+
+    def test_two_band_count_only_gives_band_count_columns(self, monkeypatch):
+        """Two bands: one {band}_count column per band, and QC uses the smallest count."""
+        adapter = _statistics_adapter({"bands": ["B1", "B2"]})
+        _stub_statistics_request(monkeypatch, adapter, {"window": {"B1": 400, "B2": 380}})
+
+        stats, meta = _fetch_point_statistics(adapter, ["count"], ["_count"])
+        table = _append_stat_columns(pd.DataFrame({"id": ["p0"]}), "stub_gee", 200, [(stats, meta)])
+
+        assert stats == {"B1_count": 400, "B2_count": 380}
+        assert table.loc[0, ["stub_gee_B1_count_200m", "stub_gee_B2_count_200m"]].tolist() == [
+            400,
+            380,
+        ]
+        assert (meta["in_extent"], meta["n_pixels"]) == (True, 380)
+        assert meta["coverage_pct"] == pytest.approx(95.0)
+        assert meta["band_coverage_pct"] == {"B1": 100.0, "B2": 95.0}
+
+
+class TestCircularAspectInPointStatistics:
+    """The circular aspect values replace only the requested linear mean, std, and var of aspect."""
+
+    def test_multi_band_replaces_only_requested_aspect_statistics(self, monkeypatch):
+        """Multi-band: aspect_mean and aspect_std become circular; other keys keep their values."""
+        adapter = _statistics_adapter({"bands": ["DEM"], "derived_bands": ["slope", "aspect"]})
+        window_result = {
+            "DEM_mean": 120.0,
+            "DEM_median": 118.0,
+            "DEM_stdDev": 6.0,
+            "DEM_count": 400,
+            "slope_mean": 12.0,
+            "slope_median": 11.0,
+            "slope_stdDev": 3.0,
+            "slope_count": 400,
+            "aspect_mean": 180.0,
+            "aspect_median": 355.0,
+            "aspect_stdDev": 170.0,
+            "aspect_count": 400,
+        }
+        recorded_requests = _stub_statistics_request(
+            monkeypatch,
+            adapter,
+            {"window": window_result, "aspect_circular": _NORTH_CIRCULAR_RESULT},
+        )
+
+        stats, meta = _fetch_point_statistics(
+            adapter, ["mean", "median", "std"], ["_mean", "_median", "_stdDev"]
+        )
+
+        # Circular values for the requested aspect mean and std.
+        assert 0.0 <= stats["aspect_mean"] < 360.0
+        assert _distance_from_north_deg(stats["aspect_mean"]) == pytest.approx(0.0, abs=1e-9)
+        assert stats["aspect_std"] == pytest.approx(_NORTH_STD_DEG)
+        # Linear values everywhere else; no key for the statistic that was not requested.
+        assert stats["aspect_median"] == 355.0
+        assert {key: stats[key] for key in ("DEM_mean", "DEM_std", "slope_mean", "slope_std")} == {
+            "DEM_mean": 120.0,
+            "DEM_std": 6.0,
+            "slope_mean": 12.0,
+            "slope_std": 3.0,
+        }
+        assert "aspect_var" not in stats
+        assert len(stats) == 9
+        # QC comes from the window branch.
+        assert (meta["n_pixels"], meta["in_extent"]) == (400, True)
+
+        # One request, with the circular branch on the same region and grid as the window.
+        assert len(recorded_requests) == 1
+        branches = recorded_requests[0]
+        assert set(branches) == {"window", "aspect_circular"}
+        window_branch, circular_branch = branches["window"], branches["aspect_circular"]
+        assert (window_branch["image"], circular_branch["image"]) == ("main", "circular")
+        assert circular_branch["reducer"].name == "mean+count"
+        for argument_name in ("geometry", "scale", "crs", "bestEffort"):
+            assert circular_branch[argument_name] == window_branch[argument_name]
+        assert circular_branch["bestEffort"] is True
+
+    def test_single_band_replaces_only_requested_aspect_statistics(self, monkeypatch):
+        """Single band (derived aspect only): mean and var become circular; max stays linear."""
+        adapter = _statistics_adapter({"derived_bands": ["aspect"]})
+        window_result = {
+            "aspect_mean": 180.0,
+            "aspect_variance": 28000.0,
+            "aspect_max": 359.0,
+            "aspect_count": 400,
+        }
+        recorded_requests = _stub_statistics_request(
+            monkeypatch,
+            adapter,
+            {"window": window_result, "aspect_circular": _NORTH_CIRCULAR_RESULT},
+        )
+
+        stats, _ = _fetch_point_statistics(
+            adapter, ["mean", "var", "max"], ["_mean", "_variance", "_max"]
+        )
+
+        assert set(stats) == {"mean", "var", "max"}
+        assert _distance_from_north_deg(stats["mean"]) == pytest.approx(0.0, abs=1e-9)
+        assert stats["var"] == pytest.approx(_NORTH_STD_DEG**2)
+        assert stats["max"] == 359.0
+        assert recorded_requests[0]["window"]["image"] == "main.select(aspect)"
+        assert recorded_requests[0]["aspect_circular"]["image"] == "circular"
+
+    def test_flat_window_gives_null_aspect_and_keeps_qc(self, monkeypatch):
+        """A window with only flat pixels gives a null circular mean, and QC still shows its pixels."""
+        adapter = _statistics_adapter({"derived_bands": ["aspect"]})
+        flat_circular_result = {"sin_mean": None, "sin_count": 0, "cos_mean": None, "cos_count": 0}
+        _stub_statistics_request(
+            monkeypatch,
+            adapter,
+            # Earth Engine gives flat pixels aspect 0, so the linear mean is 0.
+            {
+                "window": {"aspect_mean": 0.0, "aspect_count": 400},
+                "aspect_circular": flat_circular_result,
+            },
+        )
+
+        stats, meta = _fetch_point_statistics(adapter, ["mean"], ["_mean"])
+
+        assert stats == {"mean": None}
+        assert (meta["in_extent"], meta["n_pixels"], meta["coverage_pct"]) == (True, 400, 100.0)
+
+    @pytest.mark.parametrize(
+        ("dataset_spec", "reducer_names", "suffixes"),
+        [
+            # Aspect is reduced, but no mean, std, or var is requested.
+            (
+                {"bands": ["DEM"], "derived_bands": ["slope", "aspect"]},
+                ["median", "max"],
+                ["_median", "_max"],
+            ),
+            # No derived aspect band.
+            ({"bands": ["B1", "B2"]}, ["mean"], ["_mean"]),
+            # A single named source band: the derived aspect band is not reduced.
+            ({"bands": "DEM", "derived_bands": ["aspect"]}, ["mean"], ["_mean"]),
+            # A source band named "aspect" is not the derived band.
+            ({"bands": ["aspect"]}, ["mean", "std"], ["_mean", "_stdDev"]),
+        ],
+    )
+    def test_no_circular_branch_without_reduced_derived_aspect(
+        self, monkeypatch, dataset_spec, reducer_names, suffixes
+    ):
+        """The request has no circular branch unless derived aspect is reduced with mean, std, or var."""
+        adapter = _statistics_adapter(dataset_spec)
+        recorded_requests = _stub_statistics_request(monkeypatch, adapter, {"window": {}})
+
+        _fetch_point_statistics(adapter, reducer_names, suffixes)
+
+        assert [set(branches) for branches in recorded_requests] == [{"window"}]
+
+
+class TestCircularAspectImageSelection:
+    """``_get_image`` builds the circular aspect image fresh, and never uses ``_static_image``."""
+
+    @pytest.fixture
+    def recorded_builds(self, monkeypatch) -> list[dict]:
+        """Replace ``_build_image`` and ``ee`` in the adapter module; record each build."""
+        builds: list[dict] = []
+
+        def record_build(dataset_spec, date=None, geometry=None, *args, **keywords):
+            builds.append({"date": date, "geometry": geometry, **keywords})
+            return f"image {len(builds)}"
+
+        monkeypatch.setattr(adapter_module, "_build_image", record_build)
+        stub_geometry = SimpleNamespace(Point=lambda coordinates: f"point {coordinates}")
+        monkeypatch.setattr(adapter_module, "ee", SimpleNamespace(Geometry=stub_geometry))
+        return builds
+
+    def test_image_asset_does_not_use_the_static_image(self, recorded_builds):
+        """For an image asset, the circular image is built without a date; the static image stays."""
+        adapter = _make_offline_adapter(
+            _dataset_spec={"image": "users/test/dem", "derived_bands": ["aspect"]},
+            _static_image="static image",
+            _needs_per_point_date=False,
+            _collection_time_starts=None,
+            _collection_time_ends=None,
+        )
+
+        circular_image = adapter._get_image(None, lat=59.85, lon=17.63, circular_aspect=True)
+
+        assert circular_image == "image 1"
+        assert recorded_builds[0]["circular_aspect"] is True
+        assert recorded_builds[0]["date"] is None
+        assert adapter._static_image == "static image"
+        assert adapter._get_image(None, lat=59.85, lon=17.63) == "static image"
+
+    def test_most_recent_fallback_is_not_cached(self, recorded_builds):
+        """Without coordinates, the circular image of a collection is not cached; the main one is."""
+        adapter = _make_offline_adapter(
+            _dataset_spec={"collection": "users/test/collection", "derived_bands": ["aspect"]},
+            _static_image=None,
+            _needs_per_point_date=True,
+            _collection_time_starts=pd.DatetimeIndex(["2021-01-01", "2021-02-01"]),
+            _collection_time_ends=None,
+        )
+
+        assert adapter._get_image(circular_aspect=True) == "image 1"
+        assert adapter._static_image is None
+        assert adapter._get_image() == "image 2"
+        assert adapter._static_image == "image 2"
+        assert adapter._get_image(circular_aspect=True) == "image 3"
+        assert [build["circular_aspect"] for build in recorded_builds] == [True, False, True]
+        assert recorded_builds[0]["date"] == pd.Timestamp("2021-02-01")
+
+    @pytest.mark.parametrize(
+        ("dataset_spec", "needs_per_point_date"),
+        [
+            ({"collection_date_policy": "mosaic"}, False),
+            ({}, True),
+        ],
+    )
+    def test_per_point_image_passes_the_flag(
+        self, recorded_builds, dataset_spec, needs_per_point_date
+    ):
+        """Per-point collection images (mosaic or by date) get the flag and the point geometry."""
+        adapter = _make_offline_adapter(
+            _dataset_spec={
+                "collection": "users/test/collection",
+                "derived_bands": ["aspect"],
+                **dataset_spec,
+            },
+            _static_image="static image",
+            _needs_per_point_date=needs_per_point_date,
+            _collection_time_starts=pd.DatetimeIndex(["2021-01-01", "2021-02-01"]),
+            _collection_time_ends=None,
+        )
+
+        adapter._get_image("2021-01-10", lat=59.85, lon=17.63, circular_aspect=True)
+
+        assert recorded_builds[0]["circular_aspect"] is True
+        assert recorded_builds[0]["geometry"] == "point [17.63, 59.85]"
+        assert adapter._static_image == "static image"
+
+
+class _SymbolicImage:
+    """Stands in for an ``ee.Image``. Each operation returns an image whose text records it."""
+
+    def __init__(self, expression: str):
+        self.expression = expression
+
+    def multiply(self, factor: float) -> _SymbolicImage:
+        return _SymbolicImage(f"{self.expression} * {factor:.6f}")
+
+    def sin(self) -> _SymbolicImage:
+        return _SymbolicImage(f"sin({self.expression})")
+
+    def cos(self) -> _SymbolicImage:
+        return _SymbolicImage(f"cos({self.expression})")
+
+    def rename(self, band_name: str) -> _SymbolicImage:
+        return _SymbolicImage(f"{self.expression} as {band_name}")
+
+    def gt(self, threshold) -> _SymbolicImage:
+        return _SymbolicImage(f"{self.expression} > {threshold}")
+
+    def updateMask(self, mask: _SymbolicImage) -> _SymbolicImage:
+        return _SymbolicImage(f"({self.expression}) masked to {mask.expression}")
+
+    def select(self, band) -> _SymbolicImage:
+        return _SymbolicImage(f"{self.expression}.select({band})")
+
+    def projection(self) -> str:
+        return f"projection of {self.expression}"
+
+    def setDefaultProjection(self, projection: str) -> _SymbolicImage:
+        return _SymbolicImage(f"{self.expression} in {projection}")
+
+
+class _SymbolicCollection:
+    """Stands in for an ``ee.ImageCollection``, with the operations of a mosaic collection."""
+
+    def __init__(self, expression: str):
+        self.expression = expression
+
+    def filterBounds(self, geometry: str) -> _SymbolicCollection:
+        return _SymbolicCollection(f"{self.expression} at {geometry}")
+
+    def first(self) -> _SymbolicImage:
+        return _SymbolicImage(f"first of {self.expression}")
+
+    def mosaic(self) -> _SymbolicImage:
+        return _SymbolicImage(f"mosaic of {self.expression}")
+
+
+def _concatenate_symbolic_images(*images: _SymbolicImage) -> _SymbolicImage:
+    """Stands in for ``ee.Image.cat``."""
+    return _SymbolicImage("cat(" + ", ".join(image.expression for image in images) + ")")
+
+
+class TestCircularAspectImage:
+    """``_build_image(circular_aspect=True)`` gives sin and cos of aspect, without flat pixels."""
+
+    @pytest.fixture(autouse=True)
+    def symbolic_earth_engine(self, monkeypatch):
+        """Replace ``ee`` and the derived-band functions in ``_image`` with symbolic stubs."""
+
+        def open_image(asset_id: str) -> _SymbolicImage:
+            return _SymbolicImage(asset_id)
+
+        open_image.cat = _concatenate_symbolic_images  # ee.Image.cat
+        stub_ee = SimpleNamespace(Image=open_image, ImageCollection=_SymbolicCollection)
+        monkeypatch.setattr(_image, "ee", stub_ee)
+        monkeypatch.setitem(
+            _image._DERIVED_BAND_DISPATCH,
+            "aspect",
+            lambda image: _SymbolicImage(f"aspect({image.expression})"),
+        )
+        monkeypatch.setitem(
+            _image._DERIVED_BAND_DISPATCH,
+            "slope",
+            lambda image: _SymbolicImage(f"slope({image.expression})"),
+        )
+
+    def test_image_asset(self):
+        """Aspect and slope come from the source image; flat pixels (slope 0) are masked."""
+        circular_image = _image._build_image(
+            {"image": "dem", "bands": ["DEM"], "derived_bands": ["slope", "aspect"]},
+            circular_aspect=True,
+        )
+
+        assert circular_image.expression == (
+            "(cat(sin(aspect(dem) * 0.017453) as sin, cos(aspect(dem) * 0.017453) as cos))"
+            " masked to slope(dem) > 0"
+        )
+
+    def test_mosaic_collection_keeps_the_native_projection(self):
+        """For a space-tiled collection, the circular image uses the projected mosaic."""
+        circular_image = _image._build_image(
+            {
+                "collection": "tiles",
+                "collection_date_policy": "mosaic",
+                "derived_bands": ["aspect"],
+            },
+            geometry="point",
+            circular_aspect=True,
+        )
+
+        mosaic = "mosaic of tiles at point in projection of first of tiles.select(0)"
+        assert circular_image.expression == (
+            f"(cat(sin(aspect({mosaic}) * 0.017453) as sin, "
+            f"cos(aspect({mosaic}) * 0.017453) as cos)) masked to slope({mosaic}) > 0"
+        )

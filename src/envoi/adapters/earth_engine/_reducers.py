@@ -13,12 +13,15 @@ turns its raw output dict back into Python keys:
   / ``_extract_per_band_counts`` / ``_extract_count_from_reduce_result`` —
   unpack the GEE output dict back into ``{reducer_name: value}`` (or
   ``{band}_{reducer_name}: value`` for multi-band images).
+* ``_circular_aspect_statistics`` — circular mean, standard deviation, and
+  variance of the derived ``aspect`` band from the means of its sine and cosine.
 * ``_summarize_band_coverage`` — aggregate per-point band coverage into a
   dataset-level summary for the metadata sidecar.
 """
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 
@@ -179,25 +182,38 @@ def _parse_multiband_result(
     result: dict | None,
     reducer_names: Sequence[str],
     suffixes: list[str],
+    *,
+    count_only: bool = False,
 ) -> dict[str, float | None]:
     """Parse reduceRegion output for multi-band images.
 
     Returns a flat dict keyed as ``{band}_{reducer_name}`` for every band
     present in *result*, e.g. ``{"bio01_mean": 27.0, "bio02_mean": 180.5}``.
 
-    The caller (``_fetch_stats_single``) arranges for ``{band}_count``
-    keys to be present in *result* — either by combining a count reducer
-    itself for QC, or by passing through the user's own ``"count"``
-    request. Either way the result is a combined-form dict, so GEE emits
-    ``{band}{gee_suffix}`` keys (e.g. ``"bio01_mean"``) and we always use
-    suffix-based parsing here.
+    The caller (``_fetch_stats_single``) combines a count reducer with the
+    user's reducers for QC, unless the user asked for ``"count"``. With two
+    or more reducers, Earth Engine emits ``{band}{gee_suffix}`` keys (e.g.
+    ``"bio01_mean"``), and this function parses them by suffix.
 
     Special case: ``class_count`` returns a histogram-dict at
     ``{band}_histogram`` instead of a scalar. Each band's dict is unpacked
     into ``{band}_class_{value}_count`` keys.
+
+    Args:
+        result: The window branch of the ``reduceRegion`` output.
+        reducer_names: The reducer names, aligned with ``suffixes``.
+        suffixes: The Earth Engine output suffixes of the reducers.
+        count_only: True when ``count`` is the only window reducer. Earth
+            Engine names the output of a single reducer by the band name only
+            (``{"elevation": 247, "slope": 247}``), so each key is a band and
+            its value is that band's count. The result is then
+            ``{band}_count`` for each band.
     """
     if not result:
         return {}
+
+    if count_only:
+        return {f"{band}_count": value for band, value in result.items()}
 
     result_dict: dict[str, float | None] = {}
 
@@ -262,16 +278,20 @@ def _parse_point_result(
     return {"point": value}
 
 
-def _extract_per_band_counts(result: dict | None) -> dict[str, int]:
+def _extract_per_band_counts(result: dict | None, *, count_only: bool = False) -> dict[str, int]:
     """Return {band_name: valid_pixel_count} for every band in a multiband result.
 
     The combined reducer emits a "{band}_count" entry per band; this helper
     strips the suffix and collects all of them so callers can compute
     per-band coverage or pick the worst-case band.
+    With ``count_only`` (``count`` is the only window reducer), Earth Engine
+    names each count by the bare band name, so every key is a band.
     Returns an empty dict when result is None or has no count entries.
     """
     if not result:
         return {}
+    if count_only:
+        return {band: int(val) for band, val in result.items() if val is not None}
     return {
         key[:-6]: int(val)  # strip trailing "_count" (6 chars)
         for key, val in result.items()
@@ -283,6 +303,8 @@ def _extract_count_from_reduce_result(
     result: dict | None,
     band_name: str,
     multiband: bool,
+    *,
+    count_only: bool = False,
 ) -> int:
     """Pull the count-reducer output from a reduceRegion result.
 
@@ -291,6 +313,8 @@ def _extract_count_from_reduce_result(
     multi-band reductions we use the minimum count across all bands —
     i.e. the worst-case band — so that coverage reflects the most
     data-sparse band rather than an arbitrarily chosen one.
+    With ``count_only`` (``count`` is the only window reducer), Earth Engine
+    names each count by the bare band name (``{"elevation": 247}``).
     Returns 0 when the result is missing or has no count entry.
     """
     if not result:
@@ -299,11 +323,70 @@ def _extract_count_from_reduce_result(
     if multiband:
         # Use min so coverage is conservative: the window is "fully valid"
         # only when every band has data at every pixel.
-        per_band = _extract_per_band_counts(result)
+        per_band = _extract_per_band_counts(result, count_only=count_only)
         return min(per_band.values(), default=0)
 
-    val = result.get(f"{band_name}_count")
+    count_key = band_name if count_only else f"{band_name}_count"
+    val = result.get(count_key)
     return int(val) if val is not None else 0
+
+
+# ---------------------------------------------------------------------------
+# Circular statistics of the derived aspect band
+# ---------------------------------------------------------------------------
+
+# Below this mean resultant length R, the directions cancel out (for example
+# a uniform spread around the circle), so no mean direction exists. Rounding
+# also makes atan2 of two near-zero means meaningless.
+_MIN_MEAN_RESULTANT_LENGTH = 1e-12
+
+
+def _circular_aspect_statistics(
+    mean_sin: float | None,
+    mean_cos: float | None,
+    count: float | None,
+) -> dict[str, float | None]:
+    """Return the circular mean, standard deviation, and variance of aspect, in degrees.
+
+    Aspect is a direction: 350° and 10° are 20° apart, and their mean is 0°,
+    not the linear mean 180°. The adapter reduces the sine and cosine of the
+    aspect (in radians) of the window's non-flat pixels on the server. This
+    function turns those means into circular statistics:
+
+    * mean: ``atan2(mean_sin, mean_cos)`` in degrees, in [0, 360).
+    * std: ``sqrt(-2 ln R)`` in degrees, where ``R = hypot(mean_sin, mean_cos)``
+      is the mean resultant length, clamped to at most 1 (rounding can give a
+      value slightly above 1, and ``ln R`` must not be positive).
+    * var: the square of std, in square degrees.
+
+    Args:
+        mean_sin: Mean sine of the aspect of the non-flat pixels, or None.
+        mean_cos: Mean cosine of the aspect of the non-flat pixels, or None.
+        count: Number of non-flat pixels, or None when Earth Engine gave none.
+
+    Returns:
+        ``{"mean": ..., "std": ..., "var": ...}``. All three are None when the
+        window has no non-flat pixel (count 0 or missing), when a mean is
+        missing, or when R is below ``_MIN_MEAN_RESULTANT_LENGTH``.
+    """
+    empty_result: dict[str, float | None] = {"mean": None, "std": None, "var": None}
+    if not count or mean_sin is None or mean_cos is None:
+        return empty_result
+
+    mean_resultant_length = min(math.hypot(mean_sin, mean_cos), 1.0)
+    if mean_resultant_length < _MIN_MEAN_RESULTANT_LENGTH:
+        return empty_result
+
+    mean_direction_deg = math.degrees(math.atan2(mean_sin, mean_cos)) % 360.0
+    # A tiny negative angle modulo 360 rounds to exactly 360.0 in floating
+    # point. 360° is north, the same direction as 0°.
+    if mean_direction_deg >= 360.0:
+        mean_direction_deg = 0.0
+
+    # ln R <= 0, so -2 ln R >= 0. abs() turns the -0.0 of R = 1 into 0.0, so
+    # that the output table shows 0.0 and not -0.0.
+    std_deg = math.degrees(math.sqrt(abs(-2.0 * math.log(mean_resultant_length))))
+    return {"mean": mean_direction_deg, "std": std_deg, "var": std_deg**2}
 
 
 # ---------------------------------------------------------------------------

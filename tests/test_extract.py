@@ -1980,8 +1980,8 @@ class TestNumericalCorrectness:
         assert stats_df["dem_constant_mean_100m"].iloc[0] == pytest.approx(constant_dem_value)
         assert stats_df["dem_constant_min_100m"].iloc[0] == pytest.approx(constant_dem_value)
         assert stats_df["dem_constant_max_100m"].iloc[0] == pytest.approx(constant_dem_value)
-        # Standard deviation of a single repeated value is exactly 0 (the
-        # sample-std denominator (n-1) cancels with the zero numerator).
+        # Standard deviation of a single repeated value is exactly 0 (every
+        # deviation from the mean is zero).
         assert stats_df["dem_constant_std_100m"].iloc[0] == pytest.approx(0.0)
 
     def test_mean_constant_across_all_points(
@@ -2064,6 +2064,133 @@ class TestNumericalCorrectness:
             stats_df["dem_constant_point"].to_numpy(),
             np.full(len(sample_df), constant_dem_value),
         )
+
+
+# ------------------------------------------------------------------
+# Point sample of NaN and infinite pixels
+# ------------------------------------------------------------------
+
+# Two points about 100 m apart in UTM zone 34N. The raster below puts the
+# first point in pixel (row 10, col 10) and the second in pixel (row 10, col 20).
+_NON_FINITE_POINTS = pd.DataFrame(
+    {
+        "occurrenceID": ["non_finite_pixel", "valid_pixel"],
+        "decimalLatitude": [62.976878, 62.976878],
+        "decimalLongitude": [18.026823, 18.028790],
+    }
+)
+
+
+def _write_raster_without_nodata(path: Path, first_point_pixel_values: list[float]) -> np.ndarray:
+    """Write a float32 UTM 34N raster (10 m pixels) that declares no nodata value.
+
+    The pixel of the first point of ``_NON_FINITE_POINTS`` gets
+    ``first_point_pixel_values`` (one value per band). The other pixels are
+    random values from a seeded generator. Returns the written array
+    (bands, rows, columns).
+    """
+    from pyproj import Transformer
+
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+    first_x, first_y = to_utm.transform(
+        _NON_FINITE_POINTS["decimalLongitude"][0], _NON_FINITE_POINTS["decimalLatitude"][0]
+    )
+    # 30 x 30 pixels of 10 m; the first point is in the middle of pixel (10, 10).
+    west, north = first_x - 105.0, first_y + 105.0
+    transform = from_bounds(west, north - 300.0, west + 300.0, north, 30, 30)
+
+    band_count = len(first_point_pixel_values)
+    rng = np.random.default_rng(seed=7)
+    pixel_values = rng.uniform(100.0, 200.0, (band_count, 30, 30)).astype(np.float32)
+    for band_index, pixel_value in enumerate(first_point_pixel_values):
+        pixel_values[band_index, 10, 10] = pixel_value
+
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=30,
+        width=30,
+        count=band_count,
+        dtype="float32",
+        crs="EPSG:32634",
+        transform=transform,
+    ) as dst:
+        dst.write(pixel_values)
+    return pixel_values
+
+
+class TestPointSampleNonFinitePixels:
+    """A NaN or infinite pixel is missing in the point sample, also without a declared nodata."""
+
+    def test_nan_pixel_without_nodata_is_missing(self, tmp_path):
+        """A NaN pixel gives a null point value and the QC values of a nodata pixel."""
+        raster_path = tmp_path / "nan_pixel.tif"
+        pixel_values = _write_raster_without_nodata(raster_path, [float("nan")])
+        update_catalog(
+            {"datasets": {"nan_raster": {"data_source": "local", "path": str(raster_path)}}}
+        )
+        with rasterio.open(raster_path) as src:
+            assert src.nodata is None
+
+        outputs = extract(
+            _NON_FINITE_POINTS,
+            {
+                "batch_id": "nan_point",
+                "datasets": ["nan_raster"],
+                "settings": {"output_type": "tabular", "statistics": ["point"]},
+            },
+            output_dir=tmp_path,
+        )
+
+        stats_df = pd.read_csv(outputs["nan_point"])
+        qc_df = pd.read_csv(tmp_path / "nan_point_qc.csv")
+        assert pd.isna(stats_df.loc[0, "nan_raster_point"])
+        assert stats_df.loc[1, "nan_raster_point"] == pytest.approx(float(pixel_values[0, 10, 20]))
+        assert qc_df["nan_raster_in_extent_point"].tolist() == [False, True]
+        assert qc_df["nan_raster_n_pixels_point"].tolist() == [0, 1]
+        assert qc_df["nan_raster_had_nodata_point"].tolist() == [True, False]
+        assert qc_df["nan_raster_coverage_pct_point"].tolist() == [0.0, 100.0]
+
+    @pytest.mark.parametrize("pixel_value", [float("nan"), float("inf"), float("-inf")])
+    def test_single_band_value_is_none(self, tmp_path, pixel_value):
+        """The adapter returns None (not NaN or infinity) for a non-finite pixel."""
+        from envoi.adapters.local_adapter import LocalRasterAdapter
+
+        raster_path = tmp_path / "non_finite_pixel.tif"
+        _write_raster_without_nodata(raster_path, [pixel_value])
+
+        with LocalRasterAdapter({"path": str(raster_path), "bands": 1}) as adapter:
+            values, meta = adapter._sample_point_single(
+                _NON_FINITE_POINTS["decimalLatitude"][0], _NON_FINITE_POINTS["decimalLongitude"][0]
+            )
+
+        assert values == {"point": None}
+        assert meta["in_extent"] is False
+        assert meta["n_pixels"] == 0
+        assert "error" not in meta
+
+    def test_multi_band_non_finite_values_are_none(self, tmp_path):
+        """In a multi-band raster, NaN and infinite bands are None, and a finite band keeps its value."""
+        from envoi.adapters.local_adapter import LocalRasterAdapter
+
+        raster_path = tmp_path / "multi_band.tif"
+        _write_raster_without_nodata(raster_path, [float("nan"), float("inf"), 42.5])
+        lat = _NON_FINITE_POINTS["decimalLatitude"][0]
+        lon = _NON_FINITE_POINTS["decimalLongitude"][0]
+
+        with LocalRasterAdapter({"path": str(raster_path), "bands": [1, 2, 3]}) as adapter:
+            values_with_finite_band, meta_with_finite_band = adapter._sample_point_single(lat, lon)
+        with LocalRasterAdapter({"path": str(raster_path), "bands": [1, 2]}) as adapter:
+            values_without_finite_band, meta_without_finite_band = adapter._sample_point_single(
+                lat, lon
+            )
+
+        assert values_with_finite_band == {"b1": None, "b2": None, "b3": 42.5}
+        assert meta_with_finite_band["in_extent"] is True
+        assert values_without_finite_band == {"b1": None, "b2": None}
+        assert meta_without_finite_band["in_extent"] is False
+        assert meta_without_finite_band["n_pixels"] == 0
 
 
 # ------------------------------------------------------------------

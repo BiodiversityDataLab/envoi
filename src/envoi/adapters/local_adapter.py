@@ -517,19 +517,24 @@ class LocalRasterAdapter(BaseAdapter):
             meta_missing["exception"] = error
             return values_missing, meta_missing
 
+        # A pixel is missing when it is the band's nodata value, or when it is
+        # NaN or infinite. Rasters often store missing data as NaN without
+        # declaring a nodata value. Such a pixel is not a value: treat it as
+        # nodata, as the window reducers do (they keep only finite values).
+        def _clean_pixel_value(pixel_value, band_nodata) -> float | None:
+            if _is_nodata(pixel_value, band_nodata) or not np.isfinite(pixel_value):
+                return None
+            return float(pixel_value)
+
         if is_multiband:
             values: dict[str, Any] = {}
             for band_num, pixel_value, band_nodata in zip(
                 self.band, raw_pixel_values, per_band_nodata
             ):
-                clean_value = None if _is_nodata(pixel_value, band_nodata) else float(pixel_value)
-                values[f"b{band_num}"] = clean_value
+                values[f"b{band_num}"] = _clean_pixel_value(pixel_value, band_nodata)
             any_valid = any(value is not None for value in values.values())
         else:
-            pixel_value = raw_pixel_values[0]
-            clean_value = (
-                None if _is_nodata(pixel_value, per_band_nodata[0]) else float(pixel_value)
-            )
+            clean_value = _clean_pixel_value(raw_pixel_values[0], per_band_nodata[0])
             values = {"point": clean_value}
             any_valid = clean_value is not None
         meta = {

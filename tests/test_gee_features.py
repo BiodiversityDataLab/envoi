@@ -482,6 +482,149 @@ class TestRasterExport:
 
 
 # ------------------------------------------------------------------
+# Window statistics with special result shapes: count only, circular aspect.
+# ------------------------------------------------------------------
+
+
+def _angular_distance_deg(first_deg: float, second_deg: float) -> float:
+    """Return the shortest distance between two directions on the circle, in degrees."""
+    difference = abs(first_deg - second_deg) % 360.0
+    return min(difference, 360.0 - difference)
+
+
+# A point on the upper north flank of Mayon volcano (Philippines), 2 km north
+# of the summit. The slope faces north (circular mean about 8° on 2026-10-09),
+# and the directions of its pixels lie on both sides of north (min about 1°,
+# max about 360°), so their linear mean is near south (about 164°).
+_NORTH_FACING_SLOPE_DF = pd.DataFrame(
+    {
+        "occurrenceID": ["mayon_north_flank"],
+        "decimalLatitude": [13.2728],
+        "decimalLongitude": [123.6853],
+    }
+)
+
+
+class TestWindowStatisticShapes:
+    """Count-only runs and circular aspect statistics, on one point with a 200 m window."""
+
+    def test_count_only_runs_give_counts_and_qc(self, tmp_path):
+        """Count-only runs give count columns and n_pixels > 0, for one band and for two bands."""
+        settings = {"output_type": "tabular", "statistics": ["count"], "window_size_m": 200}
+        outputs = extract(
+            SWEDEN_SAMPLE_DF.iloc[[0]],
+            [
+                {
+                    "batch_id": "count_one",
+                    "datasets": ["dem_copernicus_glo30"],
+                    "settings": settings,
+                },
+                {
+                    "batch_id": "count_two",
+                    "datasets": [{"dem_copernicus_glo30": ["DEM", "slope"]}],
+                    "settings": settings,
+                },
+            ],
+            output_dir=tmp_path,
+        )
+
+        # One band: the count column and the QC count agree.
+        one_band = pd.read_csv(outputs["count_one"]).iloc[0]
+        one_band_qc = pd.read_csv(tmp_path / "count_one_qc.csv").iloc[0]
+        count = one_band["dem_copernicus_glo30_count_200m"]
+        assert count > 0
+        assert one_band_qc["dem_copernicus_glo30_n_pixels_200m"] == count
+        assert one_band_qc["dem_copernicus_glo30_coverage_pct_200m"] > 0
+        assert bool(one_band_qc["dem_copernicus_glo30_in_extent_200m"]) is True
+
+        # Two bands: one count column per band, and QC uses the smaller count.
+        two_bands = pd.read_csv(outputs["count_two"]).iloc[0]
+        two_bands_qc = pd.read_csv(tmp_path / "count_two_qc.csv").iloc[0]
+        dem_count = two_bands["dem_copernicus_glo30_DEM_count_200m"]
+        slope_count = two_bands["dem_copernicus_glo30_slope_count_200m"]
+        assert dem_count > 0 and slope_count > 0
+        assert two_bands_qc["dem_copernicus_glo30_n_pixels_200m"] == min(dem_count, slope_count)
+        assert bool(two_bands_qc["dem_copernicus_glo30_in_extent_200m"]) is True
+
+    def test_aspect_mean_is_circular_on_a_north_facing_slope(self, tmp_path):
+        """On a north-facing slope, the circular aspect mean faces north, unlike the linear mean."""
+        import ee
+
+        from envoi.adapters.earth_engine import GeeRasterAdapter
+        from envoi.geo import get_utm_crs
+
+        # Single band: a catalog entry whose only band is the derived aspect.
+        # Multi-band: the built-in DEM with the per-call bands [DEM, aspect].
+        single_band_entry = {
+            "data_source": "earth_engine",
+            "path": "COPERNICUS/DEM/GLO30_2024_1",
+            "data_type": "continuous",
+            "derived_bands": ["aspect"],
+            "supported_derived_bands": ["aspect"],
+            "dataset_spec": {"collection_date_policy": "mosaic"},
+        }
+        update_catalog({"datasets": {"aspect_only": single_band_entry}})
+        settings = {
+            "output_type": "tabular",
+            "statistics": ["mean", "std", "min", "max"],
+            "window_size_m": 200,
+        }
+        try:
+            outputs = extract(
+                _NORTH_FACING_SLOPE_DF,
+                [
+                    {"batch_id": "single", "datasets": ["aspect_only"], "settings": settings},
+                    {
+                        "batch_id": "multi",
+                        "datasets": [{"dem_copernicus_glo30": ["DEM", "aspect"]}],
+                        "settings": settings,
+                    },
+                ],
+                output_dir=tmp_path,
+            )
+        finally:
+            reset_catalog()
+        single_band = pd.read_csv(outputs["single"]).iloc[0]
+        multi_band = pd.read_csv(outputs["multi"]).iloc[0]
+
+        # The linear mean of the same window: the Earth Engine mean of the
+        # aspect band over the region, scale and grid of the window statistics.
+        lat = _NORTH_FACING_SLOPE_DF["decimalLatitude"].iloc[0]
+        lon = _NORTH_FACING_SLOPE_DF["decimalLongitude"].iloc[0]
+        adapter = GeeRasterAdapter(single_band_entry)
+        aspect_image = adapter._get_image(lat=lat, lon=lon)
+        linear_mean = aspect_image.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=adapter._make_region(lat, lon, 200),
+            scale=adapter._get_scale_value(aspect_image),
+            crs=get_utm_crs(lon, lat),
+            bestEffort=True,
+        ).getInfo()["aspect"]
+
+        circular_mean = single_band["aspect_only_mean_200m"]
+        observed = (
+            f"circular mean {circular_mean}, linear mean {linear_mean}, "
+            f"min {single_band['aspect_only_min_200m']}, max {single_band['aspect_only_max_200m']}, "
+            f"circular std {single_band['aspect_only_std_200m']}"
+        )
+        # The window has directions on both sides of north.
+        assert single_band["aspect_only_min_200m"] < 45.0, observed
+        assert single_band["aspect_only_max_200m"] > 315.0, observed
+        # The circular mean is near north. The linear mean of directions just
+        # above 0° and just below 360° is near south.
+        assert 0.0 <= circular_mean < 360.0, observed
+        assert _angular_distance_deg(circular_mean, 0.0) < 30.0, observed
+        assert _angular_distance_deg(linear_mean, 180.0) < 60.0, observed
+        assert _angular_distance_deg(circular_mean, linear_mean) > 120.0, observed
+        assert single_band["aspect_only_std_200m"] > 0.0, observed
+        # Both key forms give the same circular values for the same window.
+        assert multi_band["dem_copernicus_glo30_aspect_mean_200m"] == pytest.approx(circular_mean)
+        assert multi_band["dem_copernicus_glo30_aspect_std_200m"] == pytest.approx(
+            single_band["aspect_only_std_200m"]
+        )
+
+
+# ------------------------------------------------------------------
 # Automatic date selection for ImageCollections — QC date inspection.
 # ------------------------------------------------------------------
 #

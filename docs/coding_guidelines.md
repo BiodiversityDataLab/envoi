@@ -222,7 +222,8 @@ Reducers and missing data:
 - The `point` reducer samples the exact pixel at the point. Its columns carry no window suffix. **[Contract]**
 - `class_count` and `class_fraction` are 0 for an unobserved class, even when the window had no valid pixels.
   The QC columns (`in_extent`, `coverage_pct`) distinguish "absent class" from "no data". Keep both. **[Contract]**
-- When you change a reducer, check its definition, empty input, masks, the denominator (`ddof=1` for `std`), and the output type.
+- When you change a reducer, check its definition, empty input, masks, the denominator, and the output type.
+  `std` and `var` are population statistics (`ddof=0`, divide by n) in both adapters, as Earth Engine's `stdDev` and `variance` are.
 - Compare the local and GEE implementations before you claim they give the same result. Document material differences.
 
 Earth Engine requests (in addition to the GEE dataset pitfalls in `AGENTS.md`):

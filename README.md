@@ -158,6 +158,8 @@ The app expects a CSV in the same GBIF / Darwin Core schema as the default Pytho
 **Available reducers:**
 
 - Core stats: `mean`, `median`, `min`, `max`, `sum`, `std`, `var`, `count`, `mode`
+  - `std` and `var` are population statistics: they divide by the number of pixels n, not n − 1. Earth Engine and local rasters give the same values.
+  - For the Earth Engine derived band `aspect`, `mean`, `std`, and `var` are circular statistics in degrees (the mean of 350° and 10° is 0°, not 180°). Flat pixels (slope 0) are not used. See [Circular aspect statistics](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md#circular-aspect-statistics).
 - Quantiles: `q05`, `q10`, `q25`, `q50`, `q75`, `q90`, `q95`
 - Categorical: `class_count`, `class_fraction` (expanded per-class downstream)
 - Special: `point` — samples the exact pixel at each coordinate (no window)

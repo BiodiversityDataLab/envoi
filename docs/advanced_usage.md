@@ -9,6 +9,7 @@ The [README's quick-start](../README.md#quick-start) covers the common case — 
 - [Mixing categorical and continuous datasets](#mixing-categorical-and-continuous-datasets)
 - [Multiple window sizes in one call](#multiple-window-sizes-in-one-call)
 - [Selecting bands per call](#selecting-bands-per-call)
+- [Circular aspect statistics](#circular-aspect-statistics)
 - [Custom datasets](#custom-datasets)
 - [Failed points](#failed-points)
 - [Running interactively](#running-interactively)
@@ -153,6 +154,24 @@ The override **replaces** the catalog's `bands` list for that dataset in that ru
 **Column-naming consequences.** A one-element band override (`{"sr_landsat_annual": ["B4"]}`) keeps the multi-band column-naming style (`sr_landsat_annual_B4_mean_200m`). Use the catalog default if you instead want the bare single-band form (`sr_landsat_annual_mean_200m`) — the distinction reflects "the user picked one band out of many" versus "the dataset has only one band", which matters when downstream code keys off column names.
 
 > **Band identifiers differ by data source.** Earth Engine identifies bands by *string* names (`"B4"`, `"DEM"`, `"slope"`) because GEE exposes named bands. Local GeoTIFFs identify bands by *integer* index (`1`, `2`, `[1, 2, 3]`) because rasterio reads bands positionally. A GEE catalog entry might set `bands: ["DEM"]` and a local one `bands: 1`, and per-call overrides follow the same convention as the dataset they target.
+
+## Circular aspect statistics
+
+The derived band `aspect` is the direction that a slope faces, in degrees clockwise from north: 0° is north, 90° east, 180° south, and 270° west. A direction is a circular value. For example, 350° and 10° are only 20° apart, but their ordinary (linear) mean is 180°, which points south. For this reason, envoi computes three window statistics of `aspect` as circular statistics:
+
+- **`mean`** is the circular mean direction, in degrees from 0 to less than 360. envoi converts each pixel's direction to a unit vector (the sine and cosine of the angle), takes the mean of these vectors, and gives the direction of the mean vector.
+- **`std`** is the circular standard deviation, sqrt(−2 ln R), in degrees. R is the mean resultant length: the length of the mean vector. R is 1 when all pixels face the same direction (then `std` is 0), and goes towards 0 when the directions cancel out.
+- **`var`** is the square of `std`, in square degrees.
+
+**Flat pixels.** A pixel with slope 0 faces no direction, but Earth Engine gives it the aspect 0 (north). envoi does not use pixels with slope 0 for these three statistics. Otherwise, flat areas would pull the mean towards north.
+
+**Empty values.** The three statistics are empty when the window has no pixel with a slope above 0 (for example, a lake), or when R is below 10⁻¹² (the directions are spread evenly around the circle, so there is no mean direction). The QC columns do not change: flat pixels count as valid pixels there.
+
+**Other statistics of aspect.** `median`, `min`, `max`, the quantiles (`q05` to `q95`), `sum`, `mode`, and `point` treat aspect as a linear value from 0 to 360, and include flat pixels (as 0). Interpret them with care for slopes that face north: a window with directions on both sides of north can have a `min` near 0 and a `max` near 360. `count` counts every pixel with an aspect value, also the flat pixels.
+
+The column names are the usual ones (for example `dem_copernicus_glo30_aspect_mean_200m`). envoi computes the circular values in the same Earth Engine request as the other statistics of the point.
+
+Only the Earth Engine derived band `aspect` gets circular statistics. Local rasters have no derived bands: if your GeoTIFF has an aspect band, envoi treats it like any other band, and all its statistics are linear. The same is true for a band of an Earth Engine asset that has the name `aspect` but is not the derived band.
 
 ## Custom datasets
 

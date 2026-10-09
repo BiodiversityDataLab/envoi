@@ -89,3 +89,29 @@ These decisions came from the review of the extraction pipeline (branch `pipelin
   - The "every point failed" rule in each adapter: one rule would exist in two copies.
   - The full traceback as the error text: it is long and shows internal paths.
   - Count failed tiles in the existing `quality.tiles.n_failed`: that field already counts tiles that were not exported for any reason.
+
+### Population statistics
+
+- **Decision:** `std` and `var` are population statistics (divide by the number of pixels n, `ddof=0`) in both adapters.
+  The Earth Engine values do not change. The local values become smaller by the factor sqrt((n − 1)/n) for `std` and (n − 1)/n for `var`. A window with one valid pixel gives `std = 0` and `var = 0`.
+- **Reason:** the adapters gave different values for the same request. The Earth Engine adapter uses `ee.Reducer.stdDev` and `ee.Reducer.variance`.
+  `earthengine-api` also has `ee.Reducer.sampleStdDev` and `ee.Reducer.sampleVariance` ("the sample standard deviation", "the sample variance"), so `stdDev` and `variance` are the population statistics.
+  With population statistics, only the local adapter changes, and Earth Engine results that users already have stay valid.
+- **Rejected:**
+  - Sample statistics in both adapters (`sampleStdDev` and `sampleVariance` on Earth Engine): every existing Earth Engine result would change.
+  - Keep the difference and document it only: results from the two data sources would not be comparable.
+
+### Circular aspect statistics
+
+- **Decision:** for the Earth Engine derived band `aspect`, the window statistics `mean`, `std`, and `var` are circular statistics, in degrees.
+  - `mean` is the circular mean direction in [0, 360). `std` is the circular standard deviation sqrt(−2 ln R), where R is the mean resultant length, clamped to at most 1. `var` is the square of `std`.
+  - Pixels with slope 0 are not used for these three statistics. When the window has no pixel with slope above 0, or R is below 1e-12, the three values are null.
+  - The adapter reduces the sine and cosine of the aspect (a companion image, masked to slope above 0) in the same `ee.Dictionary` request as the other statistics, with the same region, scale, CRS, and `bestEffort`. Python computes the circular values from the means and the count (`_circular_aspect_statistics`). No request is added, and column names do not change.
+  - The other statistics of aspect (`median`, `min`, `max`, quantiles, `sum`, `mode`, `point`) stay linear, and the documentation says so. QC values come from the linear window branch.
+- **Reason:** aspect is a direction. The linear mean of 350° and 10° is 180°, the opposite direction, so the linear mean, standard deviation, and variance were wrong for slopes that face north.
+  Flat pixels: a live check on 2026-10-09 showed that `ee.Terrain.aspect` gives flat pixels the aspect 0 and does not mask them. Without the exclusion, flat pixels would pull the circular mean towards north.
+- **Rejected:**
+  - Linear statistics only, with a documentation note: the values are wrong where users need them most, on slopes that face north.
+  - The circular mean only (with linear `std` and `var`): `std` and `var` of directions that cross north are also wrong.
+  - New derived bands for northness and eastness (cos and sin of aspect): useful, but a new feature with new columns. It does not correct the existing `aspect` statistics.
+  - Hidden extra bands in the main image: multi-band reductions and tile exports would include them.

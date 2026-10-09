@@ -17,6 +17,7 @@ The ``GeeRasterAdapter`` class composes these as building blocks.
 from __future__ import annotations
 
 import logging
+import math
 
 import ee
 import pandas as pd
@@ -431,6 +432,7 @@ def _build_image(
     *,
     lat: float | None = None,
     lon: float | None = None,
+    circular_aspect: bool = False,
 ):
     """Build an ee.Image from a dataset_spec config dict.
 
@@ -441,6 +443,13 @@ def _build_image(
         3. Compute derived bands (slope, aspect, …) and addBands them.
         4. Final band select — drop source bands when only derived
            bands were requested, otherwise keep both.
+
+    With ``circular_aspect=True``, step 3 returns a companion image for the
+    circular statistics of the derived ``aspect`` band instead: two bands,
+    ``sin`` and ``cos``, of the aspect in radians. Aspect and slope come from
+    the same image (and so the same first band) as the derived bands. Flat
+    pixels (slope 0) are masked: Earth Engine gives them aspect 0 (north), so
+    they would pull the mean towards north although they face no direction.
 
     For collections, the date handling strategy is:
     - date provided + timestamps cached: find nearest timestamp, filterDate, .first()
@@ -510,6 +519,17 @@ def _build_image(
 
     else:
         raise ValueError("dataset_spec must contain 'image' or 'collection'")
+
+    # Circular aspect companion image: sine and cosine of the aspect, without
+    # flat pixels. Uses the same dispatch functions, on the same image, as the
+    # derived bands below.
+    if circular_aspect:
+        aspect_radians = _DERIVED_BAND_DISPATCH["aspect"](image).multiply(math.pi / 180.0)
+        not_flat_mask = _DERIVED_BAND_DISPATCH["slope"](image).gt(0)
+        return ee.Image.cat(
+            aspect_radians.sin().rename("sin"),
+            aspect_radians.cos().rename("cos"),
+        ).updateMask(not_flat_mask)
 
     # Compute derived bands BEFORE selecting `bands`. This allows derived bands
     # to read any source band they need internally — the user doesn't have to

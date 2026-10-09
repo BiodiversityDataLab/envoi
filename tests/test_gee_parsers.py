@@ -12,12 +12,17 @@ most cases here verify that path.
 
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 import pytest
 
 from envoi.adapters.earth_engine._image import _is_mosaic_date_policy, _resolve_date_filter_range
 from envoi.adapters.earth_engine._reducers import (
+    _circular_aspect_statistics,
     _dedupe_categorical_for_ee,
+    _extract_count_from_reduce_result,
+    _extract_per_band_counts,
     _parse_multiband_result,
     _parse_reduce_result,
 )
@@ -202,6 +207,190 @@ class TestParseMultibandResultClassCount:
             suffixes=["_histogram"],
         )
         assert parsed == {"B1_class_10_count": 4}
+
+
+# ------------------------------------------------------------------
+# Count-only results — "count" is the only window reducer.
+# ------------------------------------------------------------------
+
+# Key shapes from the live probe of 2026-10-09. A single reducer is named by
+# the band only; a combined reducer gives "{band}_{output}" keys.
+_COUNT_ONLY_ONE_BAND = {"elevation": 247}
+_COUNT_ONLY_TWO_BANDS = {"elevation": 247, "slope": 239}
+_MEAN_AND_COUNT_TWO_BANDS = {
+    "elevation_mean": 120.5,
+    "elevation_count": 280,
+    "slope_mean": 4.25,
+    "slope_count": 272,
+}
+
+
+class TestCountOnlyResults:
+    """With the count-only flag, bare band keys are the counts of those bands."""
+
+    def test_single_band_count_gives_n_pixels(self):
+        """A count-only single-band result gives the band's count as the valid-pixel count."""
+        assert (
+            _extract_count_from_reduce_result(
+                _COUNT_ONLY_ONE_BAND, "elevation", multiband=False, count_only=True
+            )
+            == 247
+        )
+
+    def test_two_band_count_gives_band_count_keys(self):
+        """A count-only two-band result gives one {band}_count key per band."""
+        parsed = _parse_multiband_result(
+            _COUNT_ONLY_TWO_BANDS, reducer_names=["count"], suffixes=["_count"], count_only=True
+        )
+        assert parsed == {"elevation_count": 247, "slope_count": 239}
+
+    def test_two_band_count_gives_per_band_counts_and_minimum(self):
+        """Per-band counts come from the bare keys, and the QC count is the smallest one."""
+        assert _extract_per_band_counts(_COUNT_ONLY_TWO_BANDS, count_only=True) == {
+            "elevation": 247,
+            "slope": 239,
+        }
+        assert (
+            _extract_count_from_reduce_result(
+                _COUNT_ONLY_TWO_BANDS, "elevation", multiband=True, count_only=True
+            )
+            == 239
+        )
+
+    def test_combined_result_without_flag_is_unchanged(self):
+        """Without the flag, counts come from {band}_count keys, as for combined reducers."""
+        assert _parse_multiband_result(
+            _MEAN_AND_COUNT_TWO_BANDS, reducer_names=["mean"], suffixes=["_mean"]
+        ) == {"elevation_mean": 120.5, "slope_mean": 4.25}
+        assert _extract_per_band_counts(_MEAN_AND_COUNT_TWO_BANDS) == {
+            "elevation": 280,
+            "slope": 272,
+        }
+        assert (
+            _extract_count_from_reduce_result(
+                _MEAN_AND_COUNT_TWO_BANDS, "elevation", multiband=True
+            )
+            == 272
+        )
+        assert (
+            _extract_count_from_reduce_result(
+                {"elevation_mean": 120.5, "elevation_count": 280}, "elevation", multiband=False
+            )
+            == 280
+        )
+
+    def test_user_count_with_other_reducer_without_flag_is_unchanged(self):
+        """A user "count" combined with "mean" keeps the suffix parsing ({band}_count keys)."""
+        parsed = _parse_multiband_result(
+            _MEAN_AND_COUNT_TWO_BANDS, reducer_names=["mean", "count"], suffixes=["_mean", "_count"]
+        )
+        assert parsed == {
+            "elevation_mean": 120.5,
+            "slope_mean": 4.25,
+            "elevation_count": 280,
+            "slope_count": 272,
+        }
+
+
+# ------------------------------------------------------------------
+# _circular_aspect_statistics — circular mean, std and var of aspect.
+# ------------------------------------------------------------------
+
+
+def _mean_sin_and_cos(directions_deg: list[float]) -> tuple[float, float]:
+    """Return the mean sine and mean cosine of directions in degrees (an independent calculation)."""
+    radians = [math.radians(direction) for direction in directions_deg]
+    mean_sin = sum(math.sin(angle) for angle in radians) / len(radians)
+    mean_cos = sum(math.cos(angle) for angle in radians) / len(radians)
+    return mean_sin, mean_cos
+
+
+def _angular_distance_deg(first_deg: float, second_deg: float) -> float:
+    """Return the shortest distance between two directions on the circle, in degrees."""
+    difference = abs(first_deg - second_deg) % 360.0
+    return min(difference, 360.0 - difference)
+
+
+class TestCircularAspectStatistics:
+    """Circular statistics of aspect from the mean sine, mean cosine, and pixel count."""
+
+    def test_directions_around_north_average_to_north(self):
+        """350° and 10° give the mean direction 0° (north), not the linear mean 180°."""
+        mean_sin, mean_cos = _mean_sin_and_cos([350.0, 10.0])
+
+        result = _circular_aspect_statistics(mean_sin, mean_cos, 2)
+
+        assert 0.0 <= result["mean"] < 360.0
+        assert _angular_distance_deg(result["mean"], 0.0) == pytest.approx(0.0, abs=1e-9)
+        # R = cos(10°); std = sqrt(-2 ln R) in degrees, var = std squared.
+        expected_std = math.degrees(math.sqrt(-2.0 * math.log(math.cos(math.radians(10.0)))))
+        assert result["std"] == pytest.approx(expected_std)
+        assert result["var"] == pytest.approx(expected_std**2)
+
+    def test_mean_direction_in_each_quadrant(self):
+        """The mean direction is in [0, 360) in every quadrant (east 90°, south 180°, west 270°)."""
+        for directions, expected_mean in (
+            ([80.0, 100.0], 90.0),
+            ([170.0, 190.0], 180.0),
+            ([260.0, 280.0], 270.0),
+            ([300.0, 320.0], 310.0),
+        ):
+            mean_sin, mean_cos = _mean_sin_and_cos(directions)
+            result = _circular_aspect_statistics(mean_sin, mean_cos, 2)
+            assert result["mean"] == pytest.approx(expected_mean)
+
+    def test_identical_directions_have_zero_spread(self):
+        """Pixels that all face 45° give mean 45°, std 0, and var 0."""
+        mean_sin, mean_cos = _mean_sin_and_cos([45.0, 45.0, 45.0])
+
+        result = _circular_aspect_statistics(mean_sin, mean_cos, 3)
+
+        assert result["mean"] == pytest.approx(45.0)
+        assert result["std"] == pytest.approx(0.0, abs=1e-6)
+        assert result["var"] == pytest.approx(0.0, abs=1e-6)
+
+    @pytest.mark.parametrize("count", [0, None])
+    def test_window_without_non_flat_pixels_gives_none(self, count):
+        """A window with only flat pixels (no count) gives None for mean, std, and var."""
+        # Earth Engine gives null means when every pixel is masked.
+        assert _circular_aspect_statistics(None, None, count) == {
+            "mean": None,
+            "std": None,
+            "var": None,
+        }
+        assert _circular_aspect_statistics(0.5, 0.5, count) == {
+            "mean": None,
+            "std": None,
+            "var": None,
+        }
+
+    def test_uniform_spread_gives_none(self):
+        """Directions spread evenly around the circle (R = 0) have no mean direction."""
+        mean_sin, mean_cos = _mean_sin_and_cos([0.0, 90.0, 180.0, 270.0])
+
+        assert _circular_aspect_statistics(mean_sin, mean_cos, 4) == {
+            "mean": None,
+            "std": None,
+            "var": None,
+        }
+        assert _circular_aspect_statistics(0.0, 0.0, 4) == {"mean": None, "std": None, "var": None}
+
+    def test_resultant_length_slightly_above_one_gives_zero_std(self):
+        """Rounding that gives R slightly above 1 gives std 0 and var 0, not NaN or an error."""
+        mean_sin, mean_cos = 0.6 * (1.0 + 1e-12), 0.8 * (1.0 + 1e-12)
+        assert math.hypot(mean_sin, mean_cos) > 1.0
+
+        result = _circular_aspect_statistics(mean_sin, mean_cos, 5)
+
+        assert result["std"] == 0.0
+        assert result["var"] == 0.0
+        assert math.copysign(1.0, result["std"]) == 1.0  # 0.0, not -0.0
+        assert result["mean"] == pytest.approx(math.degrees(math.atan2(0.6, 0.8)))
+
+    def test_missing_mean_gives_none(self):
+        """A missing mean sine or cosine gives None, also with a count."""
+        assert _circular_aspect_statistics(None, 0.5, 3)["mean"] is None
+        assert _circular_aspect_statistics(0.5, None, 3)["std"] is None
 
 
 # ------------------------------------------------------------------
