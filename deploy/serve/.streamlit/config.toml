@@ -1,0 +1,30 @@
+# Streamlit settings of the hosted envoi web app (the container image in deploy/serve/).
+# Streamlit reads this file from the working folder (/app in the image).
+# The keys were checked against Streamlit 1.65.0, the version in requirements.txt.
+
+[server]
+# Upload limit in MB, where Streamlit counts 1 MB as 1024 * 1024 bytes. Keep it
+# equal to HostedLimits.max_upload_bytes in src/envoi_webapp/settings.py.
+maxUploadSize = 50
+# No browser on the server, and no prompt for an email address.
+headless = true
+# The app code does not change in the image, so no file watcher and no reruns
+# on a file change.
+fileWatcherType = "none"
+runOnSave = false
+# The default, stated on purpose: the uploads need XSRF protection.
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Users see a general message for an unexpected error. The details go to the
+# server log only.
+showErrorDetails = "none"
+# Hide the developer options (rerun, clear cache, deploy) from users.
+toolbarMode = "viewer"
+
+[theme]
+# The same theme as the local web app (.streamlit/config.toml in the repository root).
+primaryColor = "#6fb488"
