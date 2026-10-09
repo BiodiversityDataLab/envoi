@@ -566,15 +566,36 @@ class GeeRasterAdapter(BaseAdapter):
         if policy == "contains":
             # "contains" policy: pick the image whose time interval contains
             # the sample date. When the date falls outside the collection's
-            # full range, clamp to the nearest boundary image.
-            if dt <= time_starts.min():
+            # full range, clamp to the nearest boundary image. The range starts
+            # at the first image start and ends at the end of the last image
+            # interval, so a date on the first start or inside the last
+            # interval is not clamped. The image matches the one that
+            # _resolve_date_filter_range selects for the same date.
+            if dt < time_starts.min():
                 return self._make_date_info(
                     time_starts.min(),
                     end_index=0,
                     clamped=True,
                     source="clamped_to_nearest",
                 )
-            if dt >= time_starts.max():
+
+            # The last interval ends at the system:time_end of the image with
+            # the latest start. Without end times, it ends one day after that
+            # start, the same rule that _resolve_date_filter_range uses.
+            # That function's date range also always covers the whole start
+            # day of the image, so an image whose end is on its start day (or
+            # equal to its start) is selected for a date on that day. Use the
+            # same day here, or such a date would be reported as clamped.
+            time_ends = self._collection_time_ends
+            last_start = time_starts.max()
+            if time_ends is not None and len(time_ends) == len(time_starts):
+                last_interval_end = time_ends[last_index]
+            else:
+                last_interval_end = last_start + pd.DateOffset(days=1)
+            last_interval_end = max(
+                last_interval_end, last_start.normalize() + pd.DateOffset(days=1)
+            )
+            if dt >= last_interval_end:
                 return self._make_date_info(
                     time_starts.max(),
                     end_index=last_index,

@@ -12,9 +12,10 @@ most cases here verify that path.
 
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
-from envoi.adapters.earth_engine._image import _is_mosaic_date_policy
+from envoi.adapters.earth_engine._image import _is_mosaic_date_policy, _resolve_date_filter_range
 from envoi.adapters.earth_engine._reducers import (
     _dedupe_categorical_for_ee,
     _parse_multiband_result,
@@ -279,3 +280,96 @@ class TestIsMosaicDatePolicy:
     def test_unknown_policy_is_not_mosaic(self):
         """An unrecognised value must not silently disable date selection."""
         assert not _is_mosaic_date_policy({"collection_date_policy": "whatever"})
+
+
+# ------------------------------------------------------------------
+# _resolve_date_filter_range — the filterDate range for "contains".
+# ------------------------------------------------------------------
+
+# Three 8-day intervals, the shape of the built-in "contains" collections.
+_EIGHT_DAY_STARTS = pd.DatetimeIndex(["2021-01-01", "2021-01-09", "2021-01-17"])
+_EIGHT_DAY_ENDS = pd.DatetimeIndex(["2021-01-09", "2021-01-17", "2021-01-25"])
+
+
+class TestResolveDateFilterRangeContains:
+    """``filterDate`` is half-open and gets whole days, so the range must
+    contain the start day of the selected image, or ``.first()`` is null.
+    """
+
+    def test_end_equal_to_start_covers_the_start_day(self):
+        """An instantaneous image (end == start) gives a one-day range."""
+        starts = pd.DatetimeIndex(["2021-06-15"])
+        ends = pd.DatetimeIndex(["2021-06-15"])
+        assert _resolve_date_filter_range(pd.Timestamp("2021-06-15"), "contains", starts, ends) == (
+            "2021-06-15",
+            "2021-06-16",
+        )
+
+    def test_end_later_on_the_start_day_covers_the_start_day(self):
+        """An image that ends on its start day gives a one-day range."""
+        starts = pd.DatetimeIndex(["2021-06-15 00:00:00"])
+        ends = pd.DatetimeIndex(["2021-06-15 23:59:59"])
+        assert _resolve_date_filter_range(pd.Timestamp("2021-06-15"), "contains", starts, ends) == (
+            "2021-06-15",
+            "2021-06-16",
+        )
+
+    def test_one_day_interval_is_unchanged(self):
+        """An image whose end is the next midnight keeps that end."""
+        starts = pd.DatetimeIndex(["2021-06-15"])
+        ends = pd.DatetimeIndex(["2021-06-16"])
+        assert _resolve_date_filter_range(pd.Timestamp("2021-06-15"), "contains", starts, ends) == (
+            "2021-06-15",
+            "2021-06-16",
+        )
+
+    def test_next_start_on_the_same_day_without_ends(self):
+        """Without end times, a next start on the same day still gives a one-day range."""
+        starts = pd.DatetimeIndex(["2021-06-15 00:00:00", "2021-06-15 12:00:00"])
+        assert _resolve_date_filter_range(pd.Timestamp("2021-06-15"), "contains", starts) == (
+            "2021-06-15",
+            "2021-06-16",
+        )
+
+    @pytest.mark.parametrize(
+        ("sample_date", "expected_range"),
+        [
+            # In range: the interval that contains the date.
+            ("2021-01-12", ("2021-01-09", "2021-01-17")),
+            # On the first start.
+            ("2021-01-01", ("2021-01-01", "2021-01-09")),
+            # Inside the last interval.
+            ("2021-01-20", ("2021-01-17", "2021-01-25")),
+            # Before the first start: the first image.
+            ("2020-12-01", ("2021-01-01", "2021-01-09")),
+            # After the last interval: the last image.
+            ("2022-06-01", ("2021-01-17", "2021-01-25")),
+        ],
+    )
+    def test_with_end_times(self, sample_date, expected_range):
+        """With end times, the range is the selected image's own interval."""
+        assert (
+            _resolve_date_filter_range(
+                pd.Timestamp(sample_date), "contains", _EIGHT_DAY_STARTS, _EIGHT_DAY_ENDS
+            )
+            == expected_range
+        )
+
+    @pytest.mark.parametrize(
+        ("sample_date", "expected_range"),
+        [
+            # In range: from the containing start to the next start.
+            ("2021-01-12", ("2021-01-09", "2021-01-17")),
+            ("2021-01-01", ("2021-01-01", "2021-01-09")),
+            # The last image ends one day after its start.
+            ("2021-01-17", ("2021-01-17", "2021-01-18")),
+            ("2020-12-01", ("2021-01-01", "2021-01-09")),
+            ("2022-06-01", ("2021-01-17", "2021-01-18")),
+        ],
+    )
+    def test_without_end_times(self, sample_date, expected_range):
+        """Without end times, an interval ends at the next start, or one day after the last start."""
+        assert (
+            _resolve_date_filter_range(pd.Timestamp(sample_date), "contains", _EIGHT_DAY_STARTS)
+            == expected_range
+        )

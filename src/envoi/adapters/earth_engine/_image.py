@@ -123,7 +123,9 @@ def _get_collection_time_bounds(
 ) -> tuple[pd.DatetimeIndex | None, pd.DatetimeIndex | None]:
     """Fetch start/end timestamps for a GEE ImageCollection.
 
-    Returns (start_times, end_times) as sorted DatetimeIndex objects.
+    Returns (start_times, end_times) as sorted DatetimeIndex objects. The start
+    times are unique: when several images have the same start, end_times holds
+    the latest of their ends.
     Returns (start_times, None) when end times are unavailable (e.g. user-uploaded
     assets that omit system:time_end). Returns (None, None) only on total failure.
     One getInfo() round-trip, done once per dataset.
@@ -170,17 +172,27 @@ def _get_collection_time_bounds(
         start_times = raw["starts"]
         end_times = raw["ends"]
 
-        # Drop None entries up front — we still need at least one valid start
+        # Pair each start with the end at the same position BEFORE dropping
+        # missing (None) values. Dropping first would shift the later values
+        # of one list: with one image missing its start and another missing
+        # its end, the lists keep the same length, and starts get the ends of
+        # other images. Pairing by position needs lists of the same length;
+        # otherwise there are no reliable pairs, so use no end times.
+        if len(end_times) == len(start_times):
+            paired_times = list(zip(start_times, end_times))
+        else:
+            paired_times = [(start, None) for start in start_times]
+        # Drop pairs without a start — we still need at least one valid start
         # to do anything useful, regardless of which branch we end up in.
-        clean_starts = [int(t) for t in start_times if t is not None]
+        paired_times = [(start, end) for start, end in paired_times if start is not None]
+        clean_starts = [int(start) for start, _ in paired_times]
         if not clean_starts:
             return None, None
-        clean_ends = [t for t in end_times if t is not None]
 
         # Branch 1: end-times are missing or partial → return a start-only
         # index. Build it from clean_starts (sorted + deduped) so it's
         # directly usable for nearest-neighbour lookups downstream.
-        if len(clean_ends) != len(clean_starts):
+        if any(end is None for _, end in paired_times):
             logger.debug(
                 "system:time_end missing for some images in %s; interval-based "
                 "date selection will fall back to next-start boundaries.",
@@ -194,12 +206,17 @@ def _get_collection_time_bounds(
             return pd.DatetimeIndex(start_series), None
 
         # Branch 2: every image has a paired (start, end). Build both indices
-        # from the same de-duplicated, sorted DataFrame so they stay aligned
-        # element-by-element — required for `time_ends[idx]` lookups to map
-        # back to the correct start.
-        paired_times = sorted(zip(clean_starts, [int(e) for e in clean_ends]))
-        bounds_df = pd.DataFrame(paired_times, columns=["start", "end"])
-        bounds_df = bounds_df.drop_duplicates().sort_values("start")
+        # from the same DataFrame, with one row per start and sorted by start,
+        # so they stay aligned element-by-element — required for
+        # `time_ends[idx]` lookups to map back to the correct start.
+        # Two images can have the same start and different ends. A duplicate
+        # start makes the index non-unique, and the nearest-image lookup
+        # (`get_indexer`) then raises. Keep the latest end of each start, so
+        # the interval covers every image with that start.
+        bounds_df = pd.DataFrame(
+            {"start": clean_starts, "end": [int(end) for _, end in paired_times]}
+        )
+        bounds_df = bounds_df.groupby("start", as_index=False, sort=True)["end"].max()
         start_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["start"], unit="ms", origin="unix"))
         end_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["end"], unit="ms", origin="unix"))
         return start_index, end_index
@@ -255,6 +272,8 @@ def _resolve_date_filter_range(
         - policy="contains" → [date,      date + 1d]
 
     policy="contains" selects the image whose interval contains date_timestamp.
+    A date outside the collection's range selects the first or the last image.
+    The returned range always covers at least one calendar day.
     policy="nearest"  selects the image with the closest start timestamp.
     """
     date_format = "%Y-%m-%d"
@@ -296,13 +315,15 @@ def _resolve_date_filter_range(
     else:
         end_date = start_date + pd.DateOffset(days=1)
 
-    # filterDate(start, end) is half-open. Some collections have images with
-    # system:time_end == system:time_start (instantaneous events); using the
-    # raw end would produce an empty filter and .first() would return null.
-    # Bump by one second whenever end <= start so the selected image is
-    # always inside the range.
-    if end_date <= start_date:
-        end_date = start_date + pd.Timedelta(seconds=1)
+    # filterDate(start, end) is half-open, and both ends are whole days. Some
+    # collections have images with system:time_end == system:time_start
+    # (instantaneous events), or an end later on the same day as the start.
+    # Formatted as days, start and end are then the same string: the filter
+    # is empty and .first() returns null, so every statistic is null. Use the
+    # next day as the end in that case, so the range always covers the
+    # start day and the selected image is always inside it.
+    if end_date.normalize() <= start_date.normalize():
+        end_date = start_date + pd.DateOffset(days=1)
 
     return start_date.strftime(date_format), end_date.strftime(date_format)
 

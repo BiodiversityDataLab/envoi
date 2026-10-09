@@ -871,6 +871,164 @@ class TestGbifEventDateParsing:
         assert dates == ["2026-01-01"]
 
 
+def _date_frame(date_values):
+    """Return a working dataframe (canonical column names) with the given date values."""
+    n_rows = len(date_values)
+    return pd.DataFrame(
+        {
+            "id": [f"p{i}" for i in range(n_rows)],
+            "lat": [62.97] * n_rows,
+            "lon": [18.02] * n_rows,
+            "date": date_values,
+        }
+    )
+
+
+class TestSlashDateParsing:
+    """Date values with "/": an interval keeps its start, YYYY/MM/DD is a date,
+    and any other form stops the run, because the order of day and month is unknown.
+    """
+
+    def test_yyyy_mm_dd_with_slashes_is_a_date(self):
+        """``2021/06/15`` parses to 2021-06-15 with no warning."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning would fail the test
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame(["2021/06/15"]))
+        assert dates == ["2021-06-15"]
+        assert date_warnings == []
+
+    def test_interval_keeps_its_start_with_the_interval_warning(self):
+        """``2021-01-01/2021-12-31`` parses to its start and gives only the interval warning."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(
+                _date_frame(["2021-01-01/2021-12-31"])
+            )
+        assert dates == ["2021-01-01"]
+        assert [str(w.message) for w in caught] == date_warnings
+        assert len(date_warnings) == 1
+        assert "Truncated 1 ISO 8601 date interval" in date_warnings[0]
+
+    def test_interval_warning_counts_only_intervals(self):
+        """YYYY/MM/DD dates are not counted as intervals."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(
+                _date_frame(["2021/06/15", "2021/07/01", "2021-01-01/2021-12-31", "2021-08-01"])
+            )
+        assert dates == ["2021-06-15", "2021-07-01", "2021-01-01", "2021-08-01"]
+        assert date_warnings == [
+            (
+                "Truncated 1 ISO 8601 date interval(s) ('start/end') to their start day; "
+                "nearest-image lookup only uses day precision."
+            )
+        ]
+
+    @pytest.mark.parametrize("bad_value", ["15/06/2021", "06/15/2021", "2021/6/5", "06/2021"])
+    def test_other_slash_forms_raise_with_the_date_column_name(self, bad_value):
+        """A value with "/" in another form raises ValueError that names the user's date column."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'collectionDate' has 1 date value") as error_info:
+            _parse_and_validate_dates(_date_frame([bad_value]), date_column_name="collectionDate")
+        assert repr(bad_value) in str(error_info.value)
+
+    @pytest.mark.parametrize(
+        "interval",
+        [
+            "2021-06-15T08:00/2021-06-15T10:00",
+            "2021-06-15T08:00:00Z/2021-06-16",
+            "2021-06-15 08:00/2021-06-15 10:00",
+        ],
+    )
+    def test_interval_with_time_of_day_start_is_an_interval(self, interval):
+        """An interval whose start has a time of day keeps its start day."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame([interval]))
+        assert dates == ["2021-06-15"]
+        assert "Truncated 1 ISO 8601 date interval" in date_warnings[0]
+
+    def test_year_month_interval_start_is_an_interval(self):
+        """``2021/06`` is an interval with the year-only start 2021, read as 2021-01-01."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame(["2021/06"]))
+        assert dates == ["2021-01-01"]
+        assert "Truncated 1 ISO 8601 date interval" in date_warnings[0]
+        assert "Date '2021' interpreted as 2021-01-01" in date_warnings[1]
+
+    def test_unparseable_date_error_is_chained(self):
+        """The ValueError for a date that pandas cannot parse keeps the pandas error as its cause."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="Error parsing 'eventDate' column") as error_info:
+            _parse_and_validate_dates(_date_frame(["spring 2021"]))
+        assert isinstance(error_info.value.__cause__, ValueError)
+
+    def test_one_bad_value_in_a_mixed_column_raises(self):
+        """One unsupported value stops the run, and the message lists only that value."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        date_values = ["2021-06-15", "2021/06/15", "2021-01-01/2021-12-31", "15/06/2021"]
+        with warnings.catch_warnings():
+            # The error must come before any interval warning.
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="cannot read") as error_info:
+                _parse_and_validate_dates(_date_frame(date_values))
+        message = str(error_info.value)
+        assert "'eventDate' has 1 date value(s)" in message
+        assert "'15/06/2021'" in message
+        assert "'2021/06/15'" not in message
+        assert "'2021-01-01/2021-12-31'" not in message
+
+    def test_message_lists_at_most_ten_values_and_the_total(self):
+        """With many unsupported values, the message lists ten different values and the count."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        # Twelve different values, and one of them twice: 13 rows.
+        date_values = [f"{day:02d}/06/2021" for day in range(1, 13)] + ["01/06/2021"]
+        with pytest.raises(ValueError, match="has 13 date value") as error_info:
+            _parse_and_validate_dates(_date_frame(date_values))
+        message = str(error_info.value)
+        assert "'10/06/2021'" in message
+        assert "'11/06/2021'" not in message
+        assert "... and 2 more" in message
+
+    def test_missing_date_is_not_a_slash_value(self):
+        """A missing date is skipped with its warning and does not count as a value with "/"."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.warns(UserWarning, match="Skipping 1 row"):
+            df, dates, _ = _parse_and_validate_dates(_date_frame([None, "2021/06/15"]))
+        assert dates == ["2021-06-15"]
+        assert df["id"].tolist() == ["p1"]
+
+    def test_extract_stops_before_any_output(self, sample_df, tmp_path):
+        """extract() raises for an unsupported value in a renamed date column and writes nothing."""
+        df = sample_df.rename(columns={"eventDate": "sampleDate"})
+        df.loc[2, "sampleDate"] = "02/04/1960"
+
+        with pytest.raises(ValueError, match="'sampleDate' has 1 date value"):
+            extract(
+                df,
+                _tabular_mean_config("slash_dates"),
+                date_column="sampleDate",
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+
 # ------------------------------------------------------------------
 # Raster output
 # ------------------------------------------------------------------

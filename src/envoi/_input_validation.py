@@ -14,7 +14,8 @@ Five concerns, separately invokable:
 * :func:`_parse_and_validate_dates` — accept GBIF / Darwin Core ISO 8601
   flexibility (intervals, time-of-day, timezone suffixes, year-only, year-month)
   and collapse each entry to a YYYY-MM-DD day. Drops rows whose date is null;
-  records per-batch warnings instead of raising.
+  records per-batch warnings instead of raising. Raises for date values that
+  it cannot read, such as ``15/06/2021``.
 * :func:`_validate_and_reproject_crs` — reject missing, non-numeric, and
   infinite coordinates; reproject to WGS84 when the user declared a non-WGS84
   input CRS; raise if any coordinate then sits outside ±90° / ±180°.
@@ -25,6 +26,7 @@ them in the metadata sidecar alongside its main run config.
 
 from __future__ import annotations
 
+import re
 import warnings
 from collections.abc import Hashable, Iterable
 
@@ -42,8 +44,18 @@ from ._filenames import format_id_list
 # (for example, an unmapped "date" column would become the sample date).
 _WORKING_COLUMN_NAMES = frozenset({"id", "lat", "lon", "date", "lat_original", "lon_original"})
 
-# Number of example IDs that a coordinate error message lists.
+# Number of example IDs or values that an error message lists.
 _MAX_IDS_IN_MESSAGE = 10
+
+# A date written YYYY/MM/DD, such as 2021/06/15. It is the same date as
+# YYYY-MM-DD. re.ASCII limits \d to the digits 0-9.
+_SLASH_DATE_PATTERN = re.compile(r"\d{4}/\d{2}/\d{2}", re.ASCII)
+
+# The start of an ISO 8601 interval ("start/end"): a year, a year-month, or a
+# date, optionally with a time of day after "T" or a space, such as 2021,
+# 2021-06, 2021-06-15, or 2021-06-15T13:00Z. A value such as 06/2021 has one
+# "/" but its start is not a date, so it is not an interval.
+_INTERVAL_START_PATTERN = re.compile(r"\d{4}(-\d{2}(-\d{2})?)?([T ].*)?", re.ASCII)
 
 
 def _validate_required_columns(
@@ -176,6 +188,17 @@ def _parse_and_validate_dates(
     diagnostic messages — by the time this function runs the column has
     already been renamed to the canonical ``"date"``, so look-ups inside
     use the canonical name regardless.
+
+    Values with ``/``: a value with exactly one ``/`` whose start is an ISO
+    8601 date or date-time (``2021``, ``2021-06``, ``2021-06-15``,
+    ``2021-06-15T13:00``) is an interval (``start/end``), and its start is
+    kept. A value of the form ``YYYY/MM/DD`` is the date ``YYYY-MM-DD``. Any
+    other value with ``/``, such as ``15/06/2021`` or ``06/2021``, raises,
+    because the order of day and month is unknown.
+
+    Raises:
+        ValueError: If a date value has ``/`` in an unsupported form, or if
+            pandas cannot parse a date value.
     """
     date_warnings: list[str] = []
 
@@ -216,20 +239,50 @@ def _parse_and_validate_dates(
     # it to pandas: take the start of any interval, drop the ``T...`` time
     # component. This also avoids pandas's "mixed time zones" parsing path,
     # which returns an object-dtype Index rather than a DatetimeIndex.
+    # Rows with a missing date were dropped above, so a missing value never
+    # reaches the checks for "/" below.
     preprocessed_dates: list[str] = []
+    unsupported_slash_values: list[str] = []
     interval_truncation_count = 0
     time_truncation_count = 0
     for raw_date in raw_dates:
         raw_date_str = str(raw_date).strip()
-        # Split on the first "/" to keep the start half of an interval.
-        if "/" in raw_date_str:
+        slash_count = raw_date_str.count("/")
+        interval_start = raw_date_str.split("/", 1)[0].strip()
+        if slash_count == 1 and _INTERVAL_START_PATTERN.fullmatch(interval_start):
+            # An ISO 8601 interval: keep its start.
             interval_truncation_count += 1
-            raw_date_str = raw_date_str.split("/", 1)[0]
+            raw_date_str = interval_start
+        elif _SLASH_DATE_PATTERN.fullmatch(raw_date_str):
+            # A date written YYYY/MM/DD. Cutting it at the first "/" would
+            # keep only the year, which pandas reads as January 1.
+            raw_date_str = raw_date_str.replace("/", "-")
+        elif slash_count > 0:
+            # Another form, such as 15/06/2021, 06/15/2021, or 06/2021. The
+            # order of day and month is unknown, so do not guess. Cutting at
+            # the first "/" would give a wrong date (pandas reads "06" as
+            # January 6 of the year 1). Collect the values for one error message.
+            unsupported_slash_values.append(raw_date_str)
+            continue
         # Then split on "T" to drop any time-of-day and timezone suffix.
         if "T" in raw_date_str:
             time_truncation_count += 1
             raw_date_str = raw_date_str.split("T", 1)[0]
         preprocessed_dates.append(raw_date_str)
+
+    if unsupported_slash_values:
+        # List each different value once, so a column with many copies of the
+        # same value gives a short message.
+        different_values = list(dict.fromkeys(unsupported_slash_values))
+        raise ValueError(
+            f"Column '{date_column_name}' has {len(unsupported_slash_values)} date value(s) "
+            f"with '/' that envoi cannot read: "
+            f"{format_id_list(different_values, limit=_MAX_IDS_IN_MESSAGE)}. envoi reads "
+            f"YYYY/MM/DD (for example 2021/06/15) as a date, and 'start/end' with an ISO 8601 "
+            f"start (for example 2021-06-15/2021-06-20) as an interval, of which it uses the "
+            f"start. It does not guess the order of day and month in other forms, such as "
+            f"15/06/2021 or 06/2021. Write these dates as YYYY-MM-DD."
+        )
 
     # One aggregated warning per kind of truncation, not one per row — GBIF
     # downloads routinely carry these formats and a per-row warning floods the
@@ -259,7 +312,7 @@ def _parse_and_validate_dates(
     except Exception as e:
         raise ValueError(
             f"Error parsing '{date_column_name}' column: {e}. Expected dates in YYYY-MM-DD format."
-        )
+        ) from e
 
     # Detect incomplete dates (year-only "2002" or year-month "2002-02") by
     # splitting on "-". A complete date has 3 parts (YYYY-MM-DD); year-only

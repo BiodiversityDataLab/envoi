@@ -82,7 +82,9 @@ Update this document when you add a module or change the adapter interface.
            |  3. load_defaults() reads configs/defaults.yml (cached per process).
            |  4. _parse_and_validate_dates(): drop rows without a date (with a warning),
            |     accept ISO 8601 intervals, times, time zones, year-only and year-month
-           |     values, and reduce each to YYYY-MM-DD.
+           |     values, and YYYY/MM/DD, and reduce each to YYYY-MM-DD. Raise
+           |     ValueError for other values with "/" (such as 15/06/2021 or 06/2021)
+           |     and for values that pandas cannot parse.
            |     _validate_and_reproject_crs(): reject missing, non-numeric, and
            |     infinite coordinates, reproject from input_crs to WGS84, and
            |     reject coordinates outside ±90° / ±180°.

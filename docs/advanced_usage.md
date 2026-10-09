@@ -66,14 +66,23 @@ extract(sample_points, {
 })
 ```
 
-**Date-format flexibility.** envoi follows the GBIF / Darwin Core convention and accepts the ISO 8601 variants commonly seen in occurrence records: plain `YYYY-MM-DD`, `YYYY-MM`, year-only `YYYY`, intervals like `2022-06-15/2022-06-20`, and timestamps with time-of-day or timezone. All forms are collapsed to a single `YYYY-MM-DD` per row before extraction. Incomplete or unparseable dates are recorded in the metadata sidecar so they can be audited after the run rather than killing it.
+**Date-format flexibility.** envoi follows the GBIF / Darwin Core convention and accepts the ISO 8601 variants commonly seen in occurrence records: plain `YYYY-MM-DD`, `YYYY-MM`, year-only `YYYY`, intervals like `2022-06-15/2022-06-20`, and timestamps with time-of-day or timezone. It also accepts `YYYY/MM/DD` (for example `2022/06/15`), which is the same date as `YYYY-MM-DD`. All forms are collapsed to a single `YYYY-MM-DD` per row before extraction: an interval (a value with exactly one `/` whose start is an ISO 8601 date or date-time) becomes its start day. These cases do not stop the run. envoi gives a warning, which is also recorded in the metadata sidecar:
+
+- A row with a missing date is skipped.
+- A year-only or year-month date is read as the first day of that year or month (`2022` becomes `2022-01-01`).
+- An interval is cut to its start day, and a time of day is removed.
+
+These date values stop the run with a `ValueError` before any extraction:
+
+- A value with `/` in another form, such as `15/06/2022`, `06/15/2022`, `06/2022`, or `2022/6/15`. envoi does not guess the order of day and month. The message names your date column and lists the values. Write these dates as `YYYY-MM-DD`.
+- A value that envoi cannot read as a date, such as `spring 2022` or `2022-13-45`.
 
 **Per-dataset selection policy.** For each point, envoi selects one image from the collection. The choice is controlled per-dataset by `collection_date_policy` in the catalog:
 
 - `"nearest"` (default) — the image whose start timestamp is closest to the point's date. Right for snapshot collections and most yearly composites.
 - `"contains"` — the image whose `[start, end)` time range contains the point's date. Use this for interval-based collections (monthly aggregates, seasonal composites) where "the image valid for July 2022" is more meaningful than "the image whose start is closest to July 15".
 
-**Out-of-range dates.** When a point's date falls before the earliest image in the collection or after the latest, the date is clamped to the nearest boundary and the substitution is recorded in the metadata sidecar — extraction proceeds rather than raising. This keeps a single rogue date from killing a long batch; the sidecar makes it easy to spot and decide whether to drop those points downstream.
+**Out-of-range dates.** When a point's date falls before the earliest image in the collection or after the latest, the date is clamped to the nearest boundary and the substitution is recorded in the metadata sidecar — extraction proceeds rather than raising. This keeps a single rogue date from killing a long batch; the sidecar makes it easy to spot and decide whether to drop those points downstream. With `"contains"`, the collection's range ends at the end of the last image's `[start, end)` time range, not at its start. So a date inside the last time range is not clamped. A date is clamped only when it is before the first image's start, or on or after the end of the last time range. When the collection has no end times, the last time range ends one day after the last image's start. The last time range always includes the whole start day of the last image, as the image selection does, so a date on that day is not clamped. With `"nearest"`, a date before the first image's start or after the last image's start is clamped.
 
 **No date column.** Without an `eventDate` column, envoi falls back to the most recent non-masked image in each collection (`ee.ImageCollection.mosaic()` semantics) and emits a warning that is also captured in the sidecar. This is the right behaviour for static datasets or when "most recent" is genuinely what you need, but it does mean a quiet date-less run on a time-varying dataset is hiding an assumption — the sidecar is where to verify it.
 
