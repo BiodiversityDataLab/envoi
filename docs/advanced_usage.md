@@ -10,6 +10,7 @@ The [README's quick-start](../README.md#quick-start) covers the common case — 
 - [Multiple window sizes in one call](#multiple-window-sizes-in-one-call)
 - [Selecting bands per call](#selecting-bands-per-call)
 - [Custom datasets](#custom-datasets)
+- [Failed points](#failed-points)
 - [Running interactively](#running-interactively)
 
 ## Multiple outputs in one call
@@ -109,7 +110,7 @@ Each dataset's `data_type` in the catalog (`continuous` or `categorical`) select
 
 A flat list (`"statistics": ["mean", "std"]`) is still accepted and applies to every dataset regardless of type — preferable when the run is homogeneous, since the typed-dict form is only useful when reducers differ by data type.
 
-**Categorical reducers expand per class.** When you request `class_count` or `class_fraction` on a categorical raster, envoi appends one column per class actually observed somewhere in the batch — e.g. `lulc_worldcover_2021_class_10_fraction_200m`, `..._class_20_fraction_200m`, and so on. A row whose window didn't see a given class is filled with `0` (count) or `0.0` (fraction); a class that never appears anywhere in the input batch produces no column at all, which keeps the output narrow on focused study areas. Pixel-validity is tracked separately in the QC sidecar, so the zero-fill never blurs "this class was absent" with "this window had no valid pixels".
+**Categorical reducers expand per class.** When you request `class_count` or `class_fraction` on a categorical raster, envoi appends one column per class actually observed somewhere in the batch — e.g. `lulc_worldcover_2021_class_10_fraction_200m`, `..._class_20_fraction_200m`, and so on. A row whose window didn't see a given class is filled with `0` (count) or `0.0` (fraction); a class that never appears anywhere in the input batch produces no column at all, which keeps the output narrow on focused study areas. Pixel-validity is tracked separately in the QC sidecar, so the zero-fill never blurs "this class was absent" with "this window had no valid pixels". A [failed point](#failed-points) is not zero-filled: its class columns are empty, because its classes are unknown.
 
 ## Multiple window sizes in one call
 
@@ -194,6 +195,22 @@ update_catalog({
 **Resetting the catalog.** Call `reset_catalog()` to drop everything registered at runtime and revert to the built-in catalog alone. Mostly useful in tests or notebooks where you want a clean slate between cells.
 
 For the full catalog schema, see the commented reference block at the top of [src/envoi/configs/ee_catalog.yml](../src/envoi/configs/ee_catalog.yml) — it's a copy-paste starting point for adding a new entry. A runnable starter that registers both a local raster and an Earth Engine asset lives at [examples/catalog.yml](../examples/catalog.yml).
+
+## Failed points
+
+A *failed point* is a point whose data request or read raised an error, for example a temporary Earth Engine error, a network timeout, or a damaged block in a local GeoTIFF. A point outside the dataset's extent, or a point whose window has only nodata pixels, is not a failed point: it has no error, and the QC columns show it as before.
+
+A failed point does not stop the run. envoi continues with the other points and reports the failed point:
+
+- **Statistics.** Every statistic of a failed point is empty, also the `class_count` and `class_fraction` columns, which are otherwise `0` for an absent class. A failed point adds no column of its own. With the local adapter, when a point needs both a window read and a pixel read (window statistics together with `point`), an error in either read makes the point a failed point.
+- **QC table.** The column `<dataset>_error_<N>m` (`<dataset>_error_point` for point-only statistics) holds the error of each failed point, as one line of text in the form `<error type>: <message>`, at most 500 characters. The other points have an empty value. The column exists only when at least one point of that dataset and window failed. The QC flags of a failed point are those of a point outside the extent: `in_extent` is `False`, `n_pixels` is `0`, `coverage_pct` is `0`, and `had_nodata` is `False`.
+- **Tile manifest (raster runs).** A failed tile has `exported` set to `False`, and the manifest gets an `error` column with the same text. The column exists only when at least one tile failed. A tile that was not written because its point is outside the extent, or because its window has no pixels, has no error.
+- **Metadata sidecar.** Each coverage summary (`quality.<N>m` or `quality.point`) and each tile summary (`quality.tiles`) has `n_errors` (the number of failed points) and `ids_errors` (their IDs). Both are always present, with `0` and `[]` when nothing failed. A failed point is also listed in `ids_no_data`, because it has no data. In `quality.tiles`, `n_failed` counts every tile that was not exported, for any reason; `n_errors` counts only the failed tiles.
+- **Warning.** envoi gives one warning for each dataset and window with failed points. It names the dataset, the window, the number of failed points, where the errors are, and the error of the first failed point. The sidecar records it in `warnings`, under the key `failed_<dataset>_<N>m`.
+
+When **every** point of one dataset and window fails, the cause usually affects all points (for example no network, or no access to the dataset), so envoi stops the run with a `RuntimeError`. The message names the dataset and the window and shows the error of the first point. Outputs that were written before the error (for example the tiles of an earlier dataset, or the files of an earlier run config in a list) stay on disk. Correct the problem and run the extraction again.
+
+To repeat only the failed points, select the rows whose ID is in `ids_errors` (or whose error column is not empty) and run `extract()` again for them.
 
 ## Running interactively
 

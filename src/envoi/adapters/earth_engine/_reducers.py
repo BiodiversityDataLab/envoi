@@ -315,8 +315,8 @@ def _summarize_band_coverage(meta_list: list[dict]) -> dict[str, dict[str, float
     """Aggregate per-point band_coverage_pct across all sample points.
 
     Returns ``{band: {"min": x, "mean": x, "max": x}}`` for each band that
-    appeared in at least one point's metadata. Failure-path metas carry an
-    empty ``band_coverage_pct`` dict and are skipped automatically, so the
+    appeared in at least one point's metadata. Failure-path metas have no
+    ``band_coverage_pct`` and are skipped automatically, so the
     summary only reflects points that actually ran. Returns an empty dict for
     single-band datasets or when no point produced band-level coverage data.
     """

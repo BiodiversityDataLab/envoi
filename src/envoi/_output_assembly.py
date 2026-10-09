@@ -120,6 +120,10 @@ def _append_stat_columns(
     decision is that "class not observed" = 0, regardless of whether the
     window itself was valid; the QC sidecar records extent/coverage
     separately).
+
+    A failed point (its meta dict has ``error``) has no statistic keys. It gets
+    a null value in every column, class columns included: its read failed, so
+    "class not observed" does not apply. It adds no column of its own.
     """
     # Collect keys in first-seen order so output columns stay stable across runs.
     stat_keys = dict.fromkeys(key for stat_dict, _ in stats_results for key in stat_dict)
@@ -146,7 +150,11 @@ def _append_stat_columns(
             missing_fill = None
 
         # Pull one value per sample row, using the chosen fill for absent keys.
-        column_values = [stat_dict.get(stat_key, missing_fill) for stat_dict, _ in stats_results]
+        # A failed point gets null, also in a class column (see the docstring).
+        column_values = [
+            stat_dict.get(stat_key, None if "error" in point_meta else missing_fill)
+            for stat_dict, point_meta in stats_results
+        ]
 
         # Overwrite existing columns (keeps schema stable across windows).
         if column_name in existing_columns:

@@ -64,3 +64,28 @@ These decisions came from the review of the shared agent configuration (`AGENTS.
   - Codex ignores `sandbox_mode` in role files. A Codex role is read-only only when its session starts read-only (`codex --sandbox read-only`).
 - **Rejected:** wildcard rules such as `pytest -m "not gee" *`, because a second `-m gee` option selects the live Earth Engine tests.
   A hook that checks `pytest` options, because it adds a script to maintain.
+
+## 2026-10-09 — Pipeline bug fixes
+
+These decisions came from the review of the extraction pipeline (branch `pipeline-bugs`).
+
+### Failed points
+
+- **Decision:** a point whose data request or read raised an exception that the adapter caught (a failed point) does not stop the run.
+  - The adapters record the error text (`"<exception type>: <message>"` on one line, at most 500 characters, from `qc.format_point_error`) and the exception in the point's meta dict.
+    A failed point has null statistics and adds no statistic column. A point outside the extent is not a failed point.
+  - `extract()` reports failed points in the QC column `{dataset}_error_{N}m` (or `{dataset}_error_point`), in an `error` column of the tile manifest, and in the sidecar fields `n_errors` and `ids_errors` of each quality summary.
+    Each column exists only when a point of that batch failed. The two sidecar fields are always present.
+    `quality.tiles.n_failed` keeps its meaning: the number of tiles that were not exported for any reason.
+  - `extract()` gives one warning for each dataset and window with failed points, and records it in the sidecar `warnings`.
+  - When every point of one dataset and window fails, `extract()` raises `RuntimeError` with the error of the first failed point (the lowest input index), chained to its exception.
+    `extract.py` applies this rule and the warning after the adapter call. The adapters do not.
+- **Reason:** before, a failed Earth Engine point looked like a point outside the extent, a local read error stopped the whole run,
+  and a batch where every point failed finished with empty values and no error. Users could not tell missing data from a failed request.
+  One bad point must not cost the whole batch, but a cause that affects every point must stop the run with the real error.
+- **Rejected:**
+  - Stop the run on any failed point: one temporary Earth Engine error would cost a long batch.
+  - Report failed points only in a warning and the sidecar: users could not find the failed rows in the output tables.
+  - The "every point failed" rule in each adapter: one rule would exist in two copies.
+  - The full traceback as the error text: it is long and shows internal paths.
+  - Count failed tiles in the existing `quality.tiles.n_failed`: that field already counts tiles that were not exported for any reason.

@@ -1,8 +1,20 @@
 # src/envoi/qc.py
+"""Per-point quality control (QC) columns and coverage summaries for :func:`envoi.extract`.
+
+Builds the QC columns of each dataset from the adapters' meta dicts (core flags,
+and date, CRS, per-band coverage, and error columns when present), summarizes
+coverage and failed points for the metadata sidecar, and splits the merged table
+into the statistics and QC tables.
+
+Also formats the error text of a failed point (``format_point_error``), so both
+adapters record the same text. No Earth Engine calls and no file writes.
+"""
+
 from __future__ import annotations
 
 import logging
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import pandas as pd
@@ -20,6 +32,10 @@ _DATE_META_KEYS = (
     "image_time_start",
     "image_time_end",
 )
+
+# Longest error text recorded for one failed point. Earth Engine errors can be
+# long (some contain a download URL), and the text goes into one table cell.
+_MAX_ERROR_TEXT_LENGTH = 500
 
 
 @dataclass
@@ -46,6 +62,53 @@ class QualityControlBuildResult:
     column_suffix: str
     quality_key: str
     qc_column_names: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Failed points
+# ---------------------------------------------------------------------------
+
+
+def format_point_error(exception: BaseException) -> str:
+    """Return the error text of a failed point.
+
+    A failed point is a point whose data request or read raised an exception
+    that the adapter caught. The adapter stores this text in the point's meta
+    dict as ``error`` (and the exception itself as ``exception``). Both
+    adapters use this function, so the same error gives the same text.
+
+    Args:
+        exception: The exception that the adapter caught for the point.
+
+    Returns:
+        ``"{exception type}: {message}"`` on one line: every run of whitespace,
+        line breaks included, becomes one space. The text has at most 500
+        characters. Longer text is cut.
+    """
+    error_text = " ".join(f"{type(exception).__name__}: {exception}".split())
+    return error_text[:_MAX_ERROR_TEXT_LENGTH]
+
+
+def summarize_point_errors(meta_list: list[dict], ids: Sequence) -> dict:
+    """Count the failed points of a batch and list their input IDs, for the sidecar.
+
+    Args:
+        meta_list: One adapter meta dict per point, in input order. A failed
+            point's dict has an ``error`` key.
+        ids: The input IDs, in the same order as ``meta_list``.
+
+    Returns:
+        ``{"n_errors": int, "ids_errors": list}``. Both keys are always present:
+        ``0`` and ``[]`` when no point failed. The IDs are plain Python values,
+        so the dict can be written to JSON.
+    """
+    # Series.tolist() turns NumPy scalars (for example numeric IDs) into Python
+    # values, which json.dumps can write.
+    id_values = pd.Series(list(ids)).tolist()
+    ids_errors = [
+        sample_id for sample_id, point_meta in zip(id_values, meta_list) if "error" in point_meta
+    ]
+    return {"n_errors": len(ids_errors), "ids_errors": ids_errors}
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +170,19 @@ def extract_crs_column(meta_list: list[dict]) -> pd.DataFrame:
     return pd.DataFrame({"region_crs": [m.get("region_crs") for m in meta_list]})
 
 
+def extract_error_column(meta_list: list[dict]) -> pd.DataFrame:
+    """Extract the error text of each failed point into a DataFrame.
+
+    Returns a single-column DataFrame with column 'error', or an empty
+    DataFrame when no point of the batch failed. The value is the error text
+    (see ``format_point_error``) for a failed point and null for every other
+    point. No GEE calls — reads from already-collected meta dicts.
+    """
+    if not meta_list or not any("error" in m for m in meta_list):
+        return pd.DataFrame()
+    return pd.DataFrame({"error": [m.get("error") for m in meta_list]})
+
+
 def extract_band_coverage_columns(meta_list: list[dict]) -> pd.DataFrame:
     """Extract per-point, per-band coverage from adapter meta dicts into a DataFrame.
 
@@ -120,7 +196,7 @@ def extract_band_coverage_columns(meta_list: list[dict]) -> pd.DataFrame:
     (i.e. single-band datasets, point-only runs, or failure-path metas).
     """
     # Only emit columns when at least one point across the batch has non-empty
-    # band data. Failure-path metas carry band_coverage_pct: {} so this correctly
+    # band data. Failure-path metas carry no band data, so this correctly
     # skips datasets where every point failed.
     first_band_data = next(
         (m.get("band_coverage_pct") for m in meta_list if m.get("band_coverage_pct")),
@@ -172,8 +248,8 @@ def build_quality_control_dataframe(
     """Build dataset-prefixed QC columns from adapter metadata.
 
     Produces a prefixed/suffixed DataFrame covering core flags (in_extent,
-    n_pixels, had_nodata, coverage_pct) plus optional date, CRS, and per-band
-    coverage columns when present in the meta dicts. Centralizes QC DataFrame
+    n_pixels, had_nodata, coverage_pct) plus optional date, CRS, per-band
+    coverage, and error columns when present in the meta dicts. Centralizes QC DataFrame
     construction so extract orchestration code does not need to manage
     suffixing, date/crs joins, or merge mechanics.
     """
@@ -211,6 +287,13 @@ def build_quality_control_dataframe(
     if not band_coverage_dataframe.empty:
         additional_quality_dataframes.append(
             band_coverage_dataframe.add_prefix(f"{dataset_name}_").add_suffix(column_suffix)
+        )
+
+    # The error column exists only when at least one point of the batch failed.
+    error_column_dataframe = extract_error_column(meta_list)
+    if not error_column_dataframe.empty:
+        additional_quality_dataframes.append(
+            error_column_dataframe.add_prefix(f"{dataset_name}_").add_suffix(column_suffix)
         )
 
     # Reset indexes before concat so row alignment is explicit and robust.
@@ -287,8 +370,12 @@ def attach_quality_control(
     extract orchestrator does not need to manage suffixing, column naming, or
     summary shape. The returned qc_column_names list lets the caller accumulate
     exact QC column names across datasets for use with split_stats_and_qc.
+
+    When ``df`` has an ``id`` column, the coverage summary also has
+    ``ids_no_data`` and the failed-point fields ``n_errors`` and
+    ``ids_errors`` (see ``summarize_point_errors``).
     """
-    # Build the prefixed/suffixed QC DataFrame (core flags + optional date/crs/band_coverage).
+    # Build the prefixed/suffixed QC DataFrame (core flags + optional date/crs/band_coverage/error).
     qc_build_result = build_quality_control_dataframe(
         meta_list=meta_list,
         dataset_name=dataset_name,
@@ -317,6 +404,11 @@ def attach_quality_control(
     coverage_summary = summarize_coverage(
         qc_build_result.quality_control_dataframe, coverage_column, ids=ids
     )
+
+    # Count the failed points and list their IDs. A failed point also has
+    # coverage 0, so it is in ids_no_data as well.
+    if ids is not None:
+        coverage_summary.update(summarize_point_errors(meta_list, ids))
 
     return (
         df_with_qc,

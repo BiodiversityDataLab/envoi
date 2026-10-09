@@ -122,7 +122,14 @@ Setup, caching, and cleanup:
 Failures for single points (one bad point must not cost the whole batch; a programming error must still stop the run):
 - Continue the batch when the point is outside the raster, its read fails, or its Earth Engine request fails.
   Return an empty result for that point: null statistics, or `None` instead of a tile path.
-  The QC columns, tile manifest, and metadata sidecar then report it as failed. **[Contract]**
+- When a read or request fails (a failed point), return no statistic keys, the QC values of a point outside the extent,
+  and record the error in the point's meta dict: `error`, the text from `qc.format_point_error`, and `exception`, the exception object.
+  Keep `exception` in memory only. Never write it to JSON or to an output table.
+  A point outside the raster, or with only nodata pixels, is not a failed point and has no `error`. **[Contract]**
+- The adapter does not decide what a failed point means for the run. `extract.py` does, after the adapter call:
+  it raises `RuntimeError`, chained to the first failed point's exception, when every point of the batch failed.
+  Otherwise it emits one warning for the batch and records it in the sidecar's `warnings`.
+  The QC error column, the manifest's `error` column, and the sidecar fields `n_errors` and `ids_errors` report each failed point. **[Contract]**
 - Catch the specific exception types, as `LocalRasterAdapter` does (`ValueError`, `WindowError`, `RasterioIOError`).
   Let programming errors (`TypeError`, `AttributeError`, `KeyError`) propagate.
 - The GEE adapter catches `Exception` per worker result, because Earth Engine reports unrelated failures with one exception type.

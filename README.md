@@ -153,7 +153,7 @@ The app expects a CSV in the same GBIF / Darwin Core schema as the default Pytho
 
 **Reducer columns** look like: `dem_copernicus_glo30_mean_200m`, `dem_copernicus_glo30_std_200m`.
 
-**QC columns** look like: `dem_copernicus_glo30_in_extent_200m`, `dem_copernicus_glo30_n_pixels_200m`, `dem_copernicus_glo30_had_nodata_200m`, `dem_copernicus_glo30_coverage_pct_200m`.
+**QC columns** look like: `dem_copernicus_glo30_in_extent_200m`, `dem_copernicus_glo30_n_pixels_200m`, `dem_copernicus_glo30_had_nodata_200m`, `dem_copernicus_glo30_coverage_pct_200m`. When the data request or read of a point failed, the QC table also has `dem_copernicus_glo30_error_200m` (`..._error_point` for point-only statistics), with the error for that point and an empty value for the other points. This column exists only when at least one point of that dataset and window failed.
 
 **Available reducers:**
 
@@ -269,6 +269,7 @@ The machine-readable source, including descriptions, citations, and URLs for eve
 - **Window units.** `window_size_m` is in meters. Each window is projected into the point's local UTM zone so distances are correct globally.
 - **Data source CRS and resolution.** Both are detected automatically from each dataset — no manual configuration needed.
 - **QC, not failure.** Low pixel coverage is flagged in QC columns rather than raising. Filter on `<dataset>_coverage_pct_<window>m` to drop unreliable rows downstream.
+  A point whose data request or read fails (for example a temporary Earth Engine error) does not stop the run either: its statistics are empty (raster runs: no tile), and the error goes into the QC column `<dataset>_error_<window>m` (raster runs: the `error` column of the tile manifest) and the metadata sidecar, with one warning. When every point of a dataset and window fails, the run stops with a `RuntimeError` that shows the first error. See [Failed points](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md#failed-points).
 
 ---
 

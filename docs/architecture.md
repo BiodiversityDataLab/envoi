@@ -101,8 +101,9 @@ Update this document when you add a module or change the adapter interface.
            |       adapter.fetch_stats_batch() -> (stats, meta) for each point
            |         GEE: server-side reducers; local: Python reducers (reducers.py)
            |         The "point" reducer adds an exact-pixel sample in the same call.
+           |       _raise_if_every_point_failed(): RuntimeError when every point failed
            |       _append_stat_columns() -> attach_quality_control()
-           |       -> adapter.build_dataset_meta()
+           |       -> adapter.build_dataset_meta() -> _warn_about_failed_points()
            |
            +---> [raster]  _process_dataset_raster()
            |       adapter.export_tiles() -> one GeoTIFF for each point
@@ -110,7 +111,9 @@ Update this document when you add a module or change the adapter interface.
            |         raises ValueError before any download), then getDownloadURL +
            |         requests; local: rasterio (native grid, or
            |         rasterio.warp.reproject onto a UTM grid when resample_m is set)
+           |       _raise_if_every_point_failed(): RuntimeError when every tile failed
            |       adapter.build_dataset_meta() -> _write_tile_manifest()
+           |       -> _warn_about_failed_points()
            |
            v
   9. Write outputs and the metadata sidecar:
@@ -124,7 +127,8 @@ Update this document when you add a module or change the adapter interface.
 
   Raster mode, in output_dir/<batch_id>/:
     <dataset>/<id>-<dataset>.tif       one tile for each point
-    <dataset>/tiles_manifest.csv       maps each input row to its tile
+    <dataset>/tiles_manifest.csv       maps each input row to its tile (and the
+                                       error of each failed tile)
     <batch_id>_metadata.json           sidecar (only when write_metadata=True)
     Multi-window runs add the window to tile and manifest names:
     <id>-<dataset>-200m.tif, tiles_manifest-200m.csv
@@ -156,7 +160,7 @@ Update this document when you add a module or change the adapter interface.
 | `adapters/earth_engine/_reducers.py` | Server-side reducer registry, `_build_combined_reducer` (so all statistics for a point resolve in one round-trip), `reduceRegion` result parsing (single-band, multi-band, per-class histogram), and the per-band coverage summary. |
 | `adapters/earth_engine/_tiles.py` | Size guard for synchronous downloads (`_check_tile_size`) and the retrying tile downloader (`_download_tile_via_url`, which wraps `ee.Image.getDownloadURL` + `requests` with exponential backoff for 429 / 5xx responses). |
 | `reducers.py` | Python-side reducer registry (mean, median, min, max, sum, std, var, count, mode, class_count, class_fraction, q05..q95), used by the local adapter. Also `list_reducers()` (public) and `validate_reducers()`, which warns about reducer / `data_type` mismatches such as `mean` on a categorical raster. `point` is not in the registry; the adapters handle it. |
-| `qc.py` | Builds per-dataset QC columns from the adapters' meta dicts (core flags, plus date, CRS, and per-band coverage where available), warns when points fall below `min_coverage_pct`, and splits the merged DataFrame into the stats and QC tables. |
+| `qc.py` | Builds per-dataset QC columns from the adapters' meta dicts (core flags, plus date, CRS, per-band coverage, and the error of failed points where available), warns when points fall below `min_coverage_pct`, and splits the merged DataFrame into the stats and QC tables. Also formats the error text of a failed point for both adapters (`format_point_error`), and counts failed points for the sidecar (`summarize_point_errors`). |
 | `metadata.py` | Writes the sidecar JSON (`run` / `config` / `datasets` / optional `warnings`) and provides the summaries that adapters put into it (`summarize_date_info`, `summarize_tile_export`). |
 | `auth.py` | `init_gee()`: initializes Earth Engine from a service-account JSON, found through `ENVOI_EE_CREDENTIALS`, the user config directory, or `./credentials/` (see `README.md`). |
 | `_version.py` | `__version__`. Change it only as part of a release. |
@@ -171,7 +175,7 @@ Update this document when you add a module or change the adapter interface.
 |---|---|---|
 | `with AdapterClass(spec) as adapter:` | both modes | The adapter. `close()` runs on exit, even when the batch raises. `spec` is the catalog entry merged with any per-run band override. |
 | `fetch_stats_batch(lats, lons, window_m, reducer_names, *, dates=None, progress_desc=None, disable_progress=False, progress_callback=None)` | tabular | A list with one `(stats_dict, meta_dict)` pair for each point, in input order. |
-| `export_tiles(lats, lons, window_m, output_dir, *, ids=None, dates=None, dataset_name="dataset", resample_m=None, filename_suffix=None, progress_desc=None, disable_progress=False, progress_callback=None)` | raster | `(paths, meta_list)`, one entry for each point. Tiles go to `output_dir/<dataset_name>/`. `paths[i]` is `None` when that point's export failed. |
+| `export_tiles(lats, lons, window_m, output_dir, *, ids=None, dates=None, dataset_name="dataset", resample_m=None, filename_suffix=None, progress_desc=None, disable_progress=False, progress_callback=None)` | raster | `(paths, meta_list)`, one entry for each point. Tiles go to `output_dir/<dataset_name>/`. `paths[i]` is `None` when no tile was written for that point (failed export, point outside the extent, or no pixels). |
 | `build_dataset_meta(spec, meta_list=None, exported_paths=None, quality=None, lats=None, lons=None)` | both modes | The dataset's entry in the sidecar's `datasets` section: source information, native CRS and resolution, band names, date-selection summary, and quality statistics. |
 
 Both adapters implement these with identical signatures. Notes:
@@ -183,6 +187,19 @@ Both adapters implement these with identical signatures. Notes:
 - The `"point"` reducer samples the exact pixel at each `(lat, lon)` and merges the result into the same `stats_dict` as the window reducers.
   GEE resolves both in one `getInfo()` round-trip per point. The local adapter reads the window, then samples the pixel with `src.sample()` on the same open dataset.
 - A failure for one point gives that point an empty result instead of stopping the batch. See "Failures for single points" in `docs/coding_guidelines.md`.
+  The adapter failure contract for a failed point (its data request or read raised an exception that the adapter caught):
+  - Tabular: the stats dict is empty (no statistic keys). The meta dict has the QC values of a point outside the extent
+    (`in_extent=False`, `n_pixels=0`, `coverage_pct=0.0`, `had_nodata=False`).
+  - Raster: `paths[i]` is `None`.
+  - The meta dict (`meta_list[i]` in raster mode) has `error`, the error text from `qc.format_point_error`
+    (`"<exception type>: <message>"` on one line, at most 500 characters), and `exception`, the exception object.
+    `exception` stays in memory: it is never written to JSON or to an output table.
+  - A point outside the extent, or with only nodata pixels, has no `error`.
+
+  `extract.py`, not the adapters, applies the rules for a batch: `_raise_if_every_point_failed` raises `RuntimeError`
+  (chained to the exception of the first failed point) when every point failed, and `_warn_about_failed_points` emits one warning
+  and returns it for the sidecar's `warnings`. `qc.py` adds the `<dataset>_error_<N>m` QC column, `_write_tile_manifest`
+  adds the manifest's `error` column, and both modes add `n_errors` and `ids_errors` to the sidecar's quality summaries.
 - Each adapter module registers itself at the end with `register("<data_source>", AdapterClass)`.
   `get_adapter()` raises `KeyError` for an unknown `data_source`.
 

@@ -18,18 +18,24 @@ the stub can give. A test then cannot pass because of an unrelated ``ee`` error.
 
 from __future__ import annotations
 
+import importlib
+import json
 from types import SimpleNamespace
 
 import ee
 import pandas as pd
 import pytest
 
+from envoi import update_catalog
+from envoi._output_assembly import _append_stat_columns
 from envoi.adapters.earth_engine import _image
+from envoi.adapters.earth_engine import adapter as adapter_module
 from envoi.adapters.earth_engine._image import (
     _get_collection_time_bounds,
     _resolve_date_filter_range,
 )
 from envoi.adapters.earth_engine.adapter import GeeRasterAdapter
+from envoi.extract import extract
 from envoi.metadata import summarize_date_info
 
 
@@ -393,7 +399,11 @@ class _StubImage:
 
 
 def _tile_export_adapter(**attributes) -> GeeRasterAdapter:
-    """Return an offline adapter for a two-band image asset at 10 m, ready for ``export_tiles``."""
+    """Return an offline adapter for a two-band image asset at 10 m.
+
+    It is ready for ``export_tiles`` and, when the test stubs the per-point
+    request, for ``fetch_stats_batch``.
+    """
     adapter_attributes = {
         "_dataset_spec": {"image": "users/test/image", "bands": ["B1", "B2"]},
         "_static_image": _StubImage(["B1", "B2"]),
@@ -402,6 +412,7 @@ def _tile_export_adapter(**attributes) -> GeeRasterAdapter:
         "_needs_per_point_date": False,
         "_collection_time_starts": None,
         "_collection_time_ends": None,
+        "crs": "EPSG:4326",
         "scale": 10,
         "max_workers": 2,
     }
@@ -636,3 +647,293 @@ class TestCollectionTimeBoundsRequestFailure:
         assert adapter._needs_per_point_date is True
         assert adapter._static_image is None
         assert adapter._timestamps_loaded is False
+
+
+# ------------------------------------------------------------------
+# Failed points — the per-point result loops of fetch_stats_batch and export_tiles
+# ------------------------------------------------------------------
+
+# Three points near Uppsala. The stubs below find a point's index by its latitude.
+_THREE_LATS = [59.85, 59.86, 59.87]
+_THREE_LONS = [17.63, 17.64, 17.65]
+_THREE_IDS = ["p0", "p1", "p2"]
+
+
+@pytest.fixture
+def stub_combined_reducer(monkeypatch):
+    """Replace the combined-reducer builder, which creates ``ee.Reducer`` objects."""
+    monkeypatch.setattr(
+        adapter_module,
+        "_build_combined_reducer",
+        lambda reducer_names: ("stub reducer", [f"_{name}" for name in reducer_names]),
+    )
+
+
+def _stub_two_band_requests(adapter: GeeRasterAdapter, failing_points: set[int] | None) -> dict:
+    """Replace the per-point statistics request of ``adapter`` with a two-band stub.
+
+    The request of each point in ``failing_points`` raises ``_StubEarthEngineError``
+    (``None`` makes every request fail). The other points get ``B1_mean`` and
+    ``B2_mean``, and ``B1_point`` and ``B2_point`` when the point reducer is
+    requested, as a two-band image gives them.
+
+    Returns a dict that maps the index of each failed point to its error.
+    """
+    raised_errors: dict[int, Exception] = {}
+
+    def request(lat, lon, window_m, *args, want_point=False, **kwargs):
+        point_index = _THREE_LATS.index(lat)
+        if failing_points is None or point_index in failing_points:
+            error = _StubEarthEngineError(f"stub: request failed for point {point_index}")
+            raised_errors[point_index] = error
+            raise error
+        stats = {"B1_mean": 100.0 + point_index, "B2_mean": 200.0 + point_index}
+        if want_point:
+            stats.update({"B1_point": 10.0 + point_index, "B2_point": 20.0 + point_index})
+        meta = {
+            "in_extent": True,
+            "n_pixels": 400,
+            "had_nodata": False,
+            "coverage_pct": 100.0,
+            "window_m": window_m,
+        }
+        return stats, meta
+
+    adapter._fetch_stats_single = request
+    return raised_errors
+
+
+def _stub_tile_exports(adapter: GeeRasterAdapter, failing_points: set[int] | None) -> dict:
+    """Replace the per-point tile export of ``adapter``; the points in ``failing_points`` fail.
+
+    ``None`` makes every export fail. A successful export writes no file and
+    returns its path. Returns a dict that maps the index of each failed point
+    to its error.
+    """
+    raised_errors: dict[int, Exception] = {}
+
+    def export(lat, lon, window_m, output_path, date=None, resample_m=None):
+        point_index = _THREE_LATS.index(lat)
+        if failing_points is None or point_index in failing_points:
+            error = _StubEarthEngineError(f"stub: download failed for point {point_index}")
+            raised_errors[point_index] = error
+            raise error
+        return output_path
+
+    adapter._export_single = export
+    return raised_errors
+
+
+class TestFailedPointsInBatch:
+    """A failed request gives a failed point: no statistic keys, and the error in its meta."""
+
+    @pytest.mark.parametrize(
+        ("statistics", "expected_columns"),
+        [
+            (["mean"], ["stub_gee_B1_mean_200m", "stub_gee_B2_mean_200m"]),
+            (
+                ["mean", "point"],
+                [
+                    "stub_gee_B1_mean_200m",
+                    "stub_gee_B2_mean_200m",
+                    "stub_gee_B1_point",
+                    "stub_gee_B2_point",
+                ],
+            ),
+        ],
+    )
+    def test_failed_point_adds_no_statistic_column(
+        self, stub_combined_reducer, statistics, expected_columns
+    ):
+        """A two-band batch with a failed point has the same columns as one without failures."""
+        tables = []
+        for failing_points in (set(), {1}):
+            adapter = _tile_export_adapter()
+            _stub_two_band_requests(adapter, failing_points)
+            results = adapter.fetch_stats_batch(
+                _THREE_LATS, _THREE_LONS, 200, statistics, disable_progress=True
+            )
+            tables.append(
+                _append_stat_columns(pd.DataFrame({"id": _THREE_IDS}), "stub_gee", 200, results)
+            )
+        table_without_failure, table_with_failure = tables
+
+        assert list(table_with_failure.columns) == ["id", *expected_columns]
+        assert list(table_without_failure.columns) == ["id", *expected_columns]
+        # The failed point is null in every statistic column; the others keep their values.
+        assert table_with_failure.loc[1, expected_columns].isna().all()
+        assert table_with_failure.loc[[0, 2], "stub_gee_B2_mean_200m"].tolist() == [200.0, 202.0]
+
+    def test_failed_point_meta_has_the_error(self, stub_combined_reducer):
+        """The failed point has an empty stats dict, the QC values of a point outside the extent, and its error."""
+        adapter = _tile_export_adapter()
+        raised_errors = _stub_two_band_requests(adapter, {1})
+
+        results = adapter.fetch_stats_batch(
+            _THREE_LATS, _THREE_LONS, 200, ["mean"], disable_progress=True
+        )
+
+        failed_stats, failed_meta = results[1]
+        assert failed_stats == {}
+        assert failed_meta["error"] == "_StubEarthEngineError: stub: request failed for point 1"
+        assert failed_meta["exception"] is raised_errors[1]
+        assert {key: failed_meta[key] for key in ("in_extent", "n_pixels", "had_nodata")} == {
+            "in_extent": False,
+            "n_pixels": 0,
+            "had_nodata": False,
+        }
+        assert failed_meta["coverage_pct"] == 0.0
+        assert "error" not in results[0][1] and "error" not in results[2][1]
+
+    def test_failed_tile_meta_has_the_error(self, tmp_path):
+        """A failed tile export gives no path, and its meta dict has the error."""
+        adapter = _tile_export_adapter()
+        raised_errors = _stub_tile_exports(adapter, {1})
+
+        paths, meta_list = adapter.export_tiles(
+            _THREE_LATS,
+            _THREE_LONS,
+            200,
+            tmp_path,
+            ids=_THREE_IDS,
+            dataset_name="stub_gee",
+            disable_progress=True,
+        )
+
+        assert paths[1] is None
+        assert paths[0] == tmp_path / "stub_gee" / "p0-stub_gee.tif"
+        assert meta_list[1] == {
+            "error": "_StubEarthEngineError: stub: download failed for point 1",
+            "exception": raised_errors[1],
+        }
+        assert meta_list[0] == {} and meta_list[2] == {}
+
+
+@pytest.fixture
+def stub_gee_dataset(monkeypatch, stub_combined_reducer) -> GeeRasterAdapter:
+    """Register the Earth Engine dataset ``stub_gee``, whose adapter is an offline stub.
+
+    ``extract()`` gets this adapter through its ``get_adapter`` lookup, so the
+    test runs the real per-point result loops of the Earth Engine adapter.
+    Returns the adapter, so the test can stub its per-point requests.
+    """
+    update_catalog(
+        {
+            "datasets": {
+                "stub_gee": {
+                    "data_source": "earth_engine",
+                    "path": "users/test/image",
+                    "data_type": "continuous",
+                    "bands": ["B1", "B2"],
+                }
+            }
+        }
+    )
+    adapter = _tile_export_adapter()
+    # The package exports the function extract() under the module's name, so
+    # get the module itself from the import system.
+    extract_module = importlib.import_module("envoi.extract")
+    monkeypatch.setattr(extract_module, "get_adapter", lambda data_source: lambda spec: adapter)
+    return adapter
+
+
+def _three_point_frame() -> pd.DataFrame:
+    """The three stub points, as an input table without dates."""
+    return pd.DataFrame(
+        {
+            "occurrenceID": _THREE_IDS,
+            "decimalLatitude": _THREE_LATS,
+            "decimalLongitude": _THREE_LONS,
+        }
+    )
+
+
+def _stub_gee_config(batch_id: str, output_type: str) -> dict:
+    """Return a run config for ``stub_gee`` with a 200 m window."""
+    settings = {"output_type": output_type, "window_size_m": 200}
+    if output_type == "tabular":
+        settings["statistics"] = ["mean"]
+    return {"batch_id": batch_id, "datasets": ["stub_gee"], "settings": settings}
+
+
+class TestFailedPointsThroughExtract:
+    """``extract()`` reports failed Earth Engine points, and stops when every point failed."""
+
+    def test_one_failed_point_is_reported(self, stub_gee_dataset, tmp_path):
+        """One failed request of three: same statistic columns, QC error column, sidecar fields."""
+        _stub_two_band_requests(stub_gee_dataset, {1})
+
+        with pytest.warns(UserWarning, match="1 of 3 points failed") as recorded_warnings:
+            outputs = extract(
+                _three_point_frame(), _stub_gee_config("gee_stats", "tabular"), output_dir=tmp_path
+            )
+
+        stats_table = pd.read_csv(outputs["gee_stats"])
+        assert [column for column in stats_table.columns if column.startswith("stub_gee_")] == [
+            "stub_gee_B1_mean_200m",
+            "stub_gee_B2_mean_200m",
+        ]
+        qc_table = pd.read_csv(tmp_path / "gee_stats_qc.csv")
+        assert qc_table["stub_gee_error_200m"].isna().tolist() == [True, False, True]
+        assert (
+            qc_table.loc[1, "stub_gee_error_200m"]
+            == "_StubEarthEngineError: stub: request failed for point 1"
+        )
+        sidecar = json.loads((tmp_path / "gee_stats_metadata.json").read_text())
+        quality = sidecar["datasets"]["stub_gee"]["quality"]["200m"]
+        assert (quality["n_errors"], quality["ids_errors"]) == (1, ["p1"])
+        failed_point_warnings = [
+            recorded for recorded in recorded_warnings if "points failed" in str(recorded.message)
+        ]
+        assert len(failed_point_warnings) == 1
+
+    def test_every_point_failing_raises_with_the_first_error(self, stub_gee_dataset, tmp_path):
+        """When every request fails, RuntimeError has the error of point 0 and chains it."""
+        raised_errors = _stub_two_band_requests(stub_gee_dataset, None)
+
+        with pytest.raises(RuntimeError, match="every point failed") as error_info:
+            extract(
+                _three_point_frame(), _stub_gee_config("gee_failed", "tabular"), output_dir=tmp_path
+            )
+
+        message = str(error_info.value)
+        assert "Dataset 'stub_gee', window 200 m" in message
+        assert "First error: _StubEarthEngineError: stub: request failed for point 0" in message
+        assert error_info.value.__cause__ is raised_errors[0]
+        assert not (tmp_path / "gee_failed.csv").exists()
+
+    def test_one_failed_tile_is_in_the_manifest(self, stub_gee_dataset, tmp_path):
+        """One failed tile export of three: manifest error column and tile summary."""
+        _stub_tile_exports(stub_gee_dataset, {1})
+
+        with pytest.warns(UserWarning, match="1 of 3 points failed"):
+            extract(
+                _three_point_frame(), _stub_gee_config("gee_tiles", "raster"), output_dir=tmp_path
+            )
+
+        manifest = pd.read_csv(tmp_path / "gee_tiles" / "stub_gee" / "tiles_manifest.csv")
+        assert manifest["exported"].tolist() == [True, False, True]
+        assert manifest["error"].isna().tolist() == [True, False, True]
+        assert (
+            manifest.loc[1, "error"] == "_StubEarthEngineError: stub: download failed for point 1"
+        )
+        sidecar = json.loads((tmp_path / "gee_tiles" / "gee_tiles_metadata.json").read_text())
+        tiles_summary = sidecar["datasets"]["stub_gee"]["quality"]["tiles"]
+        assert tiles_summary["n_failed"] == 1
+        assert (tiles_summary["n_errors"], tiles_summary["ids_errors"]) == (1, ["p1"])
+
+    def test_every_tile_failing_raises_with_the_first_error(self, stub_gee_dataset, tmp_path):
+        """When every tile export fails, RuntimeError has the error of point 0 and chains it."""
+        raised_errors = _stub_tile_exports(stub_gee_dataset, None)
+
+        with pytest.raises(RuntimeError, match="every point failed") as error_info:
+            extract(
+                _three_point_frame(),
+                _stub_gee_config("gee_no_tiles", "raster"),
+                output_dir=tmp_path,
+            )
+
+        assert "First error: _StubEarthEngineError: stub: download failed for point 0" in str(
+            error_info.value
+        )
+        assert error_info.value.__cause__ is raised_errors[0]

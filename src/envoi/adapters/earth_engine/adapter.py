@@ -33,6 +33,7 @@ from ...catalog import load_defaults
 from ...geo import build_tile_crs_zones, get_utm_crs
 from ...metadata import summarize_date_info, summarize_tile_export
 from ...progress import ProgressStepCallback, emit_progress_step
+from ...qc import format_point_error
 from ..base import BaseAdapter
 from ._image import (
     _build_image,
@@ -432,7 +433,7 @@ class GeeRasterAdapter(BaseAdapter):
 
         Side effect: populates ``_cached_band_name``, ``_cached_band_names``,
         and ``_cached_band_count`` on the first successful call. Other methods
-        (``_empty_stats_result``, ``_fetch_stats_single``, ``build_dataset_meta``)
+        (``_fetch_stats_single``, ``_guard_tile_size``, ``build_dataset_meta``)
         rely on these caches being warm.
 
         When the bands are not in the config, this asks Earth Engine for the
@@ -635,7 +636,7 @@ class GeeRasterAdapter(BaseAdapter):
         )
 
     # ------------------------------------------------------------------
-    # Empty-result builders  (failure-path skeletons matching success shape)
+    # Empty-result builders  (results of a failed point)
     # ------------------------------------------------------------------
 
     def _empty_result(self, window_m: int):
@@ -655,60 +656,25 @@ class GeeRasterAdapter(BaseAdapter):
         }
         return vals, meta
 
-    def _empty_stats_result(
-        self,
-        window_m: int,
-        reducer_names: Sequence[str],
-        *,
-        want_point: bool = False,
-    ):
-        """Return a (stats, meta) tuple matching the merged success schema.
+    def _empty_stats_result(self, window_m: int, error: Exception):
+        """Return the ``(stats, meta)`` result of a failed point.
 
-        Used when a fetch fails so callers see the same dict shape they'd
-        get on a successful call. Includes a "point" / "{band}_point" key
-        when the original request asked for the point reducer, regardless
-        of which window reducers were combined alongside it.
+        The stats dict has no keys. ``_append_stat_columns`` then gives the
+        failed point a null value in every statistic column that the other
+        points of the batch create, and the failed point creates no column of
+        its own. (Placeholder keys would not match the success schema: a
+        multi-band point has ``{band}_{reducer}`` keys, and the band names are
+        not always known when a request fails.)
+
+        The meta dict has the QC values of a point outside the extent, plus the
+        error text (``error``) and the exception (``exception``), so that
+        ``extract()`` can report the point and stop the run when every point
+        failed. ``exception`` stays in memory and is never written to JSON.
         """
-        # Determine multiband once — the same flag governs both the point-side
-        # placeholder shape and the band_coverage_pct emit below. A single
-        # named band ("bands": "DEM") is always single-band, regardless of how
-        # many bands the underlying image carries; otherwise we trust the
-        # cached band count populated by _get_band_name on first fetch.
-        spec_band = self._dataset_spec.get("bands")
-        band_count = getattr(self, "_cached_band_count", 1)
-        multiband = not isinstance(spec_band, str) and band_count > 1
-
-        # Window-side: one None value per requested non-point reducer.
-        # Categorical class reducers are intentionally skipped — they produce
-        # *per-class* keys (e.g. "class_10_count") on success, so on failure
-        # we emit no class keys and let _append_stat_columns zero-fill the
-        # corresponding columns alongside any successful rows in the batch.
-        stats: dict[str, float | None] = {
-            r: None for r in reducer_names if r not in ("class_count", "class_fraction")
-        }
-
-        # Point-side: mirror the success-path shape — multi-band emits one
-        # "{band}_point" key per band; single-band emits a bare "point" key.
-        if want_point:
-            if multiband:
-                # We may not have the full band list cached here; emit one
-                # placeholder per cached band name, falling back to a single
-                # "point" key when band names aren't known yet.
-                band_names = getattr(self, "_cached_band_names", None) or []
-                if band_names:
-                    for band in band_names:
-                        stats[f"{band}_point"] = None
-                else:
-                    stats["point"] = None
-            else:
-                stats["point"] = None
-
         _, meta = self._empty_result(window_m)
-        # Emit an empty band_coverage_pct for multiband failure paths so
-        # callers always see a consistent schema regardless of success/failure.
-        if multiband:
-            meta["band_coverage_pct"] = {}
-        return stats, meta
+        meta["error"] = format_point_error(error)
+        meta["exception"] = error
+        return {}, meta
 
     # ------------------------------------------------------------------
     # Mode 1: Server-side stats  (reduceRegion with combined reducers)
@@ -970,6 +936,9 @@ class GeeRasterAdapter(BaseAdapter):
           - point sample: ``"point"``  (single band) or ``{band}_point``     (multi-band)
 
         Returns a list of ``(stats_dict, meta_dict)`` tuples — one per point.
+        A point whose request failed gets an empty stats dict, and its meta
+        dict has the error text (``error``) and the exception (``exception``).
+        See ``_empty_stats_result``.
         """
         # Split "point" out of reducer_names — it doesn't go through the
         # combined window reducer; it gets its own server-side branch.
@@ -1001,8 +970,11 @@ class GeeRasterAdapter(BaseAdapter):
         else:
             combined_reducer, suffixes = None, []
 
-        # Warm the band cache once on the main thread so workers don't race
-        # to populate it (and we avoid an extra getInfo from inside a worker).
+        # Warm the band cache once on the main thread, so the workers find it
+        # filled and send no band-name request of their own. Broad catch for a
+        # harmless best-effort failure: a failed request is not cached, so each
+        # worker then asks again, and a worker whose request also fails gives
+        # a failed point.
         if not hasattr(self, "_cached_band_count"):
             try:
                 self._get_band_name(self._get_image())
@@ -1042,14 +1014,15 @@ class GeeRasterAdapter(BaseAdapter):
                     idx = future_to_idx[future]
                     try:
                         results[idx] = future.result()
-                    except Exception as e:
-                        logger.warning("GEE stats fetch failed for point %d: %s", idx, e)
-                        # Use the original reducer list so the failure stub
-                        # mirrors what the user asked for (class reducers are
-                        # filtered inside _empty_stats_result).
-                        results[idx] = self._empty_stats_result(
-                            window_m, original_window_reducers, want_point=want_point
-                        )
+                    # Broad catch that replaces one point's failed result with
+                    # an empty result (docs/coding_guidelines.md, "Failures for
+                    # single points"): Earth Engine reports unrelated failures
+                    # with one exception type. The result keeps the error, so
+                    # extract() reports the point, and stops the run when every
+                    # point failed.
+                    except Exception as error:
+                        logger.warning("GEE stats fetch failed for point %d: %s", idx, error)
+                        results[idx] = self._empty_stats_result(window_m, error)
                     pbar.update(1)
                     emit_progress_step(progress_callback, completed, n)
 
@@ -1173,6 +1146,8 @@ class GeeRasterAdapter(BaseAdapter):
 
         Returns ``(paths, meta_list)`` — one entry per input point in each
         list. ``paths[i]`` is ``None`` when the export for that point failed.
+        ``meta_list[i]`` holds the point's date information, and for a failed
+        export also the error text (``error``) and the exception (``exception``).
 
         Raises ``ValueError`` before any tile download when the tiles would
         exceed GEE's synchronous download limit. A failed request for the band
@@ -1253,9 +1228,17 @@ class GeeRasterAdapter(BaseAdapter):
                     idx = future_to_idx[future]
                     try:
                         results[idx] = future.result()
-                    except Exception as e:
-                        logger.warning("GEE export failed for point %d: %s", idx, e)
+                    # Broad catch that replaces one point's failed tile with an
+                    # empty result (no path; docs/coding_guidelines.md,
+                    # "Failures for single points"): Earth Engine reports
+                    # unrelated failures with one exception type. The point's
+                    # meta dict keeps the error, so extract() reports the tile,
+                    # and stops the run when every tile failed.
+                    except Exception as error:
+                        logger.warning("GEE export failed for point %d: %s", idx, error)
                         results[idx] = None
+                        meta_list[idx]["error"] = format_point_error(error)
+                        meta_list[idx]["exception"] = error
                     pbar.update(1)
                     emit_progress_step(progress_callback, completed, n)
 

@@ -20,6 +20,7 @@ from .._filenames import build_tile_filenames
 from ..geo import get_utm_crs
 from ..metadata import summarize_tile_export
 from ..progress import ProgressStepCallback, emit_progress_step
+from ..qc import format_point_error
 from ..reducers import get_reducer
 from .base import BaseAdapter
 
@@ -270,6 +271,42 @@ class LocalRasterAdapter(BaseAdapter):
     # Core read
     # ------------------------------------------------------------------
 
+    def _empty_window_result(self, window_m: int) -> tuple[np.ndarray, dict]:
+        """Return the ``(valid_values, meta)`` of a window with no pixels read.
+
+        Used for a point outside the raster's extent and for a failed point.
+        The meta dict has the QC values of a point outside the extent.
+        """
+        # Match the in-extent return shape so downstream code can rely on
+        # ndim alone to distinguish multi-band from single-band output.
+        # Without this, a multi-band point that falls outside the raster
+        # would return a 1D empty array and _fetch_stats_single's
+        # ``ndim == 2`` check would silently route to the single-band
+        # branch — producing flat-named keys (``mean``) instead of the
+        # per-band keys (``b1_mean``, ``b2_mean``) used for in-extent
+        # points, leading to an inconsistent DataFrame schema.
+        if self._is_multiband:
+            valid_values = np.empty((len(self.band), 0))
+        else:
+            valid_values = np.array([])
+        meta = {
+            "in_extent": False,
+            "n_pixels": 0,
+            "had_nodata": False,
+            "coverage_pct": 0.0,
+            "window_m": int(window_m),
+            "raster_crs": str(self.raster_crs),
+            "region_crs": str(self.raster_crs),
+            # JSON-safe placeholders so the meta schema stays consistent
+            # with the in-extent path even when nothing was read.
+            "transform": None,
+            "dtype": None,
+            "nodata": None,
+            "src_path": str(self.path),
+            "window_arr": None,
+        }
+        return valid_values, meta
+
     def fetch_values(self, lat: float, lon: float, window_m: int, *, return_meta: bool = False):
         geom_raster = self._project_meter_square_to_raster_geom(lat, lon, window_m)
         # Resolve the per-band nodata tuple once — rasterio exposes one entry
@@ -296,34 +333,17 @@ class LocalRasterAdapter(BaseAdapter):
                 indexes=read_indexes,
             )
         except (ValueError, WindowError):
-            # Match the in-extent return shape so downstream code can rely on
-            # ndim alone to distinguish multi-band from single-band output.
-            # Without this, a multi-band point that falls outside the raster
-            # would return a 1D empty array and _fetch_stats_single's
-            # ``ndim == 2`` check would silently route to the single-band
-            # branch — producing flat-named keys (``mean``) instead of the
-            # per-band keys (``b1_mean``, ``b2_mean``) used for in-extent
-            # points, leading to an inconsistent DataFrame schema.
-            if self._is_multiband:
-                valid_values = np.empty((len(self.band), 0))
-            else:
-                valid_values = np.array([])
-            meta = {
-                "in_extent": False,
-                "n_pixels": 0,
-                "had_nodata": False,
-                "coverage_pct": 0.0,
-                "window_m": int(window_m),
-                "raster_crs": str(self.raster_crs),
-                "region_crs": str(self.raster_crs),
-                # JSON-safe placeholders so the meta schema stays consistent
-                # with the in-extent path even when nothing was read.
-                "transform": None,
-                "dtype": None,
-                "nodata": None,
-                "src_path": str(self.path),
-                "window_arr": None,
-            }
+            # The window does not overlap the raster: a point outside the extent.
+            valid_values, meta = self._empty_window_result(window_m)
+            return (valid_values, meta) if return_meta else valid_values
+        except RasterioIOError as error:
+            # Reading the window failed, for example because a block of the
+            # file is damaged. This is a failed point, not a point outside the
+            # extent: the meta dict keeps the error, so extract() can report
+            # the point, and the rest of the batch continues.
+            valid_values, meta = self._empty_window_result(window_m)
+            meta["error"] = format_point_error(error)
+            meta["exception"] = error
             return (valid_values, meta) if return_meta else valid_values
 
         # cropped_window is 2D (H, W) for a single band int, 3D (n_bands, H, W) for a list.
@@ -440,7 +460,9 @@ class LocalRasterAdapter(BaseAdapter):
             per band for multi-band — callers re-key with the ``_point``
             suffix as needed.
           * ``meta`` carries the per-point QC fields (in_extent, n_pixels,
-            had_nodata, coverage_pct, src_path).
+            had_nodata, coverage_pct, src_path). When the pixel read fails
+            for a point inside the raster, it also has the error text
+            (``error``) and the exception (``exception``).
         """
         # Cache the WGS84 → raster-CRS transformer on first use; it's the
         # same for every point, so building it once amortises pyproj setup.
@@ -483,12 +505,17 @@ class LocalRasterAdapter(BaseAdapter):
 
         try:
             raw_pixel_values = next(self.src.sample([(raster_x, raster_y)], indexes=self.band))
-        except (RasterioIOError, IndexError, ValueError, StopIteration):
-            # Genuine read failure (corrupt block, sample iterator empty,
-            # band index out of range). Fall back to the missing shape so
-            # downstream code still sees a consistent schema. Programming
-            # errors (TypeError, AttributeError, ...) deliberately propagate.
-            return _missing()
+        except (RasterioIOError, IndexError, ValueError, StopIteration) as error:
+            # The point is inside the raster, but reading its pixel failed
+            # (corrupt block, sample iterator empty, band index out of range).
+            # This is a failed point, not a point outside the extent: keep the
+            # error in the meta dict, so extract() can report the point.
+            # Programming errors (TypeError, AttributeError, ...) deliberately
+            # propagate.
+            values_missing, meta_missing = _missing()
+            meta_missing["error"] = format_point_error(error)
+            meta_missing["exception"] = error
+            return values_missing, meta_missing
 
         if is_multiband:
             values: dict[str, Any] = {}
@@ -537,6 +564,11 @@ class LocalRasterAdapter(BaseAdapter):
         carries the full transform/dtype/nodata/window_arr fields from
         fetch_values). When only the point branch runs, those fields are
         synthesized as None so callers downstream see a consistent shape.
+
+        A read error in either branch makes the point a failed point: the
+        stats dict is empty, and the meta dict has the QC values of a point
+        outside the extent plus the error text (``error``) and the exception
+        (``exception``) of the first failed read.
         """
         # ``self.band`` is always a list (normalised in __post_init__); the
         # ``_is_multiband`` flag captures the output-shape rule used below.
@@ -545,6 +577,7 @@ class LocalRasterAdapter(BaseAdapter):
 
         stats: dict[str, Any] = {}
         meta: dict[str, Any] = {}
+        point_meta: dict[str, Any] = {}
 
         # ---- window branch ----
         if window_reducer_fns:
@@ -616,6 +649,21 @@ class LocalRasterAdapter(BaseAdapter):
                     "window_arr": None,
                 }
 
+        # ---- failed point ----
+        # A read error in either branch makes this a failed point, as on the
+        # Earth Engine adapter, where one request gives both branches. All its
+        # statistics are null: it gets no statistic keys, and
+        # _append_stat_columns gives it a null value in every column of the
+        # batch. The error is kept, so extract() can report the point.
+        failed_read_meta = next(
+            (read_meta for read_meta in (meta, point_meta) if "error" in read_meta), None
+        )
+        if failed_read_meta is not None:
+            _, failed_meta = self._empty_window_result(window_m)
+            failed_meta["error"] = failed_read_meta["error"]
+            failed_meta["exception"] = failed_read_meta["exception"]
+            return {}, failed_meta
+
         return stats, meta
 
     def fetch_stats_batch(
@@ -646,7 +694,9 @@ class LocalRasterAdapter(BaseAdapter):
 
         Mirrors the GEE adapter's design: a single per-point worker handles
         both the window and point branches, so callers see one consistent
-        merged ``(stats, meta)`` tuple per input row.
+        merged ``(stats, meta)`` tuple per input row. A point whose read
+        failed gets an empty stats dict, and its meta dict has the error text
+        (``error``) and the exception (``exception``).
         """
         # Separate "point" from ordinary window reducers — each has its own
         # internal branch inside _fetch_stats_single.
@@ -713,6 +763,12 @@ class LocalRasterAdapter(BaseAdapter):
         window runs can place every window's tiles in the same folder
         without overwriting one another. Pass ``None`` for the original
         ``"<id>-<dataset>.tif"`` naming.
+
+        Returns ``(paths, meta_list)``, one entry per point. ``paths[i]`` is
+        ``None`` when no tile was written: the point is outside the extent,
+        its window has no pixels, or a read failed. For a failed read,
+        ``meta_list[i]`` has the error text (``error``) and the exception
+        (``exception``).
         """
         from rasterio.transform import Affine
         from rasterio.warp import Resampling, reproject
@@ -765,8 +821,9 @@ class LocalRasterAdapter(BaseAdapter):
             window_array = meta.get("window_arr")
             transform_list = meta.get("transform")
             # Skip tiles for which the window couldn't be cropped at all
-            # (e.g. the point fell outside the raster's extent). Preserve
-            # the meta dict so callers can still see why each tile failed.
+            # (e.g. the point fell outside the raster's extent, or the read
+            # failed). Preserve the meta dict so callers can still see why
+            # each tile failed; a failed read has "error" in it.
             if window_array is None or window_array.size == 0 or transform_list is None:
                 paths.append(None)
                 tile_metas.append(meta)
@@ -831,27 +888,41 @@ class LocalRasterAdapter(BaseAdapter):
                 # pulls from those NaN source pixels and propagates NaN into the output.
                 # Going straight to the source file gives the interpolation valid data
                 # everywhere, matching what GEE does when it exports a plain rectangle.
-                if self._is_multiband:
-                    destination_array = np.empty((n_bands, n_pixels, n_pixels), dtype=tile_dtype)
-                    for band_idx, band_num in enumerate(self.band):
+                try:
+                    if self._is_multiband:
+                        destination_array = np.empty(
+                            (n_bands, n_pixels, n_pixels), dtype=tile_dtype
+                        )
+                        for band_idx, band_num in enumerate(self.band):
+                            reproject(
+                                source=rasterio.band(self.src, band_num),
+                                destination=destination_array[band_idx],
+                                dst_transform=destination_transform,
+                                dst_crs=utm_crs,
+                                resampling=Resampling.bilinear,
+                                dst_nodata=tile_nodata,
+                            )
+                    else:
+                        destination_array = np.empty((n_pixels, n_pixels), dtype=tile_dtype)
                         reproject(
-                            source=rasterio.band(self.src, band_num),
-                            destination=destination_array[band_idx],
+                            source=rasterio.band(self.src, self.band[0]),
+                            destination=destination_array,
                             dst_transform=destination_transform,
                             dst_crs=utm_crs,
                             resampling=Resampling.bilinear,
                             dst_nodata=tile_nodata,
                         )
-                else:
-                    destination_array = np.empty((n_pixels, n_pixels), dtype=tile_dtype)
-                    reproject(
-                        source=rasterio.band(self.src, self.band[0]),
-                        destination=destination_array,
-                        dst_transform=destination_transform,
-                        dst_crs=utm_crs,
-                        resampling=Resampling.bilinear,
-                        dst_nodata=tile_nodata,
-                    )
+                except RasterioIOError as error:
+                    # Reading the source for this tile failed, for example
+                    # because a block of the file is damaged. This is a failed
+                    # tile: no file is written, and the meta dict keeps the
+                    # error, so extract() can report the tile.
+                    meta["error"] = format_point_error(error)
+                    meta["exception"] = error
+                    paths.append(None)
+                    tile_metas.append(meta)
+                    emit_progress_step(progress_callback, len(paths), len(id_list))
+                    continue
                 output_array = destination_array
                 output_transform = destination_transform
                 output_crs = utm_crs

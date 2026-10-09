@@ -2386,6 +2386,30 @@ class TestAppendStatColumnsClassFill:
         assert result[f"{prefix}_class_10_fraction_200m"].tolist() == [0.25, 0.0]
         assert result[f"{prefix}_class_12_fraction_200m"].tolist() == [0.0, 1.0]
 
+    def test_failed_point_gets_null_class_columns(self):
+        """A failed point (meta has "error") gets null class columns; other rows are zero-filled."""
+        from envoi._output_assembly import _append_stat_columns
+
+        df = pd.DataFrame({"id": ["a", "b", "c"]})
+        stats_results = [
+            ({"class_10_count": 5, "class_10_fraction": 1.0}, {}),
+            ({}, {"error": "RasterioIOError: stub: damaged block"}),
+            ({"class_20_count": 2, "class_20_fraction": 1.0}, {}),
+        ]
+        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+
+        assert list(result.columns) == [
+            "id",
+            "lulc_class_10_count_200m",
+            "lulc_class_10_fraction_200m",
+            "lulc_class_20_count_200m",
+            "lulc_class_20_fraction_200m",
+        ]
+        assert result["lulc_class_10_count_200m"].tolist()[0::2] == [5, 0]
+        assert result["lulc_class_20_fraction_200m"].tolist()[0::2] == [0.0, 1.0]
+        for column in result.columns[1:]:
+            assert pd.isna(result.loc[1, column]), column
+
 
 # ------------------------------------------------------------------
 # _ALL_KNOWN_REDUCERS — make sure the registry sets agree.
