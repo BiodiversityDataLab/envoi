@@ -19,10 +19,12 @@ from __future__ import annotations
 import json
 import math
 import warnings
+from pathlib import Path
 
 import pandas as pd
 import pytest
 import rasterio
+import yaml
 from _gee_helpers import SWEDEN_SAMPLE_DF, gee_credentials_available
 
 from envoi import reset_catalog, update_catalog
@@ -642,7 +644,7 @@ class TestWindowStatisticShapes:
         lat = _NORTH_FACING_SLOPE_DF["decimalLatitude"].iloc[0]
         lon = _NORTH_FACING_SLOPE_DF["decimalLongitude"].iloc[0]
         adapter = GeeRasterAdapter(single_band_entry)
-        aspect_image = adapter._get_image(lat=lat, lon=lon)
+        aspect_image, _ = adapter._get_image(lat=lat, lon=lon)
         linear_mean = aspect_image.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=adapter._make_region(lat, lon, 200),
@@ -885,6 +887,148 @@ class TestAutoDateSelection:
         assert stats.loc["ocean", sum_columns].isna().all()
         # Land: the sum of valid pixels is a value.
         assert stats.loc["land", sum_columns].notna().all()
+
+
+# ------------------------------------------------------------------
+# Image selection per point: images with different dates at different places.
+# ------------------------------------------------------------------
+#
+# In June 2021, Sentinel-2 had images at Uppsala on 06-02, 05, 07, 10, 12, 15,
+# 17, ... and at Göteborg on 06-01, 03, 06, 08, 11, 13, 16, ... (live
+# 2026-10-12): the two points have no common day. The batch-selected image of
+# 2021-06-16 is at Göteborg only, so Uppsala needs an image of its own.
+
+_UPPSALA_AND_GOTEBORG_DF = pd.DataFrame(
+    {
+        "occurrenceID": ["uppsala", "goteborg"],
+        "decimalLatitude": [59.86, 57.71],
+        "decimalLongitude": [17.64, 11.97],
+        "eventDate": ["2021-06-16", "2021-06-16"],
+    }
+)
+_EXPECTED_SENTINEL_2_DAYS = {"uppsala": "2021-06-15", "goteborg": "2021-06-16"}
+_SENTINEL_2_NEAREST_ENTRY = {
+    "data_source": "earth_engine",
+    "path": "COPERNICUS/S2_SR_HARMONIZED",
+    "data_type": "continuous",
+    "bands": ["B4"],
+    "dataset_spec": {"collection_date_policy": "nearest"},
+}
+
+
+def _run_sentinel_2_statistics(points, dataset_name, output_dir, batch_id):
+    """Run a tabular mean over 100 m windows; return the stats table, the QC table, and warnings.
+
+    The warnings are the failed-point warnings of the run.
+    """
+    with warnings.catch_warnings(record=True) as recorded_warnings:
+        warnings.simplefilter("always")
+        outputs = extract(
+            points,
+            {
+                "batch_id": batch_id,
+                "datasets": [dataset_name],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=output_dir,
+            quiet=True,
+        )
+    stats = pd.read_csv(outputs[batch_id]).set_index("occurrenceID")
+    qc = pd.read_csv(output_dir / f"{batch_id}_qc.csv").set_index("occurrenceID")
+    failed_point_warnings = [
+        str(recorded.message)
+        for recorded in recorded_warnings
+        if "points failed" in str(recorded.message)
+    ]
+    return stats, qc, failed_point_warnings
+
+
+def _check_each_point_alone(dataset_name, together_qc, tmp_path):
+    """Run each point alone and check that it selects the same image as in the batch."""
+    start_column = f"{dataset_name}_image_time_start_100m"
+    for point_id in _UPPSALA_AND_GOTEBORG_DF["occurrenceID"]:
+        one_point = _UPPSALA_AND_GOTEBORG_DF[_UPPSALA_AND_GOTEBORG_DF["occurrenceID"] == point_id]
+        _, alone_qc, failed_point_warnings = _run_sentinel_2_statistics(
+            one_point, dataset_name, tmp_path, f"alone_{point_id}"
+        )
+        assert failed_point_warnings == []
+        assert alone_qc.loc[point_id, start_column] == together_qc.loc[point_id, start_column]
+
+
+class TestPerPointImageSelection:
+    """Each point gets an image of its own when the batch-selected image does not cover it."""
+
+    def test_points_with_images_on_different_days(self, tmp_path):
+        """Uppsala and Göteborg together: both have values, and the QC table names their images."""
+        update_catalog({"datasets": {"s2_nearest": _SENTINEL_2_NEAREST_ENTRY}})
+
+        stats, qc, failed_point_warnings = _run_sentinel_2_statistics(
+            _UPPSALA_AND_GOTEBORG_DF, "s2_nearest", tmp_path, "together"
+        )
+
+        assert failed_point_warnings == []
+        assert "s2_nearest_error_100m" not in qc.columns
+        assert stats["s2_nearest_mean_100m"].notna().all()
+        assert qc["s2_nearest_image_time_start_100m"].to_dict() == _EXPECTED_SENTINEL_2_DAYS
+        assert qc["s2_nearest_date_source_100m"].eq("nearest_to_sample").all()
+        _check_each_point_alone("s2_nearest", qc, tmp_path)
+
+    def test_tiles_of_points_with_images_on_different_days(self, tmp_path):
+        """In raster mode, both tiles have valid pixels, and date_info lists both days."""
+        update_catalog({"datasets": {"s2_nearest": _SENTINEL_2_NEAREST_ENTRY}})
+
+        extract(
+            _UPPSALA_AND_GOTEBORG_DF,
+            {
+                "batch_id": "tiles",
+                "datasets": ["s2_nearest"],
+                "settings": {"output_type": "raster", "window_size_m": 100, "resample_m": 20},
+            },
+            output_dir=tmp_path,
+            quiet=True,
+        )
+
+        tiles_dir = tmp_path / "tiles" / "s2_nearest"
+        manifest = pd.read_csv(tiles_dir / "tiles_manifest.csv")
+        assert manifest["exported"].all()
+        assert "error" not in manifest.columns
+        for tile_filename in manifest["tile_filename"]:
+            with rasterio.open(tiles_dir / tile_filename) as tile:
+                red_band = tile.read(1, masked=True)
+            # Valid reflectance pixels: not masked, and above 0.
+            assert red_band.count() > 0
+            assert red_band.max() > 0
+        sidecar = json.loads((tmp_path / "tiles" / "tiles_metadata.json").read_text())
+        date_info = sidecar["datasets"]["s2_nearest"]["date_info"]
+        assert [start for start, _ in date_info["image_date_ranges_used"]] == sorted(
+            _EXPECTED_SENTINEL_2_DAYS.values()
+        )
+        assert date_info["n_nearest_to_sample"] == 2
+
+    def test_contains_entry_of_the_example_catalog(self, tmp_path):
+        """The Sentinel-2 ``contains`` entry of examples/catalog.yml: each point gets its own image."""
+        example_catalog_path = Path(__file__).parents[1] / "examples" / "catalog.yml"
+        example_catalog = yaml.safe_load(example_catalog_path.read_text(encoding="utf-8"))
+        update_catalog(
+            {"datasets": {"s2_contains": example_catalog["datasets"]["sentinel_2_sr_harmonized"]}}
+        )
+
+        stats, qc, failed_point_warnings = _run_sentinel_2_statistics(
+            _UPPSALA_AND_GOTEBORG_DF, "s2_contains", tmp_path, "together"
+        )
+
+        assert failed_point_warnings == []
+        assert "s2_contains_error_100m" not in qc.columns
+        mean_columns = ["s2_contains_B4_mean_100m", "s2_contains_B8_mean_100m"]
+        assert stats[mean_columns].notna().all().all()
+        # No Uppsala image contains 2021-06-16 (each image lasts seconds), so
+        # Uppsala gets its latest image before that day.
+        assert qc["s2_contains_image_time_start_100m"].to_dict() == _EXPECTED_SENTINEL_2_DAYS
+        _check_each_point_alone("s2_contains", qc, tmp_path)
 
 
 # ------------------------------------------------------------------

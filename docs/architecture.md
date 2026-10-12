@@ -232,22 +232,37 @@ For each point: _build_image(dataset_spec, date, geometry, ...)
         image selection, by collection_date_policy:
           mosaic          -> mosaic().setDefaultProjection(native projection);
                              sample dates are ignored
-          sample date     -> filterDate(start, end).first(), with start/end taken from the
-                             timestamp index: "nearest" (default) start, or the interval that
-                             "contains" the date. Dates outside the collection clamp to the
-                             first or last image.
-          no sample date  -> the most recent image in the timestamp index
+          sample date     -> fast path: filterDate(start, end).first(), with start/end taken
+                             from the timestamp index: "nearest" (default) start, or the
+                             interval that "contains" the date. Dates outside the collection
+                             clamp to the first or last image. For "contains", end is at most
+                             the centre day + 1 day (centre day: the date limited to the
+                             index's first and latest start, at 00:00 UTC)
+          no sample date  -> the most recent image in the timestamp index (as the date)
+          no own image in -> per-point fallback (_build_fallback_image, ee.Algorithms.If in
+          the fast path      the point's request): an own image (an image at the point after
+                             the UTM-zone filter) near the centre day, first within ±32
+                             days, then ±366 days. "nearest": fewest whole days
+                             between start day and centre day, earlier start on ties.
+                             "contains": the image that contains the centre day, else the
+                             latest start before it, else the earliest start after it.
+                             Null when no own image is in the windows
           no index        -> if no image intersects the batch's points: filterDate around the
                              sample date (±1 day for "nearest", [date, date + 1 day] for
                              "contains"), or a mosaic of the whole collection when there is
-                             no date
+                             no date; no fallback
           no image at the -> when the collection has no image at the point on any date
           point              (limit(1).size() after filterBounds, before the UTM-zone and
-                             date filters): the first image of the collection with every
-                             pixel masked (ee.Algorithms.If in the point's request), so the
-                             point has no data and no error. When the point has images, but
-                             the UTM-zone or date filter removes all of them, .first() stays
-                             null, and the point is a failed point
+                             date filters): the first image of the collection that has every
+                             configured source band, with every pixel masked
+                             (ee.Algorithms.If in the point's request), so the point has no
+                             data and no error. When the point has images, but neither the
+                             fast path nor the fallback selects an own image (for example a
+                             wrong use_utm_zone), the image stays null, and the point is a
+                             failed point
+        image_dates       -> {start, end} of the selected image (before the masked image), or
+                             null for a point without images. A branch of the statistics
+                             request; one small getInfo() per tile in raster runs
     _apply_derived_bands                  <- slope, aspect (KNOWN_DERIVED_BANDS)
     select(bands + derived bands)         <- derived bands only when no bands are set;
                                              all bands when neither is set
@@ -260,9 +275,12 @@ For each point: _build_image(dataset_spec, date, geometry, ...)
 `_fetch_stats_single` sends up to three reductions in one `ee.Dictionary` request: the window statistics,
 the circular aspect statistics (only when the derived `aspect` band is reduced with `mean`, `std`, or `var`),
 and the point value (only for the `point` statistic).
-The circular aspect image is built for each point from the same image as the main image, and it is never cached in `_static_image`.
+For collections with per-point date selection, the same request also returns `image_dates`, the start and end of the selected image.
+`_resolve_date_info` takes `image_time_start` and `image_time_end` from it, and `date_clamped` and `date_source` from the timestamp index.
+In raster runs, `_export_single` requests `image_dates` once per tile, in its worker thread, before the download. A failed request makes a failed tile.
+The circular aspect image is built for each point from the same image as the main image (`_build_image` with the same date and point), and it is never cached in `_static_image`.
 
-This pipeline lives in `adapters/earth_engine/_image.py` (`_build_image`, `_resolve_date_filter_range`, `_find_nearest_timestamp`, `_get_collection_time_bounds`).
+This pipeline lives in `adapters/earth_engine/_image.py` (`_build_image`, `_build_fallback_image`, `_resolve_date_filter_range`, `_find_nearest_timestamp`, `_get_collection_time_bounds`).
 `GeeRasterAdapter._get_image()` in `adapter.py` decides which branch applies to each point.
 
 State cached on the adapter instance (`extract()` creates one instance per (dataset, window size) pair):

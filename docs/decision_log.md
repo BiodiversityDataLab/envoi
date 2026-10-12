@@ -219,3 +219,34 @@ The specification of this work is in a task folder that is not committed, so eac
   - The message names the columns and the outputs, and says to remove or rename the columns, for example when the input is the output of an earlier envoi run.
 - **Reason:** before, envoi replaced the values of an input column with a statistic name without notice, moved an input column with a QC name out of the statistics table, and stopped with an unclear error for a `_wgs84` column after the extraction had used its time and Earth Engine quota. Researchers often run envoi again on the output of an earlier run, so these names occur in practice.
 - **Rejected:** overwrite without notice (the old behavior): the user's data is lost silently. Rename the input column automatically: the output would have columns that the user did not name, and scripts that read them would break without notice.
+
+### Image selection per point
+
+- **Decision:** for Earth Engine collections with `collection_date_policy` `nearest` or `contains`, a point that has images, but no own image in the date range that envoi selects for the batch, gets an own image near its date, which Earth Engine selects in the point's own request.
+  - Terms. Batch index: the start and end times of the images at the points of a batch, which envoi requests once per batch. Point image: an image whose footprint contains the point (after `filterBounds`). Own image: a point image that also passes the `UTM_ZONE` filter when `use_utm_zone` is set. Centre day C: the sample date (without a date, the latest start of the batch index), limited to the range from the first start to the latest start of the batch index, at 00:00 UTC.
+  - Fast path: the own images in the batch-selected range, as before. For `contains`, the range ends at most at C + 1 day, so that the fast path never selects an own image that starts after the centre day when another point's image lasts longer.
+  - Fallback, only with a point geometry and a batch index, inside the existing `ee.Algorithms.If`, first with a window W of 32 days, then of 366 days, in whole UTC days:
+    - `nearest`: the own image with a start in `[C − W, C + W + 1)` with the fewest whole days between its start day and C, and the earlier start between equal gaps. One numeric sort key (day gap × 10¹¹ + milliseconds since the window start) decides, because Earth Engine does not promise a stable sort.
+    - `contains`: the own image that contains C (see "Day rule"), with the latest start; else the latest start in `[C − W, C + 1)`; else the earliest start in `[C + 1, C + 1 + W)`.
+  - No own image in the windows: the image stays null, and the point is a failed point. This includes a point whose point images all fail the `UTM_ZONE` filter, so a wrong `use_utm_zone` stays visible. A point without any point image keeps the masked image of the 2026-10-09 "Failed points" decision.
+  - Reported dates: the statistics request returns `system:time_start` and `system:time_end` of the selected image as one more branch of its `ee.Dictionary`, with no extra request. `image_time_start`, `image_time_end`, and the sidecar `date_info` come from these values. In raster runs, each tile worker requests the same two values in one small request before the download; a failed request makes a failed tile and removes an older tile of the same name. A point without point images has no date fields. `date_clamped` and `date_source` keep their rules: they compare the sample date with the batch index.
+  - Image assets and `collection_date_policy: mosaic` do not change.
+- **Reason:** in collections whose images have different dates at different places, one date for the batch does not fit every point. Live check on 2026-10-12: in June 2021, Sentinel-2 had images at Uppsala on 06-02, 05, 07, 10, 12, 15, 17, … and at Göteborg on 06-01, 03, 06, 08, 11, 13, 16, …, with no common day. With the sample date 2021-06-16 in one run, the Uppsala point failed, although each point alone had values. The QC dates also named the batch-selected image, not the image that the point used.
+- **Costs (live, 2026-10-12):**
+  - Selection on the server for every point, over the whole collection at the point: 12 s (Sentinel-2, 2 671 images) and 27 s (Landsat 8-day NDVI composites, 1 957 images) per point.
+  - The fallback, only for the points that need it: about 1.6 s per request with the 32-day window and 4.3 s with the 366-day window (probe), or about 1.1 s more than a fast-path request of the same batch (Sentinel-2: 2.6 s against 1.4 s with `nearest`, 3.2 s against 2.1 s with `contains`).
+  - The fast path, measured with the old and new code run alternately (Sentinel-2 at Göteborg): +0.15 s per request (median of 20 requests: 1.55 s before, 1.69 s after; +9 %), and no increase end to end (median of 6 runs: 16.4 s before, 15.6 s after; ten ERA5 points: 0.45 s before, 0.41 s after, per point). The end-to-end time of one Sentinel-2 point is mostly the batch-index request, which varies from 11 to 39 s between runs.
+- **Rejected:**
+  - Select the image on the server for every point: 6 to 27 s per point for long collections.
+  - Document the limitation only: points of such collections would stay failed points, and the QC dates would not name the image used.
+
+### Day rule
+
+- **Decision:** envoi compares image times with sample dates as whole days in UTC.
+  - An image starts on or before day D when its start is before D + 1 day.
+  - An image contains day D when it starts on or before day D and its end is after the start of day D (00:00 UTC).
+  - An image without an end, or with an end on its start day, ends at its start day + 1 day. So such an image contains only its start day.
+  - The rule applies to the `contains` selection of the batch-selected range (`_resolve_date_filter_range`), to `date_clamped` and `date_source` (`_resolve_date_source`), and to the per-point fallback: the whole-day gap of `nearest` and the containing image of `contains`.
+  - The batch-selected image of `nearest` is still the image whose start time is nearest to the sample date (00:00 UTC of its day). Its fast-path range is the whole start day of that image.
+- **Reason:** sample dates are days without a time of day (envoi reduces each date value to one day). Images start at any time of the day, for example a Sentinel-2 image at 10:30. A comparison of times would treat an image that starts at 10:00 on the sample day as an image after the sample date, so `contains` selected the image before it or marked the date as clamped. In the fallback, whole days make the images of the day before and the day after the sample date equally near, whatever their time of day, and the earlier start then wins.
+- **Rejected:** compare the times as they are: the result depends on the time of day of the image, which the sample date does not have.

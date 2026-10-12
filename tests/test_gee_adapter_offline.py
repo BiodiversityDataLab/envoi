@@ -206,12 +206,14 @@ class TestCollectionTimeBoundsDuplicateStarts:
             _collection_time_ends=end_index,
             _dataset_spec={"collection": "users/test/collection"},
         )
-        assert adapter._resolve_date_info("2021-01-05") == {
+        assert adapter._resolve_date_info("2021-01-05", _image_times("2021-01-01")) == {
             "date_clamped": False,
             "date_source": "nearest_to_sample",
             "image_time_start": "2021-01-01",
-            "image_time_end": "2021-01-03",
         }
+        assert _resolve_date_filter_range(
+            pd.Timestamp("2021-01-05"), "nearest", start_index, end_index
+        ) == ("2021-01-01", "2021-01-02")
 
     def test_duplicate_start_without_end_times_is_unique(self, monkeypatch):
         """Without a complete set of end times, the start index is unique and ends are None."""
@@ -316,6 +318,15 @@ class TestCollectionTimeBoundsMissingValues:
 # _resolve_date_info — date metadata for "contains" collections
 # ------------------------------------------------------------------
 
+
+def _image_times(start_text: str, end_text: str | None = None) -> dict:
+    """Return the ``image_dates`` result of a point's request for an image with these times."""
+    return {
+        "start": _epoch_ms(start_text),
+        "end": _epoch_ms(end_text) if end_text is not None else None,
+    }
+
+
 # Three 8-day intervals, the shape of the built-in "contains" collections.
 _EIGHT_DAY_STARTS = pd.DatetimeIndex(["2021-01-01", "2021-01-09", "2021-01-17"])
 _EIGHT_DAY_ENDS = pd.DatetimeIndex(["2021-01-09", "2021-01-17", "2021-01-25"])
@@ -354,7 +365,7 @@ class TestResolveDateInfoContains:
         """With end times, the last interval ends at the last image's end time."""
         adapter = _contains_adapter(_EIGHT_DAY_STARTS, _EIGHT_DAY_ENDS)
 
-        date_info = adapter._resolve_date_info(sample_date)
+        date_info = adapter._resolve_date_info(sample_date, _image_times(image_start, image_end))
 
         assert date_info == {
             "date_clamped": clamped,
@@ -382,7 +393,7 @@ class TestResolveDateInfoContains:
         """Without end times, the last interval ends one day after the last start."""
         adapter = _contains_adapter(_EIGHT_DAY_STARTS, None)
 
-        date_info = adapter._resolve_date_info(sample_date)
+        date_info = adapter._resolve_date_info(sample_date, _image_times(image_start))
 
         assert date_info == {
             "date_clamped": clamped,
@@ -399,7 +410,9 @@ class TestResolveDateInfoContains:
         time_starts = pd.DatetimeIndex(["2021-06-01", "2021-06-15"])
         adapter = _contains_adapter(time_starts, time_starts.copy())
 
-        assert adapter._resolve_date_info("2021-06-01") == {
+        first_image_times = _image_times("2021-06-01", "2021-06-01")
+        last_image_times = _image_times("2021-06-15", "2021-06-15")
+        assert adapter._resolve_date_info("2021-06-01", first_image_times) == {
             "date_clamped": False,
             "date_source": "contains_sample_date",
             "image_time_start": "2021-06-01",
@@ -407,7 +420,7 @@ class TestResolveDateInfoContains:
         }
         # The filterDate range covers the start day of the last image, so this
         # date selects that image, and is not clamped.
-        assert adapter._resolve_date_info("2021-06-15") == {
+        assert adapter._resolve_date_info("2021-06-15", last_image_times) == {
             "date_clamped": False,
             "date_source": "contains_sample_date",
             "image_time_start": "2021-06-15",
@@ -417,7 +430,7 @@ class TestResolveDateInfoContains:
             pd.Timestamp("2021-06-15"), "contains", time_starts, time_starts.copy()
         ) == ("2021-06-15", "2021-06-16")
         # The next day is after the last interval.
-        assert adapter._resolve_date_info("2021-06-16") == {
+        assert adapter._resolve_date_info("2021-06-16", last_image_times) == {
             "date_clamped": True,
             "date_source": "clamped_to_nearest",
             "image_time_start": "2021-06-15",
@@ -429,30 +442,33 @@ class TestResolveDateInfoContains:
         time_starts = pd.DatetimeIndex(["2021-06-01", "2021-06-15 00:00:00"])
         time_ends = pd.DatetimeIndex(["2021-06-15", "2021-06-15 06:00:00"])
         adapter = _contains_adapter(time_starts, time_ends)
+        last_image_times = _image_times("2021-06-15 00:00", "2021-06-15 06:00")
 
-        assert adapter._resolve_date_info("2021-06-15")["date_clamped"] is False
-        assert adapter._resolve_date_info("2021-06-16")["date_clamped"] is True
+        assert adapter._resolve_date_info("2021-06-15", last_image_times)["date_clamped"] is False
+        assert adapter._resolve_date_info("2021-06-16", last_image_times)["date_clamped"] is True
 
     def test_one_day_intervals(self):
         """With one-day intervals, a date on the last day is not clamped and the next day is."""
         time_starts = pd.DatetimeIndex(["2021-06-14", "2021-06-15"])
         time_ends = pd.DatetimeIndex(["2021-06-15", "2021-06-16"])
         adapter = _contains_adapter(time_starts, time_ends)
+        last_image_times = _image_times("2021-06-15", "2021-06-16")
 
-        assert adapter._resolve_date_info("2021-06-15")["date_clamped"] is False
-        assert adapter._resolve_date_info("2021-06-16")["date_clamped"] is True
+        assert adapter._resolve_date_info("2021-06-15", last_image_times)["date_clamped"] is False
+        assert adapter._resolve_date_info("2021-06-16", last_image_times)["date_clamped"] is True
 
     def test_last_start_later_on_its_day_without_end_times(self):
         """Without end times, the last interval ends at the end of the last start's day."""
         time_starts = pd.DatetimeIndex(["2021-06-07 10:00", "2021-06-15 10:00"])
         adapter = _contains_adapter(time_starts, None)
+        last_image_times = _image_times("2021-06-15 10:00")
 
-        assert adapter._resolve_date_info("2021-06-15") == {
+        assert adapter._resolve_date_info("2021-06-15", last_image_times) == {
             "date_clamped": False,
             "date_source": "contains_sample_date",
             "image_time_start": "2021-06-15",
         }
-        assert adapter._resolve_date_info("2021-06-16")["date_clamped"] is True
+        assert adapter._resolve_date_info("2021-06-16", last_image_times)["date_clamped"] is True
 
     @pytest.mark.parametrize(
         ("sample_date", "clamped", "image_start", "image_end"),
@@ -474,8 +490,9 @@ class TestResolveDateInfoContains:
         time_starts = pd.DatetimeIndex(["2021-06-07 10:00", "2021-06-15 10:00", "2021-06-23 10:00"])
         time_ends = pd.DatetimeIndex(["2021-06-15 10:00", "2021-06-23 10:00", "2021-07-01 10:00"])
         adapter = _contains_adapter(time_starts, time_ends)
+        image_times = _image_times(f"{image_start} 10:00", f"{image_end} 10:00")
 
-        assert adapter._resolve_date_info(sample_date) == {
+        assert adapter._resolve_date_info(sample_date, image_times) == {
             "date_clamped": clamped,
             "date_source": "clamped_to_nearest" if clamped else "contains_sample_date",
             "image_time_start": image_start,
@@ -627,7 +644,7 @@ def _record_tile_exports(adapter: GeeRasterAdapter) -> list[tuple[float, float]]
 
     def record_export(lat, lon, window_m, output_path, date=None, resample_m=None):
         exported_points.append((lat, lon))
-        return output_path
+        return output_path, {}
 
     adapter._export_single = record_export
     return exported_points
@@ -754,11 +771,14 @@ class TestExportSingleTileGrid:
     def test_odd_size_with_resample_m(self, monkeypatch, tmp_path):
         """200 m at resample_m=30: a 7 × 7 grid whose centre pixel contains the point."""
         stub_image = _StubImage(["B1"])
-        adapter = _make_offline_adapter(_get_image=lambda date=None, lat=None, lon=None: stub_image)
+        # An image asset: no per-point date selection, so no date request.
+        adapter = _make_offline_adapter(
+            _get_image=lambda date=None, lat=None, lon=None: (stub_image, None)
+        )
         recorded_downloads = _record_tile_downloads(monkeypatch)
         output_path = tmp_path / "tiles" / "a-test_dataset.tif"
 
-        returned_path = adapter._export_single(
+        returned_path, date_info = adapter._export_single(
             self._LAT, self._LON, 200, output_path, None, resample_m=30
         )
 
@@ -768,6 +788,7 @@ class TestExportSingleTileGrid:
         expected_west = (math.floor(point_x / 30) - 3) * 30
         expected_north = (math.floor(point_y / 30) + 1 + 3) * 30
         assert returned_path == output_path
+        assert date_info == {}
         assert output_path.parent.is_dir()
         [download] = recorded_downloads
         assert set(download) == {"image", "crs", "crs_transform", "dimensions", "output_path"}
@@ -783,7 +804,7 @@ class TestExportSingleTileGrid:
         """200 m at a native scale of 10 m: a 20 × 20 grid centred on the nearest grid lines."""
         stub_image = _StubImage(["B1"])
         adapter = _make_offline_adapter(
-            _get_image=lambda date=None, lat=None, lon=None: stub_image,
+            _get_image=lambda date=None, lat=None, lon=None: (stub_image, None),
             _get_scale_value=lambda image: 10.0,
         )
         recorded_downloads = _record_tile_downloads(monkeypatch)
@@ -1311,8 +1332,9 @@ def _stub_tile_exports(adapter: GeeRasterAdapter, failing_points: set[int] | Non
     """Replace the per-point tile export of ``adapter``; the points in ``failing_points`` fail.
 
     ``None`` makes every export fail. A successful export writes no file and
-    returns its path. Returns a dict that maps the index of each failed point
-    to its error.
+    returns its path and its date fields: the image of a point with a sample
+    date starts on that date and has no end. Returns a dict that maps the
+    index of each failed point to its error.
     """
     raised_errors: dict[int, Exception] = {}
 
@@ -1322,7 +1344,11 @@ def _stub_tile_exports(adapter: GeeRasterAdapter, failing_points: set[int] | Non
             error = _StubEarthEngineError(f"stub: download failed for point {point_index}")
             raised_errors[point_index] = error
             raise error
-        return output_path
+        if date is None:
+            return output_path, {}
+        return output_path, adapter._resolve_date_info(
+            date, {"start": _epoch_ms(date), "end": None}
+        )
 
     adapter._export_single = export
     return raised_errors
@@ -1601,8 +1627,8 @@ class TestFailedPointsThroughExtract:
             "n_clamped_to_nearest": 0,
             "n_most_recent_no_date": 0,
             "image_date_ranges_used": [
-                ["2021-01-01", "2021-01-01"],
-                ["2021-03-01", "2021-03-01"],
+                ["2021-01-02", "2021-01-02"],
+                ["2021-03-02", "2021-03-02"],
             ],
         }
 
@@ -1667,7 +1693,8 @@ def _stub_statistics_request(monkeypatch, adapter, branch_results: dict[str, dic
 
     The point's request returns the entries of ``branch_results`` for the
     branches that the request contains. ``_get_image`` gives the image
-    ``main``, or ``circular`` for the circular aspect image. Returns a list
+    ``main``, or ``circular`` for the circular aspect image, without a date
+    request (``image_dates`` is None, as for an image asset). Returns a list
     that records the branches of each request: branch name to the record of
     its ``reduceRegion`` call.
     """
@@ -1690,7 +1717,8 @@ def _stub_statistics_request(monkeypatch, adapter, branch_results: dict[str, dic
     monkeypatch.setattr(adapter_module, "ee", stub_ee)
     adapter._make_region = lambda lat, lon, window_m: f"square of {window_m} m"
     adapter._get_image = lambda date=None, lat=None, lon=None, circular_aspect=False: (
-        _StubStatisticsImage("circular" if circular_aspect else "main")
+        _StubStatisticsImage("circular" if circular_aspect else "main"),
+        None,
     )
     return recorded_requests
 
@@ -2005,7 +2033,7 @@ class TestCircularAspectImageSelection:
 
         def record_build(dataset_spec, date=None, geometry=None, *args, **keywords):
             builds.append({"date": date, "geometry": geometry, **keywords})
-            return f"image {len(builds)}"
+            return f"image {len(builds)}", None
 
         monkeypatch.setattr(adapter_module, "_build_image", record_build)
         stub_geometry = SimpleNamespace(Point=lambda coordinates: f"point {coordinates}")
@@ -2022,13 +2050,13 @@ class TestCircularAspectImageSelection:
             _collection_time_ends=None,
         )
 
-        circular_image = adapter._get_image(None, lat=59.85, lon=17.63, circular_aspect=True)
+        circular_image, _ = adapter._get_image(None, lat=59.85, lon=17.63, circular_aspect=True)
 
         assert circular_image == "image 1"
         assert recorded_builds[0]["circular_aspect"] is True
         assert recorded_builds[0]["date"] is None
         assert adapter._static_image == "static image"
-        assert adapter._get_image(None, lat=59.85, lon=17.63) == "static image"
+        assert adapter._get_image(None, lat=59.85, lon=17.63) == ("static image", None)
 
     def test_most_recent_fallback_is_not_cached(self, recorded_builds):
         """Without coordinates, the circular image of a collection is not cached; the main one is."""
@@ -2040,11 +2068,11 @@ class TestCircularAspectImageSelection:
             _collection_time_ends=None,
         )
 
-        assert adapter._get_image(circular_aspect=True) == "image 1"
+        assert adapter._get_image(circular_aspect=True) == ("image 1", None)
         assert adapter._static_image is None
-        assert adapter._get_image() == "image 2"
+        assert adapter._get_image() == ("image 2", None)
         assert adapter._static_image == "image 2"
-        assert adapter._get_image(circular_aspect=True) == "image 3"
+        assert adapter._get_image(circular_aspect=True) == ("image 3", None)
         assert [build["circular_aspect"] for build in recorded_builds] == [True, False, True]
         assert recorded_builds[0]["date"] == pd.Timestamp("2021-02-01")
 
@@ -2114,6 +2142,9 @@ class _SymbolicImage:
 
     def addBands(self, image: _SymbolicImage) -> _SymbolicImage:
         return _SymbolicImage(f"({self.expression} with {image.expression})")
+
+    def get(self, property_name: str) -> str:
+        return f"{self.expression}.{property_name}"
 
 
 class _SymbolicNumber:
@@ -2185,7 +2216,7 @@ class TestCircularAspectImage:
 
     def test_image_asset(self):
         """Aspect and slope come from the source image; flat pixels (slope 0) are masked."""
-        circular_image = _image._build_image(
+        circular_image, image_dates = _image._build_image(
             {"image": "dem", "bands": ["DEM"], "derived_bands": ["slope", "aspect"]},
             circular_aspect=True,
         )
@@ -2194,10 +2225,11 @@ class TestCircularAspectImage:
             "(cat(sin(aspect(dem) * 0.017453) as sin, cos(aspect(dem) * 0.017453) as cos))"
             " masked to slope(dem) > 0"
         )
+        assert image_dates is None
 
     def test_mosaic_collection_keeps_the_native_projection(self):
         """For a space-tiled collection, the circular image uses the projected mosaic."""
-        circular_image = _image._build_image(
+        circular_image, image_dates = _image._build_image(
             {
                 "collection": "tiles",
                 "collection_date_policy": "mosaic",
@@ -2212,63 +2244,103 @@ class TestCircularAspectImage:
             f"(cat(sin(aspect({mosaic}) * 0.017453) as sin, "
             f"cos(aspect({mosaic}) * 0.017453) as cos)) masked to slope({mosaic}) > 0"
         )
+        assert image_dates is None
+
+
+def _symbolic_text(value) -> str:
+    """Return the text of a symbolic value: an image, a dictionary, null (None), or text."""
+    if isinstance(value, _SymbolicImage):
+        return value.expression
+    if value is None:
+        return "null"
+    return str(value)
 
 
 class TestEmptyDateSelection:
     """``_build_image`` gives a masked image only when the collection has no image at the point.
 
     The masked image is the first image of the collection that has every
-    configured source band.
+    configured source band. The date request reads the selected image before
+    this step, and is null for the masked image.
     """
 
     @pytest.fixture(autouse=True)
     def symbolic_earth_engine(self, monkeypatch):
-        """Replace ``ee`` in ``_image`` with symbolic stubs, including the server-side ``If``."""
+        """Replace ``ee`` in ``_image`` with symbolic stubs, including the server-side ``If``.
+
+        The per-point fallback is a symbolic image whose text shows its
+        arguments; ``TestPerPointFallback`` tests its rules.
+        """
 
         def cast_to_image(value) -> _SymbolicImage:
             # ee.Image() keeps an image as it is; the text of an If is put in brackets.
             return value if isinstance(value, _SymbolicImage) else _SymbolicImage(f"({value})")
 
         def server_side_if(condition: str, true_case, false_case) -> str:
-            return f"if {condition} then {true_case.expression} else {false_case.expression}"
+            return (
+                f"if {condition} then {_symbolic_text(true_case)} "
+                f"else {_symbolic_text(false_case)}"
+            )
+
+        def symbolic_dictionary(values: dict) -> str:
+            return "{" + ", ".join(f"{key}: {value}" for key, value in values.items()) + "}"
+
+        def symbolic_fallback(own_images, centre_day, policy) -> _SymbolicImage:
+            return _SymbolicImage(
+                f"fallback({own_images.expression}, {centre_day:%Y-%m-%d}, {policy})"
+            )
 
         stub_ee = SimpleNamespace(
             Image=cast_to_image,
             ImageCollection=_SymbolicCollection,
             Algorithms=SimpleNamespace(If=server_side_if),
+            Dictionary=symbolic_dictionary,
             Filter=SimpleNamespace(
                 eq=lambda property_name, value: f"{property_name} == {value}",
                 listContains=lambda property_name, value: f"{value} in {property_name}",
             ),
         )
         monkeypatch.setattr(_image, "ee", stub_ee)
+        monkeypatch.setattr(_image, "_build_fallback_image", symbolic_fallback)
 
     @pytest.mark.parametrize(
         ("dataset_spec", "time_starts", "time_ends", "selection"),
         [
             # The interval that contains 2021-06-15, in the point's UTM zone.
+            # The range ends at the end of the centre day, not at the interval
+            # end (2022-01-01). Without an own image in it: the fallback.
             (
                 {"collection_date_policy": "contains", "use_utm_zone": True},
                 pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
                 pd.DatetimeIndex(["2022-01-01", "2023-01-01"]),
-                "embeddings at point where UTM_ZONE == 26N from 2021-01-01 to 2022-01-01",
+                (
+                    "(if size of embeddings at point where UTM_ZONE == 26N from 2021-01-01 to "
+                    "2021-06-16 limited to 1 > 0 then first of embeddings at point where "
+                    "UTM_ZONE == 26N from 2021-01-01 to 2021-06-16 else fallback(embeddings at "
+                    "point where UTM_ZONE == 26N, 2021-06-15, contains))"
+                ),
             ),
-            # The nearest start.
+            # The nearest start. Without an own image on that day: the fallback.
             (
                 {"collection_date_policy": "nearest"},
                 pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
                 None,
-                "embeddings at point from 2021-01-01 to 2021-01-02",
+                (
+                    "(if size of embeddings at point from 2021-01-01 to 2021-01-02 limited to "
+                    "1 > 0 then first of embeddings at point from 2021-01-01 to 2021-01-02 else "
+                    "fallback(embeddings at point, 2021-06-15, nearest))"
+                ),
             ),
-            # No timestamp index: one day before and after the sample date.
-            ({}, None, None, "embeddings at point from 2021-06-14 to 2021-06-16"),
+            # No timestamp index: one day before and after the sample date, no
+            # fallback, and no date request.
+            ({}, None, None, "first of embeddings at point from 2021-06-14 to 2021-06-16"),
         ],
     )
     def test_point_without_images_gets_a_masked_image(
         self, dataset_spec, time_starts, time_ends, selection
     ):
-        """The check looks for one image at the point; the image is the first selected one."""
-        image = _image._build_image(
+        """The check looks for one image at the point; the image is the selected one."""
+        image, image_dates = _image._build_image(
             {"collection": "embeddings", "bands": ["A00", "A01"], **dataset_spec},
             date=pd.Timestamp("2021-06-15"),
             geometry="point",
@@ -2279,15 +2351,25 @@ class TestEmptyDateSelection:
         )
 
         # The condition looks for an image at the point before the UTM-zone
-        # and date filters. When the point has images, but these filters
-        # remove all of them, the first selected image is null, and the
-        # point's request fails. The masked image is the first image of the
-        # whole collection that has both configured bands.
+        # and date filters. When the point has images, but no own image is
+        # selected, the selected image is null, and the point's request fails.
+        # The masked image is the first image of the whole collection that has
+        # both configured bands.
+        point_has_images = "size of embeddings at point limited to 1 > 0"
         assert image.expression == (
-            f"(if size of embeddings at point limited to 1 > 0 then first of {selection} "
+            f"(if {point_has_images} then {selection} "
             f"else (first of embeddings where A00 in system:band_names "
             f"where A01 in system:band_names) masked to 0).select(['A00', 'A01'])"
         )
+        # The date request reads the selected image, before the masked image,
+        # with the same condition: null for a point without images.
+        if time_starts is None:
+            assert image_dates is None
+        else:
+            assert image_dates == (
+                f"if {point_has_images} then {{start: {selection}.system:time_start, "
+                f"end: {selection}.system:time_end}} else null"
+            )
 
     @pytest.mark.parametrize(
         ("band_setting", "placeholder", "band_selection"),
@@ -2306,22 +2388,23 @@ class TestEmptyDateSelection:
     )
     def test_masked_image_has_the_configured_bands(self, band_setting, placeholder, band_selection):
         """Only configured source bands filter the collection of the masked image."""
-        image = _image._build_image(
+        image, _ = _image._build_image(
             {"collection": "embeddings", "collection_date_policy": "nearest", **band_setting},
             date=pd.Timestamp("2021-06-15"),
             geometry="point",
             collection_time_starts=pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
         )
 
+        fast_path = "embeddings at point from 2021-01-01 to 2021-01-02"
         assert image.expression == (
-            "(if size of embeddings at point limited to 1 > 0 then first of embeddings "
-            f"at point from 2021-01-01 to 2021-01-02 else ({placeholder}) masked to 0)"
-            f"{band_selection}"
+            f"(if size of embeddings at point limited to 1 > 0 then (if size of {fast_path} "
+            f"limited to 1 > 0 then first of {fast_path} else fallback(embeddings at point, "
+            f"2021-06-15, nearest)) else ({placeholder}) masked to 0){band_selection}"
         )
 
     def test_no_masked_image_without_a_point(self):
-        """Without a point geometry, the image is the first selected image, with no condition."""
-        image = _image._build_image(
+        """Without a point geometry: the first selected image, no condition, no fallback, no dates."""
+        image, image_dates = _image._build_image(
             {"collection": "embeddings", "collection_date_policy": "nearest", "bands": ["A00"]},
             date=pd.Timestamp("2021-06-15"),
             collection_time_starts=pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
@@ -2330,6 +2413,815 @@ class TestEmptyDateSelection:
         assert (
             image.expression == "first of embeddings from 2021-01-01 to 2021-01-02.select(['A00'])"
         )
+        assert image_dates is None
+
+
+# ------------------------------------------------------------------
+# Per-point fallback — the selection rules, evaluated by a simulated server
+# ------------------------------------------------------------------
+
+
+class _NullOnServer:
+    """Stands in for a null value on the Earth Engine server (a null image).
+
+    Every operation on null gives null again. Earth Engine evaluates only the
+    branch of ``If`` that it needs, but the stubs evaluate both branches, so
+    null fails only when a result is read (``_read_server_value``), as a
+    request that reads a null image fails.
+    """
+
+    def get(self, property_name: str) -> _NullOnServer:
+        return self
+
+    def set(self, property_name: str, value) -> _NullOnServer:
+        return self
+
+    def select(self, bands) -> _NullOnServer:
+        return self
+
+    def updateMask(self, mask) -> _NullOnServer:
+        return self
+
+
+_SERVER_NULL = _NullOnServer()
+
+
+class _SimulatedNumber:
+    """Stands in for an ``ee.Number`` and computes the value at once."""
+
+    def __init__(self, value):
+        self.value = value.value if isinstance(value, _SimulatedNumber) else value
+
+    def gt(self, other) -> bool:
+        return self.value > other
+
+    def divide(self, other) -> _SimulatedNumber:
+        return _SimulatedNumber(self.value / other)
+
+    def floor(self) -> _SimulatedNumber:
+        return _SimulatedNumber(math.floor(self.value))
+
+    def subtract(self, other) -> _SimulatedNumber:
+        return _SimulatedNumber(self.value - _SimulatedNumber(other).value)
+
+    def abs(self) -> _SimulatedNumber:
+        return _SimulatedNumber(abs(self.value))
+
+    def multiply(self, other) -> _SimulatedNumber:
+        return _SimulatedNumber(self.value * other)
+
+    def add(self, other) -> _SimulatedNumber:
+        return _SimulatedNumber(self.value + _SimulatedNumber(other).value)
+
+
+class _SimulatedImage:
+    """Stands in for one ``ee.Image``: a name, the points in its footprint, and its properties."""
+
+    def __init__(self, name: str, points: set[str], properties: dict, masked: bool = False):
+        self.name = name
+        self.points = points
+        self.properties = properties
+        self.masked = masked
+
+    def get(self, property_name: str):
+        return self.properties.get(property_name)
+
+    def set(self, property_name: str, value) -> _SimulatedImage:
+        properties = {**self.properties, property_name: _SimulatedNumber(value).value}
+        return _SimulatedImage(self.name, self.points, properties, self.masked)
+
+    def updateMask(self, mask) -> _SimulatedImage:
+        return _SimulatedImage(self.name, self.points, self.properties, masked=True)
+
+    def select(self, bands) -> _SimulatedImage:
+        return self
+
+
+def _server_milliseconds(value) -> int:
+    """Return a ``filterDate`` argument (milliseconds, or ``YYYY-MM-DD`` text) in milliseconds."""
+    return value if isinstance(value, int) else _epoch_ms(value)
+
+
+class _SimulatedCollection:
+    """Stands in for an ``ee.ImageCollection`` of simulated images, and filters them at once."""
+
+    def __init__(self, images):
+        self.images = list(images)
+
+    def filterBounds(self, point: str) -> _SimulatedCollection:
+        return _SimulatedCollection(image for image in self.images if point in image.points)
+
+    def filter(self, condition) -> _SimulatedCollection:
+        return _SimulatedCollection(image for image in self.images if condition(image))
+
+    def filterDate(self, start, end) -> _SimulatedCollection:
+        start_ms, end_ms = _server_milliseconds(start), _server_milliseconds(end)
+        return self.filter(
+            lambda image: image.get("system:time_start") is not None
+            and start_ms <= image.get("system:time_start") < end_ms
+        )
+
+    def limit(self, maximum: int) -> _SimulatedCollection:
+        return _SimulatedCollection(self.images[:maximum])
+
+    def size(self) -> _SimulatedNumber:
+        return _SimulatedNumber(len(self.images))
+
+    def first(self):
+        return self.images[0] if self.images else _SERVER_NULL
+
+    def map(self, function) -> _SimulatedCollection:
+        return _SimulatedCollection(function(image) for image in self.images)
+
+    def sort(self, property_name: str, ascending: bool = True) -> _SimulatedCollection:
+        # Not stable on purpose: images with equal values come in the reverse
+        # order of the collection. A rule that relies on the order before the
+        # sort then gives the wrong image.
+        direction = 1 if ascending else -1
+        positioned_images = list(enumerate(self.images))
+        positioned_images.sort(key=lambda pair: (direction * pair[1].get(property_name), -pair[0]))
+        return _SimulatedCollection(image for _, image in positioned_images)
+
+
+def _simulated_property_filter(compare):
+    """Return a stand-in for ``ee.Filter.lt`` and similar; a missing property never matches."""
+
+    def property_filter(property_name: str, value):
+        return lambda image: image.get(property_name) is not None and compare(
+            image.get(property_name), value
+        )
+
+    return property_filter
+
+
+def _read_server_value(value):
+    """Return what ``getInfo()`` gives for a simulated value; raise for a null image.
+
+    An image reads as its name, with `` (masked)`` for the masked image.
+    """
+    if value is _SERVER_NULL:
+        raise _StubEarthEngineError("Parameter 'image' is required and may not be null.")
+    if isinstance(value, dict):
+        return {key: _read_server_value(item) for key, item in value.items()}
+    if isinstance(value, _SimulatedImage):
+        return value.name + (" (masked)" if value.masked else "")
+    return value
+
+
+def _simulated_image(
+    name: str, start_text: str, end_text: str | None = None, *, points: str, utm_zone=None
+) -> _SimulatedImage:
+    """Return a simulated image with band B4 at the points named by the letters of ``points``."""
+    properties = {"system:time_start": _epoch_ms(start_text), "system:band_names": ["B4"]}
+    if end_text is not None:
+        properties["system:time_end"] = _epoch_ms(end_text)
+    if utm_zone is not None:
+        properties["UTM_ZONE"] = utm_zone
+    return _SimulatedImage(name, set(points), properties)
+
+
+def _batch_index(images: list[_SimulatedImage]):
+    """Return the batch index (starts, ends) of the images, as ``_get_collection_time_bounds`` does."""
+    starts = [image.get("system:time_start") for image in images]
+    ends = [image.get("system:time_end") for image in images]
+    if any(end is None for end in ends):
+        unique_starts = sorted(set(starts))
+        return pd.DatetimeIndex(pd.to_datetime(unique_starts, unit="ms")), None
+    times = pd.DataFrame({"start": starts, "end": ends}).groupby("start", as_index=False).max()
+    return (
+        pd.DatetimeIndex(pd.to_datetime(times["start"], unit="ms")),
+        pd.DatetimeIndex(pd.to_datetime(times["end"], unit="ms")),
+    )
+
+
+@pytest.fixture
+def simulated_server(monkeypatch):
+    """Replace ``ee`` in ``_image`` with a simulated server; return a function that sets its images.
+
+    The aspect and slope functions record the image they read, so a test can
+    see which image the circular aspect image comes from.
+    """
+    collection_images: list[_SimulatedImage] = []
+
+    def cast_to_image(value):
+        return _SERVER_NULL if value is None else value
+
+    cast_to_image.cat = _concatenate_symbolic_images  # ee.Image.cat
+    simulated_ee = SimpleNamespace(
+        ImageCollection=lambda collection_id: _SimulatedCollection(collection_images),
+        Image=cast_to_image,
+        Number=_SimulatedNumber,
+        Dictionary=dict,
+        Algorithms=SimpleNamespace(
+            If=lambda condition, true_case, false_case: true_case if condition else false_case
+        ),
+        Filter=SimpleNamespace(
+            eq=_simulated_property_filter(lambda left, right: left == right),
+            lt=_simulated_property_filter(lambda left, right: left < right),
+            gt=_simulated_property_filter(lambda left, right: left > right),
+            gte=_simulated_property_filter(lambda left, right: left >= right),
+            And=lambda *conditions: lambda image: all(match(image) for match in conditions),
+            Or=lambda *conditions: lambda image: any(match(image) for match in conditions),
+            listContains=lambda property_name, value: lambda image: value
+            in (image.get(property_name) or []),
+        ),
+    )
+    monkeypatch.setattr(_image, "ee", simulated_ee)
+    for derived_band in ("aspect", "slope"):
+        monkeypatch.setitem(
+            _image._DERIVED_BAND_DISPATCH,
+            derived_band,
+            lambda image, derived_band=derived_band: _SymbolicImage(
+                f"{derived_band}({_read_server_value(image)})"
+            ),
+        )
+
+    def set_images(images: list[_SimulatedImage]) -> None:
+        collection_images[:] = images
+
+    return set_images
+
+
+def _select_point_image(
+    images: list[_SimulatedImage],
+    point: str,
+    sample_date: str | None,
+    policy: str,
+    *,
+    batch_points: str,
+    **build_arguments,
+):
+    """Run ``_build_image`` for one point of a batch on the simulated server.
+
+    The batch index has the images of the ``batch_points`` (one letter for
+    each point). Without a sample date, the date is the latest start of the
+    index, as ``_get_image`` passes it. Returns ``(image, image_dates)`` as
+    the server values; read them with ``_read_server_value``.
+    """
+    batch_images = [image for image in images if image.points & set(batch_points)]
+    time_starts, time_ends = _batch_index(batch_images)
+    date = time_starts.max() if sample_date is None else pd.Timestamp(sample_date)
+    return _image._build_image(
+        {"collection": "simulated", "bands": ["B4"], "collection_date_policy": policy},
+        date=date,
+        geometry=point,
+        collection_time_starts=time_starts,
+        collection_time_ends=time_ends,
+        **build_arguments,
+    )
+
+
+def _image_dates_of(image: _SimulatedImage) -> dict:
+    """Return the ``image_dates`` result that Earth Engine gives for ``image``."""
+    return {"start": image.get("system:time_start"), "end": image.get("system:time_end")}
+
+
+# Uppsala and Göteborg in June 2021 (live 2026-10-12): Sentinel-2 images on
+# alternating days, with no common day.
+_UPPSALA_IMAGES = [
+    _simulated_image(f"U {day}", f"{day} 10:30", f"{day} 10:31", points="U")
+    for day in ("2021-06-12", "2021-06-15", "2021-06-17", "2021-06-20")
+]
+_GOTEBORG_IMAGES = [
+    _simulated_image(f"G {day}", f"{day} 10:40", f"{day} 10:41", points="G")
+    for day in ("2021-06-13", "2021-06-16", "2021-06-18")
+]
+
+
+@pytest.mark.usefixtures("simulated_server")
+class TestPerPointFallbackNearest:
+    """``nearest``: a point without an own image on the batch-selected day gets its nearest image."""
+
+    def test_points_with_images_on_different_days(self, simulated_server):
+        """Göteborg keeps the batch-selected image; Uppsala gets its own nearest image."""
+        images = _UPPSALA_IMAGES + _GOTEBORG_IMAGES
+        simulated_server(images)
+
+        results = {
+            point: _select_point_image(images, point, "2021-06-16", "nearest", batch_points="UG")
+            for point in "UG"
+        }
+
+        # The batch-selected day is 2021-06-16 (Göteborg). Uppsala's images
+        # on 06-15 and 06-17 are one day away: the earlier one wins.
+        assert {point: _read_server_value(image) for point, (image, _) in results.items()} == {
+            "U": "U 2021-06-15",
+            "G": "G 2021-06-16",
+        }
+        assert _read_server_value(results["U"][1]) == _image_dates_of(_UPPSALA_IMAGES[1])
+        assert _read_server_value(results["G"][1]) == _image_dates_of(_GOTEBORG_IMAGES[1])
+
+    def test_point_alone_gets_the_same_image(self, simulated_server):
+        """A point alone selects the same image as in the batch with the other point."""
+        simulated_server(_UPPSALA_IMAGES + _GOTEBORG_IMAGES)
+
+        for point, expected_name in (("U", "U 2021-06-15"), ("G", "G 2021-06-16")):
+            image, _ = _select_point_image(
+                _UPPSALA_IMAGES + _GOTEBORG_IMAGES,
+                point,
+                "2021-06-16",
+                "nearest",
+                batch_points=point,
+            )
+            assert _read_server_value(image) == expected_name
+
+    def test_equal_gaps_select_the_earlier_start_without_a_stable_sort(self, simulated_server):
+        """Equal whole-day gaps select the earlier start, whatever the order of the collection."""
+        # All three images are one day away. The simulated sort puts equal
+        # keys in the reverse order of the collection, so a sort by the day
+        # gap alone would select the last image (06-17). Only the start time
+        # in the sort key selects the earliest start, 06-15 09:00.
+        images = [
+            _simulated_image("A 06-15 09:00", "2021-06-15 09:00", points="A"),
+            _simulated_image("A 06-15 10:00", "2021-06-15 10:00", points="A"),
+            _simulated_image("A 06-17", "2021-06-17 09:00", points="A"),
+            _simulated_image("B 06-16", "2021-06-16 10:00", points="B"),
+        ]
+        simulated_server(images)
+
+        image, image_dates = _select_point_image(
+            images, "A", "2021-06-16", "nearest", batch_points="AB"
+        )
+
+        assert _read_server_value(image) == "A 06-15 09:00"
+        assert _read_server_value(image_dates) == {
+            "start": _epoch_ms("2021-06-15 09:00"),
+            "end": None,
+        }
+
+    def test_gap_counts_whole_days(self, simulated_server):
+        """The gap is in whole days between start days, not in hours."""
+        # 2021-06-14 23:00 is 25 hours before the centre day (2 days), and
+        # 2021-06-17 23:00 is 47 hours after it (1 day).
+        images = [
+            _simulated_image("A two days before", "2021-06-14 23:00", points="A"),
+            _simulated_image("A one day after", "2021-06-17 23:00", points="A"),
+            _simulated_image("B on the day", "2021-06-16 10:00", points="B"),
+        ]
+        simulated_server(images)
+
+        image, _ = _select_point_image(images, "A", "2021-06-16", "nearest", batch_points="AB")
+
+        assert _read_server_value(image) == "A one day after"
+
+    @pytest.mark.parametrize(
+        ("own_starts", "expected_name"),
+        [
+            # Outside the 32-day window: the 366-day window finds the nearest.
+            (["2021-04-27", "2021-07-26"], "A 2021-07-26"),
+            # The edges of the 366-day window: 366 days before and after.
+            (["2020-06-15", "2022-06-17"], "A 2020-06-15"),
+            (["2022-06-17"], "A 2022-06-17"),
+        ],
+    )
+    def test_windows(self, simulated_server, own_starts, expected_name):
+        """The 366-day window is used when the 32-day window has no own image."""
+        images = [_simulated_image(f"A {start}", start, points="A") for start in own_starts]
+        images.append(_simulated_image("B 06-16", "2021-06-16 10:00", points="B"))
+        simulated_server(images)
+
+        image, _ = _select_point_image(images, "A", "2021-06-16", "nearest", batch_points="AB")
+
+        assert _read_server_value(image) == expected_name
+
+    @pytest.mark.parametrize("own_start", ["2020-06-14", "2022-06-18"])
+    def test_no_own_image_in_the_windows_is_a_failed_point(self, simulated_server, own_start):
+        """An own image 367 days away is outside both windows: the point's request fails."""
+        images = [
+            _simulated_image("A far away", own_start, points="A"),
+            _simulated_image("B 06-16", "2021-06-16 10:00", points="B"),
+        ]
+        simulated_server(images)
+
+        image, image_dates = _select_point_image(
+            images, "A", "2021-06-16", "nearest", batch_points="AB"
+        )
+
+        with pytest.raises(_StubEarthEngineError, match="may not be null"):
+            _read_server_value(image)
+        with pytest.raises(_StubEarthEngineError, match="may not be null"):
+            _read_server_value(image_dates)
+
+    def test_centre_day_is_limited_to_the_batch_index(self, simulated_server):
+        """A sample date long after the latest start searches around the latest start."""
+        images = [
+            _simulated_image("A 06-12", "2021-06-12", points="A"),
+            _simulated_image("B 06-16", "2021-06-16 10:00", points="B"),
+        ]
+        simulated_server(images)
+
+        # The sample date is far after the latest start of the index (B
+        # 06-16), so the centre day is 2021-06-16. Windows around the sample
+        # date itself would have no image.
+        image, _ = _select_point_image(images, "A", "2099-12-31", "nearest", batch_points="AB")
+
+        assert _read_server_value(image) == "A 06-12"
+
+    def test_no_sample_date_searches_around_the_latest_start(self, simulated_server):
+        """Without a sample date, a point without an image on the latest start day gets its nearest."""
+        images = _UPPSALA_IMAGES + _GOTEBORG_IMAGES
+        simulated_server(images)
+
+        image, _ = _select_point_image(images, "G", None, "nearest", batch_points="UG")
+
+        # The latest start of the batch is Uppsala's 06-20; Göteborg's
+        # nearest image is 06-18.
+        assert _read_server_value(image) == "G 2021-06-18"
+
+
+@pytest.mark.usefixtures("simulated_server")
+class TestPerPointFallbackContains:
+    """``contains``: the fast path never selects a later image; the fallback follows the day rule."""
+
+    def test_fast_path_does_not_select_an_image_after_the_centre_day(self, simulated_server):
+        """A's images start on the 1st, B's on the 15th: on June 20, A gets its June image."""
+        a_images = [
+            _simulated_image("A 06-01", "2021-06-01", "2021-07-01", points="A"),
+            _simulated_image("A 07-01", "2021-07-01", "2021-08-01", points="A"),
+        ]
+        b_images = [
+            _simulated_image("B 05-15", "2021-05-15", "2021-06-15", points="B"),
+            _simulated_image("B 06-15", "2021-06-15", "2021-07-15", points="B"),
+            _simulated_image("B 07-15", "2021-07-15", "2021-08-15", points="B"),
+        ]
+        images = a_images + b_images
+        simulated_server(images)
+
+        # The batch-selected image is B 06-15, with the range [06-15, 07-15).
+        # A's July image starts in that range, but after the centre day.
+        a_image, a_image_dates = _select_point_image(
+            images, "A", "2021-06-20", "contains", batch_points="AB"
+        )
+        b_image, _ = _select_point_image(images, "B", "2021-06-20", "contains", batch_points="AB")
+
+        assert _read_server_value(a_image) == "A 06-01"
+        assert _read_server_value(a_image_dates) == _image_dates_of(a_images[0])
+        assert _read_server_value(b_image) == "B 06-15"
+
+    @pytest.mark.parametrize(
+        ("own_images", "expected_name"),
+        [
+            # 1. An image that contains the centre day, the latest start.
+            (
+                [("A long", "2021-05-01", "2021-08-01"), ("A short", "2021-06-10", "2021-06-21")],
+                "A short",
+            ),
+            # An image without an end that starts on the centre day contains it.
+            (
+                [("A no end", "2021-06-20 10:00", None), ("A before", "2021-06-13", None)],
+                "A no end",
+            ),
+            # 2. No image contains the day: the latest start before it. An
+            # image without an end contains only its start day.
+            ([("A 06-13", "2021-06-13", None), ("A 06-23", "2021-06-23", None)], "A 06-13"),
+            # An image that ends at the start of the day does not contain it;
+            # one that ends later on the day does.
+            (
+                [("A ends at 00:00", "2021-06-10", "2021-06-20"), ("A 06-15", "2021-06-15", None)],
+                "A 06-15",
+            ),
+            (
+                [
+                    ("A ends at 06:00", "2021-06-10", "2021-06-20 06:00"),
+                    ("A 06-15", "2021-06-15", None),
+                ],
+                "A ends at 06:00",
+            ),
+            # 3. No image starts before it in 32 days: the earliest start after it.
+            ([("A 07-10", "2021-07-10", None), ("A 07-01", "2021-07-01", None)], "A 07-01"),
+            # 366-day window: before the day first, also when an image after
+            # it is nearer.
+            ([("A 03-12", "2021-03-12", None), ("A 08-09", "2021-08-09", None)], "A 03-12"),
+            ([("A 2022-06-20", "2022-06-20", None)], "A 2022-06-20"),
+        ],
+    )
+    def test_fallback_rules(self, simulated_server, own_images, expected_name):
+        """The fallback order: containing image, latest before, earliest after; 32 then 366 days."""
+        images = [_simulated_image(name, start, end, points="A") for name, start, end in own_images]
+        simulated_server(images)
+
+        image = _image._build_fallback_image(
+            _SimulatedCollection(images), pd.Timestamp("2021-06-20"), "contains"
+        )
+
+        assert _read_server_value(image) == expected_name
+
+    def test_no_own_image_in_the_windows_is_null(self, simulated_server):
+        """An own image 367 days after the centre day is outside every window."""
+        images = [_simulated_image("A far away", "2022-06-22", None, points="A")]
+        simulated_server(images)
+
+        image = _image._build_fallback_image(
+            _SimulatedCollection(images), pd.Timestamp("2021-06-20"), "contains"
+        )
+
+        assert image is None
+
+
+@pytest.mark.usefixtures("simulated_server")
+class TestPerPointImageDates:
+    """The date request names the selected image; the masked image has no dates."""
+
+    def test_point_without_images_gets_the_masked_image_and_no_dates(self, simulated_server):
+        """A point where the collection has no image: the masked image, and null dates."""
+        images = _UPPSALA_IMAGES + _GOTEBORG_IMAGES
+        simulated_server(images)
+
+        image, image_dates = _select_point_image(
+            images, "X", "2021-06-16", "nearest", batch_points="UGX"
+        )
+
+        assert _read_server_value(image) == "U 2021-06-12 (masked)"
+        assert _read_server_value(image_dates) is None
+
+    def test_point_whose_images_fail_the_utm_filter_is_a_failed_point(self, simulated_server):
+        """Point images exist but none is in the point's UTM zone: a failed point, not no data."""
+        # The point at 0° N, 30° W is in zone 26N; its images are labelled 27N.
+        images = [
+            _simulated_image("A 06-15", "2021-06-15", points="A", utm_zone="27N"),
+            _simulated_image("A 06-16", "2021-06-16", points="A", utm_zone="27N"),
+        ]
+        simulated_server(images)
+        time_starts, time_ends = _batch_index(images)
+
+        image, image_dates = _image._build_image(
+            {"collection": "simulated", "bands": ["B4"], "use_utm_zone": True},
+            date=pd.Timestamp("2021-06-16"),
+            geometry="A",
+            collection_time_starts=time_starts,
+            collection_time_ends=time_ends,
+            lat=0.0,
+            lon=-30.0,
+        )
+
+        with pytest.raises(_StubEarthEngineError, match="may not be null"):
+            _read_server_value(image)
+        with pytest.raises(_StubEarthEngineError, match="may not be null"):
+            _read_server_value(image_dates)
+
+    def test_circular_aspect_image_uses_the_same_selection(self, simulated_server):
+        """The circular aspect image of a fallback point is built from the point's selected image."""
+        images = _UPPSALA_IMAGES + _GOTEBORG_IMAGES
+        simulated_server(images)
+
+        main_image, main_dates = _select_point_image(
+            images, "U", "2021-06-16", "nearest", batch_points="UG"
+        )
+        circular_image, circular_dates = _select_point_image(
+            images, "U", "2021-06-16", "nearest", batch_points="UG", circular_aspect=True
+        )
+
+        assert _read_server_value(main_image) == "U 2021-06-15"
+        assert circular_image.expression == (
+            "(cat(sin(aspect(U 2021-06-15) * 0.017453) as sin, "
+            "cos(aspect(U 2021-06-15) * 0.017453) as cos)) masked to slope(U 2021-06-15) > 0"
+        )
+        assert _read_server_value(circular_dates) == _read_server_value(main_dates)
+
+
+# ------------------------------------------------------------------
+# The dates of the selected image in the statistics and the tiles
+# ------------------------------------------------------------------
+
+
+def _nearest_index_adapter(**attributes) -> GeeRasterAdapter:
+    """Return an offline adapter of a ``nearest`` collection whose batch index has 2021-06-16."""
+    adapter_attributes = {
+        "_dataset_spec": {"collection": "users/test/collection", "bands": ["B4"]},
+        "_collection_time_starts": pd.DatetimeIndex(["2021-06-13", "2021-06-16"]),
+        "_collection_time_ends": None,
+    }
+    adapter_attributes.update(attributes)
+    return _make_offline_adapter(**adapter_attributes)
+
+
+class TestResolveDateInfoWithImageDates:
+    """``_resolve_date_info`` reports the selected image; the batch index gives the date source."""
+
+    def test_dates_of_the_selected_image(self):
+        """The fallback image (06-15) is reported, not the batch-selected image (06-16)."""
+        adapter = _nearest_index_adapter()
+
+        date_info = adapter._resolve_date_info(
+            "2021-06-16", _image_times("2021-06-15 10:30", "2021-06-15 10:31")
+        )
+
+        assert date_info == {
+            "date_clamped": False,
+            "date_source": "nearest_to_sample",
+            "image_time_start": "2021-06-15",
+            "image_time_end": "2021-06-15",
+        }
+
+    def test_image_without_an_end_has_no_end_field(self):
+        """An image without ``system:time_end`` gives no ``image_time_end``."""
+        adapter = _nearest_index_adapter()
+
+        assert adapter._resolve_date_info("2021-06-20", _image_times("2021-06-16")) == {
+            "date_clamped": True,
+            "date_source": "clamped_to_nearest",
+            "image_time_start": "2021-06-16",
+        }
+
+    def test_point_without_images_has_no_date_fields(self):
+        """A null date result (the masked image) gives no date field at all."""
+        adapter = _nearest_index_adapter()
+
+        assert adapter._resolve_date_info("2021-06-16", None) == {}
+        assert adapter._resolve_date_info(None, None) == {}
+
+    def test_no_batch_index_gives_no_date_fields(self):
+        """Without a batch index (image assets, mosaics), there are no date fields."""
+        adapter = _nearest_index_adapter(_collection_time_starts=None)
+
+        assert adapter._resolve_date_info("2021-06-16", _image_times("2021-06-16")) == {}
+
+
+class TestImageDatesInPointStatistics:
+    """The statistics request carries the date branch; the meta dict names the selected image."""
+
+    @pytest.mark.parametrize(
+        ("image_dates_result", "expected_date_fields"),
+        [
+            (
+                _image_times("2021-06-15 10:30", "2021-06-15 10:31"),
+                {
+                    "date_clamped": False,
+                    "date_source": "nearest_to_sample",
+                    "image_time_start": "2021-06-15",
+                    "image_time_end": "2021-06-15",
+                },
+            ),
+            # The masked image of a point without images: no date fields.
+            (None, {}),
+        ],
+    )
+    def test_date_branch(self, monkeypatch, image_dates_result, expected_date_fields):
+        """The date branch is in the point's one request, and its result gives the date fields."""
+        adapter = _nearest_index_adapter(crs="EPSG:4326", scale=10)
+        recorded_requests = _stub_statistics_request(
+            monkeypatch,
+            adapter,
+            {"window": {"B4_mean": 0.1, "B4_count": 4}, "image_dates": image_dates_result},
+        )
+        image_requests: list[tuple] = []
+
+        def get_image(date=None, lat=None, lon=None, circular_aspect=False):
+            image_requests.append((date, lat, lon, circular_aspect))
+            return _StubStatisticsImage("main"), "dates of the selected image"
+
+        adapter._get_image = get_image
+
+        stats, meta = adapter._fetch_stats_single(
+            59.85, 17.63, 200, _StubReducer("mean"), ["mean"], ["_mean"], date="2021-06-16"
+        )
+
+        assert stats == {"mean": 0.1}
+        assert [set(branches) for branches in recorded_requests] == [{"window", "image_dates"}]
+        assert recorded_requests[0]["image_dates"] == "dates of the selected image"
+        assert {key: meta[key] for key in expected_date_fields} == expected_date_fields
+        assert not {"date_clamped", "image_time_start"} & (set(meta) - set(expected_date_fields))
+        assert image_requests == [("2021-06-16", 59.85, 17.63, False)]
+
+    def test_circular_aspect_image_has_the_same_arguments(self, monkeypatch):
+        """The circular aspect image is requested with the date and point of the main image."""
+        adapter = _statistics_adapter({"bands": [], "derived_bands": ["aspect"]})
+        _stub_statistics_request(
+            monkeypatch,
+            adapter,
+            {"window": {"aspect_mean": 180.0, "aspect_count": 4}, "aspect_circular": {}},
+        )
+        image_requests: list[tuple] = []
+
+        def get_image(date=None, lat=None, lon=None, circular_aspect=False):
+            image_requests.append((date, lat, lon, circular_aspect))
+            return _StubStatisticsImage("circular" if circular_aspect else "main"), None
+
+        adapter._get_image = get_image
+        adapter._band_named_keys = True
+
+        adapter._fetch_stats_single(
+            59.85, 17.63, 200, _StubReducer("mean"), ["mean"], ["_mean"], date="2021-06-16"
+        )
+
+        assert image_requests == [
+            ("2021-06-16", 59.85, 17.63, False),
+            ("2021-06-16", 59.85, 17.63, True),
+        ]
+
+
+class _StubDateRequest:
+    """Stands in for the server-side ``image_dates`` value of one tile. ``getInfo`` counts calls."""
+
+    def __init__(self, result: dict | None = None, error: Exception | None = None):
+        self._result = result
+        self._error = error
+        self.n_requests = 0
+
+    def getInfo(self):
+        self.n_requests += 1
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+class TestImageDatesOfTiles:
+    """Each tile with per-point date selection sends one date request before its download."""
+
+    def test_tile_gets_the_dates_of_its_image(self, monkeypatch, tmp_path):
+        """One date request, then the download; the date fields name the selected image."""
+        date_request = _StubDateRequest(_image_times("2021-06-15 10:30", "2021-06-15 10:31"))
+        adapter = _nearest_index_adapter(
+            _get_image=lambda date=None, lat=None, lon=None: (_StubImage(["B4"]), date_request)
+        )
+        recorded_downloads = _record_tile_downloads(monkeypatch)
+        output_path = tmp_path / "a-test_dataset.tif"
+
+        returned_path, date_info = adapter._export_single(
+            59.85, 17.63, 200, output_path, "2021-06-16", resample_m=20
+        )
+
+        assert returned_path == output_path
+        assert date_request.n_requests == 1
+        assert len(recorded_downloads) == 1
+        assert date_info == {
+            "date_clamped": False,
+            "date_source": "nearest_to_sample",
+            "image_time_start": "2021-06-15",
+            "image_time_end": "2021-06-15",
+        }
+
+    def test_failed_date_request_removes_the_old_tile(self, monkeypatch, tmp_path):
+        """A failed date request raises before the download and removes a tile of an earlier run."""
+        error = _StubEarthEngineError("stub: date request failed")
+        adapter = _nearest_index_adapter(
+            _get_image=lambda date=None, lat=None, lon=None: (
+                _StubImage(["B4"]),
+                _StubDateRequest(error=error),
+            )
+        )
+        recorded_downloads = _record_tile_downloads(monkeypatch)
+        output_path = tmp_path / "a-test_dataset.tif"
+        output_path.write_bytes(b"tile of an earlier run")
+
+        with pytest.raises(_StubEarthEngineError, match="date request failed"):
+            adapter._export_single(59.85, 17.63, 200, output_path, "2021-06-16", resample_m=20)
+
+        assert not output_path.exists()
+        assert recorded_downloads == []
+
+    def test_failed_date_request_is_a_failed_tile(self, monkeypatch, tmp_path):
+        """In a batch, a failed date request makes a failed tile; the other tiles get their dates."""
+        date_requests = {
+            lat: _StubDateRequest(_image_times(f"2021-06-{15 + index}"))
+            for index, lat in enumerate(_THREE_LATS)
+        }
+        failed_request_error = _StubEarthEngineError("stub: date request failed")
+        date_requests[_THREE_LATS[1]] = _StubDateRequest(error=failed_request_error)
+        static_image = _StubImage(["B4"])
+
+        def get_image(date=None, lat=None, lon=None):
+            if lat is None:
+                return static_image, None
+            return _StubImage(["B4"]), date_requests[lat]
+
+        adapter = _tile_export_adapter(
+            _dataset_spec={"collection": "users/test/collection", "bands": ["B4"]},
+            _collection_time_starts=pd.DatetimeIndex(["2021-06-13", "2021-06-16"]),
+            _get_image=get_image,
+        )
+        recorded_downloads = _record_tile_downloads(monkeypatch)
+        old_tile = tmp_path / "stub_gee" / "p1-stub_gee.tif"
+        old_tile.parent.mkdir(parents=True)
+        old_tile.write_bytes(b"tile of an earlier run")
+
+        paths, meta_list = adapter.export_tiles(
+            _THREE_LATS,
+            _THREE_LONS,
+            200,
+            tmp_path,
+            ids=_THREE_IDS,
+            dates=["2021-06-16"] * 3,
+            dataset_name="stub_gee",
+            disable_progress=True,
+        )
+
+        assert [request.n_requests for request in date_requests.values()] == [1, 1, 1]
+        assert len(recorded_downloads) == 2
+        assert paths == [
+            tmp_path / "stub_gee" / "p0-stub_gee.tif",
+            None,
+            tmp_path / "stub_gee" / "p2-stub_gee.tif",
+        ]
+        assert meta_list[1] == {
+            "error": "_StubEarthEngineError: stub: date request failed",
+            "exception": failed_request_error,
+        }
+        assert not old_tile.exists()
+        assert [meta_list[index]["image_time_start"] for index in (0, 2)] == [
+            "2021-06-15",
+            "2021-06-17",
+        ]
 
 
 # ------------------------------------------------------------------

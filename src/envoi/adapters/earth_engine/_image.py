@@ -5,7 +5,8 @@ This collects, in one place:
 
 * GEE SDK initialisation (only when Earth Engine is not yet initialized) and
   session-pool tuning (once per process).
-* Collection timestamp fetching and nearest / contains date selection.
+* Collection timestamp fetching and nearest / contains date selection,
+  with the per-point fallback that selects an own image near the centre day.
 * Derived-band registration (slope, aspect, ...) and computation.
 * The central ``_build_image`` pipeline: load → spatial filter → date select →
   derive bands → final band select.
@@ -390,6 +391,142 @@ def _resolve_date_filter_range(
 
 
 # ---------------------------------------------------------------------------
+# Per-point fallback  (an own image near the centre day, selected on the server)
+# ---------------------------------------------------------------------------
+
+# Milliseconds in one day. The fallback compares image starts as whole days
+# in UTC (the day rule).
+_DAY_MS = 86_400_000
+
+# The date windows of the fallback, in whole days before and after the centre
+# day: first 32 days, then 366 days. A point whose own images are all outside
+# both windows stays a failed point. A search of the whole collection took
+# 12 to 27 s per point in live checks (2026-10-12); the 32-day window took
+# about 1.6 s and the 366-day window about 4.3 s. See the decision log,
+# "Image selection per point".
+_FALLBACK_WINDOWS_DAYS = (32, 366)
+
+# The image property that holds the sort key of the "nearest" fallback.
+_FALLBACK_SORT_KEY = "envoi_fallback_sort_key"
+
+# The sort key of the "nearest" fallback is
+# day gap × _DAY_GAP_KEY_FACTOR + (image start − window start) in milliseconds.
+# The factor is larger than the longest window, (2 × 366 + 1) days ≈ 6.3e10 ms,
+# so the day gap decides first, and an earlier start wins between equal gaps.
+# One key avoids two sorts: Earth Engine does not promise a stable sort. The
+# largest key, about 3.7e13, is below 2**53, so a double holds it exactly.
+_DAY_GAP_KEY_FACTOR = 1e11
+
+
+def _epoch_milliseconds(timestamp: pd.Timestamp) -> int:
+    """Return a UTC time without time zone in milliseconds since 1970, as ``system:time_*``."""
+    return (timestamp - pd.Timestamp("1970-01-01")) // pd.Timedelta(milliseconds=1)
+
+
+def _resolve_centre_day(
+    date_timestamp: pd.Timestamp, time_starts: pd.DatetimeIndex
+) -> pd.Timestamp:
+    """Return the centre day of a point: its date, limited to the batch index, at 00:00 UTC.
+
+    The date is limited to the range from the first start to the latest start
+    of the batch index. The caller passes the latest start for a point
+    without a sample date.
+    """
+    centre_date = min(max(date_timestamp, time_starts.min()), time_starts.max())
+    return centre_date.normalize()
+
+
+def _nearest_fallback_step(own_images, centre_ms: int, window_days: int):
+    """Return ``(window_images, image)`` for one window of the "nearest" fallback.
+
+    ``window_images`` are the own images that start in
+    ``[C − window_days, C + window_days + 1)`` days, with C the centre day.
+    ``image`` is the one with the fewest whole days between its start day and
+    C, and the earliest start between equal gaps. Both are server-side objects.
+    """
+    window_start_ms = centre_ms - window_days * _DAY_MS
+    window_images = own_images.filterDate(window_start_ms, centre_ms + (window_days + 1) * _DAY_MS)
+    centre_day_number = centre_ms // _DAY_MS
+
+    def with_sort_key(image):
+        start_ms = ee.Number(image.get("system:time_start"))
+        day_gap = start_ms.divide(_DAY_MS).floor().subtract(centre_day_number).abs()
+        sort_key = day_gap.multiply(_DAY_GAP_KEY_FACTOR).add(start_ms.subtract(window_start_ms))
+        return image.set(_FALLBACK_SORT_KEY, sort_key)
+
+    nearest_image = window_images.map(with_sort_key).sort(_FALLBACK_SORT_KEY).first()
+    return window_images, nearest_image
+
+
+def _contains_fallback_steps(own_images, centre_ms: int) -> list[tuple]:
+    """Return the ``(candidate_images, image)`` steps of the "contains" fallback, in order.
+
+    1. The own images that contain the centre day C (day rule): the latest start.
+    2. For each window W (32, then 366 days): the latest start in
+       ``[C − W, C + 1)`` days, then the earliest start in ``[C + 1, C + 1 + W)``.
+    """
+    next_day_ms = centre_ms + _DAY_MS
+
+    # Day rule: an image contains day C when it starts before C + 1 day and
+    # ends after the start of C. An image without an end, or with an end on
+    # its start day, ends at its start day + 1 day. So an image that starts
+    # on day C contains C, whatever its end, and an image that starts before
+    # C contains C only when its end is after the start of C. Filter.gt is
+    # false for an image without system:time_end, so such an image contains
+    # only its start day.
+    containing_images = own_images.filter(
+        ee.Filter.And(
+            ee.Filter.lt("system:time_start", next_day_ms),
+            ee.Filter.Or(
+                ee.Filter.gte("system:time_start", centre_ms),
+                ee.Filter.gt("system:time_end", centre_ms),
+            ),
+        )
+    )
+    steps = [(containing_images, containing_images.sort("system:time_start", False).first())]
+
+    for window_days in _FALLBACK_WINDOWS_DAYS:
+        images_before = own_images.filterDate(centre_ms - window_days * _DAY_MS, next_day_ms)
+        images_after = own_images.filterDate(next_day_ms, next_day_ms + window_days * _DAY_MS)
+        steps.append((images_before, images_before.sort("system:time_start", False).first()))
+        steps.append((images_after, images_after.sort("system:time_start").first()))
+    return steps
+
+
+def _build_fallback_image(own_images, centre_day: pd.Timestamp, policy: str):
+    """Return the server-side fallback image of one point: an own image near the centre day.
+
+    ``own_images`` are the point's images after ``filterBounds`` and the
+    optional ``UTM_ZONE`` filter. The rules of ``policy`` ("contains", or
+    "nearest" for any other value, as in ``_resolve_date_filter_range``) are
+    in ``_nearest_fallback_step`` and ``_contains_fallback_steps``.
+
+    The result is null on the server when no own image is in any window: the
+    point's request then fails, so the point stays a failed point. Building
+    it sends no request. Earth Engine evaluates it only inside the point's
+    own request, and only when the fast path has no image.
+    """
+    centre_ms = _epoch_milliseconds(centre_day)
+    if policy == "contains":
+        steps = _contains_fallback_steps(own_images, centre_ms)
+    else:
+        steps = [
+            _nearest_fallback_step(own_images, centre_ms, window_days)
+            for window_days in _FALLBACK_WINDOWS_DAYS
+        ]
+
+    # Chain the steps from the last to the first, so that a step is used only
+    # when every step before it has no image. limit(1) lets Earth Engine stop
+    # at the first image of a step.
+    selected_image = None
+    for candidate_images, candidate_image in reversed(steps):
+        selected_image = ee.Algorithms.If(
+            candidate_images.limit(1).size().gt(0), candidate_image, selected_image
+        )
+    return selected_image
+
+
+# ---------------------------------------------------------------------------
 # Derived bands  (slope, aspect, …)
 # ---------------------------------------------------------------------------
 
@@ -457,12 +594,13 @@ def _build_image(
     lon: float | None = None,
     circular_aspect: bool = False,
 ):
-    """Build an ee.Image from a dataset_spec config dict.
+    """Build an ee.Image from a dataset_spec config dict, and the request for its dates.
 
     Pipeline:
         1. Load image (single asset) or ImageCollection.
         2. For collections only: filterBounds → optional UTM-zone filter
-           → date selection (filterDate + .first(), or mosaic when no date).
+           → date selection (filterDate + .first(), the per-point fallback,
+           or mosaic when no date).
         3. Compute derived bands (slope, aspect, …) and addBands them.
         4. Final band select — drop source bands when only derived
            bands were requested, otherwise keep both.
@@ -473,11 +611,18 @@ def _build_image(
     the same image (and so the same first band) as the derived bands. Flat
     pixels (slope 0) are masked: Earth Engine gives them aspect 0 (north), so
     they would pull the mean towards north although they face no direction.
+    The same arguments select the same image as without the flag.
 
     For collections, the date handling strategy is:
-    - date provided + timestamps cached: find nearest timestamp, filterDate, .first()
+    - date provided + timestamps cached (the batch index): the fast path
+      selects the point's own image in the range of the batch-selected image
+      (``_resolve_date_filter_range``; for "contains" it ends at most one day
+      after the centre day). With a point ``geometry``, a point without an
+      own image in that range gets the per-point fallback: an own image near
+      the centre day, selected on the server (``_build_fallback_image``).
     - date provided + no timestamps (fallback): filterDate ±1 day, .first()
     - no date: mosaic (most recent non-masked pixel per position)
+    Own images are the images at the point after the optional UTM-zone filter.
 
     When the collection has no image at the point ``geometry`` on any date
     (before the UTM-zone and date filters), the image is the first image of
@@ -485,9 +630,9 @@ def _build_image(
     first image of the collection when no source band is configured), with
     every pixel masked. The point gets the values of a point without data:
     null statistics, except ``count``, which is 0 (Earth Engine decides this
-    in the point's request). When the point has images, but the UTM-zone or
-    date filter removes all of them, the image is null, and the point's
-    request fails.
+    in the point's request). When the point has images, but no own image is
+    selected (none in the date range or the fallback windows, or none in the
+    point's UTM zone), the image is null, and the point's request fails.
 
     Parameters
     ----------
@@ -499,8 +644,21 @@ def _build_image(
         Cached start timestamps for the collection.
     collection_time_ends : pd.DatetimeIndex, optional
         Cached end timestamps for the collection (aligned with start times).
+
+    Returns
+    -------
+    (image, image_dates)
+        ``image`` is the ee.Image to sample. ``image_dates`` is a server-side
+        value for the point's request: ``{"start": ..., "end": ...}``, the
+        ``system:time_start`` and ``system:time_end`` (milliseconds, ``None``
+        when the image has no end) of the image that the date selection chose,
+        or null when the collection has no image at the point (the masked
+        image). ``image_dates`` is ``None`` when there is no per-point date
+        selection (an image asset, a mosaic, no point geometry, or no batch
+        index). Building both sends no request.
     """
     image = None
+    image_dates = None
 
     if "image" in dataset_spec:
         image = ee.Image(dataset_spec["image"])
@@ -547,8 +705,39 @@ def _build_image(
                 time_starts=collection_time_starts,
                 time_ends=collection_time_ends,
             )
+
+            # The per-point fallback needs a point and the batch index. Without
+            # a point there is no location to search, and without the index
+            # there is no centre day (the ±1 day range above is already a
+            # search on the server).
+            use_point_fallback = geometry is not None and collection_time_starts is not None
+            if use_point_fallback:
+                centre_day = _resolve_centre_day(date_ts, collection_time_starts)
+                # "contains": the batch-selected range can end weeks after the
+                # centre day when another point's image starts later. This
+                # point's own image that starts after the centre day would then
+                # be selected, although it does not contain the date. End the
+                # range at most at the end of the centre day.
+                if date_policy == "contains":
+                    capped_end = min(pd.Timestamp(end), centre_day + pd.Timedelta(days=1))
+                    end = capped_end.strftime("%Y-%m-%d")
+
+            # Fast path: the point's own image in the batch-selected range.
             dated_collection = image_collection.filterDate(start, end)
             image = dated_collection.first()
+
+            # Collections whose images have different dates at different
+            # places (for example Sentinel-2 tiles) can have no own image of
+            # the point in that range, although the point has images. Then
+            # select an own image near the centre day on the server, in the
+            # point's own request. Earth Engine evaluates only the branch of
+            # If that it needs, so a point with an image in the fast-path
+            # range does not pay for the fallback.
+            if use_point_fallback:
+                fallback_image = _build_fallback_image(image_collection, centre_day, date_policy)
+                image = ee.Image(
+                    ee.Algorithms.If(dated_collection.limit(1).size().gt(0), image, fallback_image)
+                )
 
             # When the collection has no image at the point on any date (for
             # example an ocean point of a tiled land product), .first() gives
@@ -565,11 +754,12 @@ def _build_image(
             # bands, or only derived bands), take the first image.
             # The check uses the collection after filterBounds only, before
             # the UTM-zone filter and the date filter, on purpose. When the
-            # point has images, but the selection filters remove all of them
-            # (no image in the selected date range, or a wrong use_utm_zone
-            # setting), the image stays null and the point is a failed point
-            # with an error. A problem with the image selection then stays
-            # visible and is not reported as missing data.
+            # point has images, but no own image is selected (none in the
+            # date range or the fallback windows, or none in the point's UTM
+            # zone because of a wrong use_utm_zone setting), the image stays
+            # null and the point is a failed point with an error. A problem
+            # with the image selection then stays visible and is not reported
+            # as missing data.
             # Earth Engine evaluates the condition in the point's own request,
             # so no request is added, and limit(1) lets it stop at the first
             # image. Without a point geometry, there is no location to check,
@@ -586,6 +776,23 @@ def _build_image(
                     )
                 masked_placeholder = ee.Image(placeholder_collection.first()).updateMask(0)
                 point_has_images = bounds_collection.limit(1).size().gt(0)
+
+                # The dates of the selected image, from the image itself, so
+                # that the QC columns name the image that the point actually
+                # used (the fallback image can differ from the batch-selected
+                # image). The masked image has no dates of its own: its point
+                # has no image, so the value is null, with the same condition.
+                if use_point_fallback:
+                    image_dates = ee.Algorithms.If(
+                        point_has_images,
+                        ee.Dictionary(
+                            {
+                                "start": image.get("system:time_start"),
+                                "end": image.get("system:time_end"),
+                            }
+                        ),
+                        None,
+                    )
                 image = ee.Image(ee.Algorithms.If(point_has_images, image, masked_placeholder))
         else:
             # No date: mosaic (most recent non-masked pixel per position)
@@ -600,10 +807,11 @@ def _build_image(
     if circular_aspect:
         aspect_radians = _DERIVED_BAND_DISPATCH["aspect"](image).multiply(math.pi / 180.0)
         not_flat_mask = _DERIVED_BAND_DISPATCH["slope"](image).gt(0)
-        return ee.Image.cat(
+        circular_aspect_image = ee.Image.cat(
             aspect_radians.sin().rename("sin"),
             aspect_radians.cos().rename("cos"),
         ).updateMask(not_flat_mask)
+        return circular_aspect_image, image_dates
 
     # Compute derived bands BEFORE selecting `bands`. This allows derived bands
     # to read any source band they need internally — the user doesn't have to
@@ -631,4 +839,4 @@ def _build_image(
         image = image.select(derived_bands_list)
     # else: neither specified — return the image as-is.
 
-    return image
+    return image, image_dates

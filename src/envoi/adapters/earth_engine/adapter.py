@@ -16,6 +16,7 @@ and how the per-dataset metadata is assembled.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -205,10 +206,10 @@ class GeeRasterAdapter(BaseAdapter):
                 # probing, scale detection). Constructing it is lazy on GEE's
                 # side — nothing is computed until something reduces over a
                 # region — so this costs nothing here.
-                self._static_image = _build_image(dataset_spec)
+                self._static_image, _ = _build_image(dataset_spec)
         elif "image" in dataset_spec:
             self._native_proj = ee.Image(dataset_spec["image"]).select(0).projection()
-            self._static_image = _build_image(dataset_spec)
+            self._static_image, _ = _build_image(dataset_spec)
             self._needs_per_point_date = False
 
         # If the user didn't supply a native_scale_m override, sanity-check
@@ -292,7 +293,7 @@ class GeeRasterAdapter(BaseAdapter):
         # raises in _get_collection_time_bounds and stops the run.
         self._needs_per_point_date = start_times is not None
         if not self._needs_per_point_date:
-            self._static_image = _build_image(self._dataset_spec)
+            self._static_image, _ = _build_image(self._dataset_spec)
         self._timestamps_loaded = True
 
     def _validate_auto_detected_scale(self) -> None:
@@ -349,15 +350,16 @@ class GeeRasterAdapter(BaseAdapter):
 
     def _get_image(
         self, date=None, lat=None, lon=None, *, circular_aspect: bool = False
-    ) -> ee.Image:
-        """Return the ee.Image to sample, building per-point if needed.
+    ) -> tuple[ee.Image, Any | None]:
+        """Return the ee.Image to sample, building per-point if needed, and its date request.
 
         For IMAGE assets the pre-built static image is always returned,
         regardless of date or coordinates.
 
         For ImageCollections:
         - date provided + coords → per-point image picked via
-          ``collection_date_policy`` (nearest/contains)
+          ``collection_date_policy`` (nearest/contains), with the per-point
+          fallback of ``_build_image``
         - date provided + no coords → server-side date filter only
           (no spatial selection — used when timestamps weren't cached
           or for global probes)
@@ -366,10 +368,17 @@ class GeeRasterAdapter(BaseAdapter):
 
         With ``circular_aspect=True``, returns the companion image for the
         circular aspect statistics (``sin`` and ``cos`` bands, see
-        ``_build_image``), selected by the same rules. This image is built
-        for each call and never read from or written to ``_static_image``.
-        Building it sends no request: Earth Engine evaluates it only in the
-        point's ``reduceRegion`` request.
+        ``_build_image``), selected by the same rules. The same date and
+        coordinates select the same image as without the flag. This image is
+        built for each call and never read from or written to
+        ``_static_image``. Building it sends no request: Earth Engine
+        evaluates it only in the point's ``reduceRegion`` request.
+
+        Returns:
+            ``(image, image_dates)``. ``image_dates`` is the server-side value
+            for the dates of the selected image (see ``_build_image``), for a
+            collection with per-point date selection and coordinates. It is
+            ``None`` in every other case.
         """
         # Per-point branch has priority for collections that need spatial
         # filtering (e.g. tiled DEM collections). When coordinates are given,
@@ -418,11 +427,12 @@ class GeeRasterAdapter(BaseAdapter):
         # The circular aspect image is never cached: it continues to the
         # branches below, which build it from the same dataset spec.
         if not circular_aspect and date is None and self._static_image is not None:
-            return self._static_image
+            return self._static_image, None
 
         # Collection with no date and no coords: build (and cache) a global
         # most-recent fallback. Used by tile-export and band-name probing
-        # paths that don't have a specific point in mind.
+        # paths that don't have a specific point in mind. Without a point,
+        # there is no per-point date request.
         if date is None and self._needs_per_point_date:
             most_recent = self._collection_time_starts.max()
             logger.info(
@@ -430,7 +440,7 @@ class GeeRasterAdapter(BaseAdapter):
                 self._dataset_spec.get("collection"),
                 most_recent.strftime("%Y-%m-%d"),
             )
-            most_recent_image = _build_image(
+            most_recent_image, _ = _build_image(
                 self._dataset_spec,
                 date=most_recent,
                 collection_time_starts=self._collection_time_starts,
@@ -439,7 +449,7 @@ class GeeRasterAdapter(BaseAdapter):
             )
             if not circular_aspect:
                 self._static_image = most_recent_image
-            return most_recent_image
+            return most_recent_image, None
 
         # Final fallback — a date was provided but neither the per-point
         # branch (no coords) nor the static-image branch (date is None)
@@ -556,82 +566,82 @@ class GeeRasterAdapter(BaseAdapter):
     # Date metadata  (per-point image timestamps for the meta sidecar)
     # ------------------------------------------------------------------
 
-    def _make_date_info(
-        self,
-        image_start: pd.Timestamp,
-        *,
-        end_index: int | None,
-        clamped: bool,
-        source: str,
-    ) -> dict:
-        """Build the date metadata dict for one resolved image timestamp.
+    def _resolve_date_info(self, date, image_times: dict | None) -> dict:
+        """Return the date metadata of one point, for its meta dict.
 
-        ``end_index`` is the position of the matching end-time inside
-        ``_collection_time_ends``; pass ``None`` when no end-time should be
-        emitted. The ``image_time_end`` key is included only when the index
-        is valid for the cached end-times array.
+        ``date_clamped`` and ``date_source`` compare the sample date with the
+        batch index (see ``_resolve_date_source``). ``image_time_start`` and
+        ``image_time_end`` (``%Y-%m-%d``) name the image that the point's
+        request actually selected, which the per-point fallback can choose
+        instead of the batch-selected image. They come from ``image_times``.
+
+        Args:
+            date: The point's sample date, or None in a run without dates.
+            image_times: The ``image_dates`` value of ``_build_image`` that
+                Earth Engine returned for the point: ``{"start": ..., "end":
+                ...}`` in milliseconds since 1970, with ``"end"`` None when the
+                image has no end. None when the collection has no image at the
+                point (the masked image).
+
+        Returns:
+            The four date keys, without ``image_time_end`` when the image has
+            no end. An empty dict when there is no batch index (image assets,
+            mosaic collections, and collections without an image at the
+            batch's points), and when ``image_times`` is None: a point without
+            an image has no date fields, and ``date_info`` does not count it.
         """
-        # Always include the start-of-image timestamp; this is the only
-        # mandatory field.
-        info = {
-            "date_clamped": clamped,
-            "date_source": source,
-            "image_time_start": image_start.strftime("%Y-%m-%d"),
-        }
-        # Only emit image_time_end when we have a cached end-times array
-        # AND the requested index is in-bounds. Defensive bounds check —
-        # _get_collection_time_bounds() returns time_ends=None whenever
-        # an image has no end, and otherwise one end for each start, so by
-        # the time we reach here the index *should* always be valid; the guard is
-        # belt-and-braces in case that upstream invariant ever breaks.
-        end_times = self._collection_time_ends
-        if end_times is not None and end_index is not None and 0 <= end_index < len(end_times):
-            info["image_time_end"] = end_times[end_index].strftime("%Y-%m-%d")
-        return info
-
-    def _resolve_date_info(self, date=None) -> dict:
-        """Compute date metadata for a single point fetch.
-
-        Returns a dict with image_time_start, image_time_end, date_clamped,
-        date_source to be merged into the per-point meta dict.
-        """
-        if self._collection_time_starts is None:
+        if self._collection_time_starts is None or image_times is None:
             return {}
 
+        date_clamped, date_source = self._resolve_date_source(date)
+        # Every selection filter of _build_image uses system:time_start, so
+        # the selected image always has a start.
+        date_info = {
+            "date_clamped": date_clamped,
+            "date_source": date_source,
+            "image_time_start": pd.to_datetime(image_times["start"], unit="ms").strftime(
+                "%Y-%m-%d"
+            ),
+        }
+        if image_times.get("end") is not None:
+            date_info["image_time_end"] = pd.to_datetime(image_times["end"], unit="ms").strftime(
+                "%Y-%m-%d"
+            )
+        return date_info
+
+    def _resolve_date_source(self, date) -> tuple[bool, str]:
+        """Return ``(date_clamped, date_source)`` of a point, from its date and the batch index.
+
+        No request: the batch index is in memory. ``date_source`` is
+        ``most_recent_no_date`` without a date, ``clamped_to_nearest`` for a
+        date outside the collection's range, and otherwise
+        ``contains_sample_date`` ("contains") or ``nearest_to_sample``.
+
+        Uses attributes:
+            _collection_time_starts: The batch index start times (not None).
+            _collection_time_ends: The batch index end times, or None.
+        """
         time_starts = self._collection_time_starts
-        last_index = len(time_starts) - 1
 
         if date is None:
-            # No-date fallback: most recent image (last entry in the
-            # time_starts array).
-            return self._make_date_info(
-                time_starts.max(),
-                end_index=last_index,
-                clamped=False,
-                source="most_recent_no_date",
-            )
+            # No-date run: the most recent image of the batch index.
+            return False, "most_recent_no_date"
 
         dt = pd.to_datetime(date)
         policy = str(self._dataset_spec.get("collection_date_policy", "nearest")).lower()
 
         if policy == "contains":
-            # "contains" policy: pick the image whose time interval contains
-            # the sample date. When the date falls outside the collection's
-            # full range, clamp to the nearest boundary image. The range starts
-            # at the first image's start day and ends at the end of the last
-            # image interval, so a date on the first start day or inside the
-            # last interval is not clamped. Dates compare as whole days (the
-            # day rule): an image that starts at 10:00 on the sample day
-            # starts on or before that day. The image matches the one that
-            # _resolve_date_filter_range selects for the same date.
+            # "contains" policy: the date is clamped when it falls outside the
+            # collection's full range. The range starts at the first image's
+            # start day and ends at the end of the last image interval, so a
+            # date on the first start day or inside the last interval is not
+            # clamped. Dates compare as whole days (the day rule): an image
+            # that starts at 10:00 on the sample day starts on or before that
+            # day. The range is the one that _resolve_date_filter_range
+            # selects from.
             sample_day = dt.normalize()
             if sample_day < time_starts.min().normalize():
-                return self._make_date_info(
-                    time_starts.min(),
-                    end_index=0,
-                    clamped=True,
-                    source="clamped_to_nearest",
-                )
+                return True, "clamped_to_nearest"
 
             # The last interval ends at the system:time_end of the image with
             # the latest start. Without end times, it ends at the end of that
@@ -645,41 +655,20 @@ class GeeRasterAdapter(BaseAdapter):
             time_ends = self._collection_time_ends
             last_start = time_starts.max()
             if time_ends is not None and len(time_ends) == len(time_starts):
-                last_interval_end = time_ends[last_index]
+                last_interval_end = time_ends[len(time_starts) - 1]
             else:
                 last_interval_end = last_start.normalize() + pd.DateOffset(days=1)
             last_interval_end = max(
                 last_interval_end, last_start.normalize() + pd.DateOffset(days=1)
             )
             if sample_day >= last_interval_end:
-                return self._make_date_info(
-                    time_starts.max(),
-                    end_index=last_index,
-                    clamped=True,
-                    source="clamped_to_nearest",
-                )
+                return True, "clamped_to_nearest"
+            return False, "contains_sample_date"
 
-            # In-range: find the latest start before the next day.
-            next_day = sample_day + pd.DateOffset(days=1)
-            idx = int(time_starts.searchsorted(next_day, side="left")) - 1
-            idx = max(0, min(idx, last_index))
-            return self._make_date_info(
-                time_starts[idx],
-                end_index=idx,
-                clamped=False,
-                source="contains_sample_date",
-            )
-
-        # Default "nearest" policy: pick whichever image timestamp is closest
-        # to the sample date, even if the date is outside the range.
-        nearest, was_clamped = _find_nearest_timestamp(time_starts, dt)
-        nearest_index = int(time_starts.get_indexer([nearest])[0])
-        return self._make_date_info(
-            nearest,
-            end_index=nearest_index,
-            clamped=was_clamped,
-            source="clamped_to_nearest" if was_clamped else "nearest_to_sample",
-        )
+        # Default "nearest" policy: the date is clamped when it is before the
+        # first start or after the latest start of the batch index.
+        _, was_clamped = _find_nearest_timestamp(time_starts, dt)
+        return was_clamped, "clamped_to_nearest" if was_clamped else "nearest_to_sample"
 
     # ------------------------------------------------------------------
     # Empty-result builders  (results of a failed point)
@@ -757,6 +746,11 @@ class GeeRasterAdapter(BaseAdapter):
           is applied over an ``ee.Geometry.Point`` at the exact (lat, lon)
           to fetch the value of the pixel containing the point.
 
+        A fourth branch, **image_dates**, is no reduction: for collections
+        with per-point date selection, it returns the start and end of the
+        image that the date selection chose, for the date fields of the meta
+        dict (see ``_resolve_date_info``).
+
         GEE evaluates the branches in parallel server-side, so callers pay
         one round-trip for all of them. Returns a single
         ``(stats_dict, meta_dict)`` tuple with merged keys:
@@ -776,7 +770,9 @@ class GeeRasterAdapter(BaseAdapter):
         # original — preserves the old single-reducer test entry points.
         if original_reducer_names is None:
             original_reducer_names = reducer_names
-        img = self._get_image(date, lat=lat, lon=lon)
+        # image_dates: the dates of the selected image, for collections with
+        # per-point date selection (None otherwise). See _build_image.
+        img, image_dates = self._get_image(date, lat=lat, lon=lon)
         region = self._make_region(lat, lon, window_m)
 
         utm_crs = get_utm_crs(lon, lat)
@@ -864,7 +860,8 @@ class GeeRasterAdapter(BaseAdapter):
             # Circular aspect branch: mean sine, mean cosine, and the number of
             # non-flat pixels, over the same region and grid as the window
             # branch. Output keys: sin_mean, sin_count, cos_mean, cos_count.
-            circular_aspect_image = self._get_image(date, lat=lat, lon=lon, circular_aspect=True)
+            # The same date and coordinates select the same image as above.
+            circular_aspect_image, _ = self._get_image(date, lat=lat, lon=lon, circular_aspect=True)
             branches["aspect_circular"] = circular_aspect_image.reduceRegion(
                 reducer=ee.Reducer.mean().combine(reducer2=ee.Reducer.count(), sharedInputs=True),
                 geometry=region,
@@ -882,6 +879,13 @@ class GeeRasterAdapter(BaseAdapter):
                 scale=native_m,
                 crs=utm_crs,
             )
+
+        if image_dates is not None:
+            # Dates branch: system:time_start and system:time_end of the image
+            # that the date selection chose, or null for a point where the
+            # collection has no image. No extra request: it is a branch of
+            # the same dictionary.
+            branches["image_dates"] = image_dates
 
         # Single round-trip — all branches resolved server-side.
         full_result = ee.Dictionary(branches).getInfo() or {}
@@ -1024,6 +1028,14 @@ class GeeRasterAdapter(BaseAdapter):
             has_values = any_pt
             had_nodata = not any_pt
 
+        # Date metadata: the dates of the image that the point used. Without
+        # per-point date selection, the point has no date fields.
+        date_info = (
+            self._resolve_date_info(date, full_result.get("image_dates"))
+            if image_dates is not None
+            else {}
+        )
+
         # Build per-band coverage breakdown for multiband datasets. Each entry
         # shows what fraction of window cells had valid data for that band —
         # useful when bands carry independent nodata masks (e.g. a derived band
@@ -1049,7 +1061,7 @@ class GeeRasterAdapter(BaseAdapter):
             "nodata": None,
             "src_path": self._src_label(),
             "window_arr": None,
-            **self._resolve_date_info(date),
+            **date_info,
         }
         return stats, meta
 
@@ -1132,7 +1144,8 @@ class GeeRasterAdapter(BaseAdapter):
         # a failed point.
         if not hasattr(self, "_cached_band_count"):
             try:
-                self._get_band_name(self._get_image())
+                batch_image, _ = self._get_image()
+                self._get_band_name(batch_image)
             except Exception:
                 pass
 
@@ -1195,7 +1208,7 @@ class GeeRasterAdapter(BaseAdapter):
         output_path: Path,
         date=None,
         resample_m: float | None = None,
-    ):
+    ) -> tuple[Path, dict]:
         """Export a GeoTIFF tile for one point, on a pixel grid in its UTM zone.
 
         The tile has n × n pixels, with n = :func:`~envoi.geo.tile_pixel_count`
@@ -1206,8 +1219,39 @@ class GeeRasterAdapter(BaseAdapter):
         odd n, the pixel that contains the point is the centre pixel; for even
         n, the tile centre is the grid line nearest to the point. The local
         adapter uses the same grid when ``resample_m`` is set.
+
+        For a collection with per-point date selection, one small request
+        before the download returns the dates of the image that the point's
+        selection chose (``image_dates`` of ``_build_image``). When this
+        request fails, the error propagates, so the tile is a failed tile, and
+        a tile with the same name from an earlier run is removed, as for a
+        failed download.
+
+        Returns:
+            ``(output_path, date_info)``. ``date_info`` holds the point's date
+            fields (see ``_resolve_date_info``). It is empty without per-point
+            date selection, and for a point where the collection has no image.
         """
-        img = self._get_image(date, lat=lat, lon=lon)
+        output_path = Path(output_path)
+        img, image_dates = self._get_image(date, lat=lat, lon=lon)
+
+        # Dates of the selected image, so that the tile meta names the image
+        # that the tile shows. The download request cannot return them.
+        date_info: dict = {}
+        if image_dates is not None:
+            try:
+                selected_image_times = image_dates.getInfo()
+            # Broad catch that re-raises the error unchanged after a cleanup:
+            # Earth Engine reports unrelated failures with one exception type.
+            # export_tiles makes the tile a failed tile. Remove a tile with
+            # the same name from an earlier run, so that the folder matches
+            # the tile manifest, which marks the tile as not exported.
+            except Exception:
+                with contextlib.suppress(OSError):
+                    output_path.unlink(missing_ok=True)
+                raise
+            date_info = self._resolve_date_info(date, selected_image_times)
+
         # Use resample_m as the export scale when provided; fall back to native.
         scale_m = float(resample_m) if resample_m is not None else self._get_scale_value(img)
         utm = get_utm_crs(lon, lat)
@@ -1221,7 +1265,6 @@ class GeeRasterAdapter(BaseAdapter):
         n_pixels = tile_pixel_count(window_m, scale_m)
         tile_left_m, tile_top_m = tile_top_left(point_x_m, point_y_m, n_pixels, scale_m)
 
-        output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Request the exact pixel grid (transform and dimensions), not a region
@@ -1237,7 +1280,7 @@ class GeeRasterAdapter(BaseAdapter):
             dimensions=f"{n_pixels}x{n_pixels}",
             output_path=output_path,
         )
-        return output_path
+        return output_path, date_info
 
     # ------------------------------------------------------------------
     # Mode 2 helper: pre-flight size check
@@ -1306,8 +1349,12 @@ class GeeRasterAdapter(BaseAdapter):
 
         Returns ``(paths, meta_list)`` — one entry per input point in each
         list. ``paths[i]`` is ``None`` when the export for that point failed.
-        ``meta_list[i]`` holds the point's date information, and for a failed
-        export also the error text (``error``) and the exception (``exception``).
+        ``meta_list[i]`` holds the point's date information (the dates of the
+        image in the tile, see :meth:`_export_single`). For a failed export, it
+        holds only the error text (``error``) and the exception (``exception``).
+
+        For collections with per-point date selection, each tile sends one
+        small date request before its download, in its worker thread.
 
         Raises ``ValueError`` before any tile download when the tiles would
         exceed GEE's synchronous download limit. A failed request for the band
@@ -1335,7 +1382,7 @@ class GeeRasterAdapter(BaseAdapter):
 
         # The image without point coordinates (see _get_image). The band-name
         # request and the tile-size check below use it.
-        batch_image = self._get_image()
+        batch_image, _ = self._get_image()
 
         # Warm the band-name cache so build_dataset_meta can read it later.
         # Broad catch for a harmless best-effort failure: a failed request is
@@ -1358,7 +1405,10 @@ class GeeRasterAdapter(BaseAdapter):
             batch_image, window_m=window_m, scale_m=export_scale_m, dataset_name=dataset_name
         )
 
-        meta_list = [self._resolve_date_info(d) for d in date_list]
+        # One meta dict per point. Each worker returns the date fields of its
+        # tile, because only the point's own request knows which image the
+        # date selection chose.
+        meta_list: list[dict] = [{} for _ in range(n)]
 
         # Build every tile filename up front. Sample IDs come from the user's
         # input table and can contain anything (URL-style occurrenceIDs with
@@ -1394,13 +1444,14 @@ class GeeRasterAdapter(BaseAdapter):
                 for completed, future in enumerate(as_completed(future_to_idx), start=1):
                     idx = future_to_idx[future]
                     try:
-                        results[idx] = future.result()
+                        results[idx], meta_list[idx] = future.result()
                     # Broad catch that replaces one point's failed tile with an
                     # empty result (no path; docs/coding_guidelines.md,
                     # "Failures for single points"): Earth Engine reports
-                    # unrelated failures with one exception type. The point's
-                    # meta dict keeps the error, so extract() reports the tile,
-                    # and stops the run when every tile failed.
+                    # unrelated failures with one exception type. A failed
+                    # date request or download comes here. The point's meta
+                    # dict keeps the error, so extract() reports the tile, and
+                    # stops the run when every tile failed.
                     except Exception as error:
                         logger.warning("GEE export failed for point %d: %s", idx, error)
                         results[idx] = None
