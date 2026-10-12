@@ -3169,6 +3169,100 @@ class TestLocalWindowCoverage:
         assert qc_df.loc[0, "cover_coverage_pct_100m"] == 96.0
         assert qc_df.loc[0, "cover_had_nodata_100m"]
 
+    def test_window_across_the_antimeridian(self, tmp_path, monkeypatch):
+        """A window across 180° of a raster in degrees counts its part beyond 180° as missing."""
+        from pyproj import Transformer
+        from shapely.geometry import Point, Polygon
+
+        from envoi.adapters import local_adapter
+
+        # 100 x 100 pixels of 0.0005° that end at 180°. The 1000 m window of
+        # the point reaches about 0.0025° beyond 180°.
+        pixel_size_deg = 0.0005
+        raster_path = tmp_path / "antimeridian.tif"
+        with rasterio.open(
+            raster_path,
+            "w",
+            driver="GTiff",
+            height=100,
+            width=100,
+            count=1,
+            dtype="float32",
+            crs="EPSG:4326",
+            transform=from_bounds(179.95, 0.0, 180.0, 0.05, 100, 100),
+        ) as dst:
+            dst.write(np.full((1, 100, 100), 5.0, dtype=np.float32))
+        update_catalog(
+            {"datasets": {"east_edge": {"data_source": "local", "path": str(raster_path)}}}
+        )
+        point_lat, point_lon = 0.025, 179.998
+
+        # Record the size of every mask, to check that no mask spans 360°.
+        mask_shapes = []
+        original_geometry_mask = local_adapter.geometry_mask
+
+        def recording_geometry_mask(*args, **kwargs):
+            mask_shapes.append(kwargs["out_shape"])
+            return original_geometry_mask(*args, **kwargs)
+
+        monkeypatch.setattr(local_adapter, "geometry_mask", recording_geometry_mask)
+
+        outputs = extract(
+            pd.DataFrame(
+                {
+                    "occurrenceID": ["edge"],
+                    "decimalLatitude": [point_lat],
+                    "decimalLongitude": [point_lon],
+                }
+            ),
+            {
+                "batch_id": "antimeridian",
+                "datasets": ["east_edge"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["count"],
+                    "window_size_m": 1000,
+                },
+            },
+            output_dir=tmp_path / "out",
+        )
+
+        # Independent count: the window corners in degrees (UTM zone 60N),
+        # with the longitudes continued past 180°, and the pixel centres of
+        # the raster grid continued 20 columns past 180°.
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32660", always_xy=True)
+        to_degrees = Transformer.from_crs("EPSG:32660", "EPSG:4326", always_xy=True)
+        point_x, point_y = to_utm.transform(point_lon, point_lat)
+        corners = [
+            to_degrees.transform(point_x + offset_x, point_y + offset_y)
+            for offset_x, offset_y in ((-500, -500), (500, -500), (500, 500), (-500, 500))
+        ]
+        window = Polygon([(corner_lon % 360.0, corner_lat) for corner_lon, corner_lat in corners])
+        inside_pixels = [
+            (row, column)
+            for row in range(100)
+            for column in range(120)
+            if window.contains(
+                Point(
+                    179.95 + (column + 0.5) * pixel_size_deg,
+                    0.05 - (row + 0.5) * pixel_size_deg,
+                )
+            )
+        ]
+        expected_total = len(inside_pixels)
+        expected_valid = sum(1 for _, column in inside_pixels if column < 100)
+        assert expected_valid < expected_total
+
+        stats_df = pd.read_csv(outputs["antimeridian"])
+        qc_df = pd.read_csv(tmp_path / "out" / "antimeridian_qc.csv")
+        assert stats_df.loc[0, "east_edge_count_1000m"] == expected_valid
+        assert qc_df.loc[0, "east_edge_n_pixels_1000m"] == expected_valid
+        assert qc_df.loc[0, "east_edge_coverage_pct_1000m"] == pytest.approx(
+            100.0 * expected_valid / expected_total
+        )
+        assert qc_df.loc[0, "east_edge_had_nodata_1000m"]
+        assert max(width for _, width in mask_shapes) < 1000
+
 
 class TestNativeResolutionInMetres:
     """The sidecar field ``native_spatial_resolution_m`` is in metres for every CRS."""

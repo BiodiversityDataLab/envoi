@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 
 import numpy as np
@@ -521,6 +522,36 @@ class TestCatalogNodataRules:
         assert sidecar_entry["nodata_source"] == "catalog"
         with rasterio.open(tile_dir / "P-grid.tif") as tile:
             assert math.isnan(tile.nodata)
+
+    def test_printed_float32_minimum_is_accepted_and_masks_its_pixels(self, tmp_path):
+        """Catalog nodata -3.4028235e38, the printed float32 minimum, is accepted on float32."""
+        # -3.4028235e38 is a little below the exact float32 minimum, but
+        # float32 rounds it to that minimum.
+        float32_minimum = float(np.finfo(np.float32).min)
+        assert -3.4028235e38 < float32_minimum
+        pixel_values = _pixel_values_with_nodata_pixels()
+        pixel_values[pixel_values == _NODATA] = np.finfo(np.float32).min
+        raster_path = _write_raster(tmp_path / "rasters" / "float32_minimum.tif", pixel_values)
+        _register({"path": str(raster_path), "nodata": -3.4028235e38})
+
+        stats_df = _run_tabular(tmp_path / "out", ["count", "point"])
+
+        assert pd.isna(stats_df.loc[0, "grid_point"])
+        assert stats_df["grid_count_200m"].tolist() == [299, 394]
+        sidecar_entry = _sidecar_entry(tmp_path / "out" / "table_metadata.json")
+        assert sidecar_entry["nodata"] == float32_minimum
+
+    def test_float32_error_names_the_exact_limits(self, tmp_path):
+        """-3.5e38 does not fit float32; the error names the limits at full precision."""
+        float32_values = np.full((1, _RASTER_SIZE, _RASTER_SIZE), 7, dtype=np.float32)
+        raster_path = _write_raster(tmp_path / "rasters" / "float32.tif", float32_values)
+        _register({"path": str(raster_path), "nodata": -3.5e38})
+
+        float32_maximum = float(np.finfo(np.float32).max)
+        assert repr(float32_maximum) == "3.4028234663852886e+38"
+        expected_text = f"Use NaN or a number from {-float32_maximum!r} to {float32_maximum!r}."
+        with pytest.raises(ValueError, match=re.escape(expected_text)):
+            _run_tabular(tmp_path / "out", ["mean"])
 
     def test_float32_band_gets_the_nodata_value_that_it_can_store(self, tmp_path):
         """Catalog nodata -3.4e38 on a float32 file: every read path masks the float32 value."""

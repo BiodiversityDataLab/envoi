@@ -102,13 +102,19 @@ def _nodata_fits_dtype(nodata: float, dtype_name: str) -> bool:
 
     An integer band needs a whole number (an ``int``, or a ``float`` such as
     ``-9999.0``) within the range of its type. A float band can store NaN,
-    infinity, and every number within the range of its type, for example
-    from about -3.4e38 to 3.4e38 for ``float32``.
+    infinity, and every number that its type rounds to a finite number, for
+    example from about -3.4e38 to 3.4e38 for ``float32``.
     """
     dtype = np.dtype(dtype_name)
     if np.issubdtype(dtype, np.floating):
-        # A finite number outside the range would become infinity in the band.
-        return not np.isfinite(nodata) or abs(nodata) <= float(np.finfo(dtype).max)
+        if not np.isfinite(nodata):
+            return True
+        # A finite number fits when the band type rounds it to a finite
+        # number. A comparison with the range would reject -3.4028235e38, the
+        # printed form of the float32 minimum, which is a little below the
+        # exact minimum but rounds to it. A larger number becomes infinity.
+        with np.errstate(over="ignore"):
+            return bool(np.isfinite(np.asarray(nodata, dtype=dtype)))
     if not np.issubdtype(dtype, np.integer):
         return True
     # NaN, infinity, and fractions such as 1.5 are not whole numbers.
@@ -280,7 +286,10 @@ def _resolve_local_raster_settings(
                     allowed = f"a whole number from {dtype_range.min} to {dtype_range.max}"
                 else:
                     dtype_range = np.finfo(np.dtype(dtype_name))
-                    allowed = f"NaN or a number from {dtype_range.min:.7g} to {dtype_range.max:.7g}"
+                    allowed = (
+                        f"NaN or a number from {float(dtype_range.min)!r} "
+                        f"to {float(dtype_range.max)!r}"
+                    )
                 raise ValueError(
                     f"{context}: the catalog entry sets 'nodata' to {catalog_nodata!r}, but "
                     f"band {band} of the file {path} has the data type {dtype_name}, which "
@@ -586,8 +595,22 @@ class LocalRasterAdapter(BaseAdapter):
         (``all_touched=False``). They have no data, so the coverage counts
         them as missing pixels, as Earth Engine counts the part of a window
         outside the image. Returns 0, without a rasterization, when the
-        window is inside the raster.
+        window is inside the raster. A MultiPolygon window is counted part
+        by part.
         """
+        # A window that crosses the antimeridian of a raster in degrees is a
+        # MultiPolygon, with one part on each side of 180 degrees. Count each
+        # part on its own: the bounding box of both parts spans about 360
+        # degrees, and its mask could be too large for memory. The parts do
+        # not overlap, so their counts add up.
+        if window_geometry["type"] == "MultiPolygon":
+            return sum(
+                self._count_window_pixels_beyond_raster(
+                    {"type": "Polygon", "coordinates": polygon_coordinates}
+                )
+                for polygon_coordinates in window_geometry["coordinates"]
+            )
+
         # The rows and columns of the file grid that the window can reach,
         # without clipping to the raster: the pixel positions of the corners
         # of the window's bounding box. The inverse transform also works for
@@ -788,8 +811,8 @@ class LocalRasterAdapter(BaseAdapter):
         else:
             # Single-band: straightforward — drop masked and non-finite pixels.
             # Count the pixels after both steps, as for several bands: a NaN
-            # pixel of a file without a nodata value is not masked, but it is
-            # missing data, so it must lower the coverage.
+            # or infinite pixel that is not the nodata value is not masked,
+            # but it is missing data, so it must lower the coverage.
             valid_values = (
                 cropped_window.compressed()
                 if np.ma.isMaskedArray(cropped_window)
