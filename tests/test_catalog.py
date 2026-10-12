@@ -14,6 +14,7 @@ import rasterio
 import yaml
 from rasterio.transform import from_origin
 
+from envoi import adapters as adapter_registry
 from envoi import list_datasets, reset_catalog, update_catalog
 from envoi.catalog import (
     BUILTIN_EE_CATALOG,
@@ -50,6 +51,16 @@ class TestCatalogDictValidation:
     def test_missing_data_source_raises(self):
         # Every dataset spec needs data_source; the error must name the field.
         with pytest.raises(CatalogError, match="data_source"):
+            _load_catalog_any({"datasets": {"x": {"path": "data/file.tif"}}})
+
+    def test_missing_data_source_lists_the_registered_data_sources(self, monkeypatch):
+        """The message lists the data sources of the adapter registry, not a fixed list."""
+        monkeypatch.setitem(adapter_registry._REG, "test_source", object)
+
+        with pytest.raises(
+            CatalogError,
+            match="Valid values are: earth_engine, local, test_source.",
+        ):
             _load_catalog_any({"datasets": {"x": {"path": "data/file.tif"}}})
 
     def test_missing_path_raises(self):

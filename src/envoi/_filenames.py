@@ -15,7 +15,9 @@ The three public helpers:
 * :func:`sanitize_filename_component` — turn one arbitrary string into a safe
   filename component.
 * :func:`build_tile_filenames` — map a whole batch of sample IDs to tile
-  filenames in one pass, so both adapters name their tiles identically.
+  filenames in one pass, so both adapters name their tiles identically. It
+  also keeps IDs that differ only in letter case (``Site1`` and ``site1``)
+  apart, because Windows and macOS treat such file names as one file.
 * :func:`is_safe_path_component` — a boolean check used to *reject* unsafe
   config-supplied path parts (batch IDs, dataset keys) rather than silently
   rewriting them.
@@ -108,6 +110,10 @@ def sanitize_filename_component(value: object, *, max_length: int = MAX_FILENAME
     passes through completely untouched, leaving existing users' filenames
     byte-for-byte unchanged.
 
+    This function looks at one value only. IDs that differ only in letter case
+    (``"Site1"`` and ``"site1"``) pass through unchanged here;
+    :func:`build_tile_filenames` gives them the hash suffix.
+
     Args:
         value: The raw value to convert — typically one cell of the user's ID
             column, but anything with a string representation is accepted.
@@ -147,8 +153,29 @@ def sanitize_filename_component(value: object, *, max_length: int = MAX_FILENAME
         return sanitized
 
     # Rule 7: append a stable short hash of the *original* value so distinct
-    # inputs never collapse onto one filename. sha1 is used purely as a
-    # content fingerprint here, not for any security purpose.
+    # inputs never collapse onto one filename.
+    return _append_hash_suffix(original_text, sanitized, max_length)
+
+
+def _append_hash_suffix(original_text: str, readable_text: str, max_length: int) -> str:
+    """Return ``readable_text`` followed by the stable hash suffix of ``original_text``.
+
+    The suffix is ``-`` and the first 8 hexadecimal characters of the SHA-1 of
+    ``original_text``, so the same original value always gets the same
+    suffix. ``readable_text`` is truncated so that the result fits in
+    ``max_length`` bytes.
+
+    Args:
+        original_text: The value as the user wrote it (surrounding whitespace
+            removed). The hash is computed from this text.
+        readable_text: The portable text that comes before the suffix.
+        max_length: Maximum length of the result in bytes, suffix included.
+
+    Returns:
+        ``"<readable text>-<8 hex characters>"``.
+    """
+    # sha1 is used purely as a content fingerprint here, not for any security
+    # purpose.
     hash_suffix = hashlib.sha1(original_text.encode("utf-8"), usedforsecurity=False).hexdigest()[
         :_HASH_SUFFIX_LENGTH
     ]
@@ -156,7 +183,7 @@ def sanitize_filename_component(value: object, *, max_length: int = MAX_FILENAME
     # Reserve room for the hash and its separating hyphen, then truncate the
     # readable part to whatever budget remains.
     reserved_for_hash = len(hash_suffix) + 1
-    readable_part = _truncate_to_bytes(sanitized, max(0, max_length - reserved_for_hash))
+    readable_part = _truncate_to_bytes(readable_text, max(0, max_length - reserved_for_hash))
     # Truncation can re-expose a trailing separator; strip it again so the
     # name never reads as "abc_-1a2b3c4d".
     readable_part = readable_part.rstrip("._-") or _EMPTY_COMPONENT_FALLBACK
@@ -180,6 +207,15 @@ def build_tile_filenames(
     caller passes a suffix (used to keep multiple window sizes distinct inside
     one dataset folder).
 
+    Each ID first goes through :func:`sanitize_filename_component`. Then the
+    IDs are grouped by their portable form with letter case ignored
+    (``str.casefold``). Windows and macOS ignore letter case in file names by
+    default, so ``"Site1-dem.tif"`` and ``"site1-dem.tif"`` are one file there.
+    Every ID in a group of two or more gets the stable hash suffix of the ID as
+    written, unless it already has one: ``"Site1"`` and ``"site1"`` become
+    ``"Site1-<hash>"`` and ``"site1-<hash>"`` with two different hashes. An ID
+    without such a case collision keeps its name.
+
     Args:
         sample_ids: The per-point IDs, in input order.
         dataset_name: Catalog key of the dataset being exported.
@@ -189,11 +225,11 @@ def build_tile_filenames(
         A list of filenames aligned with ``sample_ids``.
 
     Raises:
-        ValueError: if two IDs somehow produce the same filename. The hash
-            suffix added by :func:`sanitize_filename_component` makes this
-            unreachable for distinct IDs, and duplicate IDs are rejected
-            upstream by ``_validate_sample_ids``; this is a last-resort guard
-            against silently overwriting a user's tile.
+        ValueError: if two IDs still produce the same filename when letter case
+            is ignored. The hash suffixes make this unreachable for distinct
+            IDs in practice, and duplicate IDs are rejected upstream by
+            ``_validate_sample_ids``; this is a last-resort guard against
+            silently overwriting a user's tile.
     """
     # The dataset name and suffix come from the catalog and from our own code
     # respectively, but they land in the same filename, so they get the same
@@ -207,22 +243,59 @@ def build_tile_filenames(
     fixed_part_length = len(f"-{safe_dataset_name}{suffix_part}.tif".encode())
     id_budget = max(1, MAX_FILENAME_BYTES - fixed_part_length)
 
-    filenames: list[str] = []
-    # Maps each generated filename back to the ID that produced it, purely so
-    # the collision guard below can name both culprits.
-    filename_to_source_id: dict[str, object] = {}
+    # Make every ID portable. sanitize_filename_component returns an ID exactly
+    # as written (without surrounding whitespace) when it did not rewrite it,
+    # and with a hash suffix when it did.
+    sample_id_list = list(sample_ids)
+    original_texts = [str(sample_id).strip() for sample_id in sample_id_list]
+    safe_ids = [
+        sanitize_filename_component(sample_id, max_length=id_budget) for sample_id in sample_id_list
+    ]
 
-    for sample_id in sample_ids:
-        safe_id = sanitize_filename_component(sample_id, max_length=id_budget)
+    # Give every ID of a case-collision group the hash suffix, so that no tile
+    # overwrites another on Windows or macOS. Suffixing every ID of the group,
+    # not only the second one, keeps each name independent of the input order.
+    # An ID that was rewritten above has its suffix already and keeps it.
+    positions_by_folded_id: dict[str, list[int]] = {}
+    for position, safe_id in enumerate(safe_ids):
+        positions_by_folded_id.setdefault(safe_id.casefold(), []).append(position)
+    for positions in positions_by_folded_id.values():
+        if len(positions) < 2:
+            continue
+        for position in positions:
+            if safe_ids[position] == original_texts[position]:
+                safe_ids[position] = _append_hash_suffix(
+                    original_texts[position], safe_ids[position], id_budget
+                )
+
+    filenames: list[str] = []
+    # Maps each filename, with letter case ignored, to the position of the ID
+    # that produced it, so the collision guard below can name both culprits.
+    position_by_folded_filename: dict[str, int] = {}
+
+    for position, (sample_id, safe_id) in enumerate(zip(sample_id_list, safe_ids)):
         filename = f"{safe_id}-{safe_dataset_name}{suffix_part}.tif"
 
-        if filename in filename_to_source_id:
+        # Last-resort guard: two filenames that are equal with letter case
+        # ignored would be one file on Windows and macOS.
+        folded_filename = filename.casefold()
+        if folded_filename in position_by_folded_filename:
+            other_position = position_by_folded_filename[folded_filename]
+            other_sample_id = sample_id_list[other_position]
+            other_filename = filenames[other_position]
+            if other_filename == filename:
+                raise ValueError(
+                    f"Sample IDs {other_sample_id!r} and {sample_id!r} both "
+                    f"produce the tile filename {filename!r}. Give these points distinct IDs."
+                )
             raise ValueError(
-                f"Sample IDs {filename_to_source_id[filename]!r} and {sample_id!r} both "
-                f"produce the tile filename {filename!r}. Give these points distinct IDs."
+                f"Sample IDs {other_sample_id!r} and {sample_id!r} produce the tile "
+                f"filenames {other_filename!r} and {filename!r}, which differ only in "
+                f"letter case. Windows and macOS treat them as one file. Give these "
+                f"points IDs that differ in more than letter case."
             )
 
-        filename_to_source_id[filename] = sample_id
+        position_by_folded_filename[folded_filename] = position
         filenames.append(filename)
 
     return filenames

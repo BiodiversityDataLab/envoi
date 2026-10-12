@@ -17,7 +17,13 @@ from shapely.geometry import box, mapping
 from tqdm.auto import tqdm
 
 from .._filenames import build_tile_filenames
-from ..geo import get_utm_crs, pixel_size_m, tile_pixel_count, tile_top_left
+from ..geo import (
+    build_tile_crs_zones,
+    get_utm_crs,
+    pixel_size_m,
+    tile_pixel_count,
+    tile_top_left,
+)
 from ..metadata import summarize_tile_export
 from ..progress import ProgressStepCallback, emit_progress_step
 from ..qc import format_point_error
@@ -77,6 +83,11 @@ class LocalRasterAdapter(BaseAdapter):
             # Native pixel width in metres, or None for a CRS without a
             # length unit. Used for the sidecar and for sub-pixel windows.
             self._native_pixel_size_m = pixel_size_m(self.raster_crs, self.src.res[0])
+
+            # resample_m of the last export_tiles call, or None. With it, tiles
+            # are in each point's UTM zone, so build_dataset_meta must list
+            # those zones as the tile CRS instead of the raster CRS.
+            self._export_resample_m: float | None = None
 
             # Determine which bands to read. If the user specifies "bands" in the
             # catalog (a single int or list of ints), use that. Otherwise default
@@ -800,6 +811,9 @@ class LocalRasterAdapter(BaseAdapter):
         from rasterio.transform import Affine
         from rasterio.warp import Resampling, reproject
 
+        # build_dataset_meta reads this to record the CRS of the tiles.
+        self._export_resample_m = resample_m
+
         output_dir = Path(output_dir) / dataset_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -829,7 +843,8 @@ class LocalRasterAdapter(BaseAdapter):
         # character set that is valid on Windows, macOS and Linux alike. When
         # the caller passes "200m", filenames become "<id>-<dataset>-200m.tif";
         # with no suffix we keep the historical "<id>-<dataset>.tif" naming,
-        # and IDs that were already safe are left untouched.
+        # and IDs that were already safe are left untouched, unless two of them
+        # differ only in letter case (then both get a hash suffix).
         tile_filenames = build_tile_filenames(id_list, dataset_name, filename_suffix)
 
         # Wrap the per-point tile loop with tqdm so users get visible progress
@@ -1004,6 +1019,14 @@ class LocalRasterAdapter(BaseAdapter):
 
         No date dimension and a single native CRS, so this is much simpler
         than the GEE implementation. Quality stats are added when present.
+
+        ``tile_crs`` is the raster CRS, except after an ``export_tiles`` call
+        with ``resample_m``: then it is the sorted list of the UTM zones of
+        the points in ``lats`` and ``lons`` (EPSG codes), as for Earth Engine.
+
+        Uses attributes:
+            _export_resample_m: ``resample_m`` of the last ``export_tiles``
+                call, or None.
         """
         # Static dataset info from the catalog spec.
         meta: dict[str, Any] = {
@@ -1022,9 +1045,13 @@ class LocalRasterAdapter(BaseAdapter):
             round(native_pixel_size_m, 2) if native_pixel_size_m is not None else None
         )
 
-        # For local rasters, tiles are exported in the file's native CRS
-        # (unlike GEE, where each tile uses its own UTM zone).
-        meta["tile_crs"] = str(self.raster_crs)
+        # Tiles with resample_m are written in the UTM zone of each point, as
+        # on Earth Engine, so list every zone of the input points. Without
+        # resample_m, tiles keep the file's native CRS.
+        if self._export_resample_m is not None and lats is not None and lons is not None:
+            meta["tile_crs"] = build_tile_crs_zones(lats, lons)
+        else:
+            meta["tile_crs"] = str(self.raster_crs)
 
         # Pass-through catalog field for dataset description.
         dataset_info = spec.get("dataset_information")

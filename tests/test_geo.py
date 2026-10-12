@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from rasterio.crs import CRS
 
-from envoi.geo import pixel_size_m, tile_pixel_count, tile_top_left
+from envoi.geo import get_utm_zone_label, pixel_size_m, tile_pixel_count, tile_top_left
 
 # ------------------------------------------------------------------
 # tile_pixel_count — pixels per side of a tile
@@ -176,3 +176,23 @@ class TestPixelSizeM:
             'LOCAL_CS["arbitrary",UNIT["metre",1],AXIS["Easting",EAST],AXIS["Northing",NORTH]]'
         )
         assert pixel_size_m(local_crs, 10.0) is None
+
+
+# ------------------------------------------------------------------
+# get_utm_zone_label — label for the GEE use_utm_zone filter
+# ------------------------------------------------------------------
+
+
+class TestUtmZoneLabel:
+    def test_plain_zones_without_the_norway_and_svalbard_exceptions(self):
+        """Bergen is in 31N and Ny-Ålesund in 32N, as the satellite-embedding tiles are labelled.
+
+        UTM has exceptions in south-west Norway (Bergen in 32V) and on Svalbard
+        (Ny-Ålesund in 33X). The ``UTM_ZONE`` property of the satellite-embedding
+        tiles uses the plain 6° zones instead: a live check on 2026-10-12 found
+        Bergen tiles labelled 31N, and Ny-Ålesund tiles labelled 32N and 33N.
+        The ``use_utm_zone`` filter compares this label with that property, so
+        the label must keep the plain zones.
+        """
+        assert get_utm_zone_label(5.32, 60.39) == "31N"
+        assert get_utm_zone_label(11.93, 78.92) == "32N"

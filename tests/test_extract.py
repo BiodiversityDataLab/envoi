@@ -1521,6 +1521,135 @@ class TestRunConfigValidation:
                 output_dir=tmp_path,
             )
 
+    def test_batch_ids_that_differ_only_in_case_raise(self, sample_df, tmp_path):
+        """'Terrain' and 'terrain' are one name on Windows and macOS, so they raise."""
+        with pytest.raises(
+            ValueError, match=r"Duplicate batch_id value\(s\) \['Terrain', 'terrain'\]"
+        ):
+            extract(
+                sample_df,
+                [_tabular_mean_config("Terrain"), _tabular_mean_config("terrain")],
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    def test_batch_ids_that_differ_only_in_case_raise_across_modes(self, sample_df, tmp_path):
+        """A raster batch_id and a tabular batch_id that differ only in case also raise."""
+        raster_config = {
+            "batch_id": "TILES",
+            "datasets": ["dem_local"],
+            "settings": {"output_type": "raster", "window_size_m": 200},
+        }
+
+        with pytest.raises(ValueError, match=r"\['TILES', 'tiles'\]"):
+            extract(
+                sample_df,
+                [_tabular_mean_config("tiles"), raster_config],
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    @pytest.mark.parametrize(
+        ("first_batch_id", "second_batch_id"),
+        [("terrain_qc", "terrain"), ("terrain", "terrain_qc"), ("Terrain", "terrain_QC")],
+        ids=["qc-first", "qc-second", "letter-case"],
+    )
+    def test_batch_id_with_the_name_of_a_qc_table_raises(
+        self, sample_df, tmp_path, first_batch_id, second_batch_id
+    ):
+        """Tabular batch_id 'X_qc' would write the QC table file of tabular batch_id 'X'."""
+        with pytest.raises(ValueError, match="would write the same file") as error_info:
+            extract(
+                sample_df,
+                [_tabular_mean_config(first_batch_id), _tabular_mean_config(second_batch_id)],
+                output_dir=tmp_path,
+            )
+        assert f"'{first_batch_id}'" in str(error_info.value)
+        assert f"'{second_batch_id}'" in str(error_info.value)
+        assert not any(tmp_path.iterdir())
+
+    def test_raster_batch_id_with_the_name_of_a_qc_table_is_allowed(self, sample_df, tmp_path):
+        """A raster output writes into its own folder, so 'X_qc' does not collide with 'X'."""
+        raster_config = {
+            "batch_id": "terrain_qc",
+            "datasets": ["dem_local"],
+            "settings": {"output_type": "raster", "window_size_m": 200},
+        }
+
+        extract(sample_df, [_tabular_mean_config("terrain"), raster_config], output_dir=tmp_path)
+
+        assert (tmp_path / "terrain_qc.csv").exists()
+        assert (tmp_path / "terrain_qc" / "dem_local" / "T2T1DJ-dem_local.tif").exists()
+
+    @pytest.mark.parametrize("output_type", ["tabular", "raster"])
+    @pytest.mark.parametrize(
+        "datasets",
+        [["dem_local", "dem_local"], ["dem_local", {"dem_local": [1]}]],
+        ids=["plain", "with-band-list"],
+    )
+    def test_dataset_listed_twice_raises(self, sample_df, tmp_path, output_type, datasets):
+        """One run config that lists a dataset twice raises in both modes."""
+        settings = {"output_type": output_type, "window_size_m": 200}
+        if output_type == "tabular":
+            settings["statistics"] = ["mean"]
+
+        with pytest.raises(
+            ValueError,
+            match=r"Output 'twice': dataset\(s\) \['dem_local'\] are listed more than once",
+        ):
+            extract(
+                sample_df,
+                {"batch_id": "twice", "datasets": datasets, "settings": settings},
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    def test_raster_datasets_that_differ_only_in_case_raise(self, sample_df, dem_tif, tmp_path):
+        """Two raster tile folders whose names differ only in case would be one folder."""
+        update_catalog(
+            {"datasets": {"DEM_local": {"data_source": "local", "path": str(dem_tif), "bands": 1}}}
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"Output 'case': datasets \['dem_local', 'DEM_local'\] differ only in letter",
+        ):
+            extract(
+                sample_df,
+                {
+                    "batch_id": "case",
+                    "datasets": ["dem_local", "DEM_local"],
+                    "settings": {"output_type": "raster", "window_size_m": 200},
+                },
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    def test_tabular_datasets_that_differ_only_in_case_are_allowed(
+        self, sample_df, dem_tif, tmp_path
+    ):
+        """Column names keep their letter case, so tabular mode allows such dataset names."""
+        update_catalog(
+            {"datasets": {"DEM_local": {"data_source": "local", "path": str(dem_tif), "bands": 1}}}
+        )
+
+        outputs = extract(
+            sample_df,
+            {
+                "batch_id": "case",
+                "datasets": ["dem_local", "DEM_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        result = pd.read_csv(outputs["case"])
+        assert list(result["dem_local_mean_100m"]) == list(result["DEM_local_mean_100m"])
+
     def test_invalid_second_run_config_raises_before_any_output(self, sample_df, tmp_path):
         """An invalid setting in the second run config stops the call before the first runs."""
         with pytest.raises(ValueError, match="Output 'second': invalid min_coverage_pct"):
@@ -2399,6 +2528,84 @@ class TestNativeResolutionInMetres:
 
 
 # ------------------------------------------------------------------
+# Tile CRS in the metadata sidecar of local raster runs
+# ------------------------------------------------------------------
+
+# Two points on both sides of 18° E, the border between UTM zones 33N and 34N.
+_TWO_ZONE_POINTS = pd.DataFrame(
+    {
+        "occurrenceID": ["zone33", "zone34"],
+        "decimalLatitude": [62.95, 62.95],
+        "decimalLongitude": [17.95, 18.05],
+    }
+)
+
+
+class TestLocalTileCrsMetadata:
+    """The sidecar ``tile_crs`` of a local dataset names the CRS of its tiles."""
+
+    @pytest.fixture
+    def two_zone_raster(self, tmp_path) -> str:
+        """Register a geographic raster that covers both points of ``_TWO_ZONE_POINTS``."""
+        raster_path = tmp_path / "two_zones.tif"
+        random_generator = np.random.default_rng(seed=31)
+        pixel_values = random_generator.uniform(0.0, 100.0, (100, 200)).astype(np.float32)
+        # 0.2° × 0.1° with 0.001° pixels, from 17.9° E to 18.1° E.
+        transform = from_bounds(17.9, 62.9, 18.1, 63.0, 200, 100)
+        with rasterio.open(
+            raster_path,
+            "w",
+            driver="GTiff",
+            height=100,
+            width=200,
+            count=1,
+            dtype="float32",
+            crs="EPSG:4326",
+            transform=transform,
+        ) as dst:
+            dst.write(pixel_values, 1)
+        update_catalog(
+            {"datasets": {"two_zones": {"data_source": "local", "path": str(raster_path)}}}
+        )
+        return "two_zones"
+
+    def _export_tiles(self, tmp_path, **settings) -> dict:
+        """Export the tiles of both points and return the sidecar entry of the dataset."""
+        extract(
+            _TWO_ZONE_POINTS,
+            {
+                "batch_id": "zones",
+                "datasets": ["two_zones"],
+                "settings": {"output_type": "raster", "window_size_m": 200, **settings},
+            },
+            output_dir=tmp_path,
+        )
+        sidecar = json.loads((tmp_path / "zones" / "zones_metadata.json").read_text())
+        return sidecar["datasets"]["two_zones"]
+
+    def test_resampled_tiles_list_the_utm_zone_of_each_point(self, two_zone_raster, tmp_path):
+        """With resample_m, tile_crs lists the UTM zones of the points, which the tiles use."""
+        dataset_meta = self._export_tiles(tmp_path, resample_m=30)
+
+        assert dataset_meta["tile_crs"] == ["EPSG:32633", "EPSG:32634"]
+        assert dataset_meta["native_crs"] == "EPSG:4326"
+        tile_dir = tmp_path / "zones" / "two_zones"
+        tile_crs_codes = []
+        for tile_name in ("zone33-two_zones.tif", "zone34-two_zones.tif"):
+            with rasterio.open(tile_dir / tile_name) as src:
+                tile_crs_codes.append(f"EPSG:{src.crs.to_epsg()}")
+        assert tile_crs_codes == ["EPSG:32633", "EPSG:32634"]
+
+    def test_native_tiles_keep_the_raster_crs(self, two_zone_raster, tmp_path):
+        """Without resample_m, tiles are in the raster CRS, and tile_crs names it."""
+        dataset_meta = self._export_tiles(tmp_path)
+
+        assert dataset_meta["tile_crs"] == "EPSG:4326"
+        with rasterio.open(tmp_path / "zones" / "two_zones" / "zone33-two_zones.tif") as src:
+            assert src.crs.to_epsg() == 4326
+
+
+# ------------------------------------------------------------------
 # Point sample without the deprecated affine "*" operator
 # ------------------------------------------------------------------
 
@@ -2911,6 +3118,23 @@ class TestTileNaming:
         """`a/b` and `a_b` both reduce to `a_b` — they need distinct files."""
         tile_dir = self._export(self._points_with_ids(["a/b", "a_b"]), tmp_path)
         assert len(list(tile_dir.glob("*.tif"))) == 2
+
+    def test_ids_that_differ_only_in_case_write_two_tiles(self, tmp_path):
+        """`Site1` and `site1` get hash suffixes, so both tiles exist on any file system."""
+        tile_dir = self._export(self._points_with_ids(["Site1", "site1", "Site2"]), tmp_path)
+
+        manifest = pd.read_csv(tile_dir / "tiles_manifest.csv")
+        tile_filename_by_id = dict(zip(manifest["occurrenceID"], manifest["tile_filename"]))
+        site1_upper = tile_filename_by_id["Site1"]
+        site1_lower = tile_filename_by_id["site1"]
+
+        assert re.fullmatch(r"Site1-[0-9a-f]{8}-dem_local\.tif", site1_upper)
+        assert re.fullmatch(r"site1-[0-9a-f]{8}-dem_local\.tif", site1_lower)
+        assert site1_upper.casefold() != site1_lower.casefold()
+        # An ID without a case collision keeps its historical name.
+        assert tile_filename_by_id["Site2"] == "Site2-dem_local.tif"
+        assert manifest["exported"].all()
+        assert {tile.name for tile in tile_dir.glob("*.tif")} == set(tile_filename_by_id.values())
 
     def test_clean_ids_keep_their_historical_filenames(self, sample_df, tmp_path):
         """Backward compatibility: unaffected inputs produce unchanged names."""

@@ -150,3 +150,22 @@ These decisions came from the review of the extraction pipeline (branch `pipelin
 - **Rejected:**
   - A pixel width that depends on the latitude (at the raster centre, or at each point): the sidecar and catalog fields hold one value for each raster,
     and the value would differ from Earth Engine's nominal scale for the same data.
+
+## 2026-10-12 — Pipeline follow-ups
+
+These decisions came from the follow-ups of the 2026-10-09 pipeline bug fixes (branch `pipeline-bugs`).
+The specification of this work is in a task folder that is not committed, so each decision is stated in full here.
+
+### Tile names that differ only in letter case
+
+- **Decision:** `build_tile_filenames` in `_filenames.py`, which both adapters use, gives the stable hash suffix to every sample ID whose tile name is equal to the tile name of another ID when letter case is ignored (a case collision, compared with `str.casefold()`).
+  - The suffix is the one that envoi already adds to IDs that it rewrites: `-` and the first 8 hexadecimal characters of the SHA-1 of the ID as written. `Site1` and `site1` become `Site1-<hash>` and `site1-<hash>`, with two different hashes.
+  - Every ID of the group gets the suffix, not only the second one, so the name of an ID does not depend on the order of the input rows.
+  - An ID that envoi already rewrote (for example because it has a `/`) has its suffix and does not get a second one.
+  - IDs without a case collision keep their names.
+  - A last check compares the final names with letter case ignored and raises `ValueError` if two are still equal.
+- **Reason:** Windows and macOS ignore letter case in file names by default. Two tiles named `Site1-<dataset>.tif` and `site1-<dataset>.tif` are one file there, so the second tile overwrote the first without an error, and the tile manifest listed both tiles as exported.
+  Sample IDs come from the user's data, and data sets with IDs that differ only in letter case are valid. The hash suffix keeps both tiles, and the tile manifest gives the file name of each ID.
+- **Rejected:**
+  - Raise an error for such IDs: it would block data sets whose IDs are case-sensitive.
+  - Add the suffix only to the second ID of a group: the name of an ID would depend on the order of the input rows.

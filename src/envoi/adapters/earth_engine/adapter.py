@@ -1318,8 +1318,10 @@ class GeeRasterAdapter(BaseAdapter):
         # into a character set that is valid on Windows, macOS and Linux
         # alike. When the caller passes "200m", filenames become
         # "<id>-<dataset>-200m.tif"; with no suffix we keep the historical
-        # "<id>-<dataset>.tif" naming, and IDs that were already safe are left
-        # untouched, so existing outputs are unaffected.
+        # "<id>-<dataset>.tif" naming. IDs that were already safe are left
+        # untouched, unless two of them differ only in letter case (then both
+        # get a hash suffix, so they cannot overwrite each other on Windows
+        # and macOS).
         tile_filenames = build_tile_filenames(id_list, dataset_name, filename_suffix)
 
         emit_progress_step(progress_callback, 0, n)

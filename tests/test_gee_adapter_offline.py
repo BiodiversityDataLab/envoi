@@ -624,16 +624,26 @@ class _StubDownloadImage:
         return "https://earthengine.invalid/tile"
 
 
+class _FailingDownloadImage:
+    """Stands in for an ``ee.Image`` whose ``getDownloadURL`` raises an Earth Engine error."""
+
+    def getDownloadURL(self, parameters: dict) -> str:
+        raise ee.EEException("stub: image has no bands")
+
+
 class _StubTileResponse:
     """Stands in for a streamed ``requests`` response.
 
     ``chunks`` holds the parts of the body. An exception in ``chunks`` is
     raised when the stream reaches it, as when a connection breaks.
+    ``iter_content`` gives each part in pieces of at most ``chunk_size`` bytes,
+    as ``requests`` does, and ``bytes_read`` counts the bytes that it gave.
     """
 
     def __init__(self, chunks: list, status_code: int = 200):
         self._chunks = chunks
         self.status_code = status_code
+        self.bytes_read = 0
 
     def close(self) -> None:
         pass
@@ -642,7 +652,10 @@ class _StubTileResponse:
         for chunk in self._chunks:
             if isinstance(chunk, Exception):
                 raise chunk
-            yield chunk
+            for start in range(0, len(chunk), chunk_size):
+                piece = chunk[start : start + chunk_size]
+                self.bytes_read += len(piece)
+                yield piece
 
 
 def _broken_stream() -> _StubTileResponse:
@@ -805,6 +818,29 @@ class TestDownloadTile:
         assert record.waits == []
         assert list(tmp_path.iterdir()) == []
 
+    def test_existing_tile_is_removed_after_a_client_error(self, monkeypatch, tmp_path):
+        """After an HTTP 400 answer, a tile of an earlier run is removed (not exported)."""
+        _stub_tile_responses(monkeypatch, [_StubTileResponse([b"stub: bad"], status_code=400)])
+        output_path = tmp_path / "a-test_dataset.tif"
+        output_path.write_bytes(b"old tile")
+
+        with pytest.raises(requests.HTTPError, match="returned HTTP 400: stub: bad$"):
+            self._download(output_path)
+
+        assert list(tmp_path.iterdir()) == []
+
+    def test_existing_tile_is_removed_when_the_download_url_fails(self, monkeypatch, tmp_path):
+        """When ``getDownloadURL`` raises, no download starts and an older tile is removed."""
+        record = _stub_tile_responses(monkeypatch, [])
+        output_path = tmp_path / "a-test_dataset.tif"
+        output_path.write_bytes(b"old tile")
+
+        with pytest.raises(ee.EEException, match="stub: image has no bands"):
+            self._download(output_path, _FailingDownloadImage())
+
+        assert record.requested_urls == []
+        assert list(tmp_path.iterdir()) == []
+
     def test_success_status_other_than_200_is_not_a_tile(self, monkeypatch, tmp_path):
         """An HTTP 204 answer (no content) raises at once, and no tile is written."""
         record = _stub_tile_responses(monkeypatch, [_StubTileResponse([], status_code=204)])
@@ -827,6 +863,40 @@ class TestDownloadTile:
         assert len(record.requested_urls) == 3
         assert record.waits == [1, 2]
         assert list(tmp_path.iterdir()) == []
+
+
+class TestHttpErrorText:
+    """``_read_http_error_text`` reads a bounded part of the body and gives one short line."""
+
+    def test_body_is_read_only_up_to_4_kib(self):
+        """Only the first 4096 bytes of a longer body are read; later text is not in the message."""
+        # 10 letters, spaces up to byte 4096, then text after the limit.
+        body = b"x" * 10 + b" " * (4096 - 10) + b"after-the-limit"
+        response = _StubTileResponse([body], status_code=400)
+
+        error_text = _tiles._read_http_error_text(response)
+
+        assert error_text == "x" * 10
+        assert response.bytes_read == 4096
+
+    def test_message_is_one_line_of_at_most_300_characters(self):
+        """Line breaks and runs of spaces become one space, and the text is cut at 300 characters."""
+        body = b"0123456789\n" * 50
+        response = _StubTileResponse([body], status_code=400)
+
+        error_text = _tiles._read_http_error_text(response)
+
+        # The one-line text is "0123456789 " repeated; its first 300 characters.
+        assert error_text == ("0123456789 " * 28)[:300]
+        assert len(error_text) == 300
+
+    def test_json_message_is_cut_at_300_characters(self):
+        """A long Earth Engine JSON message is also cut at 300 characters."""
+        body = json.dumps({"error": {"code": 400, "message": "y" * 1000}}).encode()
+
+        error_text = _tiles._read_http_error_text(_StubTileResponse([body], status_code=400))
+
+        assert error_text == "y" * 300
 
 
 class TestBandNameCache:

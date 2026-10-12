@@ -52,6 +52,13 @@ def get_utm_zone_label(lon: float, lat: float) -> str:
     """
     if not (-180 <= lon <= 180 and -90 <= lat <= 90):
         raise ValueError(f"Invalid WGS84 coordinates: ({lon}, {lat})")
+    # Plain 6° zones on purpose, without the UTM exceptions for south-west
+    # Norway (zone 32V) and Svalbard (zones 31X, 33X, 35X, and 37X). The GEE
+    # `use_utm_zone` filter compares this label with the `UTM_ZONE` property
+    # of the satellite-embedding tiles, which uses the plain zones: a live
+    # check on 2026-10-12 found Bergen tiles labelled "31N" and Ny-Ålesund
+    # tiles labelled "32N" and "33N". With the exceptions, the label at Bergen
+    # would be "32N", and the filter would select no tile there.
     zone_number = int((lon + 180) / 6) + 1
     zone_number = min(zone_number, 60)
     hemisphere = "N" if lat >= 0 else "S"

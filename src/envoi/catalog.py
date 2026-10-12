@@ -245,9 +245,14 @@ def _load_catalog_any(src: Any) -> dict[str, Any]:
             if not isinstance(spec, dict):
                 raise CatalogError(f"datasets.{name}: must be a mapping")
             if "data_source" not in spec or not spec.get("data_source"):
+                # Imported here for the reason given in
+                # _require_registered_data_source (an import cycle). The valid
+                # values are the data sources with a registered adapter.
+                from .adapters import _REG
+
                 raise CatalogError(
                     f"datasets.{name}: missing required key 'data_source'.\n"
-                    f"Valid values are: earth_engine, local."
+                    f"Valid values are: {', '.join(sorted(_REG))}."
                 )
             _require_registered_data_source(name, spec["data_source"])
             if "path" not in spec or not spec.get("path"):
