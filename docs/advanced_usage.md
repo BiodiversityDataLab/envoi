@@ -13,6 +13,7 @@ The [README's quick-start](../README.md#quick-start) covers the common case — 
 - [Custom datasets](#custom-datasets)
 - [Failed points](#failed-points)
 - [Running interactively](#running-interactively)
+- [Known limitations](#known-limitations)
 
 ## Multiple outputs in one call
 
@@ -132,7 +133,7 @@ A flat list (`"statistics": ["mean", "std"]`) is still accepted and applies to e
 
 ## Multiple window sizes in one call
 
-`window_size_m` accepts a list as well as a single integer. Each window size produces its own set of reducer columns (tabular) or its own folder of tiles (raster), all in the same output file or batch folder:
+`window_size_m` accepts a list as well as a single integer. Each window size produces its own set of reducer columns (tabular) or its own set of tiles (raster), all in the same output file or batch folder. In raster mode, the tiles of every window size are in the same dataset folder; each file name ends with `-<N>m`, and each window size has its own manifest, `tiles_manifest-<N>m.csv`:
 
 ```python
 extract(sample_points, {
@@ -284,3 +285,31 @@ stats.head()  # a single config in "dataframe" mode returns the table directly
 ```
 
 For production runs, leave both at their defaults — the JSON sidecar is the only record of which images and dates were actually used per point, and the QC table is what you filter on to drop low-coverage rows. Both are essential for reproducibility once a run leaves the notebook.
+
+## Known limitations
+
+The items below are known limitations of envoi. They do not stop a run, but they change how you can read some outputs. Each item tells what you see, why, and what to do.
+
+**Pixels at the edge of the window.** `n_pixels`, `coverage_pct`, and `had_nodata` can differ between Earth Engine and local datasets for the same window. They can also differ between two Earth Engine runs with different statistics. For example, an Earth Engine run whose only statistic is `count` can show a `coverage_pct` a few percent below 100 for a window without missing data. `had_nodata` is then `True`. The cause is that different rules apply to the pixels at the edge of the window:
+
+- Earth Engine also counts the pixels that are only partly inside the window, each with a weight below 1.
+- When `count` is the only statistic, Earth Engine counts only whole pixels.
+- For a local dataset, envoi counts a pixel as one whole pixel when its centre is inside the window. It does not count the other pixels.
+
+Use these QC values as approximate values. Compare them only between runs with the same kind of dataset and the same statistics. For the same reason, the window statistics of the two kinds of dataset can differ a little (see `std` and `var` in [Tabular outputs](../README.md#tabular)).
+
+**`in_extent` of windows without valid pixels.** For a window without valid pixels, for example a window with only nodata pixels, `in_extent` differs between the two kinds of dataset. Earth Engine datasets set it to `False`. Local datasets set it to `True` when the window overlaps the raster, with `n_pixels` `0`. [Tabular outputs](../README.md#tabular) in the README describes this difference and the related difference in `count`. For a local dataset, `in_extent` tells whether the window overlaps the raster file. For an Earth Engine dataset, it tells whether the window has at least one valid pixel. To find the windows without valid pixels in both kinds of dataset, use `n_pixels` or `coverage_pct`, which are `0` for such a window. Do not use `in_extent` for this.
+
+**Class columns when points failed.** When a point failed, the `class_count` columns of that dataset and window hold decimal numbers, for example `3.0` in a CSV file. Without failed points, they hold whole numbers. So the column types of a Parquet file (its schema) can differ between two runs with the same settings. The cause is that the class columns of a [failed point](#failed-points) are empty, because its classes are unknown. pandas stores a column of whole numbers with empty values as decimal numbers. A point without data is not a failed point: its class columns are `0` (see [Mixing categorical and continuous datasets](#mixing-categorical-and-continuous-datasets)). The `class_fraction` columns always hold decimal numbers. After you read the output, set the type of the class columns that you use. For example, `df[columns] = df[columns].astype("Int64")` in pandas gives whole numbers and keeps the empty values. Or give a fixed schema when you read or combine Parquet files.
+
+**Tiles from an earlier run.** A tile folder can contain tiles that the current run did not write. envoi writes the tiles to `<output_dir>/<batch_id>/<dataset>/` and replaces a file with the same name. It does not remove the other files in the folder. So a tile from an earlier run with the same `output_dir` and `batch_id` stays when the current run writes no tile with that name. For example:
+
+- The earlier run had other points.
+- The tile name of an ID changed, for example because the ID now gets a hash suffix (see [Raster outputs](../README.md#raster)).
+- The point has no tile in the current run, for example a local point outside the raster. envoi removes an older tile with the same name only in some cases, for example when the download of an Earth Engine tile fails.
+
+A tile manifest from an earlier run with other window sizes also stays. The tile manifest of the current run (`tiles_manifest.csv`, or `tiles_manifest-<N>m.csv` with several window sizes) is the record of what the current run wrote. A tile comes from the current run only when this manifest lists it with `exported` `True`. Use a new output folder (`output_dir`) or a new `batch_id` for each run. Or delete the old tile folder before you run the extraction again.
+
+**Paths in the metadata sidecar.** The metadata sidecar records the `path` of each dataset as you registered it, in `datasets.<dataset>.path`. For a local dataset, this can be an absolute path on your computer, for example `/home/<name>/data/dem.tif` or `C:\Users\<name>\data\dem.tif`. Such a path can show your user name and your folder structure. envoi records the path so that the sidecar shows which file the run used. Check the sidecar before you share it, and change or remove the path when necessary. A relative path, such as `data/dem.tif`, does not show these details. A relative path starts at the current working folder of Python. The error texts in the outputs can also contain private details (see the end of [Failed points](#failed-points)).
+
+**Date information in runs with several windows.** In a run config with several window sizes, the sidecar has one `date_info` for each dataset. It describes only the first window size in your `window_size_m` list. The same is true for the `band_coverage_pct` summary of an Earth Engine dataset with several bands. envoi writes these values of a dataset once, from the first window. Only the summaries under `quality.<N>m` are per window. The window size does not change which image envoi selects for a point, so the windows usually use the same images. But the counts in `date_info` leave out failed points, and a point can fail in one window and not in another. For the dates of each window in a tabular run, use the date QC columns of that window, for example `<dataset>_image_time_start_<N>m` (see [Date-aware extraction](#date-aware-extraction)). A raster run has no QC table. For a raster run, put each window size in its own run config. Each run config gets its own sidecar (see [Multiple outputs in one call](#multiple-outputs-in-one-call)).

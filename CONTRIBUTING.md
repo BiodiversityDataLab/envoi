@@ -158,13 +158,18 @@ The `package` job additionally validates `CITATION.cff` and checks that its `ver
 
 Releases publish to PyPI **and** are archived on Zenodo, which mints a DOI for each one. The order of the last two steps matters: `release.yml` fires on a *tag push*, but Zenodo only reacts to a *published GitHub Release*. Pushing a tag alone gets the version onto PyPI with no DOI.
 
-1. **Bump the version in three places, in a single PR:**
+1. **Regenerate the walkthrough outputs with a live run.**
+   Start Jupyter in the `examples/` folder, open `walkthrough.ipynb`, and run all cells from top to bottom with Earth Engine credentials.
+   The notebook needs `jupyter` and `matplotlib`, and it writes its outputs to `examples/walkthrough_output/`.
+   Check that every cell runs without an error and that the outputs agree with the documentation, for example the `date_info` section of `walkthrough_output/ndvi_metadata.json`.
+   Git ignores `examples/walkthrough_output/`, so this step changes no file in the repository.
+2. **Bump the version in three places, in a single PR:**
    - `src/envoi/_version.py` — `__version__`
    - `CITATION.cff` — both `version` and `date-released` (CI fails if the version doesn't match `_version.py`)
    - `CHANGELOG.md` — a new section for the release
-2. **Merge to `main`** once CI is green.
-3. **Push the tag:** `git tag vX.Y.Z && git push origin vX.Y.Z`. This triggers `release.yml`, which builds the distribution and publishes it to PyPI via Trusted Publishing.
-4. **Publish a GitHub Release** for that tag (Releases → Draft a new release → pick the existing tag → Publish). Zenodo archives the repository at that tag and mints a version DOI for it, plus updating the permanent concept DOI that always points at the latest version.
+3. **Merge to `main`** once CI is green.
+4. **Push the tag:** `git tag vX.Y.Z && git push origin vX.Y.Z`. This triggers `release.yml`, which builds the distribution and publishes it to PyPI via Trusted Publishing.
+5. **Publish a GitHub Release** for that tag (Releases → Draft a new release → pick the existing tag → Publish). Zenodo archives the repository at that tag and mints a version DOI for it, plus updating the permanent concept DOI that always points at the latest version.
 
 The release title should match the tag — it becomes the title of the Zenodo archive record.
 

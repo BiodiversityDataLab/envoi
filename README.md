@@ -155,7 +155,7 @@ The app expects a CSV in the same GBIF / Darwin Core schema as the default Pytho
 
 **QC columns** look like: `dem_copernicus_glo30_in_extent_200m`, `dem_copernicus_glo30_n_pixels_200m`, `dem_copernicus_glo30_had_nodata_200m`, `dem_copernicus_glo30_coverage_pct_200m`. When the data request or read of a point failed, the QC table also has `dem_copernicus_glo30_error_200m` (`..._error_point` for point-only statistics), with the error for that point and an empty value for the other points. This column exists only when at least one point of that dataset and window failed.
 
-For a window without valid pixels, both kinds of dataset give an empty `sum`, but they differ in two ways. Earth Engine datasets set `in_extent` to `False` and give `count` as `0`. Local datasets set `in_extent` to `True` when the window overlaps the raster (with `n_pixels` `0`), and give an empty `count`.
+For a window without valid pixels, both kinds of dataset give an empty `sum`, but they differ in two ways. Earth Engine datasets set `in_extent` to `False` and give `count` as `0`. Local datasets set `in_extent` to `True` when the window overlaps the raster (with `n_pixels` `0`), and give an empty `count`. [Known limitations](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md#known-limitations) lists other differences between the two kinds of dataset, and other limits of the outputs.
 
 **Available reducers:**
 
@@ -210,7 +210,7 @@ extract(sample_points, {
 })
 ```
 
-Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`. Each dataset folder also has a `tiles_manifest.csv`, which maps each input row to its tile (`exported` is `False` when no tile was written).
+Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`. When the ID is portable, for example `site_01`, the file name uses the ID as written. envoi changes an ID that is not portable, for example an ID with a character other than A–Z, a–z, 0–9, `.`, `_`, and `-` (such as `/`, `:`, or a space), or a very long ID. It replaces each other character with `_` and adds a short hash suffix: `urn:catalog:1` gives `urn_catalog_1-341248ef-<dataset>.tif`. An ID that differs from another ID only in letter case also gets a hash suffix, because Windows and macOS treat such file names as one file: `Site1` and `site1` give `Site1-d235a19f-<dataset>.tif` and `site1-8e62d73f-<dataset>.tif`. Each dataset folder also has a `tiles_manifest.csv`, which maps each input row and its ID to its tile file (`exported` is `False` when no tile was written). Use the manifest to find the tile of an ID.
 
 For a point without data, the two kinds of dataset differ. Earth Engine datasets write a tile in which every pixel is masked (`exported` is `True`, and the sidecar counts the tile in `n_exported`). Local datasets write no tile for a point outside the raster (`exported` is `False`, and the sidecar counts the point in `n_failed`).
 
