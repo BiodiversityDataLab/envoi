@@ -4,6 +4,7 @@ The synthetic DEM and ``sample_df`` fixtures are provided by ``conftest.py``,
 so this module no longer references any on-disk fixture paths.
 """
 
+import importlib
 import json
 import math
 import re
@@ -743,6 +744,179 @@ class TestReservedColumnNames:
 
 
 # ------------------------------------------------------------------
+# Input columns with the names of output columns
+# ------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_adapter(monkeypatch):
+    """Make the adapter lookup of extract() fail, so a test shows that no adapter was built."""
+    extract_module = importlib.import_module("envoi.extract")
+
+    def refuse_adapter(data_source):
+        raise AssertionError("extract() built an adapter.")
+
+    monkeypatch.setattr(extract_module, "get_adapter", refuse_adapter)
+
+
+def _raster_config(batch_id):
+    """Return a raster run config for ``dem_local`` with a 100 m window."""
+    return {
+        "batch_id": batch_id,
+        "datasets": ["dem_local"],
+        "settings": {"output_type": "raster", "window_size_m": 100},
+    }
+
+
+class TestInputColumnsWithOutputNames:
+    """An input column with the name of an output column of the same call raises before any adapter."""
+
+    @pytest.mark.parametrize(
+        "column",
+        [
+            # Statistic and QC columns of the run's dataset and window.
+            "dem_local_mean_100m",
+            "dem_local_std_100m",
+            "dem_local_coverage_pct_100m",
+            "dem_local_b1_class_3_count_100m",
+            # Point columns, which have no window.
+            "dem_local_point",
+            "dem_local_b1_point",
+            "dem_local_error_point",
+        ],
+    )
+    def test_output_column_name_raises(self, sample_df, tmp_path, no_adapter, column):
+        """The column raises ValueError that names it and the output, and nothing is written."""
+        df = sample_df.assign(**{column: 1.0})
+
+        with pytest.raises(ValueError, match="have the name of a column") as error_info:
+            extract(df, _tabular_mean_config("terrain"), output_dir=tmp_path)
+
+        message = str(error_info.value)
+        assert f"Input column(s) '{column}' have" in message
+        assert "output(s) 'terrain'" in message
+        assert "earlier envoi run" in message
+        assert not any(tmp_path.iterdir())
+
+    def test_columns_of_several_outputs_are_listed_once(self, sample_df, tmp_path, no_adapter):
+        """Each colliding column is listed once, in input order, with the first output that adds it."""
+        df = sample_df.assign(dem_local_point=1.0, dem_local_mean_100m=2.0, slope_local_max_50m=3.0)
+        slope_config = {
+            "batch_id": "slope",
+            "datasets": ["slope_local"],
+            "settings": {"output_type": "tabular", "statistics": ["max"], "window_size_m": 50},
+        }
+
+        with pytest.raises(ValueError) as error_info:
+            extract(
+                df,
+                [_tabular_mean_config("terrain"), _tabular_mean_config("terrain2"), slope_config],
+                output_dir=tmp_path,
+            )
+
+        message = str(error_info.value)
+        assert (
+            "Input column(s) 'dem_local_point', 'dem_local_mean_100m', 'slope_local_max_50m' "
+            "have the name of a column that envoi adds to the output tables of output(s) "
+            "'terrain', 'slope'"
+        ) in message
+
+    @pytest.mark.parametrize(
+        "column",
+        [
+            # Another window of the run's dataset.
+            "dem_local_mean_200m",
+            "dem_local_mean_1000m",
+            # Another dataset.
+            "slope_local_mean_100m",
+            # A longer catalog dataset whose name starts with "dem_local_".
+            "dem_local_categorical_mode_100m",
+            "dem_local_categorical_point",
+            # Not an output column of the dataset.
+            "dem_local_notes",
+            "dem_local_100m",
+            "dem_localpoint",
+            "mean_100m",
+        ],
+    )
+    def test_other_columns_are_kept(self, sample_df, tmp_path, column):
+        """Columns of another window or dataset (also with a longer name) keep their values."""
+        df = sample_df.assign(**{column: [float(number) for number in range(len(sample_df))]})
+
+        result = extract(
+            df, _tabular_mean_config("terrain", output_file_format="dataframe"), output_dir=tmp_path
+        )
+
+        assert result[column].tolist() == [float(number) for number in range(len(sample_df))]
+        assert result["dem_local_mean_100m"].notna().all()
+
+    def test_raster_run_does_not_check_columns(self, sample_df, tmp_path):
+        """A raster run adds no columns, so an input column with a statistic name does not raise."""
+        df = sample_df.assign(dem_local_mean_100m=1.0, dem_local_point=2.0)
+
+        outputs = extract(df, _raster_config("tiles"), output_dir=tmp_path)
+
+        assert outputs["tiles:dem_local"].is_dir()
+
+    def test_wgs84_column_raises_when_coordinates_are_reprojected(
+        self, sample_df, tmp_path, no_adapter
+    ):
+        """With input_crs, an input "<lat>_wgs84" or "<lon>_wgs84" column raises."""
+        projected_df, _, _ = _project_to_utm(sample_df)
+        df = projected_df.assign(decimalLatitude_wgs84=1.0, decimalLongitude_wgs84=2.0)
+
+        with pytest.raises(ValueError) as error_info:
+            extract(
+                df, _tabular_mean_config("terrain"), output_dir=tmp_path, input_crs="EPSG:32634"
+            )
+
+        assert (
+            "Input column(s) 'decimalLatitude_wgs84', 'decimalLongitude_wgs84' have the name"
+        ) in str(error_info.value)
+        assert not any(tmp_path.iterdir())
+
+    def test_wgs84_column_of_renamed_coordinate_columns_raises(
+        self, sample_df, tmp_path, no_adapter
+    ):
+        """The "_wgs84" names follow the user's own latitude and longitude column names."""
+        projected_df, _, _ = _project_to_utm(sample_df)
+        df = projected_df.rename(columns={"decimalLatitude": "y", "decimalLongitude": "x"})
+
+        with pytest.raises(ValueError, match="Input column\\(s\\) 'x_wgs84' have the name"):
+            extract(
+                df.assign(x_wgs84=1.0, decimalLongitude_wgs84=2.0),
+                _tabular_mean_config("terrain"),
+                output_dir=tmp_path,
+                input_crs="EPSG:32634",
+                latitude_column="y",
+                longitude_column="x",
+            )
+
+    @pytest.mark.parametrize("input_crs", [None, "EPSG:4326", "wgs84"])
+    def test_wgs84_column_is_kept_without_reprojection(self, sample_df, tmp_path, input_crs):
+        """Without a reprojection, an input "<lat>_wgs84" column is an ordinary column."""
+        df = sample_df.assign(decimalLatitude_wgs84=[1.0] * len(sample_df))
+
+        result = extract(
+            df,
+            _tabular_mean_config("terrain", output_file_format="dataframe"),
+            output_dir=tmp_path,
+            input_crs=input_crs,
+        )
+
+        assert result["decimalLatitude_wgs84"].tolist() == [1.0] * len(sample_df)
+
+    def test_wgs84_column_in_a_raster_run_with_reprojection(self, sample_df, tmp_path):
+        """A raster run with input_crs adds no "_wgs84" columns, so it does not raise."""
+        projected_df, _, _ = _project_to_utm(sample_df)
+        df = projected_df.assign(decimalLatitude_wgs84=1.0)
+
+        outputs = extract(df, _raster_config("tiles"), output_dir=tmp_path, input_crs="EPSG:32634")
+
+        assert outputs["tiles:dem_local"].is_dir()
+
+
+# ------------------------------------------------------------------
 # GBIF / Darwin Core eventDate parsing
 # ------------------------------------------------------------------
 
@@ -996,13 +1170,13 @@ class TestSlashDateParsing:
         assert "Truncated 1 ISO 8601 date interval" in date_warnings[0]
         assert "Date '2021' interpreted as 2021-01-01" in date_warnings[1]
 
-    def test_unparseable_date_error_is_chained(self):
-        """The ValueError for a date that pandas cannot parse keeps the pandas error as its cause."""
+    def test_text_that_is_not_a_date_raises(self):
+        """Text that is not in an accepted date form raises the error that lists the value."""
         from envoi._input_validation import _parse_and_validate_dates
 
-        with pytest.raises(ValueError, match="Error parsing 'eventDate' column") as error_info:
+        with pytest.raises(ValueError, match="'eventDate' has 1 date value") as error_info:
             _parse_and_validate_dates(_date_frame(["spring 2021"]))
-        assert isinstance(error_info.value.__cause__, ValueError)
+        assert "cannot read: 'spring 2021'." in str(error_info.value)
 
     def test_one_bad_value_in_a_mixed_column_raises(self):
         """One unsupported value stops the run, and the message lists only that value."""
@@ -1054,6 +1228,272 @@ class TestSlashDateParsing:
                 date_column="sampleDate",
                 output_dir=tmp_path,
             )
+        assert not any(tmp_path.iterdir())
+
+
+class TestAcceptedDateForms:
+    """Only the listed date forms are read; every other value raises, so envoi never guesses."""
+
+    @pytest.mark.parametrize(
+        ("date_value", "expected_day"),
+        [
+            ("2021-6-5", "2021-06-05"),
+            ("2021-06-5", "2021-06-05"),
+            ("2021-6-15", "2021-06-15"),
+            ("2021-06-15", "2021-06-15"),
+            ("20210615", "2021-06-15"),
+            ("2021/06/15", "2021-06-15"),
+            (" 2021-06-15 ", "2021-06-15"),
+            ("2021-06-15/2021-06-20", "2021-06-15"),
+            ("2021-06-15T08:00Z/2021-06-15T10:00Z", "2021-06-15"),
+        ],
+    )
+    def test_date_text_parses_to_its_day(self, date_value, expected_day):
+        """Each accepted date form without a time of day gives its day."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, _ = _parse_and_validate_dates(_date_frame([date_value]))
+        assert dates == [expected_day]
+
+    @pytest.mark.parametrize(
+        "date_value",
+        [
+            "2021-06-15T08",
+            "2021-06-15T08:00",
+            "2021-06-15T08:00Z",
+            "2021-06-15T08:00:00.123+02:00",
+            "2021-06-15T23:30-0500",
+            "2021-06-15T23:30-05",
+            "20210615T080000Z",
+            "2021-06-15 08:00",
+            "2021-06-15 08:00:00+02:00",
+        ],
+    )
+    def test_time_of_day_and_time_zone_are_dropped(self, date_value):
+        """A time of day after "T" or a space, with or without a time zone, gives the day as written."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame([date_value]))
+        assert dates == ["2021-06-15"]
+        assert date_warnings == [
+            "Dropped time-of-day from 1 date value(s); nearest-image lookup only uses day precision."
+        ]
+
+    @pytest.mark.parametrize(
+        ("date_value", "expected_day", "quoted_date"),
+        [
+            ("2021", "2021-01-01", "2021"),
+            ("2021-6", "2021-06-01", "2021-6"),
+            ("2021-06", "2021-06-01", "2021-06"),
+            ("2021-06T08:00", "2021-06-01", "2021-06"),
+        ],
+    )
+    def test_year_and_year_month_give_the_first_day_with_a_warning(
+        self, date_value, expected_day, quoted_date
+    ):
+        """A year or a year-month is read as its first day, and the warning quotes the date."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame([date_value]))
+        assert dates == [expected_day]
+        assert (
+            f"Date '{quoted_date}' interpreted as {expected_day}. Provide a full YYYY-MM-DD "
+            f"date if you want a specific day."
+        ) in date_warnings
+
+    def test_full_dates_in_new_forms_give_no_warning(self):
+        """YYYYMMDD and one-digit months and days are full dates: no warning."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning would fail the test
+            _, dates, date_warnings = _parse_and_validate_dates(
+                _date_frame(["20210615", "2021-6-5"])
+            )
+        assert dates == ["2021-06-15", "2021-06-05"]
+        assert date_warnings == []
+
+    def test_datetime_column(self):
+        """A datetime64 column gives the day of each value, without a warning."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        date_values = pd.to_datetime(["2021-06-15 08:00", "2022-01-02 23:59"])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame(date_values))
+        assert dates == ["2021-06-15", "2022-01-02"]
+        assert date_warnings == []
+
+    def test_time_zone_aware_datetime_column_keeps_its_own_day(self):
+        """A datetime column with a time zone gives the day in that time zone, not in UTC."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        # 23:30 in New York on June 15 is 03:30 UTC on June 16.
+        date_values = pd.to_datetime(["2021-06-15 23:30"]).tz_localize("America/New_York")
+        _, dates, _ = _parse_and_validate_dates(_date_frame(date_values))
+        assert dates == ["2021-06-15"]
+
+    def test_object_column_of_date_and_datetime_values(self):
+        """An object column of date, datetime, NumPy datetime64, and text values gives each day."""
+        import datetime
+
+        from envoi._input_validation import _parse_and_validate_dates
+
+        date_values = pd.Series(
+            [
+                datetime.date(2021, 6, 15),
+                datetime.datetime(2021, 6, 16, 8, 30, tzinfo=datetime.timezone.utc),
+                np.datetime64("2021-06-17T12:00"),
+                "2021-06-18",
+            ],
+            dtype=object,
+        )
+        _, dates, _ = _parse_and_validate_dates(_date_frame(date_values))
+        assert dates == ["2021-06-15", "2021-06-16", "2021-06-17", "2021-06-18"]
+
+    @pytest.mark.parametrize(
+        "year_values",
+        [
+            [2021, 2019],
+            [2021.0, 2019.0],
+            pd.array([2021, 2019], dtype="Int64"),
+            [np.int64(2021), np.int64(2019)],
+        ],
+    )
+    def test_whole_number_years(self, year_values):
+        """Integer and float year columns give January 1 of each year, with a warning."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame(year_values))
+        assert dates == ["2021-01-01", "2019-01-01"]
+        assert "Date '2021' interpreted as 2021-01-01" in date_warnings[0]
+
+    @pytest.mark.parametrize(
+        "date_values",
+        [
+            [20210615, 20200101],
+            [np.int64(20210615), np.int64(20200101)],
+            [20210615.0, 20200101.0],
+        ],
+    )
+    def test_eight_digit_numbers_are_yyyymmdd(self, date_values):
+        """Whole numbers with eight digits, as a CSV reader stores YYYYMMDD dates, are dates."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # full dates: no warning
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame(date_values))
+        assert dates == ["2021-06-15", "2020-01-01"]
+        assert date_warnings == []
+
+    def test_float_yyyymmdd_column_with_a_missing_date(self):
+        """A float YYYYMMDD column with a missing value skips that row and reads the other dates."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.warns(UserWarning, match="Skipping 1 row"):
+            df, dates, _ = _parse_and_validate_dates(_date_frame([20210615.0, np.nan]))
+        assert dates == ["2021-06-15"]
+        assert df["id"].tolist() == ["p0"]
+
+    @pytest.mark.parametrize("bad_value", [15062021, 15062021.0, 20211301, 20210230])
+    def test_eight_digit_number_that_is_not_a_date_raises(self, bad_value):
+        """An eight-digit number with an impossible month or day (15062021: month 20) raises."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'eventDate' has 1 date value") as error_info:
+            _parse_and_validate_dates(_date_frame([bad_value]))
+        assert f"are not valid dates: '{bad_value}'." in str(error_info.value)
+
+    def test_float_year_column_with_a_missing_year(self):
+        """A float year column with a missing value skips that row and reads the other years."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            df, dates, _ = _parse_and_validate_dates(_date_frame([2021.0, np.nan, 2019.0]))
+        assert dates == ["2021-01-01", "2019-01-01"]
+        assert df["id"].tolist() == ["p0", "p2"]
+
+    @pytest.mark.parametrize(
+        ("bad_value", "listed_value"),
+        [
+            ("05-06-2021", "'05-06-2021'"),
+            ("05.06.2021", "'05.06.2021'"),
+            ("June 5, 2021", "'June 5, 2021'"),
+            ("2021.06.05", "'2021.06.05'"),
+            ("202106", "'202106'"),
+            ("21-06-15", "'21-06-15'"),
+            ("2021-06 15", "'2021-06 15'"),
+            ("2021-06-15T", "'2021-06-15T'"),
+            ("2021-06-15T8:00", "'2021-06-15T8:00'"),
+            ("2021/06/15 08:00", "'2021/06/15 08:00'"),
+            (2021.5, "'2021.5'"),
+            (202106, "'202106'"),
+            (20210615.5, "'20210615.5'"),
+            (21, "'21'"),
+            (True, "'True'"),
+        ],
+    )
+    def test_other_values_raise_with_the_date_column_name(self, bad_value, listed_value):
+        """Any other text or number raises ValueError that names the date column and the value."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'collectionDate' has 1 date value") as error_info:
+            _parse_and_validate_dates(_date_frame([bad_value]), date_column_name="collectionDate")
+        message = str(error_info.value)
+        assert f"cannot read: {listed_value}." in message
+        assert "Write these dates as YYYY-MM-DD." in message
+        # Numbers get a hint, because a file reader can store dates as numbers.
+        has_number_hint = "A number is read only when it is a whole number" in message
+        is_number = isinstance(bad_value, (int, float)) and not isinstance(bad_value, bool)
+        assert has_number_hint == is_number
+
+    @pytest.mark.parametrize("bad_value", ["2021-02-30", "2021-13-01", "20210230", "2021-0-10"])
+    def test_dates_that_do_not_exist_raise(self, bad_value):
+        """A value in an accepted form that is not a valid date raises and lists the value."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'collectionDate' has 1 date value") as error_info:
+            _parse_and_validate_dates(
+                _date_frame(["2021-06-15", bad_value]), date_column_name="collectionDate"
+            )
+        assert f"are not valid dates: '{bad_value}'." in str(error_info.value)
+
+    @pytest.mark.parametrize(
+        "bad_values",
+        [
+            # Twelve different values that are not in an accepted form, and one twice.
+            [f"{day:02d}.06.2021" for day in range(1, 13)] + ["01.06.2021"],
+            # Twelve different dates that do not exist, and one twice.
+            [f"2021-{month:02d}-32" for month in range(1, 13)] + ["2021-01-32"],
+        ],
+    )
+    def test_message_lists_at_most_ten_values_and_the_total(self, bad_values):
+        """Both errors list ten different values, the number of the others, and the total."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'eventDate' has 13 date value") as error_info:
+            _parse_and_validate_dates(_date_frame(bad_values))
+        message = str(error_info.value)
+        assert repr(bad_values[9]) in message
+        assert repr(bad_values[10]) not in message
+        assert "... and 2 more" in message
+
+    def test_extract_stops_before_any_output(self, sample_df, tmp_path):
+        """extract() raises for a date with an unknown order of day and month, and writes nothing."""
+        df = sample_df.copy()
+        df.loc[2, "eventDate"] = "02.04.1960"
+
+        with pytest.raises(ValueError, match="'eventDate' has 1 date value"):
+            extract(df, _tabular_mean_config("dot_dates"), output_dir=tmp_path)
         assert not any(tmp_path.iterdir())
 
 

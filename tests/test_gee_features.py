@@ -673,6 +673,37 @@ class TestWindowStatisticShapes:
             single_band["aspect_only_std_200m"]
         )
 
+    def test_aspect_only_band_list_gives_only_aspect_columns(self, tmp_path):
+        """The per-call list [aspect] gives only the band-named aspect column, with no DEM column."""
+        outputs = extract(
+            _NORTH_FACING_SLOPE_DF,
+            {
+                "batch_id": "aspect_list",
+                "datasets": [{"dem_copernicus_glo30": ["aspect"]}],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 200,
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        stats = pd.read_csv(outputs["aspect_list"])
+        dataset_columns = [
+            column for column in stats.columns if column.startswith("dem_copernicus_glo30_")
+        ]
+        assert dataset_columns == ["dem_copernicus_glo30_aspect_mean_200m"]
+        # The circular mean of the north-facing slope is near north.
+        aspect_mean = stats.loc[0, "dem_copernicus_glo30_aspect_mean_200m"]
+        assert 0.0 <= aspect_mean < 360.0
+        assert _angular_distance_deg(aspect_mean, 0.0) < 30.0, aspect_mean
+        sidecar = json.loads((tmp_path / "aspect_list_metadata.json").read_text())
+        assert sidecar["config"]["datasets"] == [
+            {"name": "dem_copernicus_glo30", "bands": [], "derived_bands": ["aspect"]}
+        ]
+        assert sidecar["datasets"]["dem_copernicus_glo30"]["band_names"] == ["aspect"]
+
 
 # ------------------------------------------------------------------
 # Automatic date selection for ImageCollections — QC date inspection.

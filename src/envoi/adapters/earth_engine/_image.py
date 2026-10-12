@@ -568,12 +568,14 @@ def _build_image(
         else list(derived_bands) if derived_bands else []
     )
 
-    if bands is not None:
+    if bands:
         # Both source and derived specified — include all of them.
         source_bands = bands if isinstance(bands, list) else [bands]
         image = image.select(source_bands + derived_bands_list)
     elif derived_bands_list:
         # Only derived bands specified — drop source bands from the output.
+        # An empty `bands` list (a per-call band list of only derived bands,
+        # such as ["aspect"]) means no source bands, so it comes here too.
         image = image.select(derived_bands_list)
     # else: neither specified — return the image as-is.
 

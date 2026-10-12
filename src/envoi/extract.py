@@ -19,6 +19,7 @@ from ._input_validation import (
     _build_reserved_column_renames,
     _parse_and_validate_dates,
     _validate_and_reproject_crs,
+    _validate_no_output_column_names,
     _validate_required_columns,
     _validate_sample_ids,
 )
@@ -139,9 +140,11 @@ def extract(
       reserved for future per-call settings; today only ``"bands"`` is
       accepted.
 
-    A single-element list (``{"sen2": ["B4"]}``) keeps the multi-band column
-    naming (``sen2_B4_mean_<window>m``); use the catalog if you want the
-    bare single-band naming (``sen2_mean_<window>m``).
+    Every per-call band list, also a single-element list (``{"sen2": ["B4"]}``),
+    gives band-named columns (``sen2_B4_mean_<window>m``); use the catalog if
+    you want the bare single-band naming (``sen2_mean_<window>m``). A list of
+    only derived bands (``{"dem_copernicus_glo30": ["aspect"]}``) replaces the
+    catalog's bands, so the output has only the derived bands.
 
     Parameters
     ----------
@@ -151,12 +154,16 @@ def extract(
         by default, following the GBIF / Darwin Core convention — override the
         names with the ``*_column`` parameters below). An optional date column
         (``eventDate``, YYYY-MM-DD strings) enables nearest-date image selection
-        for time-varying datasets. Every latitude and longitude must be a
-        finite number (text that holds a number is converted); a missing,
-        non-numeric, or infinite value raises ``ValueError``. Other columns
-        appear in the statistics table. An unmapped column named ``id``,
-        ``lat``, ``lon``, ``date``, ``lat_original``, or ``lon_original`` keeps
-        its name there and is not used by envoi.
+        for time-varying datasets; ``docs/advanced_usage.md`` lists the other
+        date forms that envoi reads, and any other value raises ``ValueError``.
+        Every latitude and longitude must be a finite number (text that holds
+        a number is converted); a missing, non-numeric, or infinite value
+        raises ``ValueError``. Other columns appear in the statistics table.
+        An unmapped column named ``id``, ``lat``, ``lon``, ``date``,
+        ``lat_original``, or ``lon_original`` keeps its name there and is not
+        used by envoi. An input column with the name of a column that the call
+        adds to its output tables (for example from an earlier envoi run)
+        raises ``ValueError``.
     config : str, Path, dict, or list
         Output specification — see above. A path string or ``Path`` is loaded as
         YAML before processing.
@@ -235,6 +242,8 @@ def extract(
         date_column: "date",
     }
     _validate_required_columns(df, id_column, latitude_column, longitude_column)
+    # The input column names as the user gave them, before the rename below.
+    input_column_names = list(df.columns)
 
     # An unmapped input column can have the name of a working column, for
     # example the "id" column of a Darwin Core file, or a "date" column when
@@ -286,6 +295,21 @@ def extract(
     # config then stops the call before earlier outputs are written or any
     # Earth Engine quota is used.
     all_run_settings = _parse_run_configs(output_configs, defaults, catalog_datasets)
+
+    # A tabular output adds statistic and QC columns named after each dataset
+    # and window, and the "_wgs84" columns when the coordinates were
+    # reprojected (_validate_and_reproject_crs then added "lat_original"). An
+    # input column with such a name, for example from an earlier envoi run,
+    # would be overwritten without notice. Check the original input names
+    # before the first adapter is built.
+    _validate_no_output_column_names(
+        input_column_names,
+        all_run_settings,
+        catalog_datasets.keys(),
+        latitude_column=latitude_column,
+        longitude_column=longitude_column,
+        coordinates_reprojected="lat_original" in df.columns,
+    )
 
     # Raster mode names one GeoTIFF per point after that point's ID, so
     # blank or duplicated IDs would lose tiles. Every run config uses the same
@@ -584,10 +608,11 @@ def _process_dataset_tabular(
     caller is responsible for looping over multiple window sizes and merging
     the resulting metadata dicts.
 
-    `band_overrides` is a dict of per-call settings (currently `bands` and/or
-    `derived_bands`) that replace the catalog values before adapter
-    instantiation. The catalog dict itself is never mutated — the override
-    is shallow-merged into a fresh dict per call.
+    `band_overrides` is a dict of per-call settings (`bands`, `derived_bands`
+    when the list has derived bands, and the mark `band_naming`, see
+    ``_normalize_dataset_entry``) that replace the catalog values before
+    adapter instantiation. The catalog dict itself is never mutated — the
+    override is shallow-merged into a fresh dict per call.
 
     ``write_metadata`` tells whether ``extract()`` writes the QC table, so
     that the failed-point warning names a place where the errors are.
@@ -743,8 +768,8 @@ def _process_dataset_raster(
     ``id_column`` is the caller's own name for the sample-ID column; it becomes
     the join key in the tile manifest written alongside the tiles.
 
-    `band_overrides` is a dict of per-call settings (currently `bands` and/or
-    `derived_bands`) that replace the catalog values before adapter
+    `band_overrides` is a dict of per-call settings (`bands`, `derived_bands`,
+    and `band_naming`) that replace the catalog values before adapter
     instantiation. See `_process_dataset_tabular` for details.
 
     Returns ``(tiles_dir, dataset_meta, failed_point_warning)``.

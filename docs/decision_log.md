@@ -185,3 +185,37 @@ The specification of this work is in a task folder that is not committed, so eac
 - **Rejected:**
   - The catalog value replaces the file's value: the read paths mask the file's value in different ways, so a replacement needs a rewrite of the window reader, and a wrong catalog value would silently change results.
   - Reject the keys `nodata` and `crs` for local rasters: files without a CRS or without a declared nodata value could then not be used correctly.
+
+### Accepted date formats
+
+- **Decision:** `_parse_and_validate_dates` reads only a closed list of date values. Every other value raises `ValueError` before any adapter is built. The message names the user's date column and lists up to 10 different values and the total number.
+  - Text: `YYYY`; `YYYY-M` or `YYYY-MM`; `YYYY-M-D` up to `YYYY-MM-DD`; `YYYYMMDD`. Each of these forms can have a time of day after `T` (also the basic form `T080000` and the hour alone) or after one space (then at least `HH:MM`), and a time zone (`Z`, `±HH`, `±HH:MM`, `±HHMM`). The day is the day as written: envoi drops the time and does not convert the time zone.
+  - ISO 8601 intervals as before (a value with exactly one `/` whose start is a year, a year-month, or a date, optionally with a time), and `YYYY/MM/DD`.
+  - Date and datetime values (also pandas Timestamps and NumPy `datetime64` in an object column), and columns of a datetime type. The day is the day in the value's own time zone, as for text with a time zone.
+  - Whole numbers with four digits (1000 to 9999) are years, also as floats (`2021.0`), because a column of years with a missing value is a float column. Whole numbers with exactly eight digits are read as `YYYYMMDD` (`20210615`, `20210615.0`), because CSV readers turn such columns into numbers. Both are checked like the text form: an impossible month or day (`15062021`: month 20) raises the error for dates that do not exist. Other numbers, such as `2021.5` or `202106`, raise.
+  - envoi builds `YYYY-MM-DD` text for each value and parses it with `pd.to_datetime(..., format="%Y-%m-%d", errors="coerce")`. A day that does not exist (`2021-02-30`, `2021-13-01`) raises a second `ValueError` that lists the values.
+  - The warnings stay: a year or a year-month is read as its first day, an interval is cut to its start, and a dropped time of day gives one summary warning (now also for a time after a space).
+  - The web app does not check dates at upload. The run shows the error.
+- **Reason:** before, envoi gave every value that was not an interval or `YYYY/MM/DD` to `pd.to_datetime(format="mixed")`, which guesses the form of each value. It reads the first number of `05-06-2021` and `05.06.2021` as the month, so these dates became May 6, 2021 without a warning, also when the data meant June 5. A wrong date selects a wrong image, which gives plausible but wrong statistics. A closed list of unambiguous forms covers ISO 8601 and the common GBIF / Darwin Core values. A value outside the list stops the run, and the user converts it once with the format that they know.
+- **Rejected:** keep the guessing of `pd.to_datetime`: it silently gives wrong dates for day-first data. Accept day-first forms with a setting: the user can convert the column with `pd.to_datetime(..., format=...)`, and envoi reads datetime columns.
+
+### Band overrides and column names
+
+- **Decision:** a per-call band list in `datasets` (`{"dataset": [bands]}` or `{"dataset": {"bands": [...]}}`) replaces the catalog's bands, and on Earth Engine every such list gives statistic columns named after the bands.
+  - `_normalize_dataset_entry` always sets `bands` in the band overrides. For a list of only derived bands (`{"dem_copernicus_glo30": ["aspect"]}`), `bands` is an empty list, so the shallow merge with the catalog entry replaces the catalog's source bands, and the output has only the derived bands. `_build_image` selects only the derived bands for an empty `bands` list, and the sidecar `config.datasets` records `bands: []`.
+  - The band overrides of every per-call list also get the mark `band_naming: "per_band"` (`_BAND_NAMING_KEY` in the Earth Engine adapter). The merged config of that dataset carries it, and the Earth Engine adapter then uses `{band}_{reducer}` and `{band}_point` keys also for one band. For example, `{"dem_copernicus_glo30": ["DEM"]}` gives `dem_copernicus_glo30_DEM_mean_200m`, and `[aspect]` gives `dem_copernicus_glo30_aspect_mean_200m` (the circular aspect statistics replace the `aspect_*` keys, as for any multi-band run).
+  - The local adapter already gave band-named columns for every band list, because it decides by the form of `bands` (a list). It ignores the mark.
+  - A catalog default (a plain dataset name) keeps its column names, also a catalog default `derived_bands`.
+- **Reason:** before, a list of only derived bands kept the catalog's source bands, because the override had no `bands` key, so `[aspect]` also gave the `DEM` columns. And on Earth Engine a one-band list gave the bare names of a single-band catalog default (`dem_copernicus_glo30_mean_200m`), against `docs/advanced_usage.md` and the local adapter. With `[aspect]` alone, a bare `mean` column would have looked like the mean elevation. A column name that says which band was selected cannot be misread.
+- **Rejected:** band-named columns only for derived-only lists: the two adapters would still differ for one-band source lists. Change the documentation to the old Earth Engine behavior: the bare name hides which band was selected.
+
+### Input columns with output names
+
+- **Decision:** `extract()` raises `ValueError` before any adapter is built when an original input column name (before envoi renames the id, coordinate, and date columns) is the name of a column that a tabular run config of the same call adds (`_validate_no_output_column_names` in `_input_validation.py`).
+  - For a dataset `d` of a tabular run config with a window of `N` m, a column matches when it is `d_point`, or when it starts with `d_` and its remaining part ends with `_Nm` or `_point`. These patterns cover the statistic columns and the QC columns.
+  - A column that starts with `e_` for a longer catalog dataset `e` whose name starts with `d_` belongs to `e` and does not match for `d` (`dem_copernicus_glo30_mean_100m` is not a column of a dataset `dem`).
+  - `<latitude column>_wgs84` and `<longitude column>_wgs84` match in a tabular run config when envoi reprojects the coordinates (the same condition that adds these columns to the output).
+  - Raster run configs add no columns, so they are not checked.
+  - The message names the columns and the outputs, and says to remove or rename the columns, for example when the input is the output of an earlier envoi run.
+- **Reason:** before, envoi replaced the values of an input column with a statistic name without notice, moved an input column with a QC name out of the statistics table, and stopped with an unclear error for a `_wgs84` column after the extraction had used its time and Earth Engine quota. Researchers often run envoi again on the output of an earlier run, so these names occur in practice.
+- **Rejected:** overwrite without notice (the old behavior): the user's data is lost silently. Rename the input column automatically: the output would have columns that the user did not name, and scripts that read them would break without notice.

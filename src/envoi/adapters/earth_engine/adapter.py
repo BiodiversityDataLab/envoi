@@ -63,6 +63,16 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+# The mark that a per-call band list puts in the merged config of its dataset
+# (``_normalize_dataset_entry`` in ``_config_parsing.py`` adds it to the band
+# overrides). With the mark, every statistic key is named after its band
+# (``{band}_{reducer}``, ``{band}_point``), also for one band, as the local
+# adapter does for a band list. Without it, the per-call list ``["B4"]`` would
+# give the bare keys of a single-band catalog default (``mean``), and the
+# column name would not say which band was selected.
+_BAND_NAMING_KEY = "band_naming"
+_PER_BAND_NAMING = "per_band"
+
 
 # ---------------------------------------------------------------------------
 # Adapter
@@ -95,6 +105,10 @@ class GeeRasterAdapter(BaseAdapter):
     _static_image: Any = field(default=None, init=False, repr=False)
     _needs_per_point_date: bool = field(default=False, init=False, repr=False)
     _native_proj: Any = field(default=None, init=False, repr=False)
+    # True when the bands come from a per-call band list (the mark
+    # _BAND_NAMING_KEY in the spec): statistic keys are then named after their
+    # bands, also for one band.
+    _band_named_keys: bool = field(default=False, init=False, repr=False)
 
     # ------------------------------------------------------------------
     # Setup
@@ -127,10 +141,13 @@ class GeeRasterAdapter(BaseAdapter):
             else:
                 dataset_spec["image"] = asset_id
             logger.debug("Auto-detected %s as %s", asset_id, asset_type)
+        # An empty `bands` list (a per-call list of only derived bands) is not
+        # copied, so the image keeps only the derived bands (see _build_image).
         if self.spec.get("bands") and "bands" not in dataset_spec:
             dataset_spec["bands"] = self.spec["bands"]
         if self.spec.get("derived_bands") and "derived_bands" not in dataset_spec:
             dataset_spec["derived_bands"] = self.spec["derived_bands"]
+        self._band_named_keys = self.spec.get(_BAND_NAMING_KEY) == _PER_BAND_NAMING
 
         # Native scale resolution priority:
         #   1. catalog override `native_scale_m` under dataset_spec (set explicitly
@@ -739,6 +756,7 @@ class GeeRasterAdapter(BaseAdapter):
         ``(stats_dict, meta_dict)`` tuple with merged keys:
         - window keys: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
         - point  keys: ``"point"``  (single band) or ``{band}_point``     (multi-band)
+        A per-call band list gives the multi-band keys, also for one band.
 
         ``original_reducer_names`` carries the *un-deduped* user request
         (i.e. with ``class_fraction`` still present if asked for). It is
@@ -773,10 +791,14 @@ class GeeRasterAdapter(BaseAdapter):
         band_name = self._get_band_name(img)
         band_count = getattr(self, "_cached_band_count", 1)
 
-        # Use multi-band mode when: no band specified (auto-detect all bands), OR
-        # a list of bands was specified. A single named band keeps simple {reducer} naming.
+        # Use multi-band mode ({band}_{reducer} keys) when the bands come from
+        # a per-call band list, also with one band, so that the column names
+        # say which band the user selected. Otherwise use it when no band is
+        # specified (auto-detect all bands) or a list of bands is specified,
+        # and the image has more than one band. A single named band, and a
+        # catalog default with one band, keep simple {reducer} naming.
         spec_band = self._dataset_spec.get("bands")
-        multiband = not isinstance(spec_band, str) and band_count > 1
+        multiband = self._band_named_keys or (not isinstance(spec_band, str) and band_count > 1)
 
         if multiband:
             img_to_reduce = img
@@ -793,8 +815,9 @@ class GeeRasterAdapter(BaseAdapter):
         # (north). They come from a companion image of the sine and cosine of
         # the aspect (see _build_image), reduced in the same request. Only the
         # derived aspect band qualifies: it is reduced when the run is
-        # multi-band (_build_image keeps every derived band) or when it is
-        # the single band.
+        # multi-band (_build_image keeps every derived band, and a per-call
+        # band list makes even the aspect band alone multi-band) or when it
+        # is the single band.
         derived_bands = self._dataset_spec.get("derived_bands") or []
         derived_band_names = [derived_bands] if isinstance(derived_bands, str) else derived_bands
         aspect_is_reduced = "aspect" in derived_band_names and (multiband or band_name == "aspect")
@@ -930,9 +953,10 @@ class GeeRasterAdapter(BaseAdapter):
         # ---- circular aspect statistics ----
         # Replace the linear aspect mean, std and var that the user asked for
         # with the circular values: "mean"/"std"/"var" when aspect is the
-        # single band, "aspect_mean"/... when the run is multi-band. Only keys
-        # that exist are replaced, so the set of columns does not change. The
-        # other statistics of aspect stay linear. The QC values below read
+        # single band, "aspect_mean"/... when the run is multi-band (also for
+        # a per-call band list of aspect alone). Only keys that exist are
+        # replaced, so the set of columns does not change. The other
+        # statistics of aspect stay linear. The QC values below read
         # window_stats, which keeps the linear values, so QC does not change.
         if want_circular_aspect:
             circular_raw = full_result.get("aspect_circular") or {}
@@ -1033,6 +1057,7 @@ class GeeRasterAdapter(BaseAdapter):
         Output keys per point:
           - window stats: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
           - point sample: ``"point"``  (single band) or ``{band}_point``     (multi-band)
+          A per-call band list gives the multi-band keys, also for one band.
 
         Returns a list of ``(stats_dict, meta_dict)`` tuples — one per point.
         A point whose request failed gets an empty stats dict, and its meta

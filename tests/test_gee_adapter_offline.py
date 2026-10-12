@@ -29,7 +29,8 @@ import pytest
 import requests
 
 from envoi import update_catalog
-from envoi._output_assembly import _append_stat_columns
+from envoi._config_parsing import _parse_run_config
+from envoi._output_assembly import _append_stat_columns, _resolve_dataset_metadata
 from envoi.adapters.earth_engine import _image, _tiles
 from envoi.adapters.earth_engine import adapter as adapter_module
 from envoi.adapters.earth_engine._image import (
@@ -37,6 +38,7 @@ from envoi.adapters.earth_engine._image import (
     _resolve_date_filter_range,
 )
 from envoi.adapters.earth_engine.adapter import GeeRasterAdapter
+from envoi.catalog import BUILTIN_EE_CATALOG, load_catalogs, load_defaults
 from envoi.extract import extract
 from envoi.metadata import summarize_date_info
 
@@ -1869,6 +1871,9 @@ class _SymbolicImage:
     def setDefaultProjection(self, projection: str) -> _SymbolicImage:
         return _SymbolicImage(f"{self.expression} in {projection}")
 
+    def addBands(self, image: _SymbolicImage) -> _SymbolicImage:
+        return _SymbolicImage(f"({self.expression} with {image.expression})")
+
 
 class _SymbolicNumber:
     """Stands in for an ``ee.Number``. A comparison returns the text of the condition."""
@@ -2045,3 +2050,171 @@ class TestEmptyDateSelection:
         assert (
             image.expression == "first of embeddings from 2021-01-01 to 2021-01-02.select(['A00'])"
         )
+
+
+# ------------------------------------------------------------------
+# Per-call band lists — selected bands and statistic names
+# ------------------------------------------------------------------
+
+
+@pytest.fixture
+def symbolic_adapter_setup(monkeypatch):
+    """Let ``GeeRasterAdapter.__post_init__`` run offline, with symbolic Earth Engine objects.
+
+    Every asset is an image collection here. The adapter skips the Earth
+    Engine initialization and the scale check, and ``_build_image`` builds a
+    symbolic image whose text shows the bands that it selects.
+    """
+    monkeypatch.setattr(adapter_module, "_ensure_gee_init", lambda: None)
+    monkeypatch.setattr(GeeRasterAdapter, "_validate_auto_detected_scale", lambda self: None)
+    stub_data = SimpleNamespace(getAsset=lambda asset_id: {"type": "IMAGE_COLLECTION"})
+    monkeypatch.setattr(
+        adapter_module, "ee", SimpleNamespace(data=stub_data, ImageCollection=_SymbolicCollection)
+    )
+    monkeypatch.setattr(_image, "ee", SimpleNamespace(ImageCollection=_SymbolicCollection))
+    monkeypatch.setitem(
+        _image._DERIVED_BAND_DISPATCH,
+        "aspect",
+        lambda image: _SymbolicImage(f"aspect({image.expression})"),
+    )
+
+
+def _adapter_for_dataset_entry(dataset_entry) -> tuple[GeeRasterAdapter, str, dict]:
+    """Parse one ``datasets`` entry with the built-in catalog, and build its adapter.
+
+    The adapter gets the merged config that ``extract()`` gives it: the
+    catalog entry with the band overrides of the entry. Returns the adapter,
+    the dataset name, and the band overrides.
+    """
+    catalog_datasets = load_catalogs((BUILTIN_EE_CATALOG,))["datasets"]
+    run_config = {
+        "batch_id": "bands",
+        "datasets": [dataset_entry],
+        "settings": {"output_type": "tabular", "statistics": ["mean"], "window_size_m": 200},
+    }
+    run_settings = _parse_run_config(run_config, load_defaults(), 0, catalog_datasets)
+    ((dataset, band_overrides),) = run_settings.datasets
+    adapter = GeeRasterAdapter({**catalog_datasets[dataset], **band_overrides})
+    # 30 m pixels, so that the point request needs no scale request.
+    adapter.scale = 30
+    return adapter, dataset, band_overrides
+
+
+@pytest.mark.usefixtures("symbolic_adapter_setup")
+class TestPerCallBandLists:
+    """A per-call band list replaces the catalog's bands and gives band-named statistics."""
+
+    @pytest.mark.parametrize(
+        ("dataset_entry", "selected_bands"),
+        [
+            # Only a derived band: the catalog's source band DEM is not selected.
+            ({"dem_copernicus_glo30": ["aspect"]}, ["aspect"]),
+            ({"dem_copernicus_glo30": ["DEM", "aspect"]}, ["DEM", "aspect"]),
+            ("dem_copernicus_glo30", ["DEM"]),
+        ],
+    )
+    def test_selected_bands(self, dataset_entry, selected_bands):
+        """The image of the dataset selects exactly the bands of the list, or the catalog's bands."""
+        adapter, _, _ = _adapter_for_dataset_entry(dataset_entry)
+
+        assert adapter._static_image.expression.endswith(f".select({selected_bands})")
+        assert adapter._get_band_name(adapter._static_image) == selected_bands[0]
+        assert adapter._cached_band_names == selected_bands
+
+    def test_derived_only_list_records_no_source_bands(self):
+        """The sidecar records the resolved bands of a derived-only list: no source band."""
+        catalog_datasets = load_catalogs((BUILTIN_EE_CATALOG,))["datasets"]
+        _, dataset, band_overrides = _adapter_for_dataset_entry(
+            {"dem_copernicus_glo30": ["aspect"]}
+        )
+
+        assert _resolve_dataset_metadata([(dataset, band_overrides)], catalog_datasets) == [
+            {"name": "dem_copernicus_glo30", "bands": [], "derived_bands": ["aspect"]}
+        ]
+
+    @pytest.mark.parametrize(
+        ("dataset_entry", "window_result", "expected_values"),
+        [
+            # A per-call list of one source band: the column names the band.
+            (
+                {"sr_landsat_annual": ["red"]},
+                {"red_mean": 0.12, "red_count": 400},
+                {"sr_landsat_annual_red_mean_200m": 0.12},
+            ),
+            (
+                {"dem_copernicus_glo30": ["DEM"]},
+                {"DEM_mean": 120.0, "DEM_count": 400},
+                {"dem_copernicus_glo30_DEM_mean_200m": 120.0},
+            ),
+            # The catalog default with one band keeps the bare name.
+            (
+                "dem_copernicus_glo30",
+                {"DEM_mean": 120.0, "DEM_count": 400},
+                {"dem_copernicus_glo30_mean_200m": 120.0},
+            ),
+        ],
+    )
+    def test_statistic_columns(self, monkeypatch, dataset_entry, window_result, expected_values):
+        """A per-call list gives band-named columns, also for one band; a catalog default does not."""
+        adapter, dataset, _ = _adapter_for_dataset_entry(dataset_entry)
+        _stub_statistics_request(monkeypatch, adapter, {"window": window_result})
+
+        stats, meta = _fetch_point_statistics(adapter, ["mean"], ["_mean"])
+        table, column_names = _append_stat_columns(
+            pd.DataFrame({"id": ["p0"]}), dataset, 200, [(stats, meta)]
+        )
+
+        assert {column: table.loc[0, column] for column in column_names} == expected_values
+        assert (meta["in_extent"], meta["n_pixels"]) == (True, 400)
+
+    def test_one_band_list_names_point_and_count_after_the_band(self, monkeypatch):
+        """With a one-band list, the point and count-only keys also name the band."""
+        adapter, _, _ = _adapter_for_dataset_entry({"sr_landsat_annual": ["red"]})
+        _stub_statistics_request(
+            monkeypatch, adapter, {"window": {"red": 380}, "point": {"red": 0.15}}
+        )
+        # The point branch also needs Reducer.first and Geometry.Point.
+        adapter_module.ee.Reducer.first = lambda: _StubReducer("first")
+        adapter_module.ee.Geometry = SimpleNamespace(Point=lambda coordinates: "point")
+
+        stats, meta = adapter._fetch_stats_single(
+            59.85, 17.63, 200, _StubReducer("count"), ["count"], ["_count"], want_point=True
+        )
+
+        assert stats == {"red_count": 380, "red_point": 0.15}
+        assert (meta["in_extent"], meta["n_pixels"]) == (True, 380)
+
+    def test_derived_only_list_gives_circular_aspect_columns(self, monkeypatch):
+        """``[aspect]`` gives aspect-named columns, and the circular values replace mean and std."""
+        adapter, dataset, _ = _adapter_for_dataset_entry({"dem_copernicus_glo30": ["aspect"]})
+        window_result = {
+            "aspect_mean": 180.0,
+            "aspect_stdDev": 170.0,
+            "aspect_max": 359.0,
+            "aspect_count": 400,
+        }
+        recorded_requests = _stub_statistics_request(
+            monkeypatch,
+            adapter,
+            {"window": window_result, "aspect_circular": _NORTH_CIRCULAR_RESULT},
+        )
+
+        stats, meta = _fetch_point_statistics(
+            adapter, ["mean", "std", "max"], ["_mean", "_stdDev", "_max"]
+        )
+        table, column_names = _append_stat_columns(
+            pd.DataFrame({"id": ["p0"]}), dataset, 200, [(stats, meta)]
+        )
+
+        assert column_names == [
+            "dem_copernicus_glo30_aspect_mean_200m",
+            "dem_copernicus_glo30_aspect_std_200m",
+            "dem_copernicus_glo30_aspect_max_200m",
+        ]
+        circular_mean = table.loc[0, "dem_copernicus_glo30_aspect_mean_200m"]
+        assert _distance_from_north_deg(circular_mean) == pytest.approx(0.0, abs=1e-9)
+        assert table.loc[0, "dem_copernicus_glo30_aspect_std_200m"] == pytest.approx(_NORTH_STD_DEG)
+        assert table.loc[0, "dem_copernicus_glo30_aspect_max_200m"] == 359.0
+        # The window branch reduces the image of the list (only aspect), not a selection.
+        assert recorded_requests[0]["window"]["image"] == "main"
+        assert recorded_requests[0]["aspect_circular"]["image"] == "circular"

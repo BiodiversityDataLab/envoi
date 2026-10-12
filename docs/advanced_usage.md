@@ -68,16 +68,26 @@ extract(sample_points, {
 })
 ```
 
-**Date-format flexibility.** envoi follows the GBIF / Darwin Core convention and accepts the ISO 8601 variants commonly seen in occurrence records: plain `YYYY-MM-DD`, `YYYY-MM`, year-only `YYYY`, intervals like `2022-06-15/2022-06-20`, and timestamps with time-of-day or timezone. It also accepts `YYYY/MM/DD` (for example `2022/06/15`), which is the same date as `YYYY-MM-DD`. All forms are collapsed to a single `YYYY-MM-DD` per row before extraction: an interval (a value with exactly one `/` whose start is an ISO 8601 date or date-time) becomes its start day. These cases do not stop the run. envoi gives a warning, which is also recorded in the metadata sidecar:
+**Accepted date values.** envoi follows the GBIF / Darwin Core convention and reads only these date values, so that it never has to guess the order of day and month:
+
+- Text dates `YYYY`, `YYYY-MM`, and `YYYY-MM-DD`. The month and the day can have one digit (`2022-6-5` is June 5, 2022).
+- Text dates `YYYYMMDD` (`20220615`) and `YYYY/MM/DD` (`2022/06/15`). Both are the same date as `YYYY-MM-DD`.
+- Each of these forms except `YYYY/MM/DD` can also have a time of day after `T` or one space, and a time zone, such as `2022-06-15T08:00`, `2022-06-15T08:00:00Z`, `2022-06-15T08:00+02:00`, or `2022-06-15 08:00`. After a space, the time needs hours and minutes (`08:00`).
+- ISO 8601 intervals: a value with exactly one `/` whose start is a year, a year-month, or a date, optionally with a time of day, such as `2022-06-15/2022-06-20`.
+- Date and datetime values, for example a column that pandas read as dates (`datetime64`), or `datetime.date` values.
+- Whole numbers with four digits as years, such as `2022` or `2022.0`, and whole numbers with eight digits as `YYYYMMDD` dates, such as `20220615` or `20220615.0`. A CSV reader stores such columns as numbers (as decimal numbers when a value is missing).
+
+envoi reduces each value to one day (`YYYY-MM-DD`) before extraction. The day is the day as written: envoi drops the time of day and does not convert the time zone, also for datetime values with a time zone. These cases do not stop the run. envoi gives a warning, which is also recorded in the metadata sidecar:
 
 - A row with a missing date is skipped.
-- A year-only or year-month date is read as the first day of that year or month (`2022` becomes `2022-01-01`).
-- An interval is cut to its start day, and a time of day is removed.
+- A year or a year-month is read as the first day of that year or month (`2022` becomes `2022-01-01`).
+- An interval is cut to its start day, and a time of day in a text date is removed.
 
-These date values stop the run with a `ValueError` before any extraction:
+All other date values stop the run with a `ValueError` before any extraction. The message names your date column and lists up to 10 of the values, with their total number:
 
-- A value with `/` in another form, such as `15/06/2022`, `06/15/2022`, `06/2022`, or `2022/6/15`. envoi does not guess the order of day and month. The message names your date column and lists the values. Write these dates as `YYYY-MM-DD`.
-- A value that envoi cannot read as a date, such as `spring 2022` or `2022-13-45`.
+- A date in another form, such as `15/06/2022`, `06/15/2022`, `05-06-2022`, `05.06.2022`, `June 5, 2022`, `06/2022`, or `2022/6/15`. envoi does not guess the order of day and month. Write these dates as `YYYY-MM-DD`.
+- A value that is not a date, such as `spring 2022`, or a number that is not a whole number with four or eight digits, such as `2022.5` or `202206`.
+- A date that does not exist, such as `2022-02-30`, `2022-13-01`, or the number `15062022` (read as `YYYYMMDD`, its month would be 20).
 
 **Per-dataset selection policy.** For each point, envoi selects one image from the collection. The choice is controlled per-dataset by `collection_date_policy` in the catalog:
 
@@ -140,20 +150,20 @@ extract(sample_points, {
     "batch_id": "satellite",
     "datasets": [
         "dem_copernicus_glo30",                            # catalog defaults
-        {"sr_landsat_annual": ["B4", "B5"]},               # narrow bands for this run only
+        {"sr_landsat_annual": ["red", "nir"]},             # narrow bands for this run only
         {"dem_copernicus_glo30": ["DEM", "slope"]},        # mix source + derived band names
     ],
     "settings": {"output_type": "tabular", "statistics": ["mean"], "window_size_m": 200},
 })
 ```
 
-The override **replaces** the catalog's `bands` list for that dataset in that run (no merging) — if you want to keep a band the catalog already defines, list it again explicitly.
+The override **replaces** the catalog's `bands` list for that dataset in that run (no merging) — if you want to keep a band the catalog already defines, list it again explicitly. This is also true for a list of only derived bands: `{"dem_copernicus_glo30": ["aspect"]}` gives only the aspect band, without the catalog's `DEM` band.
 
 **Derived bands.** Names recognised as derived (currently `slope` and `aspect`, both computed on the fly from the dataset's first band) are split out automatically — you don't need a separate key. Derived bands only make physical sense for some datasets (DEMs, primarily), so each catalog entry that supports them declares a `supported_derived_bands` whitelist. A per-call request that isn't in that list is rejected up front with a clear error, rather than silently producing a meaningless layer. Derived bands are also Earth-Engine-only — requesting `slope` on a local raster raises `ValueError` immediately, since the local adapter doesn't run the gradient computation.
 
-**Column-naming consequences.** A one-element band override (`{"sr_landsat_annual": ["B4"]}`) keeps the multi-band column-naming style (`sr_landsat_annual_B4_mean_200m`). Use the catalog default if you instead want the bare single-band form (`sr_landsat_annual_mean_200m`) — the distinction reflects "the user picked one band out of many" versus "the dataset has only one band", which matters when downstream code keys off column names.
+**Column-naming consequences.** Every per-call band list, also a one-element list, gives columns named after the bands, for Earth Engine and local datasets. For example, `{"sr_landsat_annual": ["red"]}` gives `sr_landsat_annual_red_mean_200m`, `{"dem_copernicus_glo30": ["DEM"]}` gives `dem_copernicus_glo30_DEM_mean_200m`, and `{"dem_copernicus_glo30": ["aspect"]}` gives only `dem_copernicus_glo30_aspect_mean_200m`. Use the catalog default if you instead want the bare single-band form of a dataset with one band (`dem_copernicus_glo30_mean_200m`) — the distinction reflects "the user picked bands" versus "the dataset has only one band", which matters when downstream code keys off column names.
 
-> **Band identifiers differ by data source.** Earth Engine identifies bands by *string* names (`"B4"`, `"DEM"`, `"slope"`) because GEE exposes named bands. Local GeoTIFFs identify bands by *integer* index (`1`, `2`, `[1, 2, 3]`) because rasterio reads bands positionally. A GEE catalog entry might set `bands: ["DEM"]` and a local one `bands: 1`, and per-call overrides follow the same convention as the dataset they target.
+> **Band identifiers differ by data source.** Earth Engine identifies bands by *string* names (`"red"`, `"DEM"`, `"slope"`) because GEE exposes named bands. Local GeoTIFFs identify bands by *integer* index (`1`, `2`, `[1, 2, 3]`) because rasterio reads bands positionally. A GEE catalog entry might set `bands: ["DEM"]` and a local one `bands: 1`, and per-call overrides follow the same convention as the dataset they target.
 
 ## Circular aspect statistics
 

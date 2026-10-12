@@ -33,6 +33,7 @@ import yaml
 
 from ._filenames import describe_unsafe_path_component, is_safe_path_component
 from .adapters.earth_engine import KNOWN_DERIVED_BANDS
+from .adapters.earth_engine.adapter import _BAND_NAMING_KEY, _PER_BAND_NAMING
 
 # Keys allowed inside the full-form dict value
 # (e.g. {"sen2": {"bands": [...]}}). Adding more per-call band_overrides in the
@@ -80,9 +81,11 @@ class RunSettings:
 
     batch_id: str
     # Each entry is a (dataset_name, band_overrides) pair. `band_overrides` is an empty
-    # dict for plain-string entries in the user's `datasets` list, and contains
-    # `bands` and/or `derived_bands` keys when the user supplied a per-call
-    # override (e.g. {"sen2": ["B4", "B8"]} or {"sen2": {"bands": ["B4"]}}).
+    # dict for plain-string entries in the user's `datasets` list. When the user
+    # supplied a per-call override (e.g. {"sen2": ["B4", "B8"]} or
+    # {"sen2": {"bands": ["B4"]}}), it contains `bands` (an empty list when the
+    # override lists only derived bands), `derived_bands` when the override
+    # lists derived bands, and the mark `band_naming: "per_band"`.
     datasets: list[tuple[str, dict[str, Any]]]
     output_type: str  # "tabular" or "raster"
     output_file_format: str  # "csv", "parquet", or "dataframe"
@@ -120,6 +123,14 @@ def _normalize_dataset_entry(
                           where the inner dict accepts the keys listed in
                           `_ALLOWED_OVERRIDE_KEYS`. Reserved for future
                           per-call band_overrides; today only `bands` is allowed.
+
+    A band list replaces the catalog's bands: `bands` is always set, and is an
+    empty list when the list has only derived bands (``{"dem": ["aspect"]}``
+    then gives only the aspect band, not the catalog's source band too). The
+    band_overrides of a band list also get the mark ``band_naming: "per_band"``
+    (``_BAND_NAMING_KEY`` of the Earth Engine adapter), so the Earth Engine
+    output columns are named after the bands, also for one band. The local
+    adapter names the columns of every band list after the bands anyway.
 
     Raises ValueError for any malformed entry or unknown dataset name, so a
     single ``except ValueError`` covers every config-shape failure mode.
@@ -231,9 +242,13 @@ def _normalize_dataset_entry(
         batch_id=batch_id,
     )
 
-    band_overrides: dict[str, Any] = {}
-    if source_bands:
-        band_overrides["bands"] = source_bands
+    # The override replaces the catalog's bands, also when it lists only
+    # derived bands: an empty `bands` list then replaces the catalog's source
+    # bands in the merged config, so the output has only the derived bands.
+    band_overrides: dict[str, Any] = {
+        "bands": source_bands,
+        _BAND_NAMING_KEY: _PER_BAND_NAMING,
+    }
     if derived_bands:
         band_overrides["derived_bands"] = derived_bands
     return name, band_overrides
