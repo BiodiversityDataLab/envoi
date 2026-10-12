@@ -497,9 +497,10 @@ def _build_fallback_image(own_images, centre_day: pd.Timestamp, policy: str):
     """Return the server-side fallback image of one point: an own image near the centre day.
 
     ``own_images`` are the point's images after ``filterBounds`` and the
-    optional ``UTM_ZONE`` filter. The rules of ``policy`` ("contains", or
-    "nearest" for any other value, as in ``_resolve_date_filter_range``) are
-    in ``_nearest_fallback_step`` and ``_contains_fallback_steps``.
+    optional ``UTM_ZONE`` filter. ``policy`` is "nearest" or "contains": the
+    catalog check rejects other values, and a "mosaic" collection does not
+    select by date. The rules are in ``_nearest_fallback_step`` ("nearest")
+    and ``_contains_fallback_steps`` ("contains").
 
     The result is null on the server when no own image is in any window: the
     point's request then fails, so the point stays a failed point. Building

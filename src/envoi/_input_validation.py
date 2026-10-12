@@ -236,8 +236,9 @@ def _parse_and_validate_dates(
       A year or a year-month is read as its first day, with a warning. The
       time of day and the time zone are dropped, with a warning: the day is
       the day as written.
-    - An ISO 8601 interval: a value with exactly one ``/`` whose start is a
-      year, a year-month, or a date, optionally with a time of day
+    - An ISO 8601 interval: a value with exactly one ``/`` whose start is
+      ``YYYY``, ``YYYY-MM``, or ``YYYY-MM-DD`` with a two-digit month and day
+      (``_INTERVAL_START_PATTERN``), optionally with a time of day
       (``2021-06-15/2021-06-20``). Its start is read as above, with a warning.
     - Text ``YYYY/MM/DD``, the date ``YYYY-MM-DD``.
     - Date and datetime values (also in an object column), and the values

@@ -247,6 +247,67 @@ class TestUnknownDataSource:
 
 
 # ------------------------------------------------------------------
+# Unknown collection_date_policy — rejected when a catalog is registered or loaded.
+# ------------------------------------------------------------------
+
+
+def _earth_engine_entry(collection_date_policy) -> dict:
+    """Return an Earth Engine catalog entry with ``dataset_spec.collection_date_policy``."""
+    return {
+        "data_source": "earth_engine",
+        "path": "ECMWF/ERA5_LAND/MONTHLY_AGGR",
+        "data_type": "continuous",
+        "dataset_spec": {"collection_date_policy": collection_date_policy},
+    }
+
+
+class TestUnknownCollectionDatePolicy:
+    """A ``collection_date_policy`` other than nearest, contains, or mosaic fails at registration."""
+
+    @pytest.mark.parametrize("policy", ["nearst", "interval", "", None, 1])
+    def test_update_catalog_dict_raises_and_registers_nothing(self, policy):
+        """A dict entry with an unknown policy raises, names the value, and is not registered."""
+        with pytest.raises(CatalogError) as error_info:
+            update_catalog({"datasets": {"era5": _earth_engine_entry(policy)}})
+
+        message = str(error_info.value)
+        assert message.startswith(
+            f"datasets.era5: unknown dataset_spec.collection_date_policy {policy!r}."
+        )
+        assert message.endswith("Valid values are: contains, mosaic, nearest.")
+        assert "era5" not in load_catalogs()["datasets"]
+
+    def test_load_catalog_file_raises(self, tmp_path):
+        """A YAML entry with an unknown policy raises ``CatalogError``."""
+        catalog_path = tmp_path / "catalog.yml"
+        catalog_path.write_text(
+            yaml.safe_dump({"datasets": {"era5": _earth_engine_entry("closest")}}),
+            encoding="utf-8",
+        )
+
+        expected_message = "datasets.era5: unknown dataset_spec.collection_date_policy 'closest'"
+        with pytest.raises(CatalogError, match=expected_message):
+            load_catalog(catalog_path)
+
+    @pytest.mark.parametrize("policy", ["nearest", "contains", "mosaic", "Contains", "MOSAIC"])
+    def test_known_policies_are_accepted_in_any_letter_case(self, policy):
+        """The three policies register, also in another letter case, as the adapter reads them."""
+        update_catalog({"datasets": {"era5": _earth_engine_entry(policy)}})
+
+        registered_spec = load_catalogs()["datasets"]["era5"]["dataset_spec"]
+        assert registered_spec["collection_date_policy"] == policy
+
+    def test_builtin_catalog_loads_with_the_check(self):
+        """The built-in catalog loads, and each of its entries uses a known policy."""
+        builtin_datasets = load_catalogs(BUILTIN_EE_CATALOG)["datasets"]
+
+        for dataset_name, dataset_entry in builtin_datasets.items():
+            dataset_spec = dataset_entry.get("dataset_spec") or {}
+            policy = dataset_spec.get("collection_date_policy", "nearest")
+            assert policy in {"nearest", "contains", "mosaic"}, dataset_name
+
+
+# ------------------------------------------------------------------
 # load_catalogs — merge precedence and source-flattening.
 # ------------------------------------------------------------------
 

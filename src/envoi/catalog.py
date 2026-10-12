@@ -17,6 +17,12 @@ REQUIRED_DATASET_KEYS = {"data_source", "path"}
 # read time from the raster file when needed.
 EE_REQUIRED_DATASET_KEYS = {"data_type"}
 
+# The values of dataset_spec.collection_date_policy. The Earth Engine adapter
+# compares them without letter case. An unknown value would be read as
+# "contains" by one part of the date selection and as "nearest" by another,
+# so it is rejected when the catalog is loaded or registered.
+_COLLECTION_DATE_POLICIES = frozenset({"nearest", "contains", "mosaic"})
+
 # Module-level cache so each bundled YAML is only read once per process.
 _defaults_cache: dict[str, Any] | None = None
 
@@ -99,6 +105,24 @@ def _require_registered_data_source(name: str, data_source: Any) -> None:
         )
 
 
+def _require_known_date_policy(name: str, spec: dict[str, Any]) -> None:
+    """Raise ``CatalogError`` for an unknown ``dataset_spec.collection_date_policy``.
+
+    The value is compared without letter case, as the Earth Engine adapter
+    reads it. An entry without ``dataset_spec`` or without the key uses
+    ``nearest`` and passes.
+    """
+    dataset_spec = spec.get("dataset_spec")
+    if not isinstance(dataset_spec, Mapping) or "collection_date_policy" not in dataset_spec:
+        return
+    policy = dataset_spec["collection_date_policy"]
+    if not isinstance(policy, str) or policy.lower() not in _COLLECTION_DATE_POLICIES:
+        raise CatalogError(
+            f"datasets.{name}: unknown dataset_spec.collection_date_policy {policy!r}. "
+            f"Valid values are: {', '.join(sorted(_COLLECTION_DATE_POLICIES))}."
+        )
+
+
 def _inspect_raster(name: str, spec: dict[str, Any]) -> None:
     """Read CRS, resolution, type, and nodata from a local raster file
     and fill in any missing spec fields automatically."""
@@ -169,6 +193,7 @@ def _validate_catalog(data: dict[str, Any], source_label: str) -> dict[str, Any]
         if not isinstance(spec["data_source"], str) or not spec["data_source"]:
             raise CatalogError(f"datasets.{name}.data_source must be a non-empty string")
         _require_registered_data_source(name, spec["data_source"])
+        _require_known_date_policy(name, spec)
         if not isinstance(spec["path"], str) or not spec["path"]:
             raise CatalogError(f"datasets.{name}.path must be a non-empty string")
 
@@ -206,8 +231,8 @@ def load_catalog(path: str | Path) -> dict[str, Any]:
 
     Raises:
         CatalogError: if the file does not exist, the YAML cannot be parsed, or
-            an entry is invalid, for example without a required key or with an
-            unknown ``data_source``.
+            an entry is invalid, for example without a required key, or with an
+            unknown ``data_source`` or ``dataset_spec.collection_date_policy``.
     """
     p = Path(path)
     if not p.exists():
@@ -259,6 +284,7 @@ def _load_catalog_any(src: Any) -> dict[str, Any]:
                     f"Valid values are: {', '.join(sorted(_REG))}."
                 )
             _require_registered_data_source(name, spec["data_source"])
+            _require_known_date_policy(name, spec)
             if "path" not in spec or not spec.get("path"):
                 raise CatalogError(
                     f"datasets.{name}: missing required key 'path'.\n"
@@ -329,8 +355,9 @@ def update_catalog(source: str | Path | dict) -> None:
 
     Raises:
         CatalogError: if the source is invalid, an entry is missing a required
-            key or has an unknown ``data_source``, or a dataset name cannot be
-            used as a folder name.
+            key or has an unknown ``data_source`` or
+            ``dataset_spec.collection_date_policy``, or a dataset name cannot
+            be used as a folder name.
 
     Example:
         update_catalog("my_catalog.yml")

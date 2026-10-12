@@ -18,6 +18,7 @@ the stub can give. A test then cannot pass because of an unrelated ``ee`` error.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import math
@@ -650,14 +651,16 @@ def _record_tile_exports(adapter: GeeRasterAdapter) -> list[tuple[float, float]]
     return exported_points
 
 
-def _export_two_tiles(adapter: GeeRasterAdapter, output_dir, window_m: int, resample_m=None):
+def _export_two_tiles(
+    adapter: GeeRasterAdapter, output_dir, window_m: int, resample_m=None, *, ids=("a", "b")
+):
     """Call ``export_tiles`` for two points near Uppsala, with the dataset name ``test_dataset``."""
     return adapter.export_tiles(
         [59.85, 59.86],
         [17.63, 17.64],
         window_m,
         output_dir,
-        ids=["a", "b"],
+        ids=list(ids),
         dataset_name="test_dataset",
         resample_m=resample_m,
         disable_progress=True,
@@ -731,6 +734,37 @@ class TestTileSizeCheck:
 
         assert image.n_band_name_requests == 2
         assert exported_points == []
+
+
+class TestCaseCollisionTileNames:
+    """IDs that differ only in letter case get two tile files on Earth Engine, as on local rasters."""
+
+    def test_ids_that_differ_only_in_letter_case_get_two_files(self, tmp_path):
+        """``Site1`` and ``site1`` get two hash-suffixed names, and both tiles are written."""
+        adapter = _tile_export_adapter()
+
+        def write_tile(lat, lon, window_m, output_path, date=None, resample_m=None):
+            output_path.write_bytes(f"tile at {lat}".encode())
+            return output_path, {}
+
+        adapter._export_single = write_tile
+
+        paths, meta_list = _export_two_tiles(
+            adapter, tmp_path, window_m=200, ids=["Site1", "site1"]
+        )
+
+        # The suffix is the first 8 hex characters of the SHA-1 of the ID.
+        expected_names = [
+            f"{tile_id}-{hashlib.sha1(tile_id.encode('utf-8')).hexdigest()[:8]}-test_dataset.tif"
+            for tile_id in ("Site1", "site1")
+        ]
+        assert paths == [tmp_path / "test_dataset" / name for name in expected_names]
+        assert paths[0].name.casefold() != paths[1].name.casefold()
+        assert sorted(path.name for path in (tmp_path / "test_dataset").iterdir()) == sorted(
+            expected_names
+        )
+        assert [path.read_bytes() for path in paths] == [b"tile at 59.85", b"tile at 59.86"]
+        assert meta_list == [{}, {}]
 
 
 # ------------------------------------------------------------------
@@ -2916,6 +2950,27 @@ class TestPerPointFallbackContains:
         )
 
         assert image is None
+
+    def test_no_sample_date_searches_around_the_latest_start(self, simulated_server):
+        """Without a sample date, the centre day is the latest start; its containing image wins."""
+        # G's long image contains the latest start day of the batch (U
+        # 06-20). G 06-19 is nearer to that day, but it ends on 06-19, so
+        # it does not contain 06-20: "nearest" would select it.
+        g_images = [
+            _simulated_image("G long", "2021-06-01", "2021-07-01", points="G"),
+            _simulated_image("G 06-19", "2021-06-19 10:40", "2021-06-19 10:41", points="G"),
+        ]
+        images = _UPPSALA_IMAGES + g_images
+        simulated_server(images)
+
+        g_image, g_image_dates = _select_point_image(
+            images, "G", None, "contains", batch_points="UG"
+        )
+        u_image, _ = _select_point_image(images, "U", None, "contains", batch_points="UG")
+
+        assert _read_server_value(g_image) == "G long"
+        assert _read_server_value(g_image_dates) == _image_dates_of(g_images[0])
+        assert _read_server_value(u_image) == "U 2021-06-20"
 
 
 @pytest.mark.usefixtures("simulated_server")

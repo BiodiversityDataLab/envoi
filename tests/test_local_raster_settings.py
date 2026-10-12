@@ -20,7 +20,9 @@ import pytest
 import rasterio
 import yaml
 from pyproj import Transformer
-from rasterio.transform import from_origin
+from rasterio.crs import CRS
+from rasterio.errors import CRSError
+from rasterio.transform import Affine, from_origin
 
 from envoi import update_catalog
 from envoi.adapters.local_adapter import LocalRasterAdapter
@@ -90,11 +92,13 @@ def _write_raster(
     *,
     nodata: float | None = None,
     crs: str | None = _RASTER_CRS,
+    transform: Affine = _RASTER_TRANSFORM,
 ) -> Path:
     """Write ``pixel_values`` (bands, rows, columns) as a GeoTIFF on the test grid.
 
     ``nodata`` and ``crs`` are written only when they are not None, so the
-    file can lack a nodata value or a CRS.
+    file can lack a nodata value or a CRS. ``transform`` replaces the test
+    grid, for example with a rotated grid.
     """
     profile = {
         "driver": "GTiff",
@@ -102,7 +106,7 @@ def _write_raster(
         "width": pixel_values.shape[2],
         "count": pixel_values.shape[0],
         "dtype": str(pixel_values.dtype),
-        "transform": _RASTER_TRANSFORM,
+        "transform": transform,
     }
     if crs is not None:
         profile["crs"] = crs
@@ -362,6 +366,50 @@ class TestCatalogNodataFillsMissingFileNodata:
         assert declared_entry["nodata"] == _NODATA
         assert declared_entry["nodata_source"] == "file"
 
+    def test_rotated_grid_gives_the_resampled_tile_of_a_file_that_declares_the_nodata(
+        self, tmp_path, pixel_values
+    ):
+        """On a rotated grid, the resample_m tile equals the tile of a file that declares -9999."""
+        # The grid is rotated by 20 degrees around P. The file is read through
+        # a WarpedVRT that declares the catalog nodata. Without the grid of
+        # the file, the VRT would resample the file to a north-up grid first,
+        # so the tile would be resampled twice.
+        rotated_transform = (
+            Affine.translation(_POINT_P_X, _POINT_P_Y)
+            * Affine.rotation(20.0)
+            * Affine.translation(-_POINT_P_X, -_POINT_P_Y)
+            * _RASTER_TRANSFORM
+        )
+        catalog_path = _write_raster(
+            tmp_path / "rasters" / "rotated.tif", pixel_values, transform=rotated_transform
+        )
+        _register({"path": str(catalog_path), "nodata": _NODATA})
+        catalog_dir = _run_raster(tmp_path / "catalog", resample_m=10)
+
+        declared_path = _write_raster(
+            tmp_path / "rasters" / "rotated_declared.tif",
+            pixel_values,
+            nodata=_NODATA,
+            transform=rotated_transform,
+        )
+        _register({"path": str(declared_path)})
+        declared_dir = _run_raster(tmp_path / "declared", resample_m=10)
+
+        for tile_name in ("P-grid.tif", "Q-grid.tif"):
+            with (
+                rasterio.open(catalog_dir / tile_name) as catalog_tile,
+                rasterio.open(declared_dir / tile_name) as declared_tile,
+            ):
+                assert catalog_tile.nodata == declared_tile.nodata == _NODATA
+                assert catalog_tile.transform == declared_tile.transform
+                np.testing.assert_allclose(catalog_tile.read(), declared_tile.read(), rtol=1e-6)
+
+        # The tile of P has the nodata block and data around it.
+        with rasterio.open(declared_dir / "P-grid.tif") as declared_tile:
+            declared_values = declared_tile.read(1)
+        assert (declared_values == _NODATA).any()
+        assert (declared_values != _NODATA).any()
+
 
 class TestCatalogNodataRules:
     """The catalog ``nodata`` must be one number that fits the bands and agrees with the file."""
@@ -426,7 +474,14 @@ class TestCatalogNodataRules:
 
     @pytest.mark.parametrize(
         ("dtype", "catalog_nodata"),
-        [("uint8", -9999), ("uint8", 256), ("int16", 1.5), ("int16", math.nan)],
+        [
+            ("uint8", -9999),
+            ("uint8", 256),
+            ("int16", 1.5),
+            ("int16", math.nan),
+            # Outside the float32 range: the band would store -infinity.
+            ("float32", -3.5e38),
+        ],
     )
     def test_catalog_nodata_outside_the_band_type_raises(self, tmp_path, dtype, catalog_nodata):
         """A catalog nodata that the band type cannot store raises, for a file without nodata."""
@@ -466,6 +521,91 @@ class TestCatalogNodataRules:
         assert sidecar_entry["nodata_source"] == "catalog"
         with rasterio.open(tile_dir / "P-grid.tif") as tile:
             assert math.isnan(tile.nodata)
+
+    def test_float32_band_gets_the_nodata_value_that_it_can_store(self, tmp_path):
+        """Catalog nodata -3.4e38 on a float32 file: every read path masks the float32 value."""
+        # float32 cannot store -3.4e38 exactly. The nodata pixels of the file
+        # hold the nearest float32 number, which envoi uses and records.
+        float32_nodata = float(np.float32(-3.4e38))
+        assert float32_nodata != -3.4e38
+        pixel_values = _pixel_values_with_nodata_pixels()
+        pixel_values[pixel_values == _NODATA] = np.float32(-3.4e38)
+        raster_path = _write_raster(tmp_path / "rasters" / "float32.tif", pixel_values)
+        _register({"path": str(raster_path), "nodata": -3.4e38})
+
+        stats_df = _run_tabular(tmp_path / "out", ["count", "point"])
+        native_dir = _run_raster(tmp_path / "native")
+        resampled_dir = _run_raster(tmp_path / "resampled", resample_m=10)
+
+        # Point sample and window statistics: the nodata pixels are not data.
+        assert pd.isna(stats_df.loc[0, "grid_point"])
+        assert stats_df["grid_count_200m"].tolist() == [299, 394]
+        sidecar_entry = _sidecar_entry(tmp_path / "out" / "table_metadata.json")
+        assert sidecar_entry["nodata"] == float32_nodata
+        assert sidecar_entry["nodata_source"] == "catalog"
+
+        # Native tile: declares the float32 value, and has the 299 valid pixels.
+        with rasterio.open(native_dir / "P-grid.tif") as tile:
+            assert tile.nodata == float32_nodata
+            native_values = tile.read(1)
+        assert int((native_values != np.float32(float32_nodata)).sum()) == 299
+
+        # Resampled tile: nodata pixels, and data only from the range 100-200
+        # (a bilinear mix with -3.4e38 would be far below it).
+        with rasterio.open(resampled_dir / "P-grid.tif") as tile:
+            assert tile.nodata == float32_nodata
+            resampled_values = tile.read(1)
+        resampled_is_nodata = resampled_values == np.float32(float32_nodata)
+        assert resampled_is_nodata.any()
+        resampled_data = resampled_values[~resampled_is_nodata]
+        assert ((resampled_data >= 100.0) & (resampled_data <= 200.0)).all()
+
+    def test_float32_file_nodata_is_used_as_the_band_stores_it(self, tmp_path):
+        """A float32 file that declares nodata -3.4e38: envoi uses and records the float32 value."""
+        float32_nodata = float(np.float32(-3.4e38))
+        pixel_values = _pixel_values_with_nodata_pixels()
+        pixel_values[pixel_values == _NODATA] = np.float32(-3.4e38)
+        tiff_path = _write_raster(tmp_path / "rasters" / "float32.tif", pixel_values)
+        # GDAL's GeoTIFF driver writes the nodata value of a float32 band
+        # rounded to float32. A VRT keeps the declared text, so the file
+        # declares -3.4e38 exactly, as files from other tools can.
+        geo_transform = ", ".join(repr(value) for value in _RASTER_TRANSFORM.to_gdal())
+        raster_path = tmp_path / "rasters" / "float32_declared.vrt"
+        raster_path.write_text(
+            f"""<VRTDataset rasterXSize="{_RASTER_SIZE}" rasterYSize="{_RASTER_SIZE}">
+  <SRS>{_RASTER_CRS}</SRS>
+  <GeoTransform>{geo_transform}</GeoTransform>
+  <VRTRasterBand dataType="Float32" band="1">
+    <NoDataValue>-3.4e38</NoDataValue>
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">{tiff_path.name}</SourceFilename>
+      <SourceBand>1</SourceBand>
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>
+""",
+            encoding="utf-8",
+        )
+        with rasterio.open(raster_path) as src:
+            assert src.nodata == -3.4e38
+        _register({"path": str(raster_path)})
+
+        stats_df = _run_tabular(tmp_path / "out", ["count", "point"])
+        native_dir = _run_raster(tmp_path / "native")
+
+        # Point sample and window statistics: the nodata pixels are not data.
+        assert pd.isna(stats_df.loc[0, "grid_point"])
+        assert stats_df.loc[1, "grid_point"] == pytest.approx(pixel_values[0][_PIXEL_Q], abs=1e-4)
+        assert stats_df["grid_count_200m"].tolist() == [299, 394]
+        sidecar_entry = _sidecar_entry(tmp_path / "out" / "table_metadata.json")
+        assert sidecar_entry["nodata"] == float32_nodata
+        assert sidecar_entry["nodata_source"] == "file"
+
+        # The native tile declares the float32 value and has the 299 valid pixels.
+        with rasterio.open(native_dir / "P-grid.tif") as tile:
+            assert tile.nodata == float32_nodata
+            native_values = tile.read(1)
+        assert int((native_values != np.float32(float32_nodata)).sum()) == 299
 
 
 # ------------------------------------------------------------------
@@ -582,6 +722,44 @@ class TestCatalogCrs:
         stats_df = _run_tabular(tmp_path / "out", ["mean"])
 
         assert stats_df["grid_mean_200m"].notna().all()
+
+    def test_crs_with_only_a_non_epsg_authority_code_runs(self, tmp_path, pixel_values):
+        """A CRS with an ESRI code and no EPSG code, filled in by YAML registration, never raises."""
+        esri_code = "ESRI:102013"  # Europe Albers Equal Area Conic
+        try:
+            esri_crs = CRS.from_user_input(esri_code)
+        except CRSError:
+            pytest.skip(f"The installed PROJ database has no {esri_code}.")
+        assert esri_crs.to_epsg() is None
+        # The test grid around P, in the ESRI CRS.
+        point_x, point_y = Transformer.from_crs("EPSG:4326", esri_code, always_xy=True).transform(
+            _POINT_P_LON, _POINT_P_LAT
+        )
+        raster_path = _write_raster(
+            tmp_path / "rasters" / "esri.tif",
+            pixel_values,
+            crs=esri_code,
+            transform=from_origin(point_x - 302.5, point_y + 302.5, _PIXEL_SIZE_M, _PIXEL_SIZE_M),
+        )
+        catalog_path = tmp_path / "catalog.yml"
+        catalog_path.write_text(
+            yaml.safe_dump(
+                {"datasets": {"grid": {"data_source": "local", "path": str(raster_path)}}}
+            ),
+            encoding="utf-8",
+        )
+        filled_crs = load_catalog(catalog_path)["datasets"]["grid"]["crs"]
+        if filled_crs != esri_code:
+            pytest.skip(
+                f"GDAL did not keep the code {esri_code} in the file (read {filled_crs!r})."
+            )
+        update_catalog(str(catalog_path))
+
+        stats_df = _run_tabular(tmp_path / "out", ["mean"])
+
+        assert stats_df["grid_mean_200m"].notna().all()
+        sidecar_entry = _sidecar_entry(tmp_path / "out" / "table_metadata.json")
+        assert sidecar_entry["native_crs"] == esri_code
 
 
 # ------------------------------------------------------------------

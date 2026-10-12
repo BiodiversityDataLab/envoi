@@ -1132,7 +1132,11 @@ class TestSlashDateParsing:
             )
         ]
 
-    @pytest.mark.parametrize("bad_value", ["15/06/2021", "06/15/2021", "2021/6/5", "06/2021"])
+    @pytest.mark.parametrize(
+        "bad_value",
+        # An interval start needs a two-digit month and day (2021-6-15/... is not one).
+        ["15/06/2021", "06/15/2021", "2021/6/5", "06/2021", "2021-6-15/2021-6-20"],
+    )
     def test_other_slash_forms_raise_with_the_date_column_name(self, bad_value):
         """A value with "/" in another form raises ValueError that names the user's date column."""
         from envoi._input_validation import _parse_and_validate_dates
@@ -2905,7 +2909,9 @@ class TestWindowSmallerThanOnePixel:
         assert stats_df.loc[0, "coarse_count_50m"] == 4
         assert qc_df.loc[0, "coarse_in_extent_50m"]
         assert qc_df.loc[0, "coarse_n_pixels_50m"] == 4
-        assert qc_df.loc[0, "coarse_coverage_pct_50m"] > 0
+        # The widened window has the 4 pixel centres, all with data.
+        assert qc_df.loc[0, "coarse_coverage_pct_50m"] == 100.0
+        assert not qc_df.loc[0, "coarse_had_nodata_50m"]
         # The outputs keep the requested window, not the widened one.
         assert sidecar["config"]["window_size_m"] == 50
         assert set(sidecar["datasets"]["coarse"]["quality"]) == {"50m"}
@@ -2953,6 +2959,215 @@ class TestWindowSmallerThanOnePixel:
         assert stats["count"] == 1
         assert meta["n_pixels"] == 1
         assert meta["window_m"] == 100
+
+
+# ------------------------------------------------------------------
+# Coverage of local windows: the pixels whose centre is inside the window
+# ------------------------------------------------------------------
+
+_COVERAGE_PIXEL_SIZE_M = 10.0
+_COVERAGE_RASTER_SIZE = 40  # pixels per side
+_COVERAGE_WINDOW_M = 100
+_COVERAGE_NODATA = -9999.0
+
+
+def _coverage_grid() -> tuple[float, float, float, float]:
+    """Return ``(west, north, point_x, point_y)`` of the coverage raster in EPSG:32634.
+
+    The point of ``_SUB_PIXEL_POINT`` is 2.5 m east of the west edge and 2.5 m
+    south of the north edge of pixel (row 20, column 20). No pixel centre is
+    then on the edge of a 100 m window, and the bounding box of the window
+    has pixels whose centre is outside the window.
+    """
+    from pyproj import Transformer
+
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+    point_x, point_y = to_utm.transform(
+        _SUB_PIXEL_POINT["decimalLongitude"][0], _SUB_PIXEL_POINT["decimalLatitude"][0]
+    )
+    return point_x - 202.5, point_y + 202.5, point_x, point_y
+
+
+def _pixels_inside_coverage_window() -> np.ndarray:
+    """Return a (rows, columns) mask of the pixels whose centre is inside the 100 m window."""
+    west, north, point_x, point_y = _coverage_grid()
+    pixel_numbers = np.arange(_COVERAGE_RASTER_SIZE)
+    centre_x = west + (pixel_numbers + 0.5) * _COVERAGE_PIXEL_SIZE_M
+    centre_y = north - (pixel_numbers + 0.5) * _COVERAGE_PIXEL_SIZE_M
+    half_window_m = _COVERAGE_WINDOW_M / 2
+    inside_columns = np.abs(centre_x - point_x) < half_window_m
+    inside_rows = np.abs(centre_y - point_y) < half_window_m
+    return inside_rows[:, np.newaxis] & inside_columns[np.newaxis, :]
+
+
+def _write_coverage_raster(
+    path: Path, pixel_values: np.ndarray, nodata=None, first_column: int = 0
+) -> None:
+    """Write ``pixel_values`` (bands, rows, columns) as a float32 GeoTIFF on the coverage grid.
+
+    The file has the columns from ``first_column`` on, so with a
+    ``first_column`` above 0 its west edge is east of the grid's west edge.
+    """
+    west, north, _, _ = _coverage_grid()
+    file_west = west + first_column * _COVERAGE_PIXEL_SIZE_M
+    file_width = _COVERAGE_RASTER_SIZE - first_column
+    profile = {
+        "driver": "GTiff",
+        "height": _COVERAGE_RASTER_SIZE,
+        "width": file_width,
+        "count": pixel_values.shape[0],
+        "dtype": "float32",
+        "crs": "EPSG:32634",
+        "transform": from_bounds(
+            file_west,
+            north - _COVERAGE_RASTER_SIZE * _COVERAGE_PIXEL_SIZE_M,
+            file_west + file_width * _COVERAGE_PIXEL_SIZE_M,
+            north,
+            file_width,
+            _COVERAGE_RASTER_SIZE,
+        ),
+    }
+    if nodata is not None:
+        profile["nodata"] = nodata
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(pixel_values[:, :, first_column:].astype(np.float32))
+
+
+def _run_coverage_extraction(raster_path: Path, bands, output_dir: Path) -> tuple:
+    """Run a tabular extraction of the coverage raster with ``min_coverage_pct`` 95.
+
+    Returns ``(stats_df, qc_df, low_coverage_warnings)``.
+    """
+    update_catalog(
+        {"datasets": {"cover": {"data_source": "local", "path": str(raster_path), "bands": bands}}}
+    )
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        outputs = extract(
+            _SUB_PIXEL_POINT,
+            {
+                "batch_id": "coverage",
+                "datasets": ["cover"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean", "count"],
+                    "window_size_m": _COVERAGE_WINDOW_M,
+                    "min_coverage_pct": 95,
+                },
+            },
+            output_dir=output_dir,
+        )
+    low_coverage_warnings = [
+        str(warning.message)
+        for warning in caught_warnings
+        if str(warning.message).startswith("Low coverage")
+    ]
+    stats_df = pd.read_csv(outputs["coverage"])
+    qc_df = pd.read_csv(output_dir / "coverage_qc.csv")
+    return stats_df, qc_df, low_coverage_warnings
+
+
+class TestLocalWindowCoverage:
+    """``coverage_pct`` and ``had_nodata`` count only the pixels whose centre is inside the window."""
+
+    def test_complete_window_has_full_coverage(self, tmp_path):
+        """A window without missing data gives 100 % coverage, no nodata, and no low-coverage warning."""
+        raster_path = tmp_path / "constant.tif"
+        _write_coverage_raster(
+            raster_path, np.full((1, _COVERAGE_RASTER_SIZE, _COVERAGE_RASTER_SIZE), 5.0)
+        )
+
+        stats_df, qc_df, low_coverage_warnings = _run_coverage_extraction(
+            raster_path, 1, tmp_path / "out"
+        )
+
+        # 10 × 10 pixel centres are inside the window. Its bounding box has
+        # 11 × 11 pixels, which gave 82.6 % before.
+        assert int(_pixels_inside_coverage_window().sum()) == 100
+        assert stats_df.loc[0, "cover_count_100m"] == 100
+        assert qc_df.loc[0, "cover_n_pixels_100m"] == 100
+        assert qc_df.loc[0, "cover_coverage_pct_100m"] == 100.0
+        assert not qc_df.loc[0, "cover_had_nodata_100m"]
+        assert low_coverage_warnings == []
+
+    @pytest.mark.parametrize("bands", [1, [1, 2]])
+    def test_nodata_pixels_inside_the_window_lower_the_coverage(self, tmp_path, bands):
+        """Nodata pixels inside the window lower the coverage; those outside it do not."""
+        inside_window = _pixels_inside_coverage_window()
+        random_generator = np.random.default_rng(seed=26)
+        pixel_values = random_generator.uniform(
+            100.0, 200.0, (2, _COVERAGE_RASTER_SIZE, _COVERAGE_RASTER_SIZE)
+        )
+        # Band 1: 7 nodata pixels inside the window, and 5 in the bounding box
+        # of the window whose centre is outside it (row 25, column 25).
+        for row, column in [(15, 15), (16, 22), (18, 18), (20, 20), (22, 16), (23, 24), (24, 24)]:
+            pixel_values[0, row, column] = _COVERAGE_NODATA
+        for row, column in [(25, 15), (25, 20), (25, 25), (15, 25), (20, 25)]:
+            pixel_values[0, row, column] = _COVERAGE_NODATA
+        # Band 2: 3 more nodata pixels inside the window.
+        for row, column in [(17, 19), (19, 21), (21, 23)]:
+            pixel_values[1, row, column] = _COVERAGE_NODATA
+        raster_path = tmp_path / "with_nodata.tif"
+        _write_coverage_raster(raster_path, pixel_values, nodata=_COVERAGE_NODATA)
+
+        stats_df, qc_df, low_coverage_warnings = _run_coverage_extraction(
+            raster_path, bands, tmp_path / "out"
+        )
+
+        # A pixel is valid when it has data in every selected band.
+        selected_values = pixel_values[:1] if bands == 1 else pixel_values
+        valid_pixels = inside_window & (selected_values != _COVERAGE_NODATA).all(axis=0)
+        expected_valid = int(valid_pixels.sum())
+        assert expected_valid == (93 if bands == 1 else 90)
+        expected_coverage = 100.0 * expected_valid / int(inside_window.sum())
+        count_column = "cover_count_100m" if bands == 1 else "cover_b1_count_100m"
+        assert stats_df.loc[0, count_column] == expected_valid
+        assert qc_df.loc[0, "cover_n_pixels_100m"] == expected_valid
+        assert qc_df.loc[0, "cover_coverage_pct_100m"] == pytest.approx(expected_coverage)
+        assert qc_df.loc[0, "cover_had_nodata_100m"]
+        assert len(low_coverage_warnings) == 1
+
+    def test_window_half_beyond_the_raster_edge_has_half_coverage(self, tmp_path):
+        """The part of the window beyond the raster edge counts as missing data, as on GEE."""
+        # The file starts at column 20 of the grid, the column of the point,
+        # so its west edge is 2.5 m west of the point.
+        raster_path = tmp_path / "edge.tif"
+        _write_coverage_raster(
+            raster_path,
+            np.full((1, _COVERAGE_RASTER_SIZE, _COVERAGE_RASTER_SIZE), 5.0),
+            first_column=20,
+        )
+
+        stats_df, qc_df, low_coverage_warnings = _run_coverage_extraction(
+            raster_path, 1, tmp_path / "out"
+        )
+
+        # The window has the centres of columns 15-24 of the grid; the file
+        # has columns 20-24 of them.
+        inside_window = _pixels_inside_coverage_window()
+        expected_valid = int(inside_window[:, 20:].sum())
+        expected_coverage = 100.0 * expected_valid / int(inside_window.sum())
+        assert (expected_valid, expected_coverage) == (50, 50.0)
+        assert stats_df.loc[0, "cover_count_100m"] == expected_valid
+        assert qc_df.loc[0, "cover_in_extent_100m"]
+        assert qc_df.loc[0, "cover_n_pixels_100m"] == expected_valid
+        assert qc_df.loc[0, "cover_coverage_pct_100m"] == pytest.approx(expected_coverage)
+        assert qc_df.loc[0, "cover_had_nodata_100m"]
+        assert len(low_coverage_warnings) == 1
+
+    def test_nan_pixels_of_a_file_without_nodata_are_missing(self, tmp_path):
+        """A single band without nodata: NaN pixels are not counted in n_pixels and lower the coverage."""
+        pixel_values = np.full((1, _COVERAGE_RASTER_SIZE, _COVERAGE_RASTER_SIZE), 5.0)
+        pixel_values[0, 18:20, 18:20] = np.nan  # 4 pixels inside the window
+        raster_path = tmp_path / "nan_pixels.tif"
+        _write_coverage_raster(raster_path, pixel_values)
+
+        stats_df, qc_df, _ = _run_coverage_extraction(raster_path, 1, tmp_path / "out")
+
+        assert stats_df.loc[0, "cover_count_100m"] == 96
+        assert qc_df.loc[0, "cover_n_pixels_100m"] == 96
+        assert qc_df.loc[0, "cover_coverage_pct_100m"] == 96.0
+        assert qc_df.loc[0, "cover_had_nodata_100m"]
 
 
 class TestNativeResolutionInMetres:

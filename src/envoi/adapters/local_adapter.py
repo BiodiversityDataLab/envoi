@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -13,8 +14,12 @@ import rasterio
 from pyproj import Transformer
 from rasterio.crs import CRS
 from rasterio.errors import CRSError, RasterioIOError, WindowError
+from rasterio.features import bounds as geometry_bounds
+from rasterio.features import geometry_mask
 from rasterio.mask import mask as rio_mask
 from rasterio.warp import transform_geom
+from rasterio.windows import Window
+from rasterio.windows import transform as window_transform
 from shapely.geometry import box, mapping
 from tqdm.auto import tqdm
 
@@ -96,10 +101,14 @@ def _nodata_fits_dtype(nodata: float, dtype_name: str) -> bool:
     """Return True if a band of type ``dtype_name`` can store ``nodata``.
 
     An integer band needs a whole number (an ``int``, or a ``float`` such as
-    ``-9999.0``) within the range of its type. A float band can store any
-    number, also NaN.
+    ``-9999.0``) within the range of its type. A float band can store NaN,
+    infinity, and every number within the range of its type, for example
+    from about -3.4e38 to 3.4e38 for ``float32``.
     """
     dtype = np.dtype(dtype_name)
+    if np.issubdtype(dtype, np.floating):
+        # A finite number outside the range would become infinity in the band.
+        return not np.isfinite(nodata) or abs(nodata) <= float(np.finfo(dtype).max)
     if not np.issubdtype(dtype, np.integer):
         return True
     # NaN, infinity, and fractions such as 1.5 are not whole numbers.
@@ -107,6 +116,27 @@ def _nodata_fits_dtype(nodata: float, dtype_name: str) -> bool:
         return False
     dtype_range = np.iinfo(dtype)
     return dtype_range.min <= int(nodata) <= dtype_range.max
+
+
+def _nodata_in_band_type(nodata: Any, dtype_name: Any) -> Any:
+    """Return ``nodata`` as a band of type ``dtype_name`` stores it.
+
+    An integer band gets an ``int``, and a float band the nearest number of
+    its type as a Python ``float``: a ``float32`` band stores -3.4e38 as
+    -3.3999999521443642e38. Comparisons of pixels with the converted value
+    are then exact in every read path. Without it, the point sample would
+    count such nodata pixels as data with NumPy 1.x, where a ``float32``
+    pixel and a Python float compare as float64. None, and a value that the
+    band cannot store, are returned unchanged.
+    """
+    if nodata is None or not _nodata_fits_dtype(nodata, dtype_name):
+        return nodata
+    dtype = np.dtype(dtype_name)
+    if np.issubdtype(dtype, np.integer):
+        return int(nodata)
+    if np.issubdtype(dtype, np.floating):
+        return float(np.asarray(nodata, dtype=dtype))
+    return nodata
 
 
 def _crs_label(crs: CRS) -> str:
@@ -129,6 +159,10 @@ def _resolve_local_raster_settings(
       envoi uses it. A catalog ``nodata`` that differs raises. When the file
       declares none, envoi uses the catalog ``nodata`` for every selected
       band, if the value fits the data type of each of these bands.
+      The returned value, from the file or the catalog, is converted to the
+      data type of the bands (``_nodata_in_band_type``): an integer band
+      gets an ``int``, and a float band the nearest number that it can store
+      (for ``float32``, -3.4e38 becomes -3.3999999521443642e38).
     - CRS: When the file has a CRS, envoi uses it. A catalog ``crs`` that
       differs raises. When the file has no CRS, envoi uses the catalog
       ``crs``, and without one it raises.
@@ -210,20 +244,20 @@ def _resolve_local_raster_settings(
                 f"{context}: band(s) {invalid_band_numbers} are not in the file {path}, which "
                 f"has {src.count} band(s), numbered from 1 to {src.count}."
             )
-        declared_nodata_values = [
-            src.nodatavals[band - 1]
+        declared_nodata_by_band = {
+            band: src.nodatavals[band - 1]
             for band in band_numbers
             if src.nodatavals[band - 1] is not None
-        ]
+        }
         band_dtypes = {band: src.dtypes[band - 1] for band in band_numbers}
         # An empty CRS object counts as no CRS.
         file_crs = src.crs if src.crs else None
 
     # ---- nodata ----
-    if declared_nodata_values:
+    if declared_nodata_by_band:
         # The file's value wins. A different catalog value means that the
         # catalog entry describes another file, or has a typing error.
-        for file_nodata in declared_nodata_values:
+        for file_nodata in declared_nodata_by_band.values():
             if catalog_nodata is not None and not _nodata_values_equal(catalog_nodata, file_nodata):
                 raise ValueError(
                     f"{context}: the catalog entry sets 'nodata' to {catalog_nodata!r}, but "
@@ -231,7 +265,11 @@ def _resolve_local_raster_settings(
                     f"the nodata value of the file. Remove 'nodata' from the catalog entry, "
                     f"or set it to {file_nodata!r}."
                 )
-        nodata, nodata_source = declared_nodata_values[0], "file"
+        # Record the value as the bands store it, as _per_band_nodata gives
+        # it to the read paths.
+        first_band, first_nodata = next(iter(declared_nodata_by_band.items()))
+        nodata = _nodata_in_band_type(first_nodata, band_dtypes[first_band])
+        nodata_source = "file"
     elif catalog_nodata is not None:
         # The catalog value fills the missing nodata value of every selected
         # band, so it must be a value that each band can store.
@@ -241,12 +279,21 @@ def _resolve_local_raster_settings(
                     dtype_range = np.iinfo(np.dtype(dtype_name))
                     allowed = f"a whole number from {dtype_range.min} to {dtype_range.max}"
                 else:
-                    allowed = "a number"
+                    dtype_range = np.finfo(np.dtype(dtype_name))
+                    allowed = f"NaN or a number from {dtype_range.min:.7g} to {dtype_range.max:.7g}"
                 raise ValueError(
                     f"{context}: the catalog entry sets 'nodata' to {catalog_nodata!r}, but "
                     f"band {band} of the file {path} has the data type {dtype_name}, which "
                     f"cannot store this value. Use {allowed}."
                 )
+
+        # Use the value as the bands store it, so that every read path
+        # compares the pixels with the same number. A GeoTIFF has one data
+        # type for all bands; np.result_type covers other formats.
+        if band_dtypes:
+            catalog_nodata = _nodata_in_band_type(
+                catalog_nodata, np.result_type(*band_dtypes.values())
+            )
         nodata, nodata_source = catalog_nodata, "catalog"
     else:
         nodata, nodata_source = None, None
@@ -381,7 +428,8 @@ class LocalRasterAdapter(BaseAdapter):
         band gets the catalog value. Otherwise the values come from the file:
         ``rasterio.DatasetReader.nodatavals`` is indexed from 0, so band N
         corresponds to ``nodatavals[N - 1]``. Each entry may be ``None`` if
-        that band has no nodata declared.
+        that band has no nodata declared. Every value is converted to the data
+        type of its band (``_nodata_in_band_type``).
 
         Uses attributes:
             _nodata: The catalog nodata value when ``_nodata_source`` is
@@ -390,8 +438,14 @@ class LocalRasterAdapter(BaseAdapter):
         """
         if self._nodata_source == "catalog":
             return (self._nodata,) * len(self.band)
+        # Each file value as its band stores it (see _nodata_in_band_type),
+        # so that the point sample compares in the band's data type.
         all_nodatavals = self.src.nodatavals  # 0-indexed tuple, one per band
-        return tuple(all_nodatavals[band_num - 1] for band_num in self.band)
+        all_dtypes = self.src.dtypes
+        return tuple(
+            _nodata_in_band_type(all_nodatavals[band_num - 1], all_dtypes[band_num - 1])
+            for band_num in self.band
+        )
 
     def _per_band_dtypes(self) -> tuple:
         """Return a tuple of numpy dtype strings, one per band in ``self.band``."""
@@ -523,6 +577,59 @@ class LocalRasterAdapter(BaseAdapter):
         )
         return square_raster_geojson
 
+    def _count_window_pixels_beyond_raster(self, window_geometry: dict) -> int:
+        """Return the number of window pixels whose centre is beyond the edge of the raster.
+
+        These are the pixels of the file's pixel grid, continued beyond the
+        raster, whose centre is inside ``window_geometry`` (GeoJSON in the
+        raster CRS), with the pixel-centre rule of ``rio_mask``
+        (``all_touched=False``). They have no data, so the coverage counts
+        them as missing pixels, as Earth Engine counts the part of a window
+        outside the image. Returns 0, without a rasterization, when the
+        window is inside the raster.
+        """
+        # The rows and columns of the file grid that the window can reach,
+        # without clipping to the raster: the pixel positions of the corners
+        # of the window's bounding box. The inverse transform also works for
+        # a rotated grid.
+        left, bottom, right, top = geometry_bounds(window_geometry)
+        inverse = ~self.src.transform
+        corner_columns = []
+        corner_rows = []
+        for x, y in ((left, bottom), (left, top), (right, bottom), (right, top)):
+            corner_columns.append(inverse.a * x + inverse.b * y + inverse.c)
+            corner_rows.append(inverse.d * x + inverse.e * y + inverse.f)
+        first_column = math.floor(min(corner_columns))
+        first_row = math.floor(min(corner_rows))
+        n_columns = math.ceil(max(corner_columns)) - first_column
+        n_rows = math.ceil(max(corner_rows)) - first_row
+        window_is_inside_raster = (
+            first_column >= 0
+            and first_row >= 0
+            and first_column + n_columns <= self.src.width
+            and first_row + n_rows <= self.src.height
+        )
+        if window_is_inside_raster:
+            return 0
+
+        # The pixels whose centre is inside the window, on the continued grid.
+        grid_window = Window(first_column, first_row, n_columns, n_rows)
+        inside_window_mask = geometry_mask(
+            [window_geometry],
+            out_shape=(n_rows, n_columns),
+            transform=window_transform(grid_window, self.src.transform),
+            all_touched=False,
+            invert=True,
+        )
+
+        # Keep the pixels in a row or a column that the file does not have.
+        row_numbers = np.arange(first_row, first_row + n_rows)
+        column_numbers = np.arange(first_column, first_column + n_columns)
+        row_is_in_raster = (row_numbers >= 0) & (row_numbers < self.src.height)
+        column_is_in_raster = (column_numbers >= 0) & (column_numbers < self.src.width)
+        pixel_is_in_raster = row_is_in_raster[:, np.newaxis] & column_is_in_raster[np.newaxis, :]
+        return int((inside_window_mask & ~pixel_is_in_raster).sum())
+
     # ------------------------------------------------------------------
     # Core read
     # ------------------------------------------------------------------
@@ -604,6 +711,28 @@ class LocalRasterAdapter(BaseAdapter):
 
         # cropped_window is 2D (H, W) for a single band int, 3D (n_bands, H, W) for a list.
 
+        # The total of the coverage: the pixels of the file grid whose centre
+        # is inside the window polygon (all_touched=False), also beyond the
+        # edge of the raster. coverage_pct is the share of the window that
+        # has valid data, and the part beyond the edge has none, as on Earth
+        # Engine. The crop is the bounding box of the window, clipped to the
+        # raster, so it also has pixels outside the window, which rio_mask
+        # masks as it masks nodata pixels; they must not count. (With the
+        # crop as total, a window without missing data had a coverage of
+        # about 83 % for 100 m at 10 m pixels, and had_nodata True.) The
+        # mask of the crop uses the same geometry, transform, and shape as
+        # rio_mask, so every valid pixel is in it.
+        inside_window_mask = geometry_mask(
+            [geom_raster],
+            out_shape=cropped_window.shape[-2:],
+            transform=window_affine,
+            all_touched=False,
+            invert=True,
+        )
+        total_pixels = int(inside_window_mask.sum()) + self._count_window_pixels_beyond_raster(
+            geom_raster
+        )
+
         # rio_mask masks the pixels outside the window and the file's own
         # nodata pixels. When the file declares no nodata value and the
         # catalog sets one, it cannot know that value, so mask its pixels
@@ -646,7 +775,6 @@ class LocalRasterAdapter(BaseAdapter):
             # non-finite at that location.
             invalid_pixel_mask = band_mask.any(axis=0) | (~np.isfinite(data_float)).any(axis=0)
             valid_mask_2d = ~invalid_pixel_mask
-            total_pixels = int(valid_mask_2d.size)
             valid_pixel_count = int(valid_mask_2d.sum())
             # Shape (n_bands, n_valid_pixels) — one row per band, every column
             # is a pixel that was valid in every band.
@@ -659,20 +787,21 @@ class LocalRasterAdapter(BaseAdapter):
             )
         else:
             # Single-band: straightforward — drop masked and non-finite pixels.
-            total_pixels = cropped_window.size
-            valid_pixel_count = (
-                int(cropped_window.count())
-                if np.ma.isMaskedArray(cropped_window)
-                else int(np.isfinite(cropped_window).sum())
-            )
+            # Count the pixels after both steps, as for several bands: a NaN
+            # pixel of a file without a nodata value is not masked, but it is
+            # missing data, so it must lower the coverage.
             valid_values = (
                 cropped_window.compressed()
                 if np.ma.isMaskedArray(cropped_window)
                 else cropped_window.ravel()
             )
             valid_values = valid_values[np.isfinite(valid_values)]
+            valid_pixel_count = int(valid_values.size)
 
-        had_nodata = bool(valid_pixel_count < total_pixels)
+        # A window without a valid pixel had missing data, also a window that
+        # contains no pixel centre (total 0): a small window of a raster whose
+        # CRS has no length unit is not widened.
+        had_nodata = bool(valid_pixel_count < total_pixels or valid_pixel_count == 0)
         coverage_pct = 100.0 * (valid_pixel_count / total_pixels) if total_pixels else 0.0
 
         # JSON-safe transform: rasterio's Affine isn't JSON-serializable, so
@@ -1195,8 +1324,17 @@ class LocalRasterAdapter(BaseAdapter):
                 # declares them. Without it, a file without a CRS cannot be
                 # warped, and the bilinear interpolation would mix the catalog
                 # nodata pixels into the tile as data.
+                # The VRT keeps the grid of the file (its transform, width,
+                # and height). Without them, WarpedVRT computes a north-up
+                # grid, so a rotated or skewed raster would be resampled
+                # twice: once into the VRT, and once into the tile.
                 if self._uses_catalog_settings:
-                    vrt_options: dict[str, Any] = {"src_crs": self.raster_crs}
+                    vrt_options: dict[str, Any] = {
+                        "src_crs": self.raster_crs,
+                        "transform": self.src.transform,
+                        "width": self.src.width,
+                        "height": self.src.height,
+                    }
                     if self._nodata_source == "catalog":
                         vrt_options["src_nodata"] = self._nodata
                     resample_source = WarpedVRT(self.src, **vrt_options)
