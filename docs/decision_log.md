@@ -169,3 +169,19 @@ The specification of this work is in a task folder that is not committed, so eac
 - **Rejected:**
   - Raise an error for such IDs: it would block data sets whose IDs are case-sensitive.
   - Add the suffix only to the second ID of a group: the name of an ID would depend on the order of the input rows.
+
+### Catalog nodata and crs for local rasters
+
+- **Decision:** the catalog keys `nodata` and `crs` of a local raster fill a value that the file does not declare. A catalog value that differs from the file's value raises `ValueError`.
+  - `nodata` is one number. A list raises `ValueError`. A GeoTIFF has one nodata value for all its bands, so one value is enough, and the value that `_inspect_raster` copies from the file always agrees with the file.
+  - When the file declares no nodata value, envoi uses the catalog `nodata` for every selected band in every read path: the point sample, the window statistics (the adapter masks the value after `rio_mask`), the native tile, and the `resample_m` tile. The value must fit the data type of every selected band: an integer band needs a whole number (an `int`, or a `float` without a fractional part such as `-9999.0`) in the range of the type; a float band accepts any number or NaN.
+  - When the file declares a nodata value, envoi uses it. A catalog value that differs raises. Equal values do not raise, also NaN and NaN, and `-32768` and `-32768.0`.
+  - When the file has no CRS, envoi uses the catalog `crs` in every read path. Without a catalog `crs`, envoi raises `ValueError`. When the file has a CRS, envoi uses it. The comparison with a catalog `crs` first compares the EPSG codes with the same `to_epsg()` rule as `_inspect_raster`. When either CRS has no EPSG code, `CRS.equals` decides.
+  - `extract()` runs these checks for every local dataset of every run config, with the bands that the run config selects, before the first adapter is built. The adapter runs the same function (`_resolve_local_raster_settings`) and stores its result.
+  - The `resample_m` tile reads the file through a `rasterio.vrt.WarpedVRT` that declares the catalog CRS or nodata value, because `reproject()` ignores `src_crs` for a `rasterio.band()` source.
+  - The sidecar of a local dataset records `nodata` (a number, `"nan"` for NaN, or null) and `nodata_source` (`"file"`, `"catalog"`, or null). `resolution_m` stays informational.
+- **Reason:** before, the adapter ignored a catalog `nodata` and `crs`, although the catalog accepted them. For a file without a declared nodata value, pixels with the documented nodata value counted as data in every statistic, without a warning.
+  The read paths find the nodata pixels in different ways: the window statistics get the file's nodata mask from `rio_mask`, the point sample compares each pixel with the nodata value, and the `resample_m` tile gives the value to GDAL. To fill a missing value, each path needs only one more mask or one more setting. To replace a value that the file declares, the window reader would need a rewrite.
+- **Rejected:**
+  - The catalog value replaces the file's value: the read paths mask the file's value in different ways, so a replacement needs a rewrite of the window reader, and a wrong catalog value would silently change results.
+  - Reject the keys `nodata` and `crs` for local rasters: files without a CRS or without a declared nodata value could then not be used correctly.

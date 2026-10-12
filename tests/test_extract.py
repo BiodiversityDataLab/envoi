@@ -399,6 +399,34 @@ class TestTabular:
                     value
                 ), f"expected NaN at b{band_index}_{reducer_name} for OOB point, got {value}"
 
+    def test_user_columns_keep_their_decimals(self, sample_df, tmp_path):
+        """Only envoi's statistic columns are rounded; an input column keeps all 8 decimals."""
+        input_df = sample_df.copy()
+        habitat_index = [0.12345678, 1.23456789, 2.34567891, 3.45678912, 4.56789123, 5.67891234]
+        input_df["habitat_index"] = habitat_index
+
+        stats_df = extract(
+            input_df,
+            {
+                "batch_id": "decimals",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean", "point"],
+                    "window_size_m": [100, 200],
+                    "output_file_format": "dataframe",
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        assert stats_df["habitat_index"].tolist() == habitat_index
+        # The statistic columns of every window, and the point column, are
+        # still rounded to 5 decimals (stats_output_decimals).
+        for column in ("dem_local_mean_100m", "dem_local_mean_200m", "dem_local_point"):
+            assert stats_df[column].tolist() == stats_df[column].round(5).tolist(), column
+            assert stats_df[column].notna().all(), column
+
 
 # ------------------------------------------------------------------
 # Custom input column names
@@ -2924,7 +2952,7 @@ class TestAppendStatColumnsClassFill:
             ({"class_10_count": 5, "class_20_count": 3}, {}),
             ({"class_20_count": 4, "class_30_count": 2}, {}),
         ]
-        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+        result, _ = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
         # Union of classes across both rows.
         assert result["lulc_class_10_count_200m"].tolist() == [5, 0]
         assert result["lulc_class_20_count_200m"].tolist() == [3, 4]
@@ -2941,7 +2969,7 @@ class TestAppendStatColumnsClassFill:
             ({"class_10_fraction": 0.5, "class_20_fraction": 0.5}, {}),
             ({"class_10_fraction": 1.0}, {}),
         ]
-        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+        result, _ = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
         # Row 1's class_20 is absent — must be filled with the float 0.0
         # (not None / NaN / int 0).
         col = "lulc_class_20_fraction_200m"
@@ -2960,7 +2988,7 @@ class TestAppendStatColumnsClassFill:
             ({"mean": 1.5}, {}),
             ({}, {}),  # row 1 has no stats at all
         ]
-        result = _append_stat_columns(df, "dem", window_size_m=100, stats_results=stats_results)
+        result, _ = _append_stat_columns(df, "dem", window_size_m=100, stats_results=stats_results)
         # Row 1's mean is missing — must be NaN, not 0.
         assert pd.isna(result["dem_mean_100m"].iloc[1])
 
@@ -2975,7 +3003,7 @@ class TestAppendStatColumnsClassFill:
             ({"b1_class_10_count": 5, "b2_class_10_count": 4}, {}),
             ({"b1_class_20_count": 3}, {}),
         ]
-        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+        result, _ = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
         assert result["lulc_b1_class_10_count_200m"].tolist() == [5, 0]
         assert result["lulc_b1_class_20_count_200m"].tolist() == [0, 3]
         # b2_class_10 only appears in row 0; row 1 is zero-filled.
@@ -2992,7 +3020,7 @@ class TestAppendStatColumnsClassFill:
             ({"classification_class_10_count": 5, "classification_class_10_fraction": 0.25}, {}),
             ({"classification_class_12_count": 20, "classification_class_12_fraction": 1.0}, {}),
         ]
-        result = _append_stat_columns(
+        result, _ = _append_stat_columns(
             df, "lulc_naturallands_2020", window_size_m=200, stats_results=stats_results
         )
         prefix = "lulc_naturallands_2020_classification"
@@ -3011,7 +3039,7 @@ class TestAppendStatColumnsClassFill:
             ({}, {"error": "RasterioIOError: stub: damaged block"}),
             ({"class_20_count": 2, "class_20_fraction": 1.0}, {}),
         ]
-        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+        result, _ = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
 
         assert list(result.columns) == [
             "id",

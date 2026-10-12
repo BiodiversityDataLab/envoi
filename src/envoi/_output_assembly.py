@@ -7,8 +7,8 @@ Responsibilities:
 * :func:`_append_stat_columns` — turn per-point ``(stats_dict, meta_dict)``
   results into named DataFrame columns, with special handling for the per-
   class keys produced by ``class_count`` / ``class_fraction``.
-* :func:`_round_stat_columns` — round all non-core stat columns to a uniform
-  decimal precision for output stability.
+* :func:`_round_stat_columns` — round the statistic columns that envoi added
+  to a uniform decimal precision for output stability.
 * :func:`_restore_user_column_names` — invert the canonical ``id``/``lat``/
   ``lon``/``date`` rename so user-chosen names round-trip through extract().
 * :func:`_resolve_dataset_metadata` — record what bands were actually applied
@@ -36,16 +36,20 @@ _CLASS_COLUMN_RE = re.compile(r"^(?:\w+_)?class_-?\d+_(count|fraction)$")
 
 def _round_stat_columns(
     stats_df: pd.DataFrame,
-    core_columns: list[str],
+    stat_columns: list[str],
     decimals: int,
 ) -> pd.DataFrame:
-    """Round all non-core stat columns to the given number of decimal places.
+    """Round the statistic columns that envoi added to ``decimals`` places.
 
-    Core columns (id, lat, lon, date) are excluded so coordinate precision
-    is preserved exactly as the user supplied it.
+    ``stat_columns`` lists the column names that ``_append_stat_columns``
+    returned for each dataset and window. A name can occur more than once,
+    because point columns are the same for every window. All other columns
+    keep their values: the core columns (id, lat, lon, date) and the user's
+    own input columns, whose precision envoi must not change.
     """
-    stat_columns = [c for c in stats_df.columns if c not in core_columns]
-    stats_df[stat_columns] = stats_df[stat_columns].round(decimals)
+    columns_to_round = list(dict.fromkeys(stat_columns))
+    if columns_to_round:
+        stats_df[columns_to_round] = stats_df[columns_to_round].round(decimals)
     return stats_df
 
 
@@ -102,7 +106,7 @@ def _append_stat_columns(
     dataset_name: str,
     window_size_m: int,
     stats_results: list[tuple[dict, dict]],
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, list[str]]:
     """Append adapter statistics columns to the output dataframe.
 
     Expected stat keys from adapters:
@@ -124,6 +128,10 @@ def _append_stat_columns(
     A failed point (its meta dict has ``error``) has no statistic keys. It gets
     a null value in every column, class columns included: its read failed, so
     "class not observed" does not apply. It adds no column of its own.
+
+    Returns ``(df, stat_column_names)``: the dataframe with the statistic
+    columns, and the names of these columns (new and overwritten ones), so
+    that only they are rounded for output.
     """
     # Collect keys in first-seen order so output columns stay stable across runs.
     stat_keys = dict.fromkeys(key for stat_dict, _ in stats_results for key in stat_dict)
@@ -133,11 +141,13 @@ def _append_stat_columns(
     # which can happen for point stats when multiple window sizes are run.
     new_columns: dict[str, list] = {}
     existing_columns = set(df.columns)
+    stat_column_names: list[str] = []
     for stat_key in stat_keys:
         if stat_key == "point" or stat_key.endswith("_point"):
             column_name = f"{dataset_name}_{stat_key}"
         else:
             column_name = f"{dataset_name}_{stat_key}_{window_size_m}m"
+        stat_column_names.append(column_name)
 
         # Decide the fill value for missing entries:
         # - class_*_count   -> 0   (absent class = zero pixels)
@@ -166,7 +176,7 @@ def _append_stat_columns(
     if new_columns:
         df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
 
-    return df
+    return df, stat_column_names
 
 
 def _write_tabular(df: pd.DataFrame, name: str, output_dir: Path, output_file_format: str) -> Path:

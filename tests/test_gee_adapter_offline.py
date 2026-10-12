@@ -1155,9 +1155,10 @@ class TestFailedPointsInBatch:
             results = adapter.fetch_stats_batch(
                 _THREE_LATS, _THREE_LONS, 200, statistics, disable_progress=True
             )
-            tables.append(
-                _append_stat_columns(pd.DataFrame({"id": _THREE_IDS}), "stub_gee", 200, results)
+            table, _ = _append_stat_columns(
+                pd.DataFrame({"id": _THREE_IDS}), "stub_gee", 200, results
             )
+            tables.append(table)
         table_without_failure, table_with_failure = tables
 
         assert list(table_with_failure.columns) == ["id", *expected_columns]
@@ -1522,7 +1523,9 @@ class TestCountOnlyStatistics:
         _stub_statistics_request(monkeypatch, adapter, {"window": {"B1": 400, "B2": 380}})
 
         stats, meta = _fetch_point_statistics(adapter, ["count"], ["_count"])
-        table = _append_stat_columns(pd.DataFrame({"id": ["p0"]}), "stub_gee", 200, [(stats, meta)])
+        table, _ = _append_stat_columns(
+            pd.DataFrame({"id": ["p0"]}), "stub_gee", 200, [(stats, meta)]
+        )
 
         assert stats == {"B1_count": 400, "B2_count": 380}
         assert table.loc[0, ["stub_gee_B1_count_200m", "stub_gee_B2_count_200m"]].tolist() == [

@@ -30,6 +30,7 @@ from ._output_assembly import (
     _write_tabular,
 )
 from .adapters import get_adapter
+from .adapters.local_adapter import _resolve_local_raster_settings
 from .catalog import BUILTIN_EE_CATALOG, load_catalogs, load_defaults
 from .metadata import write_metadata_sidecar
 from .progress import ProgressCallback, ProgressEvent, ProgressStepCallback
@@ -302,6 +303,19 @@ def extract(
         quoted_batch_ids = ", ".join(f"'{batch_id}'" for batch_id in raster_batch_ids)
         _validate_sample_ids(df["id"], id_column, context=f"Output {quoted_batch_ids}")
 
+    # Check the CRS and nodata settings of every local raster, with the bands
+    # that each run config selects, before the first adapter is built. A
+    # catalog `nodata` or `crs` that conflicts with the file, or a file
+    # without any CRS, then stops the call before any output is written.
+    for run_settings in all_run_settings:
+        for dataset, band_overrides in run_settings.datasets:
+            merged_config = {**catalog_datasets[dataset], **(band_overrides or {})}
+            if merged_config.get("data_source") == "local":
+                _resolve_local_raster_settings(
+                    merged_config,
+                    context=f"Output '{run_settings.batch_id}': dataset '{dataset}'",
+                )
+
     for run_settings in all_run_settings:
         df_copy = df.copy()
 
@@ -327,6 +341,9 @@ def extract(
         # Accumulate QC column names across all datasets and window sizes so that
         # split_stats_and_qc can use the explicit list rather than substring matching.
         all_qc_columns: list[str] = []
+        # The statistic columns that envoi adds, collected the same way. Only
+        # these are rounded, so the user's own columns keep their values.
+        all_stat_columns: list[str] = []
 
         for dataset, band_overrides in datasets:
             # Look up the dataset's catalog entry once; both processing modes need it.
@@ -341,6 +358,7 @@ def extract(
                     (
                         df_copy,
                         dataset_meta,
+                        dataset_stat_columns,
                         dataset_qc_columns,
                         quality_key,
                         reducer_warning,
@@ -364,6 +382,7 @@ def extract(
                             unit="pt",
                         ),
                     )
+                    all_stat_columns.extend(dataset_stat_columns)
                     all_qc_columns.extend(dataset_qc_columns)
                     # Record the reducer/data_type mismatch (if any) in the
                     # per-dataset warnings backlog. The message is identical
@@ -464,7 +483,7 @@ def extract(
             stats_df, qc_df = split_stats_and_qc(df_copy, core_columns, all_qc_columns)
 
             stats_df = _round_stat_columns(
-                stats_df, core_columns, defaults["stats_output_decimals"]
+                stats_df, all_stat_columns, defaults["stats_output_decimals"]
             )
 
             # When the coordinates were reprojected to WGS84 (input_crs was
@@ -557,7 +576,7 @@ def _process_dataset_tabular(
     write_metadata: bool = True,
     quiet: bool = False,
     progress_callback: ProgressStepCallback | None = None,
-) -> tuple[pd.DataFrame, dict, list[str], str, str | None, str | None]:
+) -> tuple[pd.DataFrame, dict, list[str], list[str], str, str | None, str | None]:
     """Fetch stats and QC columns for one dataset/window pair in tabular mode.
 
     Owns adapter instantiation, statistic computation, QC column assembly,
@@ -573,8 +592,10 @@ def _process_dataset_tabular(
     ``write_metadata`` tells whether ``extract()`` writes the QC table, so
     that the failed-point warning names a place where the errors are.
 
-    Returns ``(df, dataset_meta, qc_column_names, quality_key,
-    reducer_warning, failed_point_warning)`` where ``quality_key`` is the key
+    Returns ``(df, dataset_meta, stat_column_names, qc_column_names,
+    quality_key, reducer_warning, failed_point_warning)`` where
+    ``stat_column_names`` are the statistic columns that the batch added (the
+    caller rounds only these), ``quality_key`` is the key
     of the batch's quality summary and the end of its QC column names
     (``"200m"``, or ``"point"`` for a point-only run), and
     ``reducer_warning`` is the message from
@@ -641,7 +662,7 @@ def _process_dataset_tabular(
 
         # Append stat columns to the output DataFrame based on the keys in
         # stats_results, and assign values accordingly.
-        df = _append_stat_columns(df, dataset, window_size, stats_results)
+        df, stat_column_names = _append_stat_columns(df, dataset, window_size, stats_results)
 
         # Attach per-row QC columns and capture the coverage summary used below
         # when assembling the per-dataset metadata dict.
@@ -688,6 +709,7 @@ def _process_dataset_tabular(
     return (
         df,
         dataset_meta,
+        stat_column_names,
         qc_column_names,
         quality_key,
         reducer_warning,

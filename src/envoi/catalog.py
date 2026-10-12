@@ -198,7 +198,11 @@ def load_catalog(path: str | Path) -> dict[str, Any]:
     For each local entry whose file exists, the raster's ``crs``,
     ``resolution_m`` (in metres), ``nodata``, and ``band_count`` are added to
     the entry when the entry does not set them. A raster that cannot be read
-    gives a logged warning, not an error.
+    gives a logged warning, not an error. ``resolution_m`` and ``band_count``
+    are for information only. An extraction uses the file's own CRS and
+    nodata value; the entry's ``crs`` and ``nodata`` only fill a value that
+    the file does not declare, and ``extract()`` raises ``ValueError`` when
+    they differ from the file's values.
 
     Raises:
         CatalogError: if the file does not exist, the YAML cannot be parsed, or
@@ -314,7 +318,10 @@ def update_catalog(source: str | Path | dict) -> None:
     metadata of local rasters to their entries. Entries of a dict are checked
     for the same required keys, but are stored without reading the raster
     files. In both cases, the local adapter reads the CRS, pixel size, nodata,
-    and band count from the file when an extraction opens it.
+    and band count from the file when an extraction opens it. The entry's
+    ``crs`` and ``nodata`` only fill a CRS or nodata value that the file does
+    not declare; ``extract()`` raises ``ValueError`` when they differ from the
+    file's values.
 
     Args:
         source: A path to a catalog YAML file, or a dict in the format:

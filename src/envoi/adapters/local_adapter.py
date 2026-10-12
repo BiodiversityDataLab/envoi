@@ -1,6 +1,7 @@
 # src/envoi/adapters/local_adapter.py
 from __future__ import annotations
 
+import contextlib
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -10,7 +11,8 @@ from typing import Any
 import numpy as np
 import rasterio
 from pyproj import Transformer
-from rasterio.errors import RasterioIOError, WindowError
+from rasterio.crs import CRS
+from rasterio.errors import CRSError, RasterioIOError, WindowError
 from rasterio.mask import mask as rio_mask
 from rasterio.warp import transform_geom
 from shapely.geometry import box, mapping
@@ -59,6 +61,227 @@ def _is_nodata(value, nodata) -> bool:
     return value == nodata
 
 
+# ----------------------------------------------------------------------
+# Raster settings: the CRS and nodata value that every read uses
+# ----------------------------------------------------------------------
+
+
+def _selected_band_numbers(bands_spec: Any, band_count: int) -> list[int]:
+    """Return the 1-based band numbers that a ``bands`` setting selects.
+
+    ``None`` selects every band of the file. A list or tuple selects its
+    bands, and a single value selects one band.
+    """
+    if bands_spec is None:
+        return list(range(1, band_count + 1))
+    if isinstance(bands_spec, (list, tuple)):
+        return [int(band) for band in bands_spec]
+    return [int(bands_spec)]
+
+
+def _nodata_values_equal(first_value: Any, second_value: Any) -> bool:
+    """Return True if two nodata values are the same number.
+
+    NaN equals NaN here, because ``nan == nan`` is False. An integer and a
+    float with the same value (``-32768`` and ``-32768.0``) are equal.
+    """
+    first_is_nan = isinstance(first_value, float) and np.isnan(first_value)
+    second_is_nan = isinstance(second_value, float) and np.isnan(second_value)
+    if first_is_nan or second_is_nan:
+        return first_is_nan and second_is_nan
+    return first_value == second_value
+
+
+def _nodata_fits_dtype(nodata: float, dtype_name: str) -> bool:
+    """Return True if a band of type ``dtype_name`` can store ``nodata``.
+
+    An integer band needs a whole number (an ``int``, or a ``float`` such as
+    ``-9999.0``) within the range of its type. A float band can store any
+    number, also NaN.
+    """
+    dtype = np.dtype(dtype_name)
+    if not np.issubdtype(dtype, np.integer):
+        return True
+    # NaN, infinity, and fractions such as 1.5 are not whole numbers.
+    if isinstance(nodata, float) and not nodata.is_integer():
+        return False
+    dtype_range = np.iinfo(dtype)
+    return dtype_range.min <= int(nodata) <= dtype_range.max
+
+
+def _crs_label(crs: CRS) -> str:
+    """Return ``EPSG:<code>`` for a CRS with an EPSG code, otherwise its text form."""
+    epsg = crs.to_epsg()
+    return f"EPSG:{epsg}" if epsg is not None else crs.to_string()
+
+
+def _resolve_local_raster_settings(
+    spec: dict[str, Any], *, context: str = "Local raster"
+) -> tuple[CRS, int | float | None, str | None]:
+    """Resolve the CRS and the nodata value that envoi uses for a local raster.
+
+    Opens the file of ``spec["path"]`` (and closes it again) and combines the
+    file's own CRS and nodata value with the optional catalog keys ``crs`` and
+    ``nodata``. The catalog keys fill values that the file does not declare;
+    they never replace a value of the file:
+
+    - nodata: When the file declares a nodata value for the selected bands,
+      envoi uses it. A catalog ``nodata`` that differs raises. When the file
+      declares none, envoi uses the catalog ``nodata`` for every selected
+      band, if the value fits the data type of each of these bands.
+    - CRS: When the file has a CRS, envoi uses it. A catalog ``crs`` that
+      differs raises. When the file has no CRS, envoi uses the catalog
+      ``crs``, and without one it raises.
+
+    The values that ``catalog._inspect_raster`` copies from the file into a
+    catalog entry never raise: a GeoTIFF has one nodata value for all bands,
+    and the CRS comparison uses the same ``to_epsg()`` rule as that function.
+
+    ``extract()`` calls this for every local dataset of every run config
+    before the first adapter is built, and ``LocalRasterAdapter`` calls it
+    again to store the result.
+
+    Args:
+        spec: The merged catalog entry: the catalog entry plus the run
+            config's band overrides. Uses ``path``, ``bands``, ``nodata``,
+            and ``crs``.
+        context: The start of each error message, for example
+            ``"Output 'terrain': dataset 'my_dem'"``.
+
+    Returns:
+        ``(crs, nodata, nodata_source)``: the rasterio CRS that every read
+        uses; the nodata value of the selected bands, or None when there is
+        none; and where that value comes from: ``"file"``, ``"catalog"``, or
+        None.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If the catalog ``nodata`` is not one number, does not fit
+            the data type of a selected band, or differs from the file's
+            nodata value; if the catalog ``crs`` is not a valid CRS or differs
+            from the file's CRS; if the file and the catalog entry have no
+            CRS; or if a selected band is not in the file.
+    """
+    path = Path(spec["path"])
+    if not path.exists():
+        raise FileNotFoundError(f"Raster not found: {path}")
+
+    # ---- catalog values ----
+    catalog_nodata = spec.get("nodata")
+    if catalog_nodata is not None:
+        # A GeoTIFF has one nodata value for all its bands, so a list of
+        # values (one per band) cannot be applied or compared.
+        if isinstance(catalog_nodata, (list, tuple)):
+            raise ValueError(
+                f"{context}: the catalog entry sets 'nodata' to a list ({catalog_nodata!r}). "
+                f"'nodata' must be one number, which envoi uses for every band, because a "
+                f"GeoTIFF has one nodata value for all its bands."
+            )
+        if isinstance(catalog_nodata, (bool, np.bool_)) or not isinstance(
+            catalog_nodata, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(
+                f"{context}: the catalog entry sets 'nodata' to {catalog_nodata!r}, which is "
+                f"not a number. Set it to one number, for example -9999 (for NaN, write .nan "
+                f"in a YAML file or float('nan') in Python)."
+            )
+        # Plain Python numbers, so that the comparisons below and the JSON
+        # sidecar do not depend on NumPy scalar types.
+        if isinstance(catalog_nodata, (int, np.integer)):
+            catalog_nodata = int(catalog_nodata)
+        else:
+            catalog_nodata = float(catalog_nodata)
+
+    catalog_crs = None
+    if spec.get("crs") is not None:
+        try:
+            catalog_crs = CRS.from_user_input(spec["crs"])
+        except CRSError as error:
+            raise ValueError(
+                f"{context}: the catalog entry sets 'crs' to {spec['crs']!r}, which is not a "
+                f"valid CRS. Use an EPSG code, for example 'EPSG:32633'."
+            ) from error
+
+    with rasterio.open(path) as src:
+        band_numbers = _selected_band_numbers(spec.get("bands"), src.count)
+        invalid_band_numbers = [band for band in band_numbers if not 1 <= band <= src.count]
+        if invalid_band_numbers:
+            raise ValueError(
+                f"{context}: band(s) {invalid_band_numbers} are not in the file {path}, which "
+                f"has {src.count} band(s), numbered from 1 to {src.count}."
+            )
+        declared_nodata_values = [
+            src.nodatavals[band - 1]
+            for band in band_numbers
+            if src.nodatavals[band - 1] is not None
+        ]
+        band_dtypes = {band: src.dtypes[band - 1] for band in band_numbers}
+        # An empty CRS object counts as no CRS.
+        file_crs = src.crs if src.crs else None
+
+    # ---- nodata ----
+    if declared_nodata_values:
+        # The file's value wins. A different catalog value means that the
+        # catalog entry describes another file, or has a typing error.
+        for file_nodata in declared_nodata_values:
+            if catalog_nodata is not None and not _nodata_values_equal(catalog_nodata, file_nodata):
+                raise ValueError(
+                    f"{context}: the catalog entry sets 'nodata' to {catalog_nodata!r}, but "
+                    f"the file {path} declares the nodata value {file_nodata!r}. envoi uses "
+                    f"the nodata value of the file. Remove 'nodata' from the catalog entry, "
+                    f"or set it to {file_nodata!r}."
+                )
+        nodata, nodata_source = declared_nodata_values[0], "file"
+    elif catalog_nodata is not None:
+        # The catalog value fills the missing nodata value of every selected
+        # band, so it must be a value that each band can store.
+        for band, dtype_name in band_dtypes.items():
+            if not _nodata_fits_dtype(catalog_nodata, dtype_name):
+                if np.issubdtype(np.dtype(dtype_name), np.integer):
+                    dtype_range = np.iinfo(np.dtype(dtype_name))
+                    allowed = f"a whole number from {dtype_range.min} to {dtype_range.max}"
+                else:
+                    allowed = "a number"
+                raise ValueError(
+                    f"{context}: the catalog entry sets 'nodata' to {catalog_nodata!r}, but "
+                    f"band {band} of the file {path} has the data type {dtype_name}, which "
+                    f"cannot store this value. Use {allowed}."
+                )
+        nodata, nodata_source = catalog_nodata, "catalog"
+    else:
+        nodata, nodata_source = None, None
+
+    # ---- CRS ----
+    if file_crs is None:
+        if catalog_crs is None:
+            raise ValueError(
+                f"{context}: the file {path} has no CRS, and the catalog entry has no "
+                f"'crs'. Add the CRS of the file to the catalog entry, for example "
+                f"crs: 'EPSG:32633'."
+            )
+        return catalog_crs, nodata, nodata_source
+
+    if catalog_crs is not None:
+        # Compare EPSG codes first, as catalog._inspect_raster writes the code
+        # of the file's CRS. A WKT text can differ in details from the file's
+        # own CRS although both describe the same CRS.
+        file_epsg = file_crs.to_epsg()
+        catalog_epsg = catalog_crs.to_epsg()
+        if file_epsg is not None and catalog_epsg is not None:
+            crs_matches = file_epsg == catalog_epsg
+        else:
+            # CRS.equals() exists only from rasterio 1.4; envoi supports 1.3,
+            # where == compares the two CRS definitions.
+            crs_matches = file_crs == catalog_crs
+        if not crs_matches:
+            raise ValueError(
+                f"{context}: the catalog entry sets 'crs' to {spec['crs']!r}, but the file "
+                f"{path} has the CRS {_crs_label(file_crs)}. envoi uses the CRS of the file. "
+                f"Remove 'crs' from the catalog entry, or correct it."
+            )
+    return file_crs, nodata, nodata_source
+
+
 @dataclass
 class LocalRasterAdapter(BaseAdapter):
     spec: dict[str, Any]
@@ -79,7 +302,17 @@ class LocalRasterAdapter(BaseAdapter):
         # run — and the file descriptor would leak for the lifetime of the
         # interpreter. Re-raise so the original error reaches the caller.
         try:
-            self.raster_crs = self.src.crs
+            # The CRS and the nodata value that every read uses: the file's
+            # own values, or the catalog's `crs` and `nodata` where the file
+            # declares none. Resolve them before anything that needs the CRS.
+            # _nodata_source is "file", "catalog", or None (no nodata value).
+            self.raster_crs, self._nodata, self._nodata_source = _resolve_local_raster_settings(
+                self.spec
+            )
+            # A tile with resample_m must read the file through a WarpedVRT
+            # that declares these catalog values (see export_tiles).
+            self._uses_catalog_settings = self._nodata_source == "catalog" or not self.src.crs
+
             # Native pixel width in metres, or None for a CRS without a
             # length unit. Used for the sidecar and for sub-pixel windows.
             self._native_pixel_size_m = pixel_size_m(self.raster_crs, self.src.res[0])
@@ -113,17 +346,17 @@ class LocalRasterAdapter(BaseAdapter):
         "I want one band" (scalar) from "I want this list of bands which
         happens to have one element" (still list-shaped output).
         """
+        # The band list follows the same rule as the settings check in
+        # _resolve_local_raster_settings, through _selected_band_numbers.
+        self.band = _selected_band_numbers(bands_spec, self.src.count)
         if bands_spec is None:
-            self.band = list(range(1, self.src.count + 1))
             self._is_multiband = len(self.band) > 1
         elif isinstance(bands_spec, (list, tuple)):
-            self.band = [int(b) for b in bands_spec]
             # Explicit list → always use per-band naming, even at length 1.
             self._is_multiband = True
         else:
             # Scalar (int / numpy scalar) — wrap in a list internally but keep
             # flat naming for backward compatibility with single-band specs.
-            self.band = [int(bands_spec)]
             self._is_multiband = False
 
     def close(self) -> None:
@@ -144,10 +377,19 @@ class LocalRasterAdapter(BaseAdapter):
     def _per_band_nodata(self) -> tuple:
         """Return a tuple of nodata values, one per band in ``self.band``.
 
+        When the file declares no nodata value and the catalog sets one, every
+        band gets the catalog value. Otherwise the values come from the file:
         ``rasterio.DatasetReader.nodatavals`` is indexed from 0, so band N
         corresponds to ``nodatavals[N - 1]``. Each entry may be ``None`` if
         that band has no nodata declared.
+
+        Uses attributes:
+            _nodata: The catalog nodata value when ``_nodata_source`` is
+                ``"catalog"``.
+            _nodata_source: ``"file"``, ``"catalog"``, or None.
         """
+        if self._nodata_source == "catalog":
+            return (self._nodata,) * len(self.band)
         all_nodatavals = self.src.nodatavals  # 0-indexed tuple, one per band
         return tuple(all_nodatavals[band_num - 1] for band_num in self.band)
 
@@ -362,6 +604,21 @@ class LocalRasterAdapter(BaseAdapter):
 
         # cropped_window is 2D (H, W) for a single band int, 3D (n_bands, H, W) for a list.
 
+        # rio_mask masks the pixels outside the window and the file's own
+        # nodata pixels. When the file declares no nodata value and the
+        # catalog sets one, it cannot know that value, so mask its pixels
+        # here. Without this, they would count as data in every statistic.
+        if self._nodata_source == "catalog":
+            window_data = np.ma.getdata(cropped_window)
+            # NaN nodata: we have to use isnan because nan == nan is False.
+            if isinstance(self._nodata, float) and np.isnan(self._nodata):
+                catalog_nodata_mask = np.isnan(window_data)
+            else:
+                catalog_nodata_mask = window_data == self._nodata
+            cropped_window = np.ma.masked_array(
+                window_data, mask=np.ma.getmaskarray(cropped_window) | catalog_nodata_mask
+            )
+
         # Materialise the masked window into a plain ndarray for tile export.
         # For multi-band rasters each band can have its own nodata sentinel,
         # so we fill band-by-band with the matching value (falling back to a
@@ -379,7 +636,9 @@ class LocalRasterAdapter(BaseAdapter):
             # unmasked AND finite in EVERY band.
             if np.ma.isMaskedArray(cropped_window):
                 band_mask = np.ma.getmaskarray(cropped_window)  # True where masked
-                data_float = cropped_window.filled(np.nan).astype(float, copy=False)
+                # Convert to float before filling: an integer array cannot hold
+                # NaN, so filling first raises TypeError for integer rasters.
+                data_float = cropped_window.astype(float).filled(np.nan)
             else:
                 band_mask = np.zeros(cropped_window.shape, dtype=bool)
                 data_float = np.asarray(cropped_window, dtype=float)
@@ -809,6 +1068,7 @@ class LocalRasterAdapter(BaseAdapter):
         (``exception``).
         """
         from rasterio.transform import Affine
+        from rasterio.vrt import WarpedVRT
         from rasterio.warp import Resampling, reproject
 
         # build_dataset_meta reads this to record the CRS of the tiles.
@@ -927,30 +1187,46 @@ class LocalRasterAdapter(BaseAdapter):
                 # pulls from those NaN source pixels and propagates NaN into the output.
                 # Going straight to the source file gives the interpolation valid data
                 # everywhere, matching what GEE does when it exports a plain rectangle.
+                #
+                # A rasterio.band() source gives reproject() the CRS and nodata
+                # value of the file, and reproject() ignores src_crs for such a
+                # source. When envoi uses the catalog crs or nodata (the file
+                # declares none), read the file through a WarpedVRT that
+                # declares them. Without it, a file without a CRS cannot be
+                # warped, and the bilinear interpolation would mix the catalog
+                # nodata pixels into the tile as data.
+                if self._uses_catalog_settings:
+                    vrt_options: dict[str, Any] = {"src_crs": self.raster_crs}
+                    if self._nodata_source == "catalog":
+                        vrt_options["src_nodata"] = self._nodata
+                    resample_source = WarpedVRT(self.src, **vrt_options)
+                else:
+                    resample_source = contextlib.nullcontext(self.src)
                 try:
-                    if self._is_multiband:
-                        destination_array = np.empty(
-                            (n_bands, n_pixels, n_pixels), dtype=tile_dtype
-                        )
-                        for band_idx, band_num in enumerate(self.band):
+                    with resample_source as source_dataset:
+                        if self._is_multiband:
+                            destination_array = np.empty(
+                                (n_bands, n_pixels, n_pixels), dtype=tile_dtype
+                            )
+                            for band_idx, band_num in enumerate(self.band):
+                                reproject(
+                                    source=rasterio.band(source_dataset, band_num),
+                                    destination=destination_array[band_idx],
+                                    dst_transform=destination_transform,
+                                    dst_crs=utm_crs,
+                                    resampling=Resampling.bilinear,
+                                    dst_nodata=tile_nodata,
+                                )
+                        else:
+                            destination_array = np.empty((n_pixels, n_pixels), dtype=tile_dtype)
                             reproject(
-                                source=rasterio.band(self.src, band_num),
-                                destination=destination_array[band_idx],
+                                source=rasterio.band(source_dataset, self.band[0]),
+                                destination=destination_array,
                                 dst_transform=destination_transform,
                                 dst_crs=utm_crs,
                                 resampling=Resampling.bilinear,
                                 dst_nodata=tile_nodata,
                             )
-                    else:
-                        destination_array = np.empty((n_pixels, n_pixels), dtype=tile_dtype)
-                        reproject(
-                            source=rasterio.band(self.src, self.band[0]),
-                            destination=destination_array,
-                            dst_transform=destination_transform,
-                            dst_crs=utm_crs,
-                            resampling=Resampling.bilinear,
-                            dst_nodata=tile_nodata,
-                        )
                 except RasterioIOError as error:
                     # Reading the source for this tile failed, for example
                     # because a block of the file is damaged. This is a failed
@@ -1024,9 +1300,15 @@ class LocalRasterAdapter(BaseAdapter):
         with ``resample_m``: then it is the sorted list of the UTM zones of
         the points in ``lats`` and ``lons`` (EPSG codes), as for Earth Engine.
 
+        ``nodata`` is the nodata value that envoi used (a number, text for NaN
+        or infinity, or None), and ``nodata_source`` tells where it came from
+        (``"file"``, ``"catalog"``, or None).
+
         Uses attributes:
             _export_resample_m: ``resample_m`` of the last ``export_tiles``
                 call, or None.
+            _nodata, _nodata_source: The result of
+                ``_resolve_local_raster_settings``.
         """
         # Static dataset info from the catalog spec.
         meta: dict[str, Any] = {
@@ -1052,6 +1334,16 @@ class LocalRasterAdapter(BaseAdapter):
             meta["tile_crs"] = build_tile_crs_zones(lats, lons)
         else:
             meta["tile_crs"] = str(self.raster_crs)
+
+        # The nodata value that envoi used for the selected bands, and where it
+        # came from: "file", "catalog" (the file declares none), or None (no
+        # nodata value). JSON has no NaN or infinity, so a non-finite value is
+        # recorded as text ("nan", "inf", or "-inf").
+        if isinstance(self._nodata, float) and not np.isfinite(self._nodata):
+            meta["nodata"] = str(self._nodata)
+        else:
+            meta["nodata"] = self._nodata
+        meta["nodata_source"] = self._nodata_source
 
         # Pass-through catalog field for dataset description.
         dataset_info = spec.get("dataset_information")
