@@ -19,11 +19,17 @@ def summarize_tile_export(exported_paths: list, n_points: int) -> dict:
 def summarize_date_info(meta_list: list[dict]) -> dict | None:
     """Summarise per-point date decisions for inclusion in group metadata.
 
-    Returns None when no meta dict contains date info (e.g. local rasters
-    or IMAGE assets where date selection does not apply).
+    Failed points and failed tiles (meta dicts with ``error``) are not
+    counted: no data of theirs is in the outputs. Returns None when no other
+    meta dict contains date info (e.g. local rasters or IMAGE assets where
+    date selection does not apply).
     """
-    # Check every point, not only the first: the meta dict of a failed point
-    # has no date keys, and the summary must not disappear because of it.
+    # A failed tile keeps the date keys of its planned image (the raster path
+    # resolves them before the download), so leave out every meta dict with
+    # an error. A failed statistics point has no date keys anyway.
+    meta_list = [point_meta for point_meta in meta_list or [] if "error" not in point_meta]
+    # Check every point, not only the first: the summary must not disappear
+    # because the first point has no date keys.
     if not meta_list or not any("image_time_start" in m for m in meta_list):
         return None
     sources = [m.get("date_source", "") for m in meta_list]

@@ -533,6 +533,32 @@ class TestResolveDateFilterRangeContains:
     @pytest.mark.parametrize(
         ("sample_date", "expected_range"),
         [
+            # The image that starts at 10:00 on the sample day, not the one before.
+            ("2021-06-15", ("2021-06-15", "2021-06-23")),
+            # The first image, which starts at 10:00 on the sample day.
+            ("2021-06-07", ("2021-06-07", "2021-06-15")),
+            # The day before the next image's start day.
+            ("2021-06-22", ("2021-06-15", "2021-06-23")),
+        ],
+    )
+    def test_image_that_starts_later_on_the_sample_day(self, sample_date, expected_range):
+        """Day rule: an image that starts at 10:00 on the sample day is the image of that day."""
+        starts = pd.DatetimeIndex(["2021-06-07 10:00", "2021-06-15 10:00", "2021-06-23 10:00"])
+        ends = pd.DatetimeIndex(["2021-06-15 10:00", "2021-06-23 10:00", "2021-07-01 10:00"])
+
+        assert (
+            _resolve_date_filter_range(pd.Timestamp(sample_date), "contains", starts, ends)
+            == expected_range
+        )
+        # Without end times, the range ends at the next image's start day.
+        assert (
+            _resolve_date_filter_range(pd.Timestamp(sample_date), "contains", starts)
+            == expected_range
+        )
+
+    @pytest.mark.parametrize(
+        ("sample_date", "expected_range"),
+        [
             # In range: the interval that contains the date.
             ("2021-01-12", ("2021-01-09", "2021-01-17")),
             # On the first start.

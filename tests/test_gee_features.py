@@ -878,11 +878,13 @@ class TestAutoDateSelection:
         assert stats.loc["land", mean_columns].notna().all()
 
         # Ocean: no data. Earth Engine gives 0, not null, for the sum of no
-        # pixels (seen live on 2026-10-09); the mean is null.
+        # pixels (seen live on 2026-10-09); envoi makes it null, as the mean is.
         assert bool(qc.loc["ocean", "aef_satellite_embeddings_in_extent_100m"]) is False
         assert qc.loc["ocean", "aef_satellite_embeddings_n_pixels_100m"] == 0
         assert stats.loc["ocean", mean_columns].isna().all()
-        assert stats.loc["ocean", sum_columns].tolist() == [0.0, 0.0]
+        assert stats.loc["ocean", sum_columns].isna().all()
+        # Land: the sum of valid pixels is a value.
+        assert stats.loc["land", sum_columns].notna().all()
 
 
 # ------------------------------------------------------------------

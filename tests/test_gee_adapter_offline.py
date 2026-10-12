@@ -73,14 +73,54 @@ def _epoch_ms(timestamp_text: str) -> int:
 # ------------------------------------------------------------------
 
 
-class _StubImageCollection:
-    """Stands in for ``ee.ImageCollection``. ``aggregate_array`` returns fixed values."""
+class _StubPropertyNames:
+    """Stands in for the ``ee.List`` of ``propertyNames()``. ``contains`` answers at once."""
 
-    def __init__(self, property_values: dict[str, list]):
-        self._property_values = property_values
+    def __init__(self, property_names: list[str]):
+        self._property_names = property_names
+
+    def contains(self, property_name: str) -> bool:
+        return property_name in self._property_names
+
+
+class _StubElement:
+    """Stands in for one ``ee.Image`` or ``ee.Feature`` of a collection, with its properties."""
+
+    def __init__(self, properties: dict):
+        self.properties = properties
+
+    def propertyNames(self) -> _StubPropertyNames:
+        return _StubPropertyNames(list(self.properties))
+
+    def get(self, property_name: str):
+        return self.properties.get(property_name)
+
+
+class _StubImageCollection:
+    """Stands in for ``ee.ImageCollection``. Each element is a dict of its properties.
+
+    ``map`` calls the function once for each element, as the server does.
+    ``aggregate_array`` leaves out the elements without the property, as
+    Earth Engine does (seen live on 2026-10-12).
+    """
+
+    def __init__(self, element_properties: list[dict]):
+        self._element_properties = element_properties
+
+    def map(self, function) -> _StubImageCollection:
+        return _StubImageCollection(
+            [
+                function(_StubElement(properties)).properties
+                for properties in self._element_properties
+            ]
+        )
 
     def aggregate_array(self, property_name: str) -> list:
-        return self._property_values[property_name]
+        return [
+            properties[property_name]
+            for properties in self._element_properties
+            if properties.get(property_name) is not None
+        ]
 
 
 class _StubDictionary:
@@ -93,18 +133,44 @@ class _StubDictionary:
         return dict(self._values)
 
 
-def _stub_collection_timestamps(monkeypatch, starts: list, ends: list) -> list[str]:
-    """Replace ``ee`` in ``_image`` so the timestamp request returns ``starts`` and ``ends``.
+def _stub_server_side_if(condition: bool, true_case, false_case):
+    """Stands in for ``ee.Algorithms.If``, with a condition that the stubs answer at once."""
+    return true_case if condition else false_case
 
-    Returns a list that records the collection IDs that the code under test opened.
+
+# The ``ee`` names that the timestamp request uses, other than the collection
+# and the dictionary.
+_STUB_TIMESTAMP_EE_NAMES = {
+    "Feature": lambda geometry, properties: _StubElement(dict(properties)),
+    "Algorithms": SimpleNamespace(If=_stub_server_side_if),
+}
+
+
+def _stub_collection_timestamps(monkeypatch, starts: list, ends: list) -> list[str]:
+    """Replace ``ee`` in ``_image`` so the collection has one image for each start and end.
+
+    ``starts[i]`` and ``ends[i]`` are the ``system:time_start`` and
+    ``system:time_end`` of image ``i``. ``None`` means that the image does
+    not have the property. Returns a list that records the collection IDs
+    that the code under test opened.
     """
+    image_properties = [
+        {
+            property_name: value
+            for property_name, value in (("system:time_start", start), ("system:time_end", end))
+            if value is not None
+        }
+        for start, end in zip(starts, ends, strict=True)
+    ]
     opened_collection_ids: list[str] = []
 
     def open_collection(collection_id):
         opened_collection_ids.append(collection_id)
-        return _StubImageCollection({"system:time_start": starts, "system:time_end": ends})
+        return _StubImageCollection(image_properties)
 
-    stub_ee = SimpleNamespace(ImageCollection=open_collection, Dictionary=_StubDictionary)
+    stub_ee = SimpleNamespace(
+        ImageCollection=open_collection, Dictionary=_StubDictionary, **_STUB_TIMESTAMP_EE_NAMES
+    )
     monkeypatch.setattr(_image, "ee", stub_ee)
     return opened_collection_ids
 
@@ -150,7 +216,7 @@ class TestCollectionTimeBoundsDuplicateStarts:
     def test_duplicate_start_without_end_times_is_unique(self, monkeypatch):
         """Without a complete set of end times, the start index is unique and ends are None."""
         starts = [_epoch_ms("2021-01-01"), _epoch_ms("2021-01-01"), _epoch_ms("2021-02-01")]
-        ends = [_epoch_ms("2021-01-09")]
+        ends = [_epoch_ms("2021-01-09"), None, None]
         _stub_collection_timestamps(monkeypatch, starts, ends)
 
         start_index, end_index = _get_collection_time_bounds("users/test/collection")
@@ -161,6 +227,65 @@ class TestCollectionTimeBoundsDuplicateStarts:
 
 class TestCollectionTimeBoundsMissingValues:
     """Each start keeps the end of its own image when some timestamps are missing."""
+
+    def test_probe_collection_gives_a_start_only_index(self, monkeypatch):
+        """The collection of the 2026-10-12 probe: start only, start and end, end only."""
+        # Two plain aggregate_array lists would be [1000, 2000] and
+        # [3000, 5000]: the same length, but 1000 would get the end 3000 of
+        # another image, and 2000 the end 5000 of the image without a start.
+        _stub_collection_timestamps(monkeypatch, [1000, 2000, None], [None, 3000, 5000])
+
+        start_index, end_index = _get_collection_time_bounds("users/test/collection")
+
+        # The image without a start is dropped, and the image with a start but
+        # no end makes the index start-only.
+        assert end_index is None
+        assert list(start_index) == [
+            pd.Timestamp("1970-01-01 00:00:01"),
+            pd.Timestamp("1970-01-01 00:00:02"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("starts", "ends", "expected_starts", "expected_ends"),
+        [
+            # An image without a start (with an end, as in the probe) is
+            # dropped, and the other images keep their own ends.
+            (
+                [_epoch_ms("1958-01-01"), _epoch_ms("1958-02-01"), None],
+                [_epoch_ms("1958-02-01"), _epoch_ms("1958-03-01"), _epoch_ms("1958-04-01")],
+                ["1958-01-01", "1958-02-01"],
+                ["1958-02-01", "1958-03-01"],
+            ),
+            # Times before 1970 are negative numbers, and they are times.
+            (
+                [_epoch_ms("1958-02-01"), _epoch_ms("1958-01-01")],
+                [_epoch_ms("1958-03-01"), _epoch_ms("1958-02-01")],
+                ["1958-01-01", "1958-02-01"],
+                ["1958-02-01", "1958-03-01"],
+            ),
+            # A negative start without an end makes the index start-only.
+            (
+                [_epoch_ms("1958-01-01"), _epoch_ms("1958-02-01")],
+                [_epoch_ms("1958-02-01"), None],
+                ["1958-01-01", "1958-02-01"],
+                None,
+            ),
+        ],
+    )
+    def test_negative_times_are_paired(
+        self, monkeypatch, starts, ends, expected_starts, expected_ends
+    ):
+        """Times before 1970 (negative, as in TerraClimate) are paired per image, as other times."""
+        assert all(start is None or start < 0 for start in starts)
+        _stub_collection_timestamps(monkeypatch, starts, ends)
+
+        start_index, end_index = _get_collection_time_bounds("users/test/collection")
+
+        assert list(start_index) == [pd.Timestamp(start) for start in expected_starts]
+        if expected_ends is None:
+            assert end_index is None
+        else:
+            assert list(end_index) == [pd.Timestamp(end) for end in expected_ends]
 
     def test_missing_start_and_missing_end_are_not_mispaired(self, monkeypatch):
         """One image without a start and another without an end give a start-only index."""
@@ -209,8 +334,8 @@ def _contains_adapter(time_starts, time_ends) -> GeeRasterAdapter:
 
 
 class TestResolveDateInfoContains:
-    """For ``contains``, a date is clamped only when it is before the first image
-    start, or at or after the end of the last image interval.
+    """For ``contains``, a date is clamped only when it is before the first image's
+    start day, or at or after the end of the last image interval.
     """
 
     @pytest.mark.parametrize(
@@ -317,6 +442,50 @@ class TestResolveDateInfoContains:
         assert adapter._resolve_date_info("2021-06-15")["date_clamped"] is False
         assert adapter._resolve_date_info("2021-06-16")["date_clamped"] is True
 
+    def test_last_start_later_on_its_day_without_end_times(self):
+        """Without end times, the last interval ends at the end of the last start's day."""
+        time_starts = pd.DatetimeIndex(["2021-06-07 10:00", "2021-06-15 10:00"])
+        adapter = _contains_adapter(time_starts, None)
+
+        assert adapter._resolve_date_info("2021-06-15") == {
+            "date_clamped": False,
+            "date_source": "contains_sample_date",
+            "image_time_start": "2021-06-15",
+        }
+        assert adapter._resolve_date_info("2021-06-16")["date_clamped"] is True
+
+    @pytest.mark.parametrize(
+        ("sample_date", "clamped", "image_start", "image_end"),
+        [
+            ("2021-06-06", True, "2021-06-07", "2021-06-15"),  # before the first start day
+            # On the first start day: the first image starts at 10:00 on that day.
+            ("2021-06-07", False, "2021-06-07", "2021-06-15"),
+            # The image that starts at 10:00 on the sample day, not the one before.
+            ("2021-06-15", False, "2021-06-15", "2021-06-23"),
+            # The last image ends at 10:00 on this day, after the start of the day.
+            ("2021-07-01", False, "2021-06-23", "2021-07-01"),
+            ("2021-07-02", True, "2021-06-23", "2021-07-01"),  # after the last interval
+        ],
+    )
+    def test_images_that_start_later_on_the_sample_day(
+        self, sample_date, clamped, image_start, image_end
+    ):
+        """Day rule: an image that starts at 10:00 on the sample day contains that day."""
+        time_starts = pd.DatetimeIndex(["2021-06-07 10:00", "2021-06-15 10:00", "2021-06-23 10:00"])
+        time_ends = pd.DatetimeIndex(["2021-06-15 10:00", "2021-06-23 10:00", "2021-07-01 10:00"])
+        adapter = _contains_adapter(time_starts, time_ends)
+
+        assert adapter._resolve_date_info(sample_date) == {
+            "date_clamped": clamped,
+            "date_source": "clamped_to_nearest" if clamped else "contains_sample_date",
+            "image_time_start": image_start,
+            "image_time_end": image_end,
+        }
+        # The reported image is the image that the filterDate range selects.
+        assert _resolve_date_filter_range(
+            pd.Timestamp(sample_date), "contains", time_starts, time_ends
+        ) == (image_start, image_end)
+
 
 # ------------------------------------------------------------------
 # summarize_date_info — the sidecar date_info summary
@@ -324,7 +493,7 @@ class TestResolveDateInfoContains:
 
 
 class TestSummarizeDateInfo:
-    """The sidecar ``date_info`` uses every point that has date information."""
+    """The sidecar ``date_info`` uses every point that has date information and no error."""
 
     def test_first_point_without_date_keys(self):
         """A first meta dict without date keys (a failed point) does not remove the summary."""
@@ -372,6 +541,31 @@ class TestSummarizeDateInfo:
         """Without date information on any point, there is no summary."""
         assert summarize_date_info([{"in_extent": True}, {"in_extent": False}]) is None
         assert summarize_date_info([]) is None
+
+    def test_failed_tile_is_not_counted(self):
+        """A meta dict with an error (a failed tile keeps its date keys) is not counted."""
+        successful_meta = {
+            "date_clamped": False,
+            "date_source": "nearest_to_sample",
+            "image_time_start": "2021-01-01",
+        }
+        failed_meta = {
+            "date_clamped": True,
+            "date_source": "clamped_to_nearest",
+            "image_time_start": "2021-02-01",
+            "error": "_StubEarthEngineError: stub: download failed",
+        }
+
+        date_info = summarize_date_info([successful_meta, failed_meta])
+
+        assert date_info == {
+            "n_nearest_to_sample": 1,
+            "n_contains_sample_date": 0,
+            "n_clamped_to_nearest": 0,
+            "n_most_recent_no_date": 0,
+            "image_date_ranges_used": [["2021-01-01", "2021-01-01"]],
+        }
+        assert summarize_date_info([failed_meta]) is None
 
 
 # ------------------------------------------------------------------
@@ -984,9 +1178,11 @@ def _stub_failing_timestamp_request(monkeypatch, request_error: Exception) -> No
             raise request_error
 
     def open_collection(collection_id):
-        return _StubImageCollection({"system:time_start": [], "system:time_end": []})
+        return _StubImageCollection([])
 
-    stub_ee = SimpleNamespace(ImageCollection=open_collection, Dictionary=FailingDictionary)
+    stub_ee = SimpleNamespace(
+        ImageCollection=open_collection, Dictionary=FailingDictionary, **_STUB_TIMESTAMP_EE_NAMES
+    )
     monkeypatch.setattr(_image, "ee", stub_ee)
 
 
@@ -1017,9 +1213,13 @@ class TestCollectionTimeBoundsRequestFailure:
                 return {"starts": [_epoch_ms("2021-01-01")]}
 
         def open_collection(collection_id):
-            return _StubImageCollection({"system:time_start": [], "system:time_end": []})
+            return _StubImageCollection([])
 
-        stub_ee = SimpleNamespace(ImageCollection=open_collection, Dictionary=ResponseWithoutEnds)
+        stub_ee = SimpleNamespace(
+            ImageCollection=open_collection,
+            Dictionary=ResponseWithoutEnds,
+            **_STUB_TIMESTAMP_EE_NAMES,
+        )
         monkeypatch.setattr(_image, "ee", stub_ee)
 
         with pytest.raises(KeyError, match="ends"):
@@ -1382,6 +1582,30 @@ class TestFailedPointsThroughExtract:
         assert tiles_summary["n_failed"] == 1
         assert (tiles_summary["n_errors"], tiles_summary["ids_errors"]) == (1, ["p1"])
 
+    def test_failed_tile_is_not_in_the_date_info(self, stub_gee_dataset, tmp_path):
+        """The sidecar ``date_info`` of a raster run counts only the tiles that were exported."""
+        _stub_tile_exports(stub_gee_dataset, {1})
+        # A time index with one image a month, so each tile gets date information.
+        stub_gee_dataset._collection_time_starts = pd.DatetimeIndex(
+            ["2021-01-01", "2021-02-01", "2021-03-01", "2021-04-01"]
+        )
+        points = _three_point_frame().assign(eventDate=["2021-01-02", "2021-02-02", "2021-03-02"])
+
+        with pytest.warns(UserWarning, match="1 of 3 points failed"):
+            extract(points, _stub_gee_config("gee_tiles", "raster"), output_dir=tmp_path)
+
+        sidecar = json.loads((tmp_path / "gee_tiles" / "gee_tiles_metadata.json").read_text())
+        assert sidecar["datasets"]["stub_gee"]["date_info"] == {
+            "n_nearest_to_sample": 2,
+            "n_contains_sample_date": 0,
+            "n_clamped_to_nearest": 0,
+            "n_most_recent_no_date": 0,
+            "image_date_ranges_used": [
+                ["2021-01-01", "2021-01-01"],
+                ["2021-03-01", "2021-03-01"],
+            ],
+        }
+
     def test_every_tile_failing_raises_with_the_first_error(self, stub_gee_dataset, tmp_path):
         """When every tile export fails, RuntimeError has the error of point 0 and chains it."""
         raised_errors = _stub_tile_exports(stub_gee_dataset, None)
@@ -1566,7 +1790,7 @@ class TestCountOnlyStatistics:
 
 
 class TestWindowWithoutValidPixels:
-    """A window without valid pixels has in_extent False, also when count or sum is 0, not null."""
+    """A window without valid pixels has in_extent False and a null sum; count stays 0."""
 
     @pytest.mark.parametrize(
         ("bands", "reducer_names", "window_result", "expected_stats"),
@@ -1575,7 +1799,7 @@ class TestWindowWithoutValidPixels:
                 "DEM",
                 ["mean", "sum"],
                 {"DEM_mean": None, "DEM_sum": 0, "DEM_count": 0},
-                {"mean": None, "sum": 0},
+                {"mean": None, "sum": None},
             ),
             (
                 "DEM",
@@ -1594,14 +1818,14 @@ class TestWindowWithoutValidPixels:
                     "B2_sum": 0,
                     "B2_count": 0,
                 },
-                {"B1_mean": None, "B2_mean": None, "B1_sum": 0, "B2_sum": 0},
+                {"B1_mean": None, "B2_mean": None, "B1_sum": None, "B2_sum": None},
             ),
         ],
     )
     def test_zero_sum_or_count_is_not_data(
         self, monkeypatch, bands, reducer_names, window_result, expected_stats
     ):
-        """Statistics that are 0 on an empty window do not make the point look inside the extent."""
+        """Earth Engine's 0 sum of an empty window becomes null; the point is not in the extent."""
         adapter = _statistics_adapter({"bands": bands})
         _stub_statistics_request(monkeypatch, adapter, {"window": window_result})
         suffixes = [f"_{reducer_name}" for reducer_name in reducer_names]
@@ -1612,14 +1836,31 @@ class TestWindowWithoutValidPixels:
         assert (meta["in_extent"], meta["n_pixels"], meta["coverage_pct"]) == (False, 0, 0.0)
 
     def test_one_valid_pixel_is_data(self, monkeypatch):
-        """A window with one valid pixel has in_extent True."""
+        """A window with one valid pixel has in_extent True and keeps its sum."""
         adapter = _statistics_adapter({"bands": "DEM"})
         window_result = {"DEM_mean": 250.0, "DEM_sum": 250.0, "DEM_count": 1}
         _stub_statistics_request(monkeypatch, adapter, {"window": window_result})
 
-        _, meta = _fetch_point_statistics(adapter, ["mean", "sum"], ["_mean", "_sum"])
+        stats, meta = _fetch_point_statistics(adapter, ["mean", "sum"], ["_mean", "_sum"])
 
+        assert stats == {"mean": 250.0, "sum": 250.0}
         assert (meta["in_extent"], meta["n_pixels"]) == (True, 1)
+
+    def test_only_the_band_without_valid_pixels_has_a_null_sum(self, monkeypatch):
+        """Only the sum of the band with count 0 is null; a sum of 0 with valid pixels stays 0."""
+        adapter = _statistics_adapter({"bands": ["B1", "B2"]})
+        window_result = {
+            "B1_sum": 0.0,
+            "B1_count": 25,
+            "B2_sum": 0,
+            "B2_count": 0,
+        }
+        _stub_statistics_request(monkeypatch, adapter, {"window": window_result})
+
+        stats, meta = _fetch_point_statistics(adapter, ["sum", "count"], ["_sum", "_count"])
+
+        assert stats == {"B1_sum": 0.0, "B2_sum": None, "B1_count": 25, "B2_count": 0}
+        assert (meta["in_extent"], meta["n_pixels"]) == (True, 0)
 
 
 class TestCircularAspectInPointStatistics:
@@ -1974,7 +2215,11 @@ class TestCircularAspectImage:
 
 
 class TestEmptyDateSelection:
-    """``_build_image`` gives a masked image only when the collection has no image at the point."""
+    """``_build_image`` gives a masked image only when the collection has no image at the point.
+
+    The masked image is the first image of the collection that has every
+    configured source band.
+    """
 
     @pytest.fixture(autouse=True)
     def symbolic_earth_engine(self, monkeypatch):
@@ -1991,7 +2236,10 @@ class TestEmptyDateSelection:
             Image=cast_to_image,
             ImageCollection=_SymbolicCollection,
             Algorithms=SimpleNamespace(If=server_side_if),
-            Filter=SimpleNamespace(eq=lambda property_name, value: f"{property_name} == {value}"),
+            Filter=SimpleNamespace(
+                eq=lambda property_name, value: f"{property_name} == {value}",
+                listContains=lambda property_name, value: f"{value} in {property_name}",
+            ),
         )
         monkeypatch.setattr(_image, "ee", stub_ee)
 
@@ -2033,10 +2281,42 @@ class TestEmptyDateSelection:
         # The condition looks for an image at the point before the UTM-zone
         # and date filters. When the point has images, but these filters
         # remove all of them, the first selected image is null, and the
-        # point's request fails.
+        # point's request fails. The masked image is the first image of the
+        # whole collection that has both configured bands.
         assert image.expression == (
             f"(if size of embeddings at point limited to 1 > 0 then first of {selection} "
-            f"else (first of embeddings) masked to 0).select(['A00', 'A01'])"
+            f"else (first of embeddings where A00 in system:band_names "
+            f"where A01 in system:band_names) masked to 0).select(['A00', 'A01'])"
+        )
+
+    @pytest.mark.parametrize(
+        ("band_setting", "placeholder", "band_selection"),
+        [
+            # One configured band, as text.
+            (
+                {"bands": "A00"},
+                "first of embeddings where A00 in system:band_names",
+                ".select(['A00'])",
+            ),
+            # No configured band (all bands): the first image of the collection.
+            ({}, "first of embeddings", ""),
+            # An empty band list (a per-call list of only derived bands).
+            ({"bands": []}, "first of embeddings", ""),
+        ],
+    )
+    def test_masked_image_has_the_configured_bands(self, band_setting, placeholder, band_selection):
+        """Only configured source bands filter the collection of the masked image."""
+        image = _image._build_image(
+            {"collection": "embeddings", "collection_date_policy": "nearest", **band_setting},
+            date=pd.Timestamp("2021-06-15"),
+            geometry="point",
+            collection_time_starts=pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
+        )
+
+        assert image.expression == (
+            "(if size of embeddings at point limited to 1 > 0 then first of embeddings "
+            f"at point from 2021-01-01 to 2021-01-02 else ({placeholder}) masked to 0)"
+            f"{band_selection}"
         )
 
     def test_no_masked_image_without_a_point(self):

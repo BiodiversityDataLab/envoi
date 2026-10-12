@@ -581,8 +581,8 @@ class GeeRasterAdapter(BaseAdapter):
         # Only emit image_time_end when we have a cached end-times array
         # AND the requested index is in-bounds. Defensive bounds check —
         # _get_collection_time_bounds() returns time_ends=None whenever
-        # the start/end array lengths don't match, so by the time we
-        # reach here the index *should* always be valid; the guard is
+        # an image has no end, and otherwise one end for each start, so by
+        # the time we reach here the index *should* always be valid; the guard is
         # belt-and-braces in case that upstream invariant ever breaks.
         end_times = self._collection_time_ends
         if end_times is not None and end_index is not None and 0 <= end_index < len(end_times):
@@ -618,11 +618,14 @@ class GeeRasterAdapter(BaseAdapter):
             # "contains" policy: pick the image whose time interval contains
             # the sample date. When the date falls outside the collection's
             # full range, clamp to the nearest boundary image. The range starts
-            # at the first image start and ends at the end of the last image
-            # interval, so a date on the first start or inside the last
-            # interval is not clamped. The image matches the one that
+            # at the first image's start day and ends at the end of the last
+            # image interval, so a date on the first start day or inside the
+            # last interval is not clamped. Dates compare as whole days (the
+            # day rule): an image that starts at 10:00 on the sample day
+            # starts on or before that day. The image matches the one that
             # _resolve_date_filter_range selects for the same date.
-            if dt < time_starts.min():
+            sample_day = dt.normalize()
+            if sample_day < time_starts.min().normalize():
                 return self._make_date_info(
                     time_starts.min(),
                     end_index=0,
@@ -631,8 +634,10 @@ class GeeRasterAdapter(BaseAdapter):
                 )
 
             # The last interval ends at the system:time_end of the image with
-            # the latest start. Without end times, it ends one day after that
-            # start, the same rule that _resolve_date_filter_range uses.
+            # the latest start. Without end times, it ends at the end of that
+            # start's day (the day rule), as the date range of
+            # _resolve_date_filter_range does: a later day is clamped, also
+            # when the image starts at 10:00.
             # That function's date range also always covers the whole start
             # day of the image, so an image whose end is on its start day (or
             # equal to its start) is selected for a date on that day. Use the
@@ -642,11 +647,11 @@ class GeeRasterAdapter(BaseAdapter):
             if time_ends is not None and len(time_ends) == len(time_starts):
                 last_interval_end = time_ends[last_index]
             else:
-                last_interval_end = last_start + pd.DateOffset(days=1)
+                last_interval_end = last_start.normalize() + pd.DateOffset(days=1)
             last_interval_end = max(
                 last_interval_end, last_start.normalize() + pd.DateOffset(days=1)
             )
-            if dt >= last_interval_end:
+            if sample_day >= last_interval_end:
                 return self._make_date_info(
                     time_starts.max(),
                     end_index=last_index,
@@ -654,8 +659,9 @@ class GeeRasterAdapter(BaseAdapter):
                     source="clamped_to_nearest",
                 )
 
-            # In-range: find the latest start-time that's still <= dt.
-            idx = int(time_starts.searchsorted(dt, side="right") - 1)
+            # In-range: find the latest start before the next day.
+            next_day = sample_day + pd.DateOffset(days=1)
+            idx = int(time_starts.searchsorted(next_day, side="left")) - 1
             idx = max(0, min(idx, last_index))
             return self._make_date_info(
                 time_starts[idx],
@@ -757,6 +763,8 @@ class GeeRasterAdapter(BaseAdapter):
         - window keys: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
         - point  keys: ``"point"``  (single band) or ``{band}_point``     (multi-band)
         A per-call band list gives the multi-band keys, also for one band.
+        For a band whose window has no valid pixel, ``sum`` is None and
+        ``count`` is 0.
 
         ``original_reducer_names`` carries the *un-deduped* user request
         (i.e. with ``class_fraction`` still present if asked for). It is
@@ -896,6 +904,20 @@ class GeeRasterAdapter(BaseAdapter):
                 window_raw, band_name, multiband, count_only=count_only
             )
 
+            # ---- sum of a window without valid pixels ----
+            # Earth Engine gives sum 0, not null, for a band whose window has
+            # no valid pixel (seen live on 2026-10-09). A 0 would look like
+            # data, and the local adapter gives no value for the sum of no
+            # pixels. So the sum of a band with a pixel count of 0 becomes
+            # null. count stays 0: it is the true number of valid pixels.
+            if "sum" in reducer_names:
+                if multiband:
+                    for band, band_count in per_band_counts.items():
+                        if band_count == 0 and f"{band}_sum" in window_stats:
+                            window_stats[f"{band}_sum"] = None
+                elif valid_count == 0:
+                    window_stats["sum"] = None
+
             # ---- categorical post-process ----
             # We always ask GEE for `class_count` (frequencyHistogram) when
             # the user wants either class_count or class_fraction; fractions
@@ -984,7 +1006,8 @@ class GeeRasterAdapter(BaseAdapter):
             # The window has data when at least one band has a valid pixel.
             # Use the pixel counts, not the statistics: on a window without
             # valid pixels, Earth Engine gives null for most statistics, but
-            # 0 for count and sum, so a non-null statistic does not show data.
+            # 0 for count (and for sum, which the step above sets to null), so
+            # a non-null statistic does not show data.
             # The window branch always has a count for each band: the QC
             # count, or the user's count.
             if multiband:

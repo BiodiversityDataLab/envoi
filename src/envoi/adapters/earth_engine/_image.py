@@ -112,6 +112,37 @@ def _ensure_gee_init() -> None:
 # Timestamp helpers  (collection time bounds, nearest-image lookup, date filters)
 # ---------------------------------------------------------------------------
 
+# The value that the timestamp request gives for a missing system:time_start
+# or system:time_end. aggregate_array leaves out the images without the
+# property (seen live on 2026-10-12), so a list of starts and a list of ends
+# would no longer pair by position. With this value, both lists keep one
+# entry for each image. It is text, so it cannot be a time: times are
+# numbers, and they are negative before 1970 (TerraClimate starts in 1958),
+# so a negative number cannot mark a missing time.
+_MISSING_TIME = "missing"
+
+
+def _image_start_and_end(image):
+    """Return a feature with the start and end time of ``image`` (for ``ImageCollection.map``).
+
+    The values are ``system:time_start`` and ``system:time_end`` in
+    milliseconds since 1970, or ``_MISSING_TIME`` when the image does not have
+    the property. Earth Engine evaluates the condition for each image on the
+    server, in the request that reads the times.
+    """
+    property_names = image.propertyNames()
+    start = ee.Algorithms.If(
+        property_names.contains("system:time_start"),
+        image.get("system:time_start"),
+        _MISSING_TIME,
+    )
+    end = ee.Algorithms.If(
+        property_names.contains("system:time_end"),
+        image.get("system:time_end"),
+        _MISSING_TIME,
+    )
+    return ee.Feature(None, {"start": start, "end": end})
+
 
 def _get_collection_time_bounds(
     collection_id: str,
@@ -121,13 +152,15 @@ def _get_collection_time_bounds(
 ) -> tuple[pd.DatetimeIndex | None, pd.DatetimeIndex | None]:
     """Fetch start/end timestamps for a GEE ImageCollection.
 
-    Returns (start_times, end_times) as sorted DatetimeIndex objects. The start
-    times are unique: when several images have the same start, end_times holds
-    the latest of their ends.
-    Returns (start_times, None) when end times are unavailable (e.g. user-uploaded
-    assets that omit system:time_end). Returns (None, None) when no image with a
-    start time is left after the filters (for example, no image of the
-    collection intersects ``bounds_geometry``).
+    Returns (start_times, end_times) as sorted DatetimeIndex objects. Each end
+    time is the end of an image with that start time: the request pairs the
+    two times of each image. The start times are unique: when several images
+    have the same start, end_times holds the latest of their ends.
+    An image without system:time_start is not in the index.
+    Returns (start_times, None) when an image with a start has no
+    system:time_end (e.g. user-uploaded assets that omit it). Returns
+    (None, None) when no image with a start time is left after the filters
+    (for example, no image of the collection intersects ``bounds_geometry``).
     One getInfo() round-trip, done once per dataset.
 
     Parameters
@@ -172,11 +205,17 @@ def _get_collection_time_bounds(
                 range_start.strftime("%Y-%m-%d"),
                 (range_end + pd.DateOffset(days=1)).strftime("%Y-%m-%d"),
             )
-        # Fetch both arrays in a single round-trip by wrapping in ee.Dictionary.
+        # Map each image to its start and end time, with _MISSING_TIME for a
+        # missing time, so that the two lists below have one entry for each
+        # image, in the same order. Two plain aggregate_array calls on the
+        # image properties would leave out the missing values, and the two
+        # lists would pair the start of one image with the end of another.
+        image_times_collection = image_collection.map(_image_start_and_end)
+        # Fetch both lists in a single round-trip by wrapping in ee.Dictionary.
         raw = ee.Dictionary(
             {
-                "starts": image_collection.aggregate_array("system:time_start"),
-                "ends": image_collection.aggregate_array("system:time_end"),
+                "starts": image_times_collection.aggregate_array("start"),
+                "ends": image_times_collection.aggregate_array("end"),
             }
         ).getInfo()
     # Broad catch that re-raises a clear error: Earth Engine reports unrelated
@@ -196,29 +235,25 @@ def _get_collection_time_bounds(
     start_times = raw["starts"]
     end_times = raw["ends"]
 
-    # Pair each start with the end at the same position, and only then drop
-    # the pairs without a start. This keeps the pairs correct when Earth
-    # Engine returns a null value for an image without the property. When
-    # Earth Engine instead leaves such an image out of a list, the positions
-    # of the two lists do not match. Lists of different lengths show this:
-    # there are then no reliable pairs, so use no end times. Known limitation:
-    # one image without a start and another image without an end give two
-    # lists of the same length, and their pairs can then be wrong.
-    if len(end_times) == len(start_times):
-        paired_times = list(zip(start_times, end_times))
-    else:
-        paired_times = [(start, None) for start in start_times]
-    # Drop pairs without a start — we still need at least one valid start
-    # to do anything useful, regardless of which branch we end up in.
-    paired_times = [(start, end) for start, end in paired_times if start is not None]
+    # Pair each start with the end at the same position: both are the times
+    # of one image. strict=True: lists of different lengths would mean that
+    # the positions do not match, and every pair after the gap would be
+    # wrong, so the run stops instead. Then drop the images without a start:
+    # we still need at least one valid start to do anything useful,
+    # regardless of which branch we end up in.
+    paired_times = [
+        (start, end)
+        for start, end in zip(start_times, end_times, strict=True)
+        if start != _MISSING_TIME
+    ]
     clean_starts = [int(start) for start, _ in paired_times]
     if not clean_starts:
         return None, None
 
-    # Branch 1: end-times are missing or partial → return a start-only
+    # Branch 1: an image with a start has no end → return a start-only
     # index. Build it from clean_starts (sorted + deduped) so it's
     # directly usable for nearest-neighbour lookups downstream.
-    if any(end is None for _, end in paired_times):
+    if any(end == _MISSING_TIME for _, end in paired_times):
         logger.debug(
             "system:time_end missing for some images in %s; interval-based "
             "date selection will fall back to next-start boundaries.",
@@ -293,7 +328,11 @@ def _resolve_date_filter_range(
         - policy="contains" → [date,      date + 1d]
 
     policy="contains" selects the image whose interval contains date_timestamp.
-    A date outside the collection's range selects the first or the last image.
+    Dates compare as whole days in UTC (the day rule): an image that starts at
+    any time on the day of date_timestamp starts on or before that day. The
+    image is the one with the latest start before the next day. A day before
+    the first image's start day selects the first image, and a day after the
+    last interval the last image.
     The returned range always covers at least one calendar day.
     policy="nearest"  selects the image with the closest start timestamp.
     """
@@ -317,14 +356,15 @@ def _resolve_date_filter_range(
         )
 
     # --- policy == "contains": find the image interval that contains date_timestamp. ---
-    # Clamp to collection boundaries when date_timestamp is out of range.
-    if date_timestamp <= time_starts.min():
-        idx = 0
-    elif date_timestamp >= time_starts.max():
-        idx = len(time_starts) - 1
-    else:
-        idx = int(time_starts.searchsorted(date_timestamp, side="right") - 1)
-        idx = max(0, min(idx, len(time_starts) - 1))
+    # Day rule: compare whole days. The sample date is 00:00 of its day, so
+    # comparing the times would give the previous image (or a clamp to the
+    # first image) for an image that starts later on the sample day, for
+    # example at 10:00. Select the latest start before the next day instead.
+    # A day before the first start day gives no such start: clamp to the
+    # first image. A day after the last interval selects the last image.
+    next_day = date_timestamp.normalize() + pd.DateOffset(days=1)
+    idx = int(time_starts.searchsorted(next_day, side="left")) - 1
+    idx = max(0, idx)
 
     start_date = time_starts[idx]
 
@@ -441,11 +481,13 @@ def _build_image(
 
     When the collection has no image at the point ``geometry`` on any date
     (before the UTM-zone and date filters), the image is the first image of
-    the collection with every pixel masked, so the point gets the values of a
-    point without data: null statistics, except ``count`` and ``sum``, which
-    are 0 (Earth Engine decides this in the point's request). When the point
-    has images, but the UTM-zone or date filter removes all of them, the image
-    is null, and the point's request fails.
+    the collection that has every configured source band (``bands``; the
+    first image of the collection when no source band is configured), with
+    every pixel masked. The point gets the values of a point without data:
+    null statistics, except ``count``, which is 0 (Earth Engine decides this
+    in the point's request). When the point has images, but the UTM-zone or
+    date filter removes all of them, the image is null, and the point's
+    request fails.
 
     Parameters
     ----------
@@ -513,10 +555,14 @@ def _build_image(
             # a null image. Every request on a null image raises ("Parameter
             # 'image' is required"), so the point would be a failed point
             # although it only has no data. Use the first image of the whole
-            # collection with every pixel masked instead: it has the
-            # collection's bands, so the band selection and the derived bands
-            # below work, and the point gets the values of a point without
-            # data, as a point outside a mosaic does.
+            # collection with every pixel masked instead, so the point gets
+            # the values of a point without data, as a point outside a mosaic
+            # does. The image must have the configured source bands, or the
+            # band selection below fails ("Band ... not found") and the point
+            # is a failed point again: the images of some collections have
+            # different sets of bands. So take the first image that has every
+            # configured source band. Without configured source bands (all
+            # bands, or only derived bands), take the first image.
             # The check uses the collection after filterBounds only, before
             # the UTM-zone filter and the date filter, on purpose. When the
             # point has images, but the selection filters remove all of them
@@ -530,9 +576,15 @@ def _build_image(
             # and the condition would only count the images of the whole
             # collection, so it is left out.
             if geometry is not None:
-                masked_placeholder = ee.Image(
-                    ee.ImageCollection(dataset_spec["collection"]).first()
-                ).updateMask(0)
+                placeholder_collection = ee.ImageCollection(dataset_spec["collection"])
+                configured_bands = dataset_spec.get("bands") or []
+                if isinstance(configured_bands, str):
+                    configured_bands = [configured_bands]
+                for band in configured_bands:
+                    placeholder_collection = placeholder_collection.filter(
+                        ee.Filter.listContains("system:band_names", band)
+                    )
+                masked_placeholder = ee.Image(placeholder_collection.first()).updateMask(0)
                 point_has_images = bounds_collection.limit(1).size().gt(0)
                 image = ee.Image(ee.Algorithms.If(point_has_images, image, masked_placeholder))
         else:
