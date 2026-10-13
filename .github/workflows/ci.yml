@@ -26,6 +26,27 @@ jobs:
       - name: Tests
         run: pytest -q
 
+  # The offline test suite on Windows and macOS. envoi supports both, and file
+  # names, paths, and raster I/O can differ there. One Python version is enough:
+  # the build job above covers the Python versions on Linux.
+  portability:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install -U pip
+          pip install -e ".[dev,webapp]"
+      - name: Tests
+        run: pytest -m "not gee" -q
+
   package:
     runs-on: ubuntu-latest
     steps:
