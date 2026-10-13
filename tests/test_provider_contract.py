@@ -5,8 +5,10 @@ runs through ``envoi.extract()`` with no change to a generic module, so a new
 data provider needs only its adapter module. The module also tests the checks
 of ``envoi.adapters.register()``, the pre-flight checks that ``extract()``
 runs with the adapter declarations and ``check_dataset`` before it builds any
-adapter, and the catalog checks with the adapter's ``catalog_keys`` and
-catalog hooks. No test uses the network or a raster file.
+adapter, the catalog checks with the adapter's ``catalog_keys`` and
+catalog hooks, and the checks of the adapter results with variants of the
+fake adapter that break the result contract. No test uses the network or a
+raster file.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import pytest
 import yaml
 
 from envoi import adapters, update_catalog
+from envoi._filenames import build_tile_filenames
 from envoi.adapters import register
 from envoi.adapters.base import BaseAdapter
 from envoi.adapters.local_adapter import LocalRasterAdapter
@@ -110,7 +113,6 @@ class FakeStatsAdapter(BaseAdapter):
         self,
         spec: dict,
         meta_list: list | None = None,
-        exported_paths: list | None = None,
         quality: dict | None = None,
         lats: Sequence[float] | None = None,
         lons: Sequence[float] | None = None,
@@ -124,6 +126,42 @@ class FakeStatsAdapter(BaseAdapter):
         if quality:
             dataset_meta["quality"] = dict(quality)
         return dataset_meta
+
+
+class FakeRasterAdapter(FakeStatsAdapter):
+    """The fake provider, with the ``"raster"`` output type as well.
+
+    ``export_tiles`` writes no file. It returns the tile path of each point
+    with a latitude below 25, and ``None`` (no tile, as for a point outside
+    the extent) for the other points. Each meta dict is empty.
+    """
+
+    output_types = frozenset({"tabular", "raster"})
+
+    def export_tiles(
+        self,
+        lats: Sequence[float],
+        lons: Sequence[float],
+        window_m: int,
+        output_dir: str | Path,
+        *,
+        ids: Sequence[str] | None = None,
+        dates: Sequence | None = None,
+        dataset_name: str = "dataset",
+        resample_m: float | None = None,
+        filename_suffix: str | None = None,
+        progress_desc: str | None = None,
+        disable_progress: bool = False,
+        progress_callback: ProgressStepCallback | None = None,
+    ) -> tuple[list[Path | None], list[dict]]:
+        """Return ``(paths, meta_list)``, in input order, without writing any file."""
+        tiles_dir = Path(output_dir) / dataset_name
+        tile_filenames = build_tile_filenames(ids, dataset_name, filename_suffix)
+        paths = [
+            tiles_dir / tile_filename if lat < 25 else None
+            for lat, tile_filename in zip(lats, tile_filenames)
+        ]
+        return paths, [{} for _ in paths]
 
 
 def _fake_adapter_with(**class_attributes: Any) -> type[BaseAdapter]:
@@ -219,6 +257,16 @@ def _fake_raster_config(batch_id: str) -> dict[str, Any]:
     }
 
 
+def _register_fake_variant(adapter_class: type[BaseAdapter]) -> None:
+    """Register ``adapter_class`` as the data source ``fake_variant``.
+
+    Also register the dataset ``fake_climate`` of that data source. Use it
+    with the ``isolated_registry`` fixture.
+    """
+    register("fake_variant", adapter_class)
+    update_catalog({"datasets": {"fake_climate": _fake_climate_entry(data_source="fake_variant")}})
+
+
 class TestFakeProviderThroughExtract:
     """A provider that is only an adapter class runs through ``envoi.extract()``."""
 
@@ -233,6 +281,9 @@ class TestFakeProviderThroughExtract:
             fake_signature = inspect.signature(getattr(FakeStatsAdapter, method_name))
             base_signature = inspect.signature(getattr(BaseAdapter, method_name))
             assert fake_signature == base_signature, method_name
+        assert inspect.signature(FakeRasterAdapter.export_tiles) == inspect.signature(
+            BaseAdapter.export_tiles
+        )
 
     def test_tabular_run_with_per_call_band_list(self, fake_provider, three_points, tmp_path):
         """A per-call list of two bands gives the exact statistic, QC, and sidecar outputs.
@@ -342,6 +393,41 @@ class TestFakeProviderThroughExtract:
             {"name": "fake_climate", "bands": ["precip", "temp"], "derived_bands": None}
         ]
         assert "warnings" not in sidecar
+
+    def test_raster_run_gets_the_tile_summary_from_extract(
+        self, isolated_registry, three_points, tmp_path
+    ):
+        """``extract()`` adds the tile summary as the last key of the adapter's dataset entry.
+
+        The fake adapter computes no tile summary. Point C gets no tile.
+        """
+        _register_fake_variant(FakeRasterAdapter)
+
+        extract(three_points, _fake_raster_config("fake_tiles"), output_dir=tmp_path)
+
+        sidecar = _read_sidecar(tmp_path / "fake_tiles" / "fake_tiles_metadata.json")
+        dataset_entry = sidecar["datasets"]["fake_climate"]
+        assert dataset_entry == {
+            "data_source": "fake_variant",
+            "path": "fake://climate",
+            "bands": ["temp", "precip"],
+            "quality": {
+                "tiles": {
+                    "n_exported": 2,
+                    "n_failed": 1,
+                    "total": 3,
+                    "n_errors": 0,
+                    "ids_errors": [],
+                }
+            },
+        }
+        assert list(dataset_entry)[-1] == "quality"
+        manifest = pd.read_csv(tmp_path / "fake_tiles" / "fake_climate" / "tiles_manifest.csv")
+        assert manifest["tile_filename"].tolist()[:2] == [
+            "A-fake_climate.tif",
+            "B-fake_climate.tif",
+        ]
+        assert manifest["exported"].tolist() == [True, True, False]
 
 
 class TestPreFlightChecks:
@@ -686,3 +772,151 @@ class TestRegister:
         )
         register("fake_raster", raster_only_class)
         assert isolated_registry["fake_raster"] is raster_only_class
+
+
+# Variants of the fake adapter that break one rule of the result contract
+# ("Result contract" in the BaseAdapter docstring). Each one changes the
+# valid result of the fake adapter.
+
+
+class TooFewResultsAdapter(FakeStatsAdapter):
+    """Returns no result for the last point."""
+
+    def fetch_stats_batch(self, *args: Any, **kwargs: Any) -> Any:
+        return super().fetch_stats_batch(*args, **kwargs)[:-1]
+
+
+class NonPairItemAdapter(FakeStatsAdapter):
+    """Returns the result of the second point as a tuple of three items."""
+
+    def fetch_stats_batch(self, *args: Any, **kwargs: Any) -> Any:
+        results = super().fetch_stats_batch(*args, **kwargs)
+        stats, meta = results[1]
+        results[1] = (stats, meta, {})
+        return results
+
+
+class MissingMetaKeyAdapter(FakeStatsAdapter):
+    """Returns meta dicts without the required key ``coverage_pct``."""
+
+    def fetch_stats_batch(self, *args: Any, **kwargs: Any) -> Any:
+        results = super().fetch_stats_batch(*args, **kwargs)
+        for _, meta in results:
+            del meta["coverage_pct"]
+        return results
+
+
+class NonDictDatasetMetaAdapter(FakeStatsAdapter):
+    """Returns the dataset entry as a list of (key, value) pairs."""
+
+    def build_dataset_meta(self, *args: Any, **kwargs: Any) -> Any:
+        return list(super().build_dataset_meta(*args, **kwargs).items())
+
+
+class ShortPathsAdapter(FakeRasterAdapter):
+    """Returns no tile path for the last point."""
+
+    def export_tiles(self, *args: Any, **kwargs: Any) -> Any:
+        paths, meta_list = super().export_tiles(*args, **kwargs)
+        return paths[:-1], meta_list
+
+
+class TextPathAdapter(FakeRasterAdapter):
+    """Returns each tile path as text, not as a ``pathlib.Path``."""
+
+    def export_tiles(self, *args: Any, **kwargs: Any) -> Any:
+        paths, meta_list = super().export_tiles(*args, **kwargs)
+        return [None if path is None else str(path) for path in paths], meta_list
+
+
+def _contract_error_message(adapter_class: type[BaseAdapter], method_name: str, rule: str) -> str:
+    """Return the ``RuntimeError`` message for a result of ``fake_climate`` that breaks ``rule``."""
+    return (
+        f"Dataset 'fake_climate': {method_name} of the adapter {adapter_class.__qualname__} "
+        f"returned a result that breaks the adapter result contract: {rule}. This is a bug "
+        f"in the adapter, not a problem with your input table or run config. Please report "
+        f"it to the envoi developers."
+    )
+
+
+class TestAdapterResultChecks:
+    """``extract()`` checks each adapter result before it uses it.
+
+    A result that breaks the result contract raises ``RuntimeError`` that
+    names the dataset, the adapter class, the call, and the broken rule, and
+    the call writes no output.
+    """
+
+    @pytest.mark.parametrize(
+        ("adapter_class", "method_name", "rule"),
+        [
+            pytest.param(
+                TooFewResultsAdapter,
+                "fetch_stats_batch",
+                "it must return one (stats, meta) pair for each point, but returned 2 item(s) "
+                "for 3 point(s)",
+                id="too_few_results",
+            ),
+            pytest.param(
+                NonPairItemAdapter,
+                "fetch_stats_batch",
+                "each item must be a (stats, meta) pair, but item 1 is a tuple of 3 item(s)",
+                id="non_pair_item",
+            ),
+            pytest.param(
+                MissingMetaKeyAdapter,
+                "fetch_stats_batch",
+                "each meta dict must have the keys ['in_extent', 'n_pixels', 'had_nodata', "
+                "'coverage_pct'], but the meta dict of item 0 has no ['coverage_pct']",
+                id="missing_meta_key",
+            ),
+            pytest.param(
+                NonDictDatasetMetaAdapter,
+                "build_dataset_meta",
+                "it must return a dict, but returned a list",
+                id="non_dict_dataset_meta",
+            ),
+        ],
+    )
+    def test_broken_tabular_result_raises(
+        self, isolated_registry, three_points, tmp_path, adapter_class, method_name, rule
+    ):
+        """A tabular result that breaks one rule raises ``RuntimeError`` that names the adapter."""
+        _register_fake_variant(adapter_class)
+
+        with pytest.raises(RuntimeError) as error_info:
+            extract(
+                three_points,
+                _fake_tabular_config("broken", ["fake_climate"]),
+                output_dir=tmp_path,
+            )
+
+        assert str(error_info.value) == _contract_error_message(adapter_class, method_name, rule)
+        assert not any(tmp_path.iterdir())
+
+    @pytest.mark.parametrize(
+        ("adapter_class", "rule"),
+        [
+            pytest.param(
+                ShortPathsAdapter,
+                "paths must have one entry for each point, but has 2 for 3 point(s)",
+                id="short_paths",
+            ),
+            pytest.param(
+                TextPathAdapter,
+                "each path must be a pathlib.Path or None, but path 0 is a str",
+                id="text_path",
+            ),
+        ],
+    )
+    def test_broken_raster_result_raises(
+        self, isolated_registry, three_points, tmp_path, adapter_class, rule
+    ):
+        """A raster result that breaks one rule raises ``RuntimeError`` that names the adapter."""
+        _register_fake_variant(adapter_class)
+
+        with pytest.raises(RuntimeError) as error_info:
+            extract(three_points, _fake_raster_config("broken_tiles"), output_dir=tmp_path)
+
+        assert str(error_info.value) == _contract_error_message(adapter_class, "export_tiles", rule)
+        assert not any(tmp_path.iterdir())

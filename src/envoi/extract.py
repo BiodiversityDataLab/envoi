@@ -30,8 +30,9 @@ from ._output_assembly import (
     _write_tabular,
 )
 from .adapters import get_adapter
+from .adapters.base import REQUIRED_POINT_META_KEYS, BaseAdapter
 from .catalog import BUILTIN_EE_CATALOG, load_catalogs, load_defaults
-from .metadata import write_metadata_sidecar
+from .metadata import summarize_tile_export, write_metadata_sidecar
 from .progress import ProgressCallback, ProgressEvent, ProgressStepCallback
 from .qc import attach_quality_control, split_stats_and_qc, summarize_point_errors
 from .reducers import validate_reducers
@@ -655,7 +656,8 @@ def _process_dataset_tabular(
     The caller threads the warnings into the metadata sidecar's ``warnings`` section.
 
     Raises ``RuntimeError`` when every point of the batch failed (see
-    :func:`_raise_if_every_point_failed`).
+    :func:`_raise_if_every_point_failed`), and when a result of the adapter
+    breaks the adapter result contract (see :func:`_check_adapter_result`).
     """
     # Build a fresh shallow-merged config so per-call band_overrides replace the
     # catalog values for this run only. The catalog dict itself is not
@@ -698,6 +700,11 @@ def _process_dataset_tabular(
             disable_progress=quiet,
             progress_callback=progress_callback,
         )
+        # Check the shape of the result before it is used: one (stats, meta)
+        # pair for each row of df, and the QC keys in each meta dict.
+        _check_adapter_result(
+            adapter, "fetch_stats_batch", stats_results, dataset=dataset, n_points=len(df)
+        )
 
         # Split the (stat, meta) tuples so meta_list can feed QC and dataset metadata.
         meta_list = [meta for _, meta in stats_results]
@@ -733,6 +740,7 @@ def _process_dataset_tabular(
             meta_list=meta_list,
             quality={quality_key: coverage_summary},
         )
+        _check_adapter_result(adapter, "build_dataset_meta", dataset_meta, dataset=dataset)
 
     # Warn once when some points failed. The QC error column, built by
     # attach_quality_control above, has the error text of each failed point.
@@ -826,7 +834,12 @@ def _process_dataset_raster(
     batch, or ``None`` when no tile failed. ``far_image_warning`` is the
     warning about points that used an image far from their sample date (see
     :func:`_warn_about_far_images`), or ``None``. Raises ``RuntimeError`` when
-    every tile of the batch failed (see :func:`_raise_if_every_point_failed`).
+    every tile of the batch failed (see :func:`_raise_if_every_point_failed`),
+    and when a result of the adapter breaks the adapter result contract (see
+    :func:`_check_adapter_result`).
+
+    This helper, not the adapter, adds the tile summary ``quality["tiles"]``
+    to ``dataset_meta``, so that it is the same for every adapter.
     """
     # Build a fresh shallow-merged config so per-call band_overrides replace the
     # catalog values without mutating the catalog dict.
@@ -841,7 +854,7 @@ def _process_dataset_raster(
         # tiles_root / dataset / ... and returning the paths it wrote.
         # progress_desc is shown in the per-tile tqdm bar so the user can tell at
         # a glance which dataset/window the bar belongs to when several run in series.
-        exported_paths, meta_list = adapter.export_tiles(
+        tile_results = adapter.export_tiles(
             lats,
             lons,
             window_size,
@@ -855,6 +868,12 @@ def _process_dataset_raster(
             disable_progress=quiet,
             progress_callback=progress_callback,
         )
+        # Check the shape of the result before it is used: one path (or
+        # None) and one meta dict for each point.
+        _check_adapter_result(
+            adapter, "export_tiles", tile_results, dataset=dataset, n_points=len(lats)
+        )
+        exported_paths, meta_list = tile_results
 
         # A failed tile has "error" in its meta dict. When every tile of the
         # batch failed, stop the run now, with the real error.
@@ -862,21 +881,25 @@ def _process_dataset_raster(
             meta_list, dataset=dataset, batch_label=f"window {window_size} m"
         )
 
-        # Adapter assembles the full per-dataset metadata dict, including
-        # per-tile export info (paths, bounds, CRS). Pass the merged spec so
-        # the metadata reflects the resolved bands the user actually ran with.
+        # Adapter assembles the per-dataset metadata dict, including the
+        # tile CRS of the points. Pass the merged spec so the metadata
+        # reflects the resolved bands the user actually ran with.
         dataset_meta = adapter.build_dataset_meta(
             merged_config,
             meta_list=meta_list,
-            exported_paths=exported_paths,
             lats=lats,
             lons=lons,
         )
+        _check_adapter_result(adapter, "build_dataset_meta", dataset_meta, dataset=dataset)
 
-    # Count the failed tiles and list their IDs in the tile summary. The
-    # adapter has no IDs. tiles.n_failed keeps its meaning: the number of
-    # tiles not exported for any reason, failed tiles included.
-    dataset_meta["quality"]["tiles"].update(summarize_point_errors(meta_list, ids))
+    # The tile summary, the same for every adapter: the numbers of exported
+    # and not exported tiles, and the failed tiles with their IDs (the
+    # adapter has no IDs). tiles.n_failed counts the tiles not exported for
+    # any reason, failed tiles included. quality is the last key of the
+    # dataset's entry.
+    tile_summary = summarize_tile_export(exported_paths, len(lats))
+    tile_summary.update(summarize_point_errors(meta_list, ids))
+    dataset_meta["quality"] = {"tiles": tile_summary}
 
     # Write the manifest that maps each input row to the tile it produced.
     # Sample IDs containing characters that are not portable across operating
@@ -975,6 +998,129 @@ def _write_tile_manifest(
     dataset_tiles_dir.mkdir(parents=True, exist_ok=True)
     manifest_dataframe.to_csv(manifest_path, index=False)
     return manifest_path
+
+
+def _check_adapter_result(
+    adapter: BaseAdapter,
+    method_name: str,
+    result: Any,
+    *,
+    dataset: str,
+    n_points: int | None = None,
+) -> None:
+    """Raise RuntimeError when the result of an adapter call breaks the result contract.
+
+    The mode helpers call this directly after each adapter call, before they
+    use the result. Without the check, a result with too few items would put
+    values in the wrong rows without notice, or fail later with an error far
+    from its cause. :func:`_find_result_contract_break` applies the rules.
+
+    Args:
+        adapter: The adapter that returned ``result``, for the message.
+        method_name: The adapter call: ``"fetch_stats_batch"``,
+            ``"export_tiles"``, or ``"build_dataset_meta"``.
+        result: The value that the call returned.
+        dataset: The dataset name, for the message.
+        n_points: The number of points that the call received. Not used for
+            ``"build_dataset_meta"``.
+
+    Raises:
+        RuntimeError: The result breaks a rule. The message names the
+            dataset, the adapter class, the call, and the rule, and says that
+            the problem is a bug in the adapter.
+    """
+    broken_rule = _find_result_contract_break(method_name, result, n_points)
+    if broken_rule is None:
+        return
+    raise RuntimeError(
+        f"Dataset '{dataset}': {method_name} of the adapter {type(adapter).__qualname__} "
+        f"returned a result that breaks the adapter result contract: {broken_rule}. "
+        f"This is a bug in the adapter, not a problem with your input table or run "
+        f"config. Please report it to the envoi developers."
+    )
+
+
+def _find_result_contract_break(method_name: str, result: Any, n_points: int | None) -> str | None:
+    """Return the rule of the adapter result contract that ``result`` breaks, or None.
+
+    The rules ("Result contract" in the ``BaseAdapter`` docstring):
+
+    - ``fetch_stats_batch``: a list or tuple with ``n_points`` items. Each
+      item is a pair (a tuple or list of two items) of dicts
+      ``(stats, meta)``, and each meta dict has every key of
+      ``REQUIRED_POINT_META_KEYS``.
+    - ``export_tiles``: a pair ``(paths, meta_list)`` of lists or tuples
+      with ``n_points`` items each. Each path is a ``pathlib.Path`` or None,
+      and each meta is a dict.
+    - ``build_dataset_meta``: a dict.
+
+    The text names the rule and the first item that breaks it, with types,
+    not values: a meta dict can hold large arrays.
+    """
+    if method_name == "fetch_stats_batch":
+        if not isinstance(result, (list, tuple)):
+            return f"it must return a list, but returned a {type(result).__name__}"
+        if len(result) != n_points:
+            return (
+                f"it must return one (stats, meta) pair for each point, but returned "
+                f"{len(result)} item(s) for {n_points} point(s)"
+            )
+        for index, item in enumerate(result):
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                item_length = f" of {len(item)} item(s)" if isinstance(item, (list, tuple)) else ""
+                return (
+                    f"each item must be a (stats, meta) pair, but item {index} is a "
+                    f"{type(item).__name__}{item_length}"
+                )
+            stats, meta = item
+            if not isinstance(stats, dict) or not isinstance(meta, dict):
+                return (
+                    f"each item must be a pair of two dicts, but item {index} is a pair of "
+                    f"{type(stats).__name__} and {type(meta).__name__}"
+                )
+            missing_keys = [key for key in REQUIRED_POINT_META_KEYS if key not in meta]
+            if missing_keys:
+                return (
+                    f"each meta dict must have the keys {list(REQUIRED_POINT_META_KEYS)}, but "
+                    f"the meta dict of item {index} has no {missing_keys}"
+                )
+        return None
+
+    if method_name == "export_tiles":
+        if not isinstance(result, (list, tuple)) or len(result) != 2:
+            result_length = (
+                f" of {len(result)} item(s)" if isinstance(result, (list, tuple)) else ""
+            )
+            return (
+                f"it must return a pair (paths, meta_list), but returned a "
+                f"{type(result).__name__}{result_length}"
+            )
+        paths, meta_list = result
+        for list_name, values in (("paths", paths), ("meta_list", meta_list)):
+            if not isinstance(values, (list, tuple)):
+                return f"{list_name} must be a list, but is a {type(values).__name__}"
+            if len(values) != n_points:
+                return (
+                    f"{list_name} must have one entry for each point, but has "
+                    f"{len(values)} for {n_points} point(s)"
+                )
+        for index, path in enumerate(paths):
+            if path is not None and not isinstance(path, Path):
+                return (
+                    f"each path must be a pathlib.Path or None, but path {index} is a "
+                    f"{type(path).__name__}"
+                )
+        for index, tile_meta in enumerate(meta_list):
+            if not isinstance(tile_meta, dict):
+                return f"each meta must be a dict, but meta {index} is a {type(tile_meta).__name__}"
+        return None
+
+    if method_name == "build_dataset_meta":
+        if not isinstance(result, dict):
+            return f"it must return a dict, but returned a {type(result).__name__}"
+        return None
+
+    raise ValueError(f"No result contract for the adapter call {method_name!r}.")
 
 
 def _failed_point_batch_label(reducer_names: list[str], window_size: int) -> str:

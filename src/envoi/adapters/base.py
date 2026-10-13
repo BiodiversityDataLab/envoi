@@ -16,6 +16,10 @@ from ..progress import ProgressStepCallback
 _BAND_NAMING_KEY = "band_naming"
 _PER_BAND_NAMING = "per_band"
 
+# The keys that every meta dict of fetch_stats_batch has, in the order of
+# their QC columns. extract() checks them (see "Result contract" below).
+REQUIRED_POINT_META_KEYS = ("in_extent", "n_pixels", "had_nodata", "coverage_pct")
+
 
 class BaseAdapter:
     """The adapter interface: the calls that ``extract()`` makes, and the capability declarations.
@@ -30,6 +34,73 @@ class BaseAdapter:
     ``validate_catalog_entry``, and ``inspect_catalog_entry`` (the catalog
     hooks), with the same parameters.
     ``docs/architecture.md`` ("Adapter interface") describes each method.
+
+    Result contract. ``extract()`` checks each result directly after the
+    call, and raises ``RuntimeError`` (a bug in the adapter) when it breaks
+    one of these rules:
+
+    - ``fetch_stats_batch`` returns a list with one ``(stats, meta)`` pair of
+      dicts for each point, in input order. Each meta dict has every key of
+      ``REQUIRED_POINT_META_KEYS``: ``in_extent``, ``n_pixels``,
+      ``had_nodata``, and ``coverage_pct``.
+    - ``export_tiles`` returns ``(paths, meta_list)``, two lists with one
+      entry for each point, in input order. ``paths[i]`` is a
+      ``pathlib.Path``, or ``None`` when no tile was written.
+      ``meta_list[i]`` is a dict. Its keys are optional.
+    - ``build_dataset_meta`` returns a dict.
+
+    Statistic keys. Each key of a stats dict becomes the output column
+    ``<dataset>_<key>_<N>m``, or ``<dataset>_<key>`` when the key is
+    ``point`` or ends with ``_point``. The key forms are ``{reducer}`` and
+    ``point`` for one band, ``{band}_{reducer}`` and ``{band}_point`` for
+    more bands or a per-call band list (``{band}`` is the band name, or
+    ``b<n>`` for band ``n`` of a local raster), and ``class_<value>_count``
+    and ``class_<value>_fraction``, with an optional ``{band}_`` prefix, for
+    the reducers ``class_count`` and ``class_fraction`` (``<value>`` is a
+    whole number). A point without a key gets null in that column, or 0 in a
+    class column (a failed point gets null).
+
+    Failed point (its data request or read raised an exception that the
+    adapter caught): the stats dict is empty, the required meta keys have the
+    values of a point outside the extent (``False``, ``0``, ``False``,
+    ``0.0``), and the meta dict has ``error`` and ``exception``. In raster
+    mode the path is ``None``. A point outside the extent has no ``error``.
+
+    Optional meta keys that generic code reads. A QC column (tabular mode) is
+    named ``<dataset>_<column>_<N>m``, or ``<dataset>_<column>_point`` for a
+    run with only the ``point`` reducer:
+
+    - ``error``: the text of ``qc.format_point_error``. QC column ``error``,
+      the ``error`` column of the tile manifest, ``n_errors`` and
+      ``ids_errors`` in the sidecar ``quality`` summary, and a
+      ``failed_<dataset>_...`` sidecar warning. When every point of a batch
+      has it, ``extract()`` raises ``RuntimeError``.
+    - ``exception``: the caught exception. That ``RuntimeError`` is raised
+      from the exception of the first point. It stays in memory: no output
+      writes it.
+    - ``date_clamped``, ``date_source``, ``image_time_start``,
+      ``image_time_end``: QC columns with these names, when a point has
+      ``date_clamped``. ``metadata.summarize_date_info``, which an adapter
+      can call in ``build_dataset_meta``, makes the sidecar ``date_info``
+      from them. It counts the ``date_source`` values ``nearest_to_sample``,
+      ``contains_sample_date``, ``clamped_to_nearest``, and
+      ``most_recent_no_date``.
+    - ``region_crs``: QC column ``region_crs``.
+    - ``band_coverage_pct``: ``{band: percent}``. QC columns
+      ``<band>_coverage_pct``, when the bands have different values.
+    - ``fallback_image_gap_days``: the whole days between the sample date
+      and an image that a per-point fallback selected. More than 32 days
+      gives a ``far_image_<dataset>_...`` sidecar warning.
+
+    Internal meta keys, which no generic code reads: ``window_m``,
+    ``raster_crs``, ``transform``, ``dtype``, ``nodata``, ``src_path``, and
+    ``window_arr``.
+
+    Per-call band list. A band list in the run config sets ``bands``,
+    ``derived_bands`` (when the list has derived bands), and the mark
+    ``band_naming: "per_band"`` (``_BAND_NAMING_KEY``) in the merged spec.
+    With the mark, every statistic key starts with ``{band}_``, also for one
+    band.
     """
 
     # ---- capability declarations --------------------------------------------
@@ -179,7 +250,11 @@ class BaseAdapter:
         disable_progress: bool = False,
         progress_callback: ProgressStepCallback | None = None,
     ) -> list[tuple[dict, dict]]:
-        """Return one ``(stats_dict, meta_dict)`` pair for each point, in input order."""
+        """Return one ``(stats_dict, meta_dict)`` pair for each point, in input order.
+
+        See "Result contract" in the class docstring for the statistic keys,
+        the meta keys, and the result of a failed point.
+        """
         raise NotImplementedError
 
     def export_tiles(
@@ -198,22 +273,27 @@ class BaseAdapter:
         disable_progress: bool = False,
         progress_callback: ProgressStepCallback | None = None,
     ) -> tuple[list[Path | None], list[dict]]:
-        """Export a GeoTIFF tile for each point. Return ``(paths, meta_list)``, in input order."""
+        """Export a GeoTIFF tile for each point. Return ``(paths, meta_list)``, in input order.
+
+        See "Result contract" in the class docstring.
+        """
         raise NotImplementedError
 
     def build_dataset_meta(
         self,
         spec: dict,
         meta_list: list | None = None,
-        exported_paths: list | None = None,
         quality: dict | None = None,
         lats: Sequence[float] | None = None,
         lons: Sequence[float] | None = None,
     ) -> dict:
-        """Build the per-dataset metadata dict for the sidecar JSON.
+        """Build the dataset's entry in the ``datasets`` section of the sidecar JSON.
 
         Each adapter overrides this to use its own cached internal state
-        (CRS, bands, timestamps, ...) and optionally include quality stats,
-        date-selection info, and tile-export summary under the dataset's entry.
+        (CRS, bands, timestamps, ...), and can include date-selection info.
+        It adds ``quality``, when given, as the last key of the entry. In
+        tabular mode ``extract()`` passes the coverage summary of the batch as
+        ``quality``. In raster mode it passes no ``quality``, and adds the
+        tile summary ``quality["tiles"]`` to the returned dict itself.
         """
         raise NotImplementedError

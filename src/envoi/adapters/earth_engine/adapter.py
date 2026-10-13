@@ -32,7 +32,7 @@ from tqdm.auto import tqdm
 from ..._filenames import build_tile_filenames
 from ...catalog import _DATA_TYPES, CatalogError, load_defaults
 from ...geo import build_tile_crs_zones, get_utm_crs, tile_pixel_count, tile_top_left
-from ...metadata import summarize_date_info, summarize_tile_export
+from ...metadata import summarize_date_info
 from ...progress import ProgressStepCallback, emit_progress_step
 from ...qc import format_point_error
 from ...reducers import KNOWN_REDUCERS
@@ -1574,7 +1574,6 @@ class GeeRasterAdapter(BaseAdapter):
         self,
         spec: dict,
         meta_list: list | None = None,
-        exported_paths: list | None = None,
         quality: dict | None = None,
         lats: Sequence[float] | None = None,
         lons: Sequence[float] | None = None,
@@ -1659,15 +1658,10 @@ class GeeRasterAdapter(BaseAdapter):
             if band_coverage_summary:
                 meta["band_coverage_pct"] = band_coverage_summary
 
-        # QC/coverage stats accumulated during processing. Make a copy so we
-        # don't mutate the caller's dict when adding the tile-export summary.
-        quality = dict(quality or {})
-        # Tile-export summary: populated only when this call is for the raster path.
-        if exported_paths is not None:
-            n_points = len(lats) if lats is not None else len(exported_paths)
-            quality["tiles"] = summarize_tile_export(exported_paths, n_points)
+        # QC/coverage stats accumulated during processing, as the last key.
+        # A copy, so that the entry does not share the caller's dict.
         if quality:
-            meta["quality"] = quality
+            meta["quality"] = dict(quality)
 
         return meta
 
