@@ -148,6 +148,7 @@ Two GitHub Actions workflows run automatically:
 
 - **`ci.yml`** runs on every push and pull request. It installs envoi with the `dev` and `webapp` extras across Python 3.10–3.13, runs `ruff check src tests` and `black --check src tests`, then `pytest -q`. The live `gee`-marked tests are skipped in CI (no service account is provisioned), so they should pass deterministically based on the non-GEE suite.
   The `portability` job runs `pytest -m "not gee"` on Windows and macOS with Python 3.12.
+  The `minimum-versions` job runs the same tests on Python 3.10 with every dependency at the minimum version that `pyproject.toml` allows (`.github/scripts/minimum_constraints.py` turns each `>=` into `==`). When you raise a minimum in `pyproject.toml`, this job tests the new minimum.
 
 If CI fails on your PR, the formatter/lint output is the first thing to check — running `pre-commit run --all-files` locally reproduces those steps.
 
