@@ -145,7 +145,9 @@ Adapted from
 - Use `_filenames.py` for output path components across both adapters.
 - Output file and folder names may contain only `[A-Za-z0-9._-]`.
 - Sanitize sample IDs to that character set. Append a stable hash suffix when an ID was rewritten.
-- Preserve filenames for IDs that already satisfy portability and length limits.
+- Preserve filenames for IDs that already satisfy portability and length limits
+  and do not collide with another ID when letter case is ignored.
+  Append the hash suffix to every ID in such a case collision (`Site1` and `site1`).
 - Reject unsafe configuration-supplied `batch_id` values and dataset keys instead of silently rewriting them.
 - Preserve raster-mode validation that requires present, nonblank, unique sample IDs before adapter construction.
 - Preserve tile manifest CSVs that map input rows to exported files. Multi-window runs use suffixed manifest filenames.

@@ -101,9 +101,11 @@ Each subclasses `BaseAdapter`. `docs/architecture.md` lists the method contract.
 Interface and registration:
 - Keep method signatures identical across adapters. **[Contract]**
   To add a keyword, add it to `BaseAdapter` and both adapters in the same change. Check every caller first.
+  `tests/test_adapters.py` compares the parameter names, kinds, and defaults of each adapter with `BaseAdapter`.
 - Return one `(stats_dict, meta_dict)` pair per input point, in input order. **[Contract]**
   The GEE adapter finishes requests out of order and writes each result back to its input index.
 - Register the adapter at the end of its module with `_register("<data_source>", AdapterClass)`, and import the module in `adapters/__init__.py`.
+  Catalog validation in `catalog.py` accepts only a `data_source` that has a registered adapter.
 - If only one source supports a feature, reject it for the other source with a clear `ValueError`.
   Example: `_config_parsing.py` rejects the GEE-only derived bands (`slope`, `aspect`) for local datasets.
 
@@ -122,7 +124,14 @@ Setup, caching, and cleanup:
 Failures for single points (one bad point must not cost the whole batch; a programming error must still stop the run):
 - Continue the batch when the point is outside the raster, its read fails, or its Earth Engine request fails.
   Return an empty result for that point: null statistics, or `None` instead of a tile path.
-  The QC columns, tile manifest, and metadata sidecar then report it as failed. **[Contract]**
+- When a read or request fails (a failed point), return no statistic keys, the QC values of a point outside the extent,
+  and record the error in the point's meta dict: `error`, the text from `qc.format_point_error`, and `exception`, the exception object.
+  Keep `exception` in memory only. Never write it to JSON or to an output table.
+  A point outside the raster, or with only nodata pixels, is not a failed point and has no `error`. **[Contract]**
+- The adapter does not decide what a failed point means for the run. `extract.py` does, after the adapter call:
+  it raises `RuntimeError`, chained to the first failed point's exception, when every point of the batch failed.
+  Otherwise it emits one warning for the batch and records it in the sidecar's `warnings`.
+  The QC error column, the manifest's `error` column, and the sidecar fields `n_errors` and `ids_errors` report each failed point. **[Contract]**
 - Catch the specific exception types, as `LocalRasterAdapter` does (`ValueError`, `WindowError`, `RasterioIOError`).
   Let programming errors (`TypeError`, `AttributeError`, `KeyError`) propagate.
 - The GEE adapter catches `Exception` per worker result, because Earth Engine reports unrelated failures with one exception type.
@@ -160,7 +169,7 @@ Examples are Earth Engine reducers, rasterio windows, image selection by date, b
 Do not add a setting for every implementation detail.
 
 - User-registered catalog entries override built-in entries with the same name. **[Contract]**
-- GEE asset type detection and local raster metadata detection live in `catalog.py`.
+- Local raster metadata detection lives in `catalog.py`. GEE asset type detection runs in `GeeRasterAdapter.__post_init__`.
 - GEE datasets identify bands by name (`DEM`, `B4`). Local rasters use integer band indices that start at 1.
 
 Parsed settings (model: `RunSettings` in `_config_parsing.py`):
@@ -203,7 +212,7 @@ Coordinates and windows:
 - `_validate_and_reproject_crs` reprojects coordinates from `input_crs` to WGS84.
   The output keeps the user's original coordinates and adds `_wgs84` columns. **[Contract]**
 - Check the coordinate order at every call. `get_utm_crs(lon, lat)` and `pyproj` transformers with `always_xy=True` take longitude first.
-  Adapter methods (`fetch_values`, `fetch_stats_batch`, `export_tiles`) take latitude first.
+  Adapter methods (`fetch_stats_batch`, `export_tiles`, and `LocalRasterAdapter.fetch_values`) take latitude first.
 - `window_size_m` is the side length of a square window in metres, not a radius. **[Contract]**
 - Build metric windows in each point's UTM zone through `geo.py`. Do not compute distances in degrees.
 - For a geographic change, also check both hemispheres, longitudes near ±180°,
@@ -215,7 +224,8 @@ Reducers and missing data:
 - The `point` reducer samples the exact pixel at the point. Its columns carry no window suffix. **[Contract]**
 - `class_count` and `class_fraction` are 0 for an unobserved class, even when the window had no valid pixels.
   The QC columns (`in_extent`, `coverage_pct`) distinguish "absent class" from "no data". Keep both. **[Contract]**
-- When you change a reducer, check its definition, empty input, masks, the denominator (`ddof=1` for `std`), and the output type.
+- When you change a reducer, check its definition, empty input, masks, the denominator, and the output type.
+  `std` and `var` are population statistics (`ddof=0`, divide by n) in both adapters, as Earth Engine's `stdDev` and `variance` are.
 - Compare the local and GEE implementations before you claim they give the same result. Document material differences.
 
 Earth Engine requests (in addition to the GEE dataset pitfalls in `AGENTS.md`):
@@ -354,7 +364,7 @@ batch_id = run_settings.batch_id
 
 ### Module docstrings
 
-Start each module with a docstring. **[Proposed]** `qc.py`, `metadata.py`, `catalog.py`, and `reducers.py` do not have one yet.
+Start each module with a docstring. **[Proposed]** `metadata.py`, `catalog.py`, and `reducers.py` do not have one yet.
 Add one when you make a substantial change to such a module. The model is `_input_validation.py`.
 It states the module's responsibility, its main functions, and its boundaries (for example "no GEE calls").
 

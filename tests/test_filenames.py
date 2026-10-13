@@ -5,6 +5,7 @@ integration side (tiles actually landing on disk with these names) lives in
 ``test_extract.py::TestTileNaming``.
 """
 
+import hashlib
 import re
 
 import pytest
@@ -147,6 +148,64 @@ class TestBuildTileFilenames:
         filenames = build_tile_filenames(ids, "dem_local")
         assert len(filenames) == len(ids)
         assert filenames[1].startswith("p2-")
+
+
+def _hash_suffix(original_text: str) -> str:
+    """Return the first 8 hex characters of the SHA-1 of ``original_text``."""
+    return hashlib.sha1(original_text.encode("utf-8")).hexdigest()[:8]
+
+
+class TestCaseCollisions:
+    """IDs that differ only in letter case get distinct names on case-insensitive systems."""
+
+    def test_ids_that_differ_only_in_case_get_hash_suffixes(self):
+        """Both IDs of a case collision get their hash suffix; other IDs keep their names."""
+        filenames = build_tile_filenames(["Site1", "site1", "Site2"], "dem_local")
+
+        assert filenames == [
+            f"Site1-{_hash_suffix('Site1')}-dem_local.tif",
+            f"site1-{_hash_suffix('site1')}-dem_local.tif",
+            "Site2-dem_local.tif",
+        ]
+        # No two names are the same file on Windows or macOS.
+        assert len({filename.casefold() for filename in filenames}) == 3
+
+    def test_names_do_not_depend_on_the_input_order(self):
+        """Each ID of a case collision gets the same name in any order."""
+        forward = build_tile_filenames(["Site1", "site1"], "dem_local")
+        backward = build_tile_filenames(["site1", "Site1"], "dem_local")
+
+        assert backward == list(reversed(forward))
+
+    def test_suffix_is_inserted_before_the_window_suffix(self):
+        """In multi-window runs the hash suffix comes before the window suffix."""
+        filenames = build_tile_filenames(["AB", "ab"], "dem_local", "200m")
+
+        assert filenames == [
+            f"AB-{_hash_suffix('AB')}-dem_local-200m.tif",
+            f"ab-{_hash_suffix('ab')}-dem_local-200m.tif",
+        ]
+
+    def test_rewritten_id_in_a_case_group_is_suffixed_once(self):
+        """An ID that already has its hash suffix keeps it; only the other ID gets one."""
+        rewritten_id = "a/B"
+        # A portable ID equal to the rewritten name of "a/B" when case is ignored.
+        portable_id = f"a_b-{_hash_suffix(rewritten_id)}"
+
+        filenames = build_tile_filenames([rewritten_id, portable_id], "dem_local")
+
+        assert filenames == [
+            f"a_B-{_hash_suffix(rewritten_id)}-dem_local.tif",
+            f"{portable_id}-{_hash_suffix(portable_id)}-dem_local.tif",
+        ]
+
+    def test_remaining_case_collision_raises(self):
+        """The last-resort guard compares names with letter case ignored."""
+        # "Site1" gets the name "Site1-<hash>"; the third ID is that name in lower case.
+        colliding_id = f"site1-{_hash_suffix('Site1')}"
+
+        with pytest.raises(ValueError, match="differ only in letter case"):
+            build_tile_filenames(["Site1", "site1", colliding_id], "dem_local")
 
 
 class TestIsSafePathComponent:

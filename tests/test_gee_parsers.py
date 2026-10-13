@@ -12,11 +12,21 @@ most cases here verify that path.
 
 from __future__ import annotations
 
+import math
+
+import pandas as pd
 import pytest
 
-from envoi.adapters.earth_engine._image import _is_mosaic_date_policy
+from envoi.adapters.earth_engine._image import (
+    _find_nearest_timestamp,
+    _is_mosaic_date_policy,
+    _resolve_date_filter_range,
+)
 from envoi.adapters.earth_engine._reducers import (
+    _circular_aspect_statistics,
     _dedupe_categorical_for_ee,
+    _extract_count_from_reduce_result,
+    _extract_per_band_counts,
     _parse_multiband_result,
     _parse_reduce_result,
 )
@@ -204,6 +214,190 @@ class TestParseMultibandResultClassCount:
 
 
 # ------------------------------------------------------------------
+# Count-only results — "count" is the only window reducer.
+# ------------------------------------------------------------------
+
+# Key shapes from the live probe of 2026-10-09. A single reducer is named by
+# the band only; a combined reducer gives "{band}_{output}" keys.
+_COUNT_ONLY_ONE_BAND = {"elevation": 247}
+_COUNT_ONLY_TWO_BANDS = {"elevation": 247, "slope": 239}
+_MEAN_AND_COUNT_TWO_BANDS = {
+    "elevation_mean": 120.5,
+    "elevation_count": 280,
+    "slope_mean": 4.25,
+    "slope_count": 272,
+}
+
+
+class TestCountOnlyResults:
+    """With the count-only flag, bare band keys are the counts of those bands."""
+
+    def test_single_band_count_gives_n_pixels(self):
+        """A count-only single-band result gives the band's count as the valid-pixel count."""
+        assert (
+            _extract_count_from_reduce_result(
+                _COUNT_ONLY_ONE_BAND, "elevation", multiband=False, count_only=True
+            )
+            == 247
+        )
+
+    def test_two_band_count_gives_band_count_keys(self):
+        """A count-only two-band result gives one {band}_count key per band."""
+        parsed = _parse_multiband_result(
+            _COUNT_ONLY_TWO_BANDS, reducer_names=["count"], suffixes=["_count"], count_only=True
+        )
+        assert parsed == {"elevation_count": 247, "slope_count": 239}
+
+    def test_two_band_count_gives_per_band_counts_and_minimum(self):
+        """Per-band counts come from the bare keys, and the QC count is the smallest one."""
+        assert _extract_per_band_counts(_COUNT_ONLY_TWO_BANDS, count_only=True) == {
+            "elevation": 247,
+            "slope": 239,
+        }
+        assert (
+            _extract_count_from_reduce_result(
+                _COUNT_ONLY_TWO_BANDS, "elevation", multiband=True, count_only=True
+            )
+            == 239
+        )
+
+    def test_combined_result_without_flag_is_unchanged(self):
+        """Without the flag, counts come from {band}_count keys, as for combined reducers."""
+        assert _parse_multiband_result(
+            _MEAN_AND_COUNT_TWO_BANDS, reducer_names=["mean"], suffixes=["_mean"]
+        ) == {"elevation_mean": 120.5, "slope_mean": 4.25}
+        assert _extract_per_band_counts(_MEAN_AND_COUNT_TWO_BANDS) == {
+            "elevation": 280,
+            "slope": 272,
+        }
+        assert (
+            _extract_count_from_reduce_result(
+                _MEAN_AND_COUNT_TWO_BANDS, "elevation", multiband=True
+            )
+            == 272
+        )
+        assert (
+            _extract_count_from_reduce_result(
+                {"elevation_mean": 120.5, "elevation_count": 280}, "elevation", multiband=False
+            )
+            == 280
+        )
+
+    def test_user_count_with_other_reducer_without_flag_is_unchanged(self):
+        """A user "count" combined with "mean" keeps the suffix parsing ({band}_count keys)."""
+        parsed = _parse_multiband_result(
+            _MEAN_AND_COUNT_TWO_BANDS, reducer_names=["mean", "count"], suffixes=["_mean", "_count"]
+        )
+        assert parsed == {
+            "elevation_mean": 120.5,
+            "slope_mean": 4.25,
+            "elevation_count": 280,
+            "slope_count": 272,
+        }
+
+
+# ------------------------------------------------------------------
+# _circular_aspect_statistics — circular mean, std and var of aspect.
+# ------------------------------------------------------------------
+
+
+def _mean_sin_and_cos(directions_deg: list[float]) -> tuple[float, float]:
+    """Return the mean sine and mean cosine of directions in degrees (an independent calculation)."""
+    radians = [math.radians(direction) for direction in directions_deg]
+    mean_sin = sum(math.sin(angle) for angle in radians) / len(radians)
+    mean_cos = sum(math.cos(angle) for angle in radians) / len(radians)
+    return mean_sin, mean_cos
+
+
+def _angular_distance_deg(first_deg: float, second_deg: float) -> float:
+    """Return the shortest distance between two directions on the circle, in degrees."""
+    difference = abs(first_deg - second_deg) % 360.0
+    return min(difference, 360.0 - difference)
+
+
+class TestCircularAspectStatistics:
+    """Circular statistics of aspect from the mean sine, mean cosine, and pixel count."""
+
+    def test_directions_around_north_average_to_north(self):
+        """350° and 10° give the mean direction 0° (north), not the linear mean 180°."""
+        mean_sin, mean_cos = _mean_sin_and_cos([350.0, 10.0])
+
+        result = _circular_aspect_statistics(mean_sin, mean_cos, 2)
+
+        assert 0.0 <= result["mean"] < 360.0
+        assert _angular_distance_deg(result["mean"], 0.0) == pytest.approx(0.0, abs=1e-9)
+        # R = cos(10°); std = sqrt(-2 ln R) in degrees, var = std squared.
+        expected_std = math.degrees(math.sqrt(-2.0 * math.log(math.cos(math.radians(10.0)))))
+        assert result["std"] == pytest.approx(expected_std)
+        assert result["var"] == pytest.approx(expected_std**2)
+
+    def test_mean_direction_in_each_quadrant(self):
+        """The mean direction is in [0, 360) in every quadrant (east 90°, south 180°, west 270°)."""
+        for directions, expected_mean in (
+            ([80.0, 100.0], 90.0),
+            ([170.0, 190.0], 180.0),
+            ([260.0, 280.0], 270.0),
+            ([300.0, 320.0], 310.0),
+        ):
+            mean_sin, mean_cos = _mean_sin_and_cos(directions)
+            result = _circular_aspect_statistics(mean_sin, mean_cos, 2)
+            assert result["mean"] == pytest.approx(expected_mean)
+
+    def test_identical_directions_have_zero_spread(self):
+        """Pixels that all face 45° give mean 45°, std 0, and var 0."""
+        mean_sin, mean_cos = _mean_sin_and_cos([45.0, 45.0, 45.0])
+
+        result = _circular_aspect_statistics(mean_sin, mean_cos, 3)
+
+        assert result["mean"] == pytest.approx(45.0)
+        assert result["std"] == pytest.approx(0.0, abs=1e-6)
+        assert result["var"] == pytest.approx(0.0, abs=1e-6)
+
+    @pytest.mark.parametrize("count", [0, None])
+    def test_window_without_non_flat_pixels_gives_none(self, count):
+        """A window with only flat pixels (no count) gives None for mean, std, and var."""
+        # Earth Engine gives null means when every pixel is masked.
+        assert _circular_aspect_statistics(None, None, count) == {
+            "mean": None,
+            "std": None,
+            "var": None,
+        }
+        assert _circular_aspect_statistics(0.5, 0.5, count) == {
+            "mean": None,
+            "std": None,
+            "var": None,
+        }
+
+    def test_uniform_spread_gives_none(self):
+        """Directions spread evenly around the circle (R = 0) have no mean direction."""
+        mean_sin, mean_cos = _mean_sin_and_cos([0.0, 90.0, 180.0, 270.0])
+
+        assert _circular_aspect_statistics(mean_sin, mean_cos, 4) == {
+            "mean": None,
+            "std": None,
+            "var": None,
+        }
+        assert _circular_aspect_statistics(0.0, 0.0, 4) == {"mean": None, "std": None, "var": None}
+
+    def test_resultant_length_slightly_above_one_gives_zero_std(self):
+        """Rounding that gives R slightly above 1 gives std 0 and var 0, not NaN or an error."""
+        mean_sin, mean_cos = 0.6 * (1.0 + 1e-12), 0.8 * (1.0 + 1e-12)
+        assert math.hypot(mean_sin, mean_cos) > 1.0
+
+        result = _circular_aspect_statistics(mean_sin, mean_cos, 5)
+
+        assert result["std"] == 0.0
+        assert result["var"] == 0.0
+        assert math.copysign(1.0, result["std"]) == 1.0  # 0.0, not -0.0
+        assert result["mean"] == pytest.approx(math.degrees(math.atan2(0.6, 0.8)))
+
+    def test_missing_mean_gives_none(self):
+        """A missing mean sine or cosine gives None, also with a count."""
+        assert _circular_aspect_statistics(None, 0.5, 3)["mean"] is None
+        assert _circular_aspect_statistics(0.5, None, 3)["std"] is None
+
+
+# ------------------------------------------------------------------
 # _check_tile_size — pure-Python sync-download size guard.
 # ------------------------------------------------------------------
 
@@ -249,6 +443,16 @@ class TestCheckTileSize:
         with pytest.raises(ValueError):
             _check_tile_size(band_count=200, **kwargs)
 
+    def test_estimate_uses_the_exported_pixel_count_with_ties_rounded_up(self):
+        # The check must use the tile size that the export requests
+        # (geo.tile_pixel_count, ties rounded up). 2896.5 pixels per side
+        # gives a 2897 × 2897 tile: 2897² × 4 bytes is just over the 32 MiB
+        # limit, while 2896² × 4 bytes (Python's round(), ties to even) is
+        # just under it.
+        assert 2896**2 * 4 <= GEE_SYNC_LIMIT_BYTES < 2897**2 * 4
+        with pytest.raises(ValueError, match="too large"):
+            _check_tile_size(window_m=2896.5, scale_m=1, band_count=1, dataset_name="tie_rounding")
+
 
 class TestIsMosaicDatePolicy:
     """The ``collection_date_policy: mosaic`` switch, read from a catalog entry.
@@ -279,3 +483,162 @@ class TestIsMosaicDatePolicy:
     def test_unknown_policy_is_not_mosaic(self):
         """An unrecognised value must not silently disable date selection."""
         assert not _is_mosaic_date_policy({"collection_date_policy": "whatever"})
+
+
+# ------------------------------------------------------------------
+# _resolve_date_filter_range — the filterDate range for "contains".
+# ------------------------------------------------------------------
+
+# Three 8-day intervals, the shape of the built-in "contains" collections.
+_EIGHT_DAY_STARTS = pd.DatetimeIndex(["2021-01-01", "2021-01-09", "2021-01-17"])
+_EIGHT_DAY_ENDS = pd.DatetimeIndex(["2021-01-09", "2021-01-17", "2021-01-25"])
+
+
+class TestFindNearestTimestamp:
+    """The nearest start and the clamp flag follow whole UTC days (the day rule)."""
+
+    # Two images start later in their day, and one starts at 23:00.
+    _STARTS = pd.DatetimeIndex(
+        ["2021-06-01 10:00", "2021-06-05 23:00", "2021-06-06 10:00", "2021-06-10 10:00"]
+    )
+
+    @pytest.mark.parametrize(
+        ("sample_date", "expected_start", "expected_clamped"),
+        [
+            # On the start day of the first or last image: not clamped, although
+            # the image starts later in that day.
+            ("2021-06-01", "2021-06-01 10:00", False),
+            ("2021-06-10", "2021-06-10 10:00", False),
+            # Before the first or after the last start day: clamped.
+            ("2021-05-31", "2021-06-01 10:00", True),
+            ("2021-06-11", "2021-06-10 10:00", True),
+            # An image on the sample day wins over a closer time on the day before.
+            ("2021-06-06", "2021-06-06 10:00", False),
+            # Equally many days to two images: the earlier image.
+            ("2021-06-03", "2021-06-01 10:00", False),
+            ("2021-06-08", "2021-06-06 10:00", False),
+        ],
+    )
+    def test_whole_days(self, sample_date, expected_start, expected_clamped):
+        """Gaps, ties, and clamping count whole days between the start day and the sample day."""
+        nearest, was_clamped = _find_nearest_timestamp(self._STARTS, pd.Timestamp(sample_date))
+
+        assert nearest == pd.Timestamp(expected_start)
+        assert was_clamped is expected_clamped
+
+    def test_batch_range_is_the_day_of_the_nearest_start(self):
+        """The nearest policy filters the whole start day of the selected image."""
+        assert _resolve_date_filter_range(pd.Timestamp("2021-06-06"), "nearest", self._STARTS) == (
+            "2021-06-06",
+            "2021-06-07",
+        )
+
+
+class TestResolveDateFilterRangeContains:
+    """``filterDate`` is half-open and gets whole days, so the range must
+    contain the start day of the selected image, or ``.first()`` is null.
+    """
+
+    def test_end_equal_to_start_covers_the_start_day(self):
+        """An instantaneous image (end == start) gives a one-day range."""
+        starts = pd.DatetimeIndex(["2021-06-15"])
+        ends = pd.DatetimeIndex(["2021-06-15"])
+        assert _resolve_date_filter_range(pd.Timestamp("2021-06-15"), "contains", starts, ends) == (
+            "2021-06-15",
+            "2021-06-16",
+        )
+
+    def test_end_later_on_the_start_day_covers_the_start_day(self):
+        """An image that ends on its start day gives a one-day range."""
+        starts = pd.DatetimeIndex(["2021-06-15 00:00:00"])
+        ends = pd.DatetimeIndex(["2021-06-15 23:59:59"])
+        assert _resolve_date_filter_range(pd.Timestamp("2021-06-15"), "contains", starts, ends) == (
+            "2021-06-15",
+            "2021-06-16",
+        )
+
+    def test_one_day_interval_is_unchanged(self):
+        """An image whose end is the next midnight keeps that end."""
+        starts = pd.DatetimeIndex(["2021-06-15"])
+        ends = pd.DatetimeIndex(["2021-06-16"])
+        assert _resolve_date_filter_range(pd.Timestamp("2021-06-15"), "contains", starts, ends) == (
+            "2021-06-15",
+            "2021-06-16",
+        )
+
+    def test_next_start_on_the_same_day_without_ends(self):
+        """Without end times, a next start on the same day still gives a one-day range."""
+        starts = pd.DatetimeIndex(["2021-06-15 00:00:00", "2021-06-15 12:00:00"])
+        assert _resolve_date_filter_range(pd.Timestamp("2021-06-15"), "contains", starts) == (
+            "2021-06-15",
+            "2021-06-16",
+        )
+
+    @pytest.mark.parametrize(
+        ("sample_date", "expected_range"),
+        [
+            # The image that starts at 10:00 on the sample day, not the one before.
+            ("2021-06-15", ("2021-06-15", "2021-06-23")),
+            # The first image, which starts at 10:00 on the sample day.
+            ("2021-06-07", ("2021-06-07", "2021-06-15")),
+            # The day before the next image's start day.
+            ("2021-06-22", ("2021-06-15", "2021-06-23")),
+        ],
+    )
+    def test_image_that_starts_later_on_the_sample_day(self, sample_date, expected_range):
+        """Day rule: an image that starts at 10:00 on the sample day is the image of that day."""
+        starts = pd.DatetimeIndex(["2021-06-07 10:00", "2021-06-15 10:00", "2021-06-23 10:00"])
+        ends = pd.DatetimeIndex(["2021-06-15 10:00", "2021-06-23 10:00", "2021-07-01 10:00"])
+
+        assert (
+            _resolve_date_filter_range(pd.Timestamp(sample_date), "contains", starts, ends)
+            == expected_range
+        )
+        # Without end times, the range ends at the next image's start day.
+        assert (
+            _resolve_date_filter_range(pd.Timestamp(sample_date), "contains", starts)
+            == expected_range
+        )
+
+    @pytest.mark.parametrize(
+        ("sample_date", "expected_range"),
+        [
+            # In range: the interval that contains the date.
+            ("2021-01-12", ("2021-01-09", "2021-01-17")),
+            # On the first start.
+            ("2021-01-01", ("2021-01-01", "2021-01-09")),
+            # Inside the last interval.
+            ("2021-01-20", ("2021-01-17", "2021-01-25")),
+            # Before the first start: the first image.
+            ("2020-12-01", ("2021-01-01", "2021-01-09")),
+            # After the last interval: the last image.
+            ("2022-06-01", ("2021-01-17", "2021-01-25")),
+        ],
+    )
+    def test_with_end_times(self, sample_date, expected_range):
+        """With end times, the range is the selected image's own interval."""
+        assert (
+            _resolve_date_filter_range(
+                pd.Timestamp(sample_date), "contains", _EIGHT_DAY_STARTS, _EIGHT_DAY_ENDS
+            )
+            == expected_range
+        )
+
+    @pytest.mark.parametrize(
+        ("sample_date", "expected_range"),
+        [
+            # In range: from the containing start to the next start.
+            ("2021-01-12", ("2021-01-09", "2021-01-17")),
+            ("2021-01-01", ("2021-01-01", "2021-01-09")),
+            # The last image ends one day after its start.
+            ("2021-01-17", ("2021-01-17", "2021-01-18")),
+            ("2020-12-01", ("2021-01-01", "2021-01-09")),
+            ("2022-06-01", ("2021-01-17", "2021-01-18")),
+        ],
+    )
+    def test_without_end_times(self, sample_date, expected_range):
+        """Without end times, an interval ends at the next start, or one day after the last start."""
+        assert (
+            _resolve_date_filter_range(pd.Timestamp(sample_date), "contains", _EIGHT_DAY_STARTS)
+            == expected_range
+        )

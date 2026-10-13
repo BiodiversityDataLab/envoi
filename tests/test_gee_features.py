@@ -17,15 +17,20 @@ I/O even when this file is part of the collection.
 from __future__ import annotations
 
 import json
+import math
+import warnings
+from pathlib import Path
 
 import pandas as pd
 import pytest
 import rasterio
+import yaml
 from _gee_helpers import SWEDEN_SAMPLE_DF, gee_credentials_available
 
 from envoi import reset_catalog, update_catalog
 from envoi.catalog import BUILTIN_EE_CATALOG, load_catalogs
 from envoi.extract import extract
+from envoi.geo import get_utm_crs, tile_pixel_count
 
 # Apply two markers to every test in this module:
 #   * ``gee`` — selectable via ``pytest -m gee`` / ``pytest -m 'not gee'``.
@@ -424,9 +429,13 @@ class TestRasterExport:
         assert len(exported_tifs) == len(SWEDEN_SAMPLE_DF)
         # And every tile must actually contain data (not just be a header).
         # Catches silent failures where the request returned an empty image.
+        # Without resample_m, the tile pixel size is the native scale (about
+        # 30.92 m), and every tile has n × n pixels (6 × 6 for 200 m). A
+        # request by region and scale gave an extra row or column at some points.
         for tif_path in exported_tifs:
             with rasterio.open(tif_path) as src:
-                assert src.width > 0 and src.height > 0
+                expected_pixels = tile_pixel_count(200, src.res[0])
+                assert (src.width, src.height) == (expected_pixels, expected_pixels)
                 assert src.count >= 1
 
     def test_tiles_worldcover_resample(self, tmp_path):
@@ -450,6 +459,49 @@ class TestRasterExport:
             with rasterio.open(tif_path) as src:
                 assert src.width == expected_pixels_per_side
                 assert src.height == expected_pixels_per_side
+
+    def test_odd_tile_has_the_point_in_its_centre_pixel(self, tmp_path):
+        """A 200 m tile at resample_m=30 is 7 × 7, with the point in its centre pixel (3, 3)."""
+        from pyproj import Transformer
+
+        one_point_df = SWEDEN_SAMPLE_DF.iloc[[0]]
+        update_catalog(_make_catalog(("dem_aster", "projects/sat-io/open-datasets/ASTER/GDEM")))
+        try:
+            extract(
+                one_point_df,
+                {
+                    "batch_id": "odd_tile",
+                    "datasets": ["dem_aster"],
+                    "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 30},
+                },
+                output_dir=tmp_path,
+            )
+        finally:
+            reset_catalog()
+
+        lat = one_point_df["decimalLatitude"].iloc[0]
+        lon = one_point_df["decimalLongitude"].iloc[0]
+        utm_crs = get_utm_crs(lon, lat)
+        point_x, point_y = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True).transform(
+            lon, lat
+        )
+        sample_id = one_point_df["occurrenceID"].iloc[0]
+        with rasterio.open(
+            tmp_path / "odd_tile" / "dem_aster" / f"{sample_id}-dem_aster.tif"
+        ) as src:
+            assert (src.width, src.height) == (7, 7)
+            assert src.crs.to_epsg() == int(utm_crs.split(":")[1])
+            tile_transform = src.transform
+
+        # 30 m pixels, corners on multiples of 30 m, and the point in pixel (3, 3),
+        # counted from the tile's top-left corner.
+        assert tile_transform.a == pytest.approx(30.0)
+        assert tile_transform.e == pytest.approx(-30.0)
+        assert tile_transform.c / 30 == pytest.approx(round(tile_transform.c / 30))
+        assert tile_transform.f / 30 == pytest.approx(round(tile_transform.f / 30))
+        column = math.floor((point_x - tile_transform.c) / 30.0)
+        row = math.floor((tile_transform.f - point_y) / 30.0)
+        assert (column, row) == (3, 3)
 
     def test_raster_metadata_sidecar(self, tmp_path):
         """Raster export writes a sidecar metadata JSON with native CRS/scale.
@@ -479,6 +531,180 @@ class TestRasterExport:
         meta = json.loads(meta_path.read_text())
         assert "dem_aster" in meta["datasets"]
         assert meta["datasets"]["dem_aster"]["data_source"] == "earth_engine"
+
+
+# ------------------------------------------------------------------
+# Window statistics with special result shapes: count only, circular aspect.
+# ------------------------------------------------------------------
+
+
+def _angular_distance_deg(first_deg: float, second_deg: float) -> float:
+    """Return the shortest distance between two directions on the circle, in degrees."""
+    difference = abs(first_deg - second_deg) % 360.0
+    return min(difference, 360.0 - difference)
+
+
+# A point on the upper north flank of Mayon volcano (Philippines), 2 km north
+# of the summit. The slope faces north (circular mean about 8° on 2026-10-09),
+# and the directions of its pixels lie on both sides of north (min about 1°,
+# max about 360°), so their linear mean is near south (about 164°).
+_NORTH_FACING_SLOPE_DF = pd.DataFrame(
+    {
+        "occurrenceID": ["mayon_north_flank"],
+        "decimalLatitude": [13.2728],
+        "decimalLongitude": [123.6853],
+    }
+)
+
+
+class TestWindowStatisticShapes:
+    """Count-only runs and circular aspect statistics, on one point with a 200 m window."""
+
+    def test_count_only_runs_give_counts_and_qc(self, tmp_path):
+        """Count-only runs give count columns and n_pixels > 0, for one band and for two bands."""
+        settings = {"output_type": "tabular", "statistics": ["count"], "window_size_m": 200}
+        outputs = extract(
+            SWEDEN_SAMPLE_DF.iloc[[0]],
+            [
+                {
+                    "batch_id": "count_one",
+                    "datasets": ["dem_copernicus_glo30"],
+                    "settings": settings,
+                },
+                {
+                    "batch_id": "count_two",
+                    "datasets": [{"dem_copernicus_glo30": ["DEM", "slope"]}],
+                    "settings": settings,
+                },
+            ],
+            output_dir=tmp_path,
+        )
+
+        # One band: the count column and the QC count agree.
+        one_band = pd.read_csv(outputs["count_one"]).iloc[0]
+        one_band_qc = pd.read_csv(tmp_path / "count_one_qc.csv").iloc[0]
+        count = one_band["dem_copernicus_glo30_count_200m"]
+        assert count > 0
+        assert one_band_qc["dem_copernicus_glo30_n_pixels_200m"] == count
+        assert one_band_qc["dem_copernicus_glo30_coverage_pct_200m"] > 0
+        assert bool(one_band_qc["dem_copernicus_glo30_in_extent_200m"]) is True
+
+        # Two bands: one count column per band, and QC uses the smaller count.
+        two_bands = pd.read_csv(outputs["count_two"]).iloc[0]
+        two_bands_qc = pd.read_csv(tmp_path / "count_two_qc.csv").iloc[0]
+        dem_count = two_bands["dem_copernicus_glo30_DEM_count_200m"]
+        slope_count = two_bands["dem_copernicus_glo30_slope_count_200m"]
+        assert dem_count > 0 and slope_count > 0
+        assert two_bands_qc["dem_copernicus_glo30_n_pixels_200m"] == min(dem_count, slope_count)
+        assert bool(two_bands_qc["dem_copernicus_glo30_in_extent_200m"]) is True
+
+    def test_aspect_mean_is_circular_on_a_north_facing_slope(self, tmp_path):
+        """On a north-facing slope, the circular aspect mean faces north, unlike the linear mean."""
+        import ee
+
+        from envoi.adapters.earth_engine import GeeRasterAdapter
+        from envoi.geo import get_utm_crs
+
+        # Single band: a catalog entry whose only band is the derived aspect.
+        # Multi-band: the built-in DEM with the per-call bands [DEM, aspect].
+        single_band_entry = {
+            "data_source": "earth_engine",
+            "path": "COPERNICUS/DEM/GLO30_2024_1",
+            "data_type": "continuous",
+            "derived_bands": ["aspect"],
+            "supported_derived_bands": ["aspect"],
+            "dataset_spec": {"collection_date_policy": "mosaic"},
+        }
+        update_catalog({"datasets": {"aspect_only": single_band_entry}})
+        settings = {
+            "output_type": "tabular",
+            "statistics": ["mean", "std", "min", "max"],
+            "window_size_m": 200,
+        }
+        try:
+            outputs = extract(
+                _NORTH_FACING_SLOPE_DF,
+                [
+                    {"batch_id": "single", "datasets": ["aspect_only"], "settings": settings},
+                    {
+                        "batch_id": "multi",
+                        "datasets": [{"dem_copernicus_glo30": ["DEM", "aspect"]}],
+                        "settings": settings,
+                    },
+                ],
+                output_dir=tmp_path,
+            )
+        finally:
+            reset_catalog()
+        single_band = pd.read_csv(outputs["single"]).iloc[0]
+        multi_band = pd.read_csv(outputs["multi"]).iloc[0]
+
+        # The linear mean of the same window: the Earth Engine mean of the
+        # aspect band over the region, scale and grid of the window statistics.
+        lat = _NORTH_FACING_SLOPE_DF["decimalLatitude"].iloc[0]
+        lon = _NORTH_FACING_SLOPE_DF["decimalLongitude"].iloc[0]
+        adapter = GeeRasterAdapter(single_band_entry)
+        aspect_image, _ = adapter._get_image(lat=lat, lon=lon)
+        linear_mean = aspect_image.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=adapter._make_region(lat, lon, 200),
+            scale=adapter._get_scale_value(aspect_image),
+            crs=get_utm_crs(lon, lat),
+            bestEffort=True,
+        ).getInfo()["aspect"]
+
+        circular_mean = single_band["aspect_only_mean_200m"]
+        observed = (
+            f"circular mean {circular_mean}, linear mean {linear_mean}, "
+            f"min {single_band['aspect_only_min_200m']}, max {single_band['aspect_only_max_200m']}, "
+            f"circular std {single_band['aspect_only_std_200m']}"
+        )
+        # The window has directions on both sides of north.
+        assert single_band["aspect_only_min_200m"] < 45.0, observed
+        assert single_band["aspect_only_max_200m"] > 315.0, observed
+        # The circular mean is near north. The linear mean of directions just
+        # above 0° and just below 360° is near south.
+        assert 0.0 <= circular_mean < 360.0, observed
+        assert _angular_distance_deg(circular_mean, 0.0) < 30.0, observed
+        assert _angular_distance_deg(linear_mean, 180.0) < 60.0, observed
+        assert _angular_distance_deg(circular_mean, linear_mean) > 120.0, observed
+        assert single_band["aspect_only_std_200m"] > 0.0, observed
+        # Both key forms give the same circular values for the same window.
+        assert multi_band["dem_copernicus_glo30_aspect_mean_200m"] == pytest.approx(circular_mean)
+        assert multi_band["dem_copernicus_glo30_aspect_std_200m"] == pytest.approx(
+            single_band["aspect_only_std_200m"]
+        )
+
+    def test_aspect_only_band_list_gives_only_aspect_columns(self, tmp_path):
+        """The per-call list [aspect] gives only the band-named aspect column, with no DEM column."""
+        outputs = extract(
+            _NORTH_FACING_SLOPE_DF,
+            {
+                "batch_id": "aspect_list",
+                "datasets": [{"dem_copernicus_glo30": ["aspect"]}],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 200,
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        stats = pd.read_csv(outputs["aspect_list"])
+        dataset_columns = [
+            column for column in stats.columns if column.startswith("dem_copernicus_glo30_")
+        ]
+        assert dataset_columns == ["dem_copernicus_glo30_aspect_mean_200m"]
+        # The circular mean of the north-facing slope is near north.
+        aspect_mean = stats.loc[0, "dem_copernicus_glo30_aspect_mean_200m"]
+        assert 0.0 <= aspect_mean < 360.0
+        assert _angular_distance_deg(aspect_mean, 0.0) < 30.0, aspect_mean
+        sidecar = json.loads((tmp_path / "aspect_list_metadata.json").read_text())
+        assert sidecar["config"]["datasets"] == [
+            {"name": "dem_copernicus_glo30", "bands": [], "derived_bands": ["aspect"]}
+        ]
+        assert sidecar["datasets"]["dem_copernicus_glo30"]["band_names"] == ["aspect"]
 
 
 # ------------------------------------------------------------------
@@ -608,6 +834,201 @@ class TestAutoDateSelection:
         # Source label should explicitly indicate "no date column was provided"
         # so users can audit which path their points took.
         assert qc_df["era5_date_source_200m"].eq("most_recent_no_date").all()
+
+    def test_point_without_images_has_no_data_and_no_error(self, tmp_path):
+        """A point where the collection has no image gets no data, not a failed-point error."""
+        # The satellite embeddings cover land only. Their collection selects one
+        # image per point with .first() (collection_date_policy: contains), so
+        # the open-ocean point has no image to select.
+        points = pd.DataFrame(
+            {
+                "occurrenceID": ["land", "ocean"],
+                "decimalLatitude": [62.9768783, 0.0],
+                "decimalLongitude": [18.026823, -30.0],
+                "eventDate": ["2021-06-15", "2021-06-15"],
+            }
+        )
+        with warnings.catch_warnings(record=True) as recorded_warnings:
+            warnings.simplefilter("always")
+            outputs = extract(
+                points,
+                {
+                    "batch_id": "no_image",
+                    "datasets": [{"aef_satellite_embeddings": ["A00", "A01"]}],
+                    "settings": {
+                        "output_type": "tabular",
+                        "statistics": ["mean", "sum"],
+                        "window_size_m": 100,
+                    },
+                },
+                output_dir=tmp_path,
+            )
+
+        # No point failed: the ocean point is a point without data.
+        assert not [
+            recorded for recorded in recorded_warnings if "points failed" in str(recorded.message)
+        ]
+        stats = pd.read_csv(outputs["no_image"]).set_index("occurrenceID")
+        qc = pd.read_csv(tmp_path / "no_image_qc.csv").set_index("occurrenceID")
+        assert "aef_satellite_embeddings_error_100m" not in qc.columns
+        mean_columns = [f"aef_satellite_embeddings_{band}_mean_100m" for band in ("A00", "A01")]
+        sum_columns = [f"aef_satellite_embeddings_{band}_sum_100m" for band in ("A00", "A01")]
+
+        # Land: values inside the extent.
+        assert bool(qc.loc["land", "aef_satellite_embeddings_in_extent_100m"]) is True
+        assert qc.loc["land", "aef_satellite_embeddings_n_pixels_100m"] > 0
+        assert stats.loc["land", mean_columns].notna().all()
+
+        # Ocean: no data. Earth Engine gives 0, not null, for the sum of no
+        # pixels (seen live on 2026-10-09); envoi makes it null, as the mean is.
+        assert bool(qc.loc["ocean", "aef_satellite_embeddings_in_extent_100m"]) is False
+        assert qc.loc["ocean", "aef_satellite_embeddings_n_pixels_100m"] == 0
+        assert stats.loc["ocean", mean_columns].isna().all()
+        assert stats.loc["ocean", sum_columns].isna().all()
+        # Land: the sum of valid pixels is a value.
+        assert stats.loc["land", sum_columns].notna().all()
+
+
+# ------------------------------------------------------------------
+# Image selection per point: images with different dates at different places.
+# ------------------------------------------------------------------
+#
+# In June 2021, Sentinel-2 had images at Uppsala on 06-02, 05, 07, 10, 12, 15,
+# 17, ... and at Göteborg on 06-01, 03, 06, 08, 11, 13, 16, ... (live
+# 2026-10-12): the two points have no common day. The batch-selected image of
+# 2021-06-16 is at Göteborg only, so Uppsala needs an image of its own.
+
+_UPPSALA_AND_GOTEBORG_DF = pd.DataFrame(
+    {
+        "occurrenceID": ["uppsala", "goteborg"],
+        "decimalLatitude": [59.86, 57.71],
+        "decimalLongitude": [17.64, 11.97],
+        "eventDate": ["2021-06-16", "2021-06-16"],
+    }
+)
+_EXPECTED_SENTINEL_2_DAYS = {"uppsala": "2021-06-15", "goteborg": "2021-06-16"}
+_SENTINEL_2_NEAREST_ENTRY = {
+    "data_source": "earth_engine",
+    "path": "COPERNICUS/S2_SR_HARMONIZED",
+    "data_type": "continuous",
+    "bands": ["B4"],
+    "dataset_spec": {"collection_date_policy": "nearest"},
+}
+
+
+def _run_sentinel_2_statistics(points, dataset_name, output_dir, batch_id):
+    """Run a tabular mean over 100 m windows; return the stats table, the QC table, and warnings.
+
+    The warnings are the failed-point warnings of the run.
+    """
+    with warnings.catch_warnings(record=True) as recorded_warnings:
+        warnings.simplefilter("always")
+        outputs = extract(
+            points,
+            {
+                "batch_id": batch_id,
+                "datasets": [dataset_name],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=output_dir,
+            quiet=True,
+        )
+    stats = pd.read_csv(outputs[batch_id]).set_index("occurrenceID")
+    qc = pd.read_csv(output_dir / f"{batch_id}_qc.csv").set_index("occurrenceID")
+    failed_point_warnings = [
+        str(recorded.message)
+        for recorded in recorded_warnings
+        if "points failed" in str(recorded.message)
+    ]
+    return stats, qc, failed_point_warnings
+
+
+def _check_each_point_alone(dataset_name, together_qc, tmp_path):
+    """Run each point alone and check that it selects the same image as in the batch."""
+    start_column = f"{dataset_name}_image_time_start_100m"
+    for point_id in _UPPSALA_AND_GOTEBORG_DF["occurrenceID"]:
+        one_point = _UPPSALA_AND_GOTEBORG_DF[_UPPSALA_AND_GOTEBORG_DF["occurrenceID"] == point_id]
+        _, alone_qc, failed_point_warnings = _run_sentinel_2_statistics(
+            one_point, dataset_name, tmp_path, f"alone_{point_id}"
+        )
+        assert failed_point_warnings == []
+        assert alone_qc.loc[point_id, start_column] == together_qc.loc[point_id, start_column]
+
+
+class TestPerPointImageSelection:
+    """Each point gets an image of its own when the batch-selected image does not cover it."""
+
+    def test_points_with_images_on_different_days(self, tmp_path):
+        """Uppsala and Göteborg together: both have values, and the QC table names their images."""
+        update_catalog({"datasets": {"s2_nearest": _SENTINEL_2_NEAREST_ENTRY}})
+
+        stats, qc, failed_point_warnings = _run_sentinel_2_statistics(
+            _UPPSALA_AND_GOTEBORG_DF, "s2_nearest", tmp_path, "together"
+        )
+
+        assert failed_point_warnings == []
+        assert "s2_nearest_error_100m" not in qc.columns
+        assert stats["s2_nearest_mean_100m"].notna().all()
+        assert qc["s2_nearest_image_time_start_100m"].to_dict() == _EXPECTED_SENTINEL_2_DAYS
+        assert qc["s2_nearest_date_source_100m"].eq("nearest_to_sample").all()
+        _check_each_point_alone("s2_nearest", qc, tmp_path)
+
+    def test_tiles_of_points_with_images_on_different_days(self, tmp_path):
+        """In raster mode, both tiles have valid pixels, and date_info lists both days."""
+        update_catalog({"datasets": {"s2_nearest": _SENTINEL_2_NEAREST_ENTRY}})
+
+        extract(
+            _UPPSALA_AND_GOTEBORG_DF,
+            {
+                "batch_id": "tiles",
+                "datasets": ["s2_nearest"],
+                "settings": {"output_type": "raster", "window_size_m": 100, "resample_m": 20},
+            },
+            output_dir=tmp_path,
+            quiet=True,
+        )
+
+        tiles_dir = tmp_path / "tiles" / "s2_nearest"
+        manifest = pd.read_csv(tiles_dir / "tiles_manifest.csv")
+        assert manifest["exported"].all()
+        assert "error" not in manifest.columns
+        for tile_filename in manifest["tile_filename"]:
+            with rasterio.open(tiles_dir / tile_filename) as tile:
+                red_band = tile.read(1, masked=True)
+            # Valid reflectance pixels: not masked, and above 0.
+            assert red_band.count() > 0
+            assert red_band.max() > 0
+        sidecar = json.loads((tmp_path / "tiles" / "tiles_metadata.json").read_text())
+        date_info = sidecar["datasets"]["s2_nearest"]["date_info"]
+        assert [start for start, _ in date_info["image_date_ranges_used"]] == sorted(
+            _EXPECTED_SENTINEL_2_DAYS.values()
+        )
+        assert date_info["n_nearest_to_sample"] == 2
+
+    def test_contains_entry_of_the_example_catalog(self, tmp_path):
+        """The Sentinel-2 ``contains`` entry of examples/catalog.yml: each point gets its own image."""
+        example_catalog_path = Path(__file__).parents[1] / "examples" / "catalog.yml"
+        example_catalog = yaml.safe_load(example_catalog_path.read_text(encoding="utf-8"))
+        update_catalog(
+            {"datasets": {"s2_contains": example_catalog["datasets"]["sentinel_2_sr_harmonized"]}}
+        )
+
+        stats, qc, failed_point_warnings = _run_sentinel_2_statistics(
+            _UPPSALA_AND_GOTEBORG_DF, "s2_contains", tmp_path, "together"
+        )
+
+        assert failed_point_warnings == []
+        assert "s2_contains_error_100m" not in qc.columns
+        mean_columns = ["s2_contains_B4_mean_100m", "s2_contains_B8_mean_100m"]
+        assert stats[mean_columns].notna().all().all()
+        # No Uppsala image contains 2021-06-16 (each image lasts seconds), so
+        # Uppsala gets its latest image before that day.
+        assert qc["s2_contains_image_time_start_100m"].to_dict() == _EXPECTED_SENTINEL_2_DAYS
+        _check_each_point_alone("s2_contains", qc, tmp_path)
 
 
 # ------------------------------------------------------------------

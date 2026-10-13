@@ -26,6 +26,47 @@ jobs:
       - name: Tests
         run: pytest -q
 
+  # The offline test suite on Windows and macOS. envoi supports both, and file
+  # names, paths, and raster I/O can differ there. One Python version is enough:
+  # the build job above covers the Python versions on Linux.
+  portability:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install -U pip
+          pip install -e ".[dev,webapp]"
+      - name: Tests
+        run: pytest -m "not gee" -q
+
+  # The offline test suite at the oldest versions that pyproject.toml allows,
+  # on the oldest supported Python. The pins come from pyproject.toml itself
+  # (each '>=' becomes '=='), so this job follows the declared minimums.
+  minimum-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Pin the minimum versions
+        run: |
+          python -m pip install -U pip tomli
+          python .github/scripts/minimum_constraints.py > minimum-constraints.txt
+          cat minimum-constraints.txt
+      - name: Install
+        run: pip install -e ".[dev,webapp]" -c minimum-constraints.txt
+      - name: Tests
+        run: pytest -m "not gee" -q
+
   package:
     runs-on: ubuntu-latest
     steps:

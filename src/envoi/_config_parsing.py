@@ -8,6 +8,9 @@ no GEE calls, no file I/O beyond reading a YAML config file.
 Public surface re-imported by ``extract.py``:
 
 * :class:`RunSettings` — immutable container of one parsed output config.
+* :func:`_parse_run_configs` — parse every run config of one extract() call
+  with :func:`_parse_run_config` and reject batch_id values whose output
+  files or folders would collide.
 * :func:`_parse_run_config` — turn one raw config dict into RunSettings,
   raising ValueError for any malformed setting.
 * :func:`_resolve_stats_for_dataset` — pick the right reducer list for a
@@ -21,6 +24,8 @@ Most other helpers (``_normalize_dataset_entry``, ``_validate_*``,
 
 from __future__ import annotations
 
+import math
+import numbers
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +33,7 @@ import yaml
 
 from ._filenames import describe_unsafe_path_component, is_safe_path_component
 from .adapters.earth_engine import KNOWN_DERIVED_BANDS
+from .adapters.earth_engine.adapter import _BAND_NAMING_KEY, _PER_BAND_NAMING
 
 # Keys allowed inside the full-form dict value
 # (e.g. {"sen2": {"bands": [...]}}). Adding more per-call band_overrides in the
@@ -75,9 +81,11 @@ class RunSettings:
 
     batch_id: str
     # Each entry is a (dataset_name, band_overrides) pair. `band_overrides` is an empty
-    # dict for plain-string entries in the user's `datasets` list, and contains
-    # `bands` and/or `derived_bands` keys when the user supplied a per-call
-    # override (e.g. {"sen2": ["B4", "B8"]} or {"sen2": {"bands": ["B4"]}}).
+    # dict for plain-string entries in the user's `datasets` list. When the user
+    # supplied a per-call override (e.g. {"sen2": ["B4", "B8"]} or
+    # {"sen2": {"bands": ["B4"]}}), it contains `bands` (an empty list when the
+    # override lists only derived bands), `derived_bands` when the override
+    # lists derived bands, and the mark `band_naming: "per_band"`.
     datasets: list[tuple[str, dict[str, Any]]]
     output_type: str  # "tabular" or "raster"
     output_file_format: str  # "csv", "parquet", or "dataframe"
@@ -115,6 +123,14 @@ def _normalize_dataset_entry(
                           where the inner dict accepts the keys listed in
                           `_ALLOWED_OVERRIDE_KEYS`. Reserved for future
                           per-call band_overrides; today only `bands` is allowed.
+
+    A band list replaces the catalog's bands: `bands` is always set, and is an
+    empty list when the list has only derived bands (``{"dem": ["aspect"]}``
+    then gives only the aspect band, not the catalog's source band too). The
+    band_overrides of a band list also get the mark ``band_naming: "per_band"``
+    (``_BAND_NAMING_KEY`` of the Earth Engine adapter), so the Earth Engine
+    output columns are named after the bands, also for one band. The local
+    adapter names the columns of every band list after the bands anyway.
 
     Raises ValueError for any malformed entry or unknown dataset name, so a
     single ``except ValueError`` covers every config-shape failure mode.
@@ -226,9 +242,13 @@ def _normalize_dataset_entry(
         batch_id=batch_id,
     )
 
-    band_overrides: dict[str, Any] = {}
-    if source_bands:
-        band_overrides["bands"] = source_bands
+    # The override replaces the catalog's bands, also when it lists only
+    # derived bands: an empty `bands` list then replaces the catalog's source
+    # bands in the merged config, so the output has only the derived bands.
+    band_overrides: dict[str, Any] = {
+        "bands": source_bands,
+        _BAND_NAMING_KEY: _PER_BAND_NAMING,
+    }
     if derived_bands:
         band_overrides["derived_bands"] = derived_bands
     return name, band_overrides
@@ -284,6 +304,83 @@ def _validate_effective_derived_bands(
     )
 
 
+def _parse_run_configs(
+    run_configs: list[dict],
+    defaults: dict,
+    catalog_datasets: dict,
+) -> list[RunSettings]:
+    """Parse every run config of one extract() call, in list order.
+
+    Args:
+        run_configs: The raw run config dicts, as ``_as_config_list`` returns them.
+        defaults: Project-wide defaults from ``load_defaults()``.
+        catalog_datasets: The merged catalog's ``datasets`` dict.
+
+    Returns:
+        One ``RunSettings`` per run config, in the same order.
+
+    Raises:
+        ValueError: If a run config is invalid (see ``_parse_run_config``), if
+            two run configs resolve to ``batch_id`` values that are equal when
+            letter case is ignored, or if the QC table of a tabular output
+            would have the file name of another tabular output.
+    """
+    all_run_settings = [
+        _parse_run_config(run_config, defaults, index, catalog_datasets)
+        for index, run_config in enumerate(run_configs)
+    ]
+
+    # Each output writes files named after its batch_id, so two run configs
+    # with the same batch_id would overwrite each other's outputs. Windows and
+    # macOS ignore letter case in file and folder names by default, so
+    # "Terrain" and "terrain" are the same name there. A run config without
+    # batch_id gets the default "output<N>", which can be the same as an
+    # explicit batch_id of another run config, so compare resolved values.
+    batch_ids = [str(run_settings.batch_id) for run_settings in all_run_settings]
+    folded_batch_ids = [batch_id.casefold() for batch_id in batch_ids]
+    duplicate_batch_ids = sorted(
+        {
+            batch_id
+            for batch_id, folded_batch_id in zip(batch_ids, folded_batch_ids)
+            if folded_batch_ids.count(folded_batch_id) > 1
+        }
+    )
+    if duplicate_batch_ids:
+        raise ValueError(
+            f"Duplicate batch_id value(s) {duplicate_batch_ids} in the config list. "
+            f"Each output writes files named after its batch_id, so every run config "
+            f"needs a different batch_id. Windows and macOS do not tell upper-case and "
+            f"lower-case letters apart in file names, so batch_id values that differ "
+            f"only in letter case also count as the same. A run config without "
+            f"batch_id gets the name 'output<N>', where N is its position in the list "
+            f"(starting at 1)."
+        )
+
+    # A tabular output writes its QC table to "<batch_id>_qc.<format>", so a
+    # tabular batch_id "X" and a tabular batch_id "X_qc" would write the same
+    # file. Raster outputs write into a folder named after the batch_id, so
+    # they cannot collide with these files.
+    tabular_batch_ids = [
+        str(run_settings.batch_id)
+        for run_settings in all_run_settings
+        if run_settings.output_type == "tabular"
+    ]
+    tabular_batch_id_by_folded = {batch_id.casefold(): batch_id for batch_id in tabular_batch_ids}
+    for batch_id in tabular_batch_ids:
+        qc_file_stem = f"{batch_id}_qc"
+        colliding_batch_id = tabular_batch_id_by_folded.get(qc_file_stem.casefold())
+        if colliding_batch_id is not None:
+            raise ValueError(
+                f"batch_id values '{batch_id}' and '{colliding_batch_id}' in the config "
+                f"list would write the same file: output '{batch_id}' writes its QC "
+                f"table as '{qc_file_stem}.<format>', the file name of the statistics "
+                f"table of output '{colliding_batch_id}'. Rename one of these batch_id "
+                f"values."
+            )
+
+    return all_run_settings
+
+
 def _parse_run_config(
     run_config: dict,
     defaults: dict,
@@ -329,10 +426,20 @@ def _parse_run_config(
     if output_type not in ("tabular", "raster"):
         raise ValueError(f"Unknown or missing output_type: {output_type}")
 
+    # Each dataset writes columns or a tile folder named after it, so two
+    # entries of one dataset, or two raster folders whose names differ only in
+    # letter case, would overwrite each other.
+    _validate_unique_dataset_names(datasets, output_type, batch_id)
+
     # resample_m is only meaningful for raster output.
     resample_m = settings.get("resample_m")
-    if output_type == "raster" and resample_m is not None and resample_m <= 0:
-        raise ValueError(f"Invalid resample_m: {resample_m}. Must be a positive number.")
+    if output_type == "raster" and resample_m is not None:
+        resample_m = _parse_finite_number(resample_m, "resample_m", batch_id)
+        if resample_m <= 0:
+            raise ValueError(
+                f"Output '{batch_id}': invalid resample_m: {resample_m!r}. "
+                f"Must be a positive number."
+            )
     if output_type == "tabular" and resample_m is not None:
         raise ValueError("resample_m is not applicable when output_type is 'tabular'.")
 
@@ -342,9 +449,16 @@ def _parse_run_config(
         raise ValueError(f"Unknown output_file_format: {output_file_format}")
 
     # min_coverage_pct is a percentage — must be in [0, 100].
-    min_coverage = settings.get("min_coverage_pct", defaults["min_coverage_pct"])
+    min_coverage = _parse_finite_number(
+        settings.get("min_coverage_pct", defaults["min_coverage_pct"]),
+        "min_coverage_pct",
+        batch_id,
+    )
     if min_coverage < 0 or min_coverage > 100:
-        raise ValueError(f"Invalid min_coverage_pct: {min_coverage}. Must be between 0 and 100.")
+        raise ValueError(
+            f"Output '{batch_id}': invalid min_coverage_pct: {min_coverage!r}. "
+            f"Must be between 0 and 100."
+        )
 
     # statistics — required for tabular, forbidden for raster.
     # Accepts either a flat list (applied to all datasets) or a typed dict
@@ -404,6 +518,88 @@ def _parse_run_config(
         resample_m=resample_m,
         user_window_size=user_window_size,
     )
+
+
+def _validate_unique_dataset_names(
+    datasets: list[tuple[str, dict[str, Any]]],
+    output_type: str,
+    batch_id: str,
+) -> None:
+    """Raise ValueError if the datasets of one run config would write the same output.
+
+    A tabular output names its statistic and QC columns after each dataset, and
+    a raster output writes the tiles of each dataset to a folder named after
+    it. So a dataset listed twice would overwrite its own output in both modes.
+    In raster mode, two dataset names that differ only in letter case
+    (``dem`` and ``DEM``) are also rejected: Windows and macOS ignore letter
+    case in folder names by default, so the two folders would be one. Column
+    names keep their letter case, so tabular mode allows such names.
+
+    Args:
+        datasets: The normalized ``(dataset_name, band_overrides)`` pairs.
+        output_type: ``"tabular"`` or ``"raster"``.
+        batch_id: The run config's batch_id, used in the error message.
+
+    Raises:
+        ValueError: If a dataset is listed more than once, or if a raster run
+            config lists two datasets whose names differ only in letter case.
+    """
+    dataset_names = [dataset_name for dataset_name, _ in datasets]
+
+    duplicate_dataset_names = sorted(
+        {dataset_name for dataset_name in dataset_names if dataset_names.count(dataset_name) > 1}
+    )
+    if duplicate_dataset_names:
+        raise ValueError(
+            f"Output '{batch_id}': dataset(s) {duplicate_dataset_names} are listed more "
+            f"than once in 'datasets'. Each dataset writes columns or a tile folder named "
+            f"after it, so a second entry would overwrite the first. List each dataset "
+            f"once, with all the bands you need in one band list."
+        )
+
+    if output_type != "raster":
+        return
+
+    dataset_names_by_folded: dict[str, list[str]] = {}
+    for dataset_name in dataset_names:
+        dataset_names_by_folded.setdefault(dataset_name.casefold(), []).append(dataset_name)
+    for names_in_group in dataset_names_by_folded.values():
+        if len(names_in_group) > 1:
+            raise ValueError(
+                f"Output '{batch_id}': datasets {names_in_group} differ only in letter "
+                f"case. Raster output writes the tiles of each dataset to a folder named "
+                f"after the dataset, and Windows and macOS treat these folder names as "
+                f"one folder. Put these datasets in separate run configs (each with its "
+                f"own batch_id), or register one of them under another name."
+            )
+
+
+def _parse_finite_number(value: Any, setting_name: str, batch_id: str) -> int | float:
+    """Return a numeric setting as a Python ``int`` or ``float``, or raise ValueError.
+
+    Accepts any real number, including NumPy numbers such as ``np.int64`` and
+    ``np.float32``. These become Python numbers, because the metadata sidecar
+    writes settings with ``json``, which cannot write NumPy numbers. Rejects
+    ``bool`` (a subclass of ``int`` in Python, so ``True`` would silently mean
+    1), text such as ``"30"``, ``None``, NaN, and infinity.
+
+    Args:
+        value: The raw setting value from the run config.
+        setting_name: The config key, used in the error message.
+        batch_id: The run config's batch_id, used in the error message.
+
+    Returns:
+        ``value`` as ``int`` when it is an integer, otherwise as ``float``.
+
+    Raises:
+        ValueError: If ``value`` is not a finite real number.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value):
+        raise ValueError(
+            f"Output '{batch_id}': invalid {setting_name}: {value!r}. "
+            f"Must be a finite number (not text, true/false, null, NaN, or infinity)."
+        )
+    return int(value) if isinstance(value, numbers.Integral) else float(value)
 
 
 def _parse_statistics(

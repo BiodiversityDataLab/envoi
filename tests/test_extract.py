@@ -4,6 +4,7 @@ The synthetic DEM and ``sample_df`` fixtures are provided by ``conftest.py``,
 so this module no longer references any on-disk fixture paths.
 """
 
+import importlib
 import json
 import math
 import re
@@ -154,6 +155,61 @@ class TestTabular:
         np.testing.assert_allclose(
             result["decimalLongitude_wgs84"], sample_df["decimalLongitude"], atol=1e-6
         )
+
+    def test_input_crs_wgs84_columns_follow_core_columns(self, sample_df, tmp_path):
+        """With input_crs, *_wgs84 columns follow the core columns in both output tables."""
+        from pyproj import Transformer
+
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+        easting, northing = to_utm.transform(
+            sample_df["decimalLongitude"].values, sample_df["decimalLatitude"].values
+        )
+        projected_df = sample_df.copy()
+        projected_df["decimalLongitude"] = easting
+        projected_df["decimalLatitude"] = northing
+
+        outputs = extract(
+            projected_df,
+            {
+                "batch_id": "crs_order",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+            input_crs="EPSG:32634",
+        )
+        stats_df = pd.read_csv(outputs["crs_order"])
+        qc_df = pd.read_csv(tmp_path / "crs_order_qc.csv")
+
+        core_and_wgs84_columns = [
+            "occurrenceID",
+            "decimalLatitude",
+            "decimalLongitude",
+            "eventDate",
+            "decimalLatitude_wgs84",
+            "decimalLongitude_wgs84",
+        ]
+        # The extra input column (n_otu) and the statistics follow the
+        # WGS84 columns in the statistics table.
+        assert list(stats_df.columns) == core_and_wgs84_columns + [
+            "n_otu",
+            "dem_local_mean_100m",
+        ]
+        assert list(qc_df.columns) == core_and_wgs84_columns + [
+            "dem_local_in_extent_100m",
+            "dem_local_n_pixels_100m",
+            "dem_local_had_nodata_100m",
+            "dem_local_coverage_pct_100m",
+            "dem_local_region_crs_100m",
+        ]
+        # The internal copies of the input coordinates are in neither table.
+        for output_df in (stats_df, qc_df):
+            assert "lat_original" not in output_df.columns
+            assert "lon_original" not in output_df.columns
 
     def test_no_input_crs_has_no_wgs84_columns(self, sample_df, tmp_path):
         """Without input_crs (coordinates already WGS84), no *_wgs84 columns
@@ -344,6 +400,34 @@ class TestTabular:
                     value
                 ), f"expected NaN at b{band_index}_{reducer_name} for OOB point, got {value}"
 
+    def test_user_columns_keep_their_decimals(self, sample_df, tmp_path):
+        """Only envoi's statistic columns are rounded; an input column keeps all 8 decimals."""
+        input_df = sample_df.copy()
+        habitat_index = [0.12345678, 1.23456789, 2.34567891, 3.45678912, 4.56789123, 5.67891234]
+        input_df["habitat_index"] = habitat_index
+
+        stats_df = extract(
+            input_df,
+            {
+                "batch_id": "decimals",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean", "point"],
+                    "window_size_m": [100, 200],
+                    "output_file_format": "dataframe",
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        assert stats_df["habitat_index"].tolist() == habitat_index
+        # The statistic columns of every window, and the point column, are
+        # still rounded to 5 decimals (stats_output_decimals).
+        for column in ("dem_local_mean_100m", "dem_local_mean_200m", "dem_local_point"):
+            assert stats_df[column].tolist() == stats_df[column].round(5).tolist(), column
+            assert stats_df[column].notna().all(), column
+
 
 # ------------------------------------------------------------------
 # Custom input column names
@@ -402,6 +486,434 @@ class TestCustomColumnNames:
         assert list(result["id"]) == list(legacy_df["id"])
         # And the actual extraction still ran end-to-end.
         assert "dem_local_mean_100m" in result.columns
+
+
+def _tabular_mean_config(batch_id, **extra_settings):
+    """Return a tabular run config for the mean of ``dem_local`` in a 100 m window."""
+    return {
+        "batch_id": batch_id,
+        "datasets": ["dem_local"],
+        "settings": {
+            "output_type": "tabular",
+            "statistics": ["mean"],
+            "window_size_m": 100,
+            **extra_settings,
+        },
+    }
+
+
+def _project_to_utm(sample_df):
+    """Return ``(projected_df, easting, northing)`` with the sample points in EPSG:32634."""
+    from pyproj import Transformer
+
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+    easting, northing = to_utm.transform(
+        sample_df["decimalLongitude"].values, sample_df["decimalLatitude"].values
+    )
+    projected_df = sample_df.copy()
+    projected_df["decimalLongitude"] = easting
+    projected_df["decimalLatitude"] = northing
+    return projected_df, easting, northing
+
+
+# ------------------------------------------------------------------
+# Coordinate validation
+# ------------------------------------------------------------------
+
+
+class TestCoordinateValidation:
+    """Missing, non-numeric, and infinite coordinates stop the run before extraction."""
+
+    @pytest.mark.parametrize(
+        "bad_latitude",
+        [np.nan, None, "not a number", np.inf, -np.inf],
+        ids=["nan", "none", "text", "inf", "minus-inf"],
+    )
+    def test_invalid_latitude_raises(self, sample_df, bad_latitude, tmp_path):
+        """A bad latitude raises ValueError that names the column and the row's ID."""
+        df = sample_df.astype({"decimalLatitude": object})
+        df.loc[1, "decimalLatitude"] = bad_latitude
+
+        with pytest.raises(ValueError, match="missing, non-numeric, or infinite") as error_info:
+            extract(df, _tabular_mean_config("coords"), output_dir=tmp_path)
+
+        message = str(error_info.value)
+        assert "'decimalLatitude'" in message
+        assert "in 1 row(s)" in message
+        assert "'T6WPKD'" in message
+        # The value is not a CRS problem, so the message must not say so.
+        assert "WGS84" not in message
+        assert not any(tmp_path.iterdir())
+
+    def test_invalid_longitude_with_input_crs_raises_before_reprojection(self, sample_df, tmp_path):
+        """A text longitude raises the same ValueError when input_crs is set."""
+        projected_df, _, _ = _project_to_utm(sample_df)
+        projected_df = projected_df.astype({"decimalLongitude": object})
+        projected_df.loc[0, "decimalLongitude"] = "349321,6"
+
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError, match="'decimalLongitude' have a missing, non-numeric"):
+                extract(
+                    projected_df,
+                    _tabular_mean_config("coords"),
+                    output_dir=tmp_path,
+                    input_crs="EPSG:32634",
+                )
+
+        # The reprojection notice comes after the check, so it was never emitted.
+        assert not any("Reprojecting" in str(warning.message) for warning in caught_warnings)
+
+    def test_error_lists_ten_ids_and_the_total_count(self, tmp_path):
+        """With more than ten bad rows, the message lists ten IDs and the total count."""
+        df = pd.DataFrame(
+            {
+                "site": [f"site{number}" for number in range(12)],
+                "y": [62.98] * 12,
+                "x": [np.nan] * 12,
+            }
+        )
+
+        with pytest.raises(ValueError, match=r"in 12 row\(s\)") as error_info:
+            extract(
+                df,
+                _tabular_mean_config("coords"),
+                output_dir=tmp_path,
+                id_column="site",
+                latitude_column="y",
+                longitude_column="x",
+            )
+
+        message = str(error_info.value)
+        assert "Column(s) 'x' have" in message
+        assert "'site' of these rows" in message
+        assert "'site9'" in message
+        assert "'site10'" not in message
+        assert "... and 2 more" in message
+
+    def test_numeric_text_coordinates_give_the_same_result(self, sample_df, tmp_path):
+        """Coordinates stored as text that holds a number give the same statistics."""
+        text_df = sample_df.astype({"decimalLatitude": str, "decimalLongitude": str})
+
+        from_text = extract(
+            text_df,
+            _tabular_mean_config("text", output_file_format="dataframe"),
+            output_dir=tmp_path / "text",
+        )
+        from_numbers = extract(
+            sample_df,
+            _tabular_mean_config("numbers", output_file_format="dataframe"),
+            output_dir=tmp_path / "numbers",
+        )
+
+        pd.testing.assert_frame_equal(from_text, from_numbers)
+
+
+# ------------------------------------------------------------------
+# Input columns with the names of working columns
+# ------------------------------------------------------------------
+
+
+class TestReservedColumnNames:
+    """Unmapped input columns named like envoi's working columns keep their names and values."""
+
+    def test_extra_working_column_names_keep_their_names_and_values(self, sample_df, tmp_path):
+        """Extra id, lat, lon, date, lat_original, and lon_original columns do not change the run."""
+        number_of_points = len(sample_df)
+        extra_columns = {
+            "id": [f"dwc-{number}" for number in range(number_of_points)],
+            "lat": [1.5 + number for number in range(number_of_points)],
+            "lon": [-1.5 - number for number in range(number_of_points)],
+            "date": [f"visit {number}" for number in range(number_of_points)],
+            "lat_original": [0.25 * number for number in range(number_of_points)],
+            "lon_original": [0.5 * number for number in range(number_of_points)],
+        }
+
+        outputs = extract(
+            sample_df.assign(**extra_columns),
+            _tabular_mean_config("extra"),
+            output_dir=tmp_path / "extra",
+        )
+        baseline_outputs = extract(
+            sample_df,
+            _tabular_mean_config("baseline"),
+            output_dir=tmp_path / "baseline",
+        )
+        stats_df = pd.read_csv(outputs["extra"])
+        baseline_stats_df = pd.read_csv(baseline_outputs["baseline"])
+        qc_df = pd.read_csv(tmp_path / "extra" / "extra_qc.csv")
+        baseline_qc_df = pd.read_csv(tmp_path / "baseline" / "baseline_qc.csv")
+
+        # The extra columns keep their names, positions, and values.
+        assert list(stats_df.columns) == [
+            "occurrenceID",
+            "decimalLatitude",
+            "decimalLongitude",
+            "eventDate",
+            "n_otu",
+            *extra_columns,
+            "dem_local_mean_100m",
+        ]
+        for column, values in extra_columns.items():
+            assert stats_df[column].tolist() == values
+
+        # The run used the mapped columns only: everything else is identical
+        # to a run without the extra columns, and the QC table has none of them.
+        pd.testing.assert_frame_equal(stats_df.drop(columns=list(extra_columns)), baseline_stats_df)
+        pd.testing.assert_frame_equal(qc_df, baseline_qc_df)
+
+    def test_extra_original_coordinate_columns_with_input_crs(self, sample_df, tmp_path):
+        """With input_crs, extra lat_original and lon_original columns do not replace the input."""
+        projected_df, easting, northing = _project_to_utm(sample_df)
+        extra_columns = {
+            "lat_original": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "lon_original": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        }
+
+        outputs = extract(
+            projected_df.assign(**extra_columns),
+            _tabular_mean_config("crs_extra"),
+            output_dir=tmp_path,
+            input_crs="EPSG:32634",
+        )
+        result = pd.read_csv(outputs["crs_extra"])
+
+        np.testing.assert_allclose(result["decimalLatitude"], northing)
+        np.testing.assert_allclose(result["decimalLongitude"], easting)
+        np.testing.assert_allclose(
+            result["decimalLatitude_wgs84"], sample_df["decimalLatitude"], atol=1e-6
+        )
+        np.testing.assert_allclose(
+            result["decimalLongitude_wgs84"], sample_df["decimalLongitude"], atol=1e-6
+        )
+        for column, values in extra_columns.items():
+            assert result[column].tolist() == values
+
+    def test_unmapped_date_column_is_not_the_sample_date(self, sample_df, tmp_path):
+        """Without eventDate, an extra date column is kept but not used as the sample date."""
+        # The values are not dates: if envoi parsed them, the run would raise.
+        visit_labels = [f"visit {number}" for number in range(len(sample_df))]
+        df = sample_df.drop(columns=["eventDate"]).assign(date=visit_labels)
+
+        result = extract(
+            df,
+            _tabular_mean_config("extra_date", output_file_format="dataframe"),
+            output_dir=tmp_path,
+        )
+
+        assert result["date"].tolist() == visit_labels
+        assert "eventDate" not in result.columns
+        # The run behaves as a run without a date column, and the sidecar says so.
+        meta = json.loads((tmp_path / "extra_date_metadata.json").read_text())
+        assert "No 'eventDate' column found" in meta["warnings"]["date_parsing"]
+
+    def test_date_column_override_uses_a_date_column(self, sample_df, tmp_path):
+        """With date_column="date", the date column is the sample date."""
+        df = sample_df.rename(columns={"eventDate": "date"})
+
+        result = extract(
+            df,
+            _tabular_mean_config("mapped_date", output_file_format="dataframe"),
+            output_dir=tmp_path,
+            date_column="date",
+        )
+
+        assert result["date"].tolist() == sample_df["eventDate"].tolist()
+        meta = json.loads((tmp_path / "mapped_date_metadata.json").read_text())
+        assert "date_parsing" not in meta.get("warnings", {})
+
+    def test_raster_mode_names_tiles_after_the_mapped_id_column(self, sample_df, tmp_path):
+        """In raster mode, an extra id column does not replace the mapped ID column."""
+        df = sample_df.assign(id=["same"] * len(sample_df))
+
+        extract(
+            df,
+            {
+                "batch_id": "extra_id_tiles",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200},
+            },
+            output_dir=tmp_path,
+        )
+
+        tile_dir = tmp_path / "extra_id_tiles" / "dem_local"
+        manifest = pd.read_csv(tile_dir / "tiles_manifest.csv")
+        assert manifest["occurrenceID"].tolist() == sample_df["occurrenceID"].tolist()
+        for occurrence_id in sample_df["occurrenceID"]:
+            assert (tile_dir / f"{occurrence_id}-dem_local.tif").exists()
+
+
+# ------------------------------------------------------------------
+# Input columns with the names of output columns
+# ------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_adapter(monkeypatch):
+    """Make the adapter lookup of extract() fail, so a test shows that no adapter was built."""
+    extract_module = importlib.import_module("envoi.extract")
+
+    def refuse_adapter(data_source):
+        raise AssertionError("extract() built an adapter.")
+
+    monkeypatch.setattr(extract_module, "get_adapter", refuse_adapter)
+
+
+def _raster_config(batch_id):
+    """Return a raster run config for ``dem_local`` with a 100 m window."""
+    return {
+        "batch_id": batch_id,
+        "datasets": ["dem_local"],
+        "settings": {"output_type": "raster", "window_size_m": 100},
+    }
+
+
+class TestInputColumnsWithOutputNames:
+    """An input column with the name of an output column of the same call raises before any adapter."""
+
+    @pytest.mark.parametrize(
+        "column",
+        [
+            # Statistic and QC columns of the run's dataset and window.
+            "dem_local_mean_100m",
+            "dem_local_std_100m",
+            "dem_local_coverage_pct_100m",
+            "dem_local_b1_class_3_count_100m",
+            # Point columns, which have no window.
+            "dem_local_point",
+            "dem_local_b1_point",
+            "dem_local_error_point",
+        ],
+    )
+    def test_output_column_name_raises(self, sample_df, tmp_path, no_adapter, column):
+        """The column raises ValueError that names it and the output, and nothing is written."""
+        df = sample_df.assign(**{column: 1.0})
+
+        with pytest.raises(ValueError, match="have the name of a column") as error_info:
+            extract(df, _tabular_mean_config("terrain"), output_dir=tmp_path)
+
+        message = str(error_info.value)
+        assert f"Input column(s) '{column}' have" in message
+        assert "output(s) 'terrain'" in message
+        assert "earlier envoi run" in message
+        assert not any(tmp_path.iterdir())
+
+    def test_columns_of_several_outputs_are_listed_once(self, sample_df, tmp_path, no_adapter):
+        """Each colliding column is listed once, in input order, with the first output that adds it."""
+        df = sample_df.assign(dem_local_point=1.0, dem_local_mean_100m=2.0, slope_local_max_50m=3.0)
+        slope_config = {
+            "batch_id": "slope",
+            "datasets": ["slope_local"],
+            "settings": {"output_type": "tabular", "statistics": ["max"], "window_size_m": 50},
+        }
+
+        with pytest.raises(ValueError) as error_info:
+            extract(
+                df,
+                [_tabular_mean_config("terrain"), _tabular_mean_config("terrain2"), slope_config],
+                output_dir=tmp_path,
+            )
+
+        message = str(error_info.value)
+        assert (
+            "Input column(s) 'dem_local_point', 'dem_local_mean_100m', 'slope_local_max_50m' "
+            "have the name of a column that envoi adds to the output tables of output(s) "
+            "'terrain', 'slope'"
+        ) in message
+
+    @pytest.mark.parametrize(
+        "column",
+        [
+            # Another window of the run's dataset.
+            "dem_local_mean_200m",
+            "dem_local_mean_1000m",
+            # Another dataset.
+            "slope_local_mean_100m",
+            # A longer catalog dataset whose name starts with "dem_local_".
+            "dem_local_categorical_mode_100m",
+            "dem_local_categorical_point",
+            # Not an output column of the dataset.
+            "dem_local_notes",
+            "dem_local_100m",
+            "dem_localpoint",
+            "mean_100m",
+        ],
+    )
+    def test_other_columns_are_kept(self, sample_df, tmp_path, column):
+        """Columns of another window or dataset (also with a longer name) keep their values."""
+        df = sample_df.assign(**{column: [float(number) for number in range(len(sample_df))]})
+
+        result = extract(
+            df, _tabular_mean_config("terrain", output_file_format="dataframe"), output_dir=tmp_path
+        )
+
+        assert result[column].tolist() == [float(number) for number in range(len(sample_df))]
+        assert result["dem_local_mean_100m"].notna().all()
+
+    def test_raster_run_does_not_check_columns(self, sample_df, tmp_path):
+        """A raster run adds no columns, so an input column with a statistic name does not raise."""
+        df = sample_df.assign(dem_local_mean_100m=1.0, dem_local_point=2.0)
+
+        outputs = extract(df, _raster_config("tiles"), output_dir=tmp_path)
+
+        assert outputs["tiles:dem_local"].is_dir()
+
+    def test_wgs84_column_raises_when_coordinates_are_reprojected(
+        self, sample_df, tmp_path, no_adapter
+    ):
+        """With input_crs, an input "<lat>_wgs84" or "<lon>_wgs84" column raises."""
+        projected_df, _, _ = _project_to_utm(sample_df)
+        df = projected_df.assign(decimalLatitude_wgs84=1.0, decimalLongitude_wgs84=2.0)
+
+        with pytest.raises(ValueError) as error_info:
+            extract(
+                df, _tabular_mean_config("terrain"), output_dir=tmp_path, input_crs="EPSG:32634"
+            )
+
+        assert (
+            "Input column(s) 'decimalLatitude_wgs84', 'decimalLongitude_wgs84' have the name"
+        ) in str(error_info.value)
+        assert not any(tmp_path.iterdir())
+
+    def test_wgs84_column_of_renamed_coordinate_columns_raises(
+        self, sample_df, tmp_path, no_adapter
+    ):
+        """The "_wgs84" names follow the user's own latitude and longitude column names."""
+        projected_df, _, _ = _project_to_utm(sample_df)
+        df = projected_df.rename(columns={"decimalLatitude": "y", "decimalLongitude": "x"})
+
+        with pytest.raises(ValueError, match="Input column\\(s\\) 'x_wgs84' have the name"):
+            extract(
+                df.assign(x_wgs84=1.0, decimalLongitude_wgs84=2.0),
+                _tabular_mean_config("terrain"),
+                output_dir=tmp_path,
+                input_crs="EPSG:32634",
+                latitude_column="y",
+                longitude_column="x",
+            )
+
+    @pytest.mark.parametrize("input_crs", [None, "EPSG:4326", "wgs84"])
+    def test_wgs84_column_is_kept_without_reprojection(self, sample_df, tmp_path, input_crs):
+        """Without a reprojection, an input "<lat>_wgs84" column is an ordinary column."""
+        df = sample_df.assign(decimalLatitude_wgs84=[1.0] * len(sample_df))
+
+        result = extract(
+            df,
+            _tabular_mean_config("terrain", output_file_format="dataframe"),
+            output_dir=tmp_path,
+            input_crs=input_crs,
+        )
+
+        assert result["decimalLatitude_wgs84"].tolist() == [1.0] * len(sample_df)
+
+    def test_wgs84_column_in_a_raster_run_with_reprojection(self, sample_df, tmp_path):
+        """A raster run with input_crs adds no "_wgs84" columns, so it does not raise."""
+        projected_df, _, _ = _project_to_utm(sample_df)
+        df = projected_df.assign(decimalLatitude_wgs84=1.0)
+
+        outputs = extract(df, _raster_config("tiles"), output_dir=tmp_path, input_crs="EPSG:32634")
+
+        assert outputs["tiles:dem_local"].is_dir()
 
 
 # ------------------------------------------------------------------
@@ -561,6 +1073,434 @@ class TestGbifEventDateParsing:
         assert dates == ["2026-01-01"]
 
 
+def _date_frame(date_values):
+    """Return a working dataframe (canonical column names) with the given date values."""
+    n_rows = len(date_values)
+    return pd.DataFrame(
+        {
+            "id": [f"p{i}" for i in range(n_rows)],
+            "lat": [62.97] * n_rows,
+            "lon": [18.02] * n_rows,
+            "date": date_values,
+        }
+    )
+
+
+class TestSlashDateParsing:
+    """Date values with "/": an interval keeps its start, YYYY/MM/DD is a date,
+    and any other form stops the run, because the order of day and month is unknown.
+    """
+
+    def test_yyyy_mm_dd_with_slashes_is_a_date(self):
+        """``2021/06/15`` parses to 2021-06-15 with no warning."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning would fail the test
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame(["2021/06/15"]))
+        assert dates == ["2021-06-15"]
+        assert date_warnings == []
+
+    def test_interval_keeps_its_start_with_the_interval_warning(self):
+        """``2021-01-01/2021-12-31`` parses to its start and gives only the interval warning."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(
+                _date_frame(["2021-01-01/2021-12-31"])
+            )
+        assert dates == ["2021-01-01"]
+        assert [str(w.message) for w in caught] == date_warnings
+        assert len(date_warnings) == 1
+        assert "Truncated 1 ISO 8601 date interval" in date_warnings[0]
+
+    def test_interval_warning_counts_only_intervals(self):
+        """YYYY/MM/DD dates are not counted as intervals."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(
+                _date_frame(["2021/06/15", "2021/07/01", "2021-01-01/2021-12-31", "2021-08-01"])
+            )
+        assert dates == ["2021-06-15", "2021-07-01", "2021-01-01", "2021-08-01"]
+        assert date_warnings == [
+            (
+                "Truncated 1 ISO 8601 date interval(s) ('start/end') to their start day; "
+                "nearest-image lookup only uses day precision."
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        # An interval start needs a two-digit month and day (2021-6-15/... is not one).
+        ["15/06/2021", "06/15/2021", "2021/6/5", "06/2021", "2021-6-15/2021-6-20"],
+    )
+    def test_other_slash_forms_raise_with_the_date_column_name(self, bad_value):
+        """A value with "/" in another form raises ValueError that names the user's date column."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'collectionDate' has 1 date value") as error_info:
+            _parse_and_validate_dates(_date_frame([bad_value]), date_column_name="collectionDate")
+        assert repr(bad_value) in str(error_info.value)
+
+    @pytest.mark.parametrize(
+        "interval",
+        [
+            "2021-06-15T08:00/2021-06-15T10:00",
+            "2021-06-15T08:00:00Z/2021-06-16",
+            "2021-06-15 08:00/2021-06-15 10:00",
+        ],
+    )
+    def test_interval_with_time_of_day_start_is_an_interval(self, interval):
+        """An interval whose start has a time of day keeps its start day."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame([interval]))
+        assert dates == ["2021-06-15"]
+        assert "Truncated 1 ISO 8601 date interval" in date_warnings[0]
+
+    def test_year_month_interval_start_is_an_interval(self):
+        """``2021/06`` is an interval with the year-only start 2021, read as 2021-01-01."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame(["2021/06"]))
+        assert dates == ["2021-01-01"]
+        assert "Truncated 1 ISO 8601 date interval" in date_warnings[0]
+        assert "Date '2021' interpreted as 2021-01-01" in date_warnings[1]
+
+    def test_text_that_is_not_a_date_raises(self):
+        """Text that is not in an accepted date form raises the error that lists the value."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'eventDate' has 1 date value") as error_info:
+            _parse_and_validate_dates(_date_frame(["spring 2021"]))
+        assert "cannot read: 'spring 2021'." in str(error_info.value)
+
+    def test_one_bad_value_in_a_mixed_column_raises(self):
+        """One unsupported value stops the run, and the message lists only that value."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        date_values = ["2021-06-15", "2021/06/15", "2021-01-01/2021-12-31", "15/06/2021"]
+        with warnings.catch_warnings():
+            # The error must come before any interval warning.
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="cannot read") as error_info:
+                _parse_and_validate_dates(_date_frame(date_values))
+        message = str(error_info.value)
+        assert "'eventDate' has 1 date value(s)" in message
+        assert "'15/06/2021'" in message
+        assert "'2021/06/15'" not in message
+        assert "'2021-01-01/2021-12-31'" not in message
+
+    def test_message_lists_at_most_ten_values_and_the_total(self):
+        """With many unsupported values, the message lists ten different values and the count."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        # Twelve different values, and one of them twice: 13 rows.
+        date_values = [f"{day:02d}/06/2021" for day in range(1, 13)] + ["01/06/2021"]
+        with pytest.raises(ValueError, match="has 13 date value") as error_info:
+            _parse_and_validate_dates(_date_frame(date_values))
+        message = str(error_info.value)
+        assert "'10/06/2021'" in message
+        assert "'11/06/2021'" not in message
+        assert "... and 2 more" in message
+
+    def test_missing_date_is_not_a_slash_value(self):
+        """A missing date is skipped with its warning and does not count as a value with "/"."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.warns(UserWarning, match="Skipping 1 row"):
+            df, dates, _ = _parse_and_validate_dates(_date_frame([None, "2021/06/15"]))
+        assert dates == ["2021-06-15"]
+        assert df["id"].tolist() == ["p1"]
+
+    def test_extract_stops_before_any_output(self, sample_df, tmp_path):
+        """extract() raises for an unsupported value in a renamed date column and writes nothing."""
+        df = sample_df.rename(columns={"eventDate": "sampleDate"})
+        df.loc[2, "sampleDate"] = "02/04/1960"
+
+        with pytest.raises(ValueError, match="'sampleDate' has 1 date value"):
+            extract(
+                df,
+                _tabular_mean_config("slash_dates"),
+                date_column="sampleDate",
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+
+class TestAcceptedDateForms:
+    """Only the listed date forms are read; every other value raises, so envoi never guesses."""
+
+    @pytest.mark.parametrize(
+        ("date_value", "expected_day"),
+        [
+            ("2021-6-5", "2021-06-05"),
+            ("2021-06-5", "2021-06-05"),
+            ("2021-6-15", "2021-06-15"),
+            ("2021-06-15", "2021-06-15"),
+            ("20210615", "2021-06-15"),
+            ("2021/06/15", "2021-06-15"),
+            (" 2021-06-15 ", "2021-06-15"),
+            ("2021-06-15/2021-06-20", "2021-06-15"),
+            ("2021-06-15T08:00Z/2021-06-15T10:00Z", "2021-06-15"),
+        ],
+    )
+    def test_date_text_parses_to_its_day(self, date_value, expected_day):
+        """Each accepted date form without a time of day gives its day."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, _ = _parse_and_validate_dates(_date_frame([date_value]))
+        assert dates == [expected_day]
+
+    @pytest.mark.parametrize(
+        "date_value",
+        [
+            "2021-06-15T08",
+            "2021-06-15T08:00",
+            "2021-06-15T08:00Z",
+            "2021-06-15T08:00:00.123+02:00",
+            "2021-06-15T23:30-0500",
+            "2021-06-15T23:30-05",
+            "20210615T080000Z",
+            "2021-06-15 08:00",
+            "2021-06-15 08:00:00+02:00",
+        ],
+    )
+    def test_time_of_day_and_time_zone_are_dropped(self, date_value):
+        """A time of day after "T" or a space, with or without a time zone, gives the day as written."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame([date_value]))
+        assert dates == ["2021-06-15"]
+        assert date_warnings == [
+            "Dropped time-of-day from 1 date value(s); nearest-image lookup only uses day precision."
+        ]
+
+    @pytest.mark.parametrize(
+        ("date_value", "expected_day", "quoted_date"),
+        [
+            ("2021", "2021-01-01", "2021"),
+            ("2021-6", "2021-06-01", "2021-6"),
+            ("2021-06", "2021-06-01", "2021-06"),
+            ("2021-06T08:00", "2021-06-01", "2021-06"),
+        ],
+    )
+    def test_year_and_year_month_give_the_first_day_with_a_warning(
+        self, date_value, expected_day, quoted_date
+    ):
+        """A year or a year-month is read as its first day, and the warning quotes the date."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame([date_value]))
+        assert dates == [expected_day]
+        assert (
+            f"Date '{quoted_date}' interpreted as {expected_day}. Provide a full YYYY-MM-DD "
+            f"date if you want a specific day."
+        ) in date_warnings
+
+    def test_full_dates_in_new_forms_give_no_warning(self):
+        """YYYYMMDD and one-digit months and days are full dates: no warning."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning would fail the test
+            _, dates, date_warnings = _parse_and_validate_dates(
+                _date_frame(["20210615", "2021-6-5"])
+            )
+        assert dates == ["2021-06-15", "2021-06-05"]
+        assert date_warnings == []
+
+    def test_datetime_column(self):
+        """A datetime64 column gives the day of each value, without a warning."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        date_values = pd.to_datetime(["2021-06-15 08:00", "2022-01-02 23:59"])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame(date_values))
+        assert dates == ["2021-06-15", "2022-01-02"]
+        assert date_warnings == []
+
+    def test_time_zone_aware_datetime_column_keeps_its_own_day(self):
+        """A datetime column with a time zone gives the day in that time zone, not in UTC."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        # 23:30 in New York on June 15 is 03:30 UTC on June 16.
+        date_values = pd.to_datetime(["2021-06-15 23:30"]).tz_localize("America/New_York")
+        _, dates, _ = _parse_and_validate_dates(_date_frame(date_values))
+        assert dates == ["2021-06-15"]
+
+    def test_object_column_of_date_and_datetime_values(self):
+        """An object column of date, datetime, NumPy datetime64, and text values gives each day."""
+        import datetime
+
+        from envoi._input_validation import _parse_and_validate_dates
+
+        date_values = pd.Series(
+            [
+                datetime.date(2021, 6, 15),
+                datetime.datetime(2021, 6, 16, 8, 30, tzinfo=datetime.timezone.utc),
+                np.datetime64("2021-06-17T12:00"),
+                "2021-06-18",
+            ],
+            dtype=object,
+        )
+        _, dates, _ = _parse_and_validate_dates(_date_frame(date_values))
+        assert dates == ["2021-06-15", "2021-06-16", "2021-06-17", "2021-06-18"]
+
+    @pytest.mark.parametrize(
+        "year_values",
+        [
+            [2021, 2019],
+            [2021.0, 2019.0],
+            pd.array([2021, 2019], dtype="Int64"),
+            [np.int64(2021), np.int64(2019)],
+        ],
+    )
+    def test_whole_number_years(self, year_values):
+        """Integer and float year columns give January 1 of each year, with a warning."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame(year_values))
+        assert dates == ["2021-01-01", "2019-01-01"]
+        assert "Date '2021' interpreted as 2021-01-01" in date_warnings[0]
+
+    @pytest.mark.parametrize(
+        "date_values",
+        [
+            [20210615, 20200101],
+            [np.int64(20210615), np.int64(20200101)],
+            [20210615.0, 20200101.0],
+        ],
+    )
+    def test_eight_digit_numbers_are_yyyymmdd(self, date_values):
+        """Whole numbers with eight digits, as a CSV reader stores YYYYMMDD dates, are dates."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # full dates: no warning
+            _, dates, date_warnings = _parse_and_validate_dates(_date_frame(date_values))
+        assert dates == ["2021-06-15", "2020-01-01"]
+        assert date_warnings == []
+
+    def test_float_yyyymmdd_column_with_a_missing_date(self):
+        """A float YYYYMMDD column with a missing value skips that row and reads the other dates."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.warns(UserWarning, match="Skipping 1 row"):
+            df, dates, _ = _parse_and_validate_dates(_date_frame([20210615.0, np.nan]))
+        assert dates == ["2021-06-15"]
+        assert df["id"].tolist() == ["p0"]
+
+    @pytest.mark.parametrize("bad_value", [15062021, 15062021.0, 20211301, 20210230])
+    def test_eight_digit_number_that_is_not_a_date_raises(self, bad_value):
+        """An eight-digit number with an impossible month or day (15062021: month 20) raises."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'eventDate' has 1 date value") as error_info:
+            _parse_and_validate_dates(_date_frame([bad_value]))
+        assert f"are not valid dates: '{bad_value}'." in str(error_info.value)
+
+    def test_float_year_column_with_a_missing_year(self):
+        """A float year column with a missing value skips that row and reads the other years."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            df, dates, _ = _parse_and_validate_dates(_date_frame([2021.0, np.nan, 2019.0]))
+        assert dates == ["2021-01-01", "2019-01-01"]
+        assert df["id"].tolist() == ["p0", "p2"]
+
+    @pytest.mark.parametrize(
+        ("bad_value", "listed_value"),
+        [
+            ("05-06-2021", "'05-06-2021'"),
+            ("05.06.2021", "'05.06.2021'"),
+            ("June 5, 2021", "'June 5, 2021'"),
+            ("2021.06.05", "'2021.06.05'"),
+            ("202106", "'202106'"),
+            ("21-06-15", "'21-06-15'"),
+            ("2021-06 15", "'2021-06 15'"),
+            ("2021-06-15T", "'2021-06-15T'"),
+            ("2021-06-15T8:00", "'2021-06-15T8:00'"),
+            ("2021/06/15 08:00", "'2021/06/15 08:00'"),
+            (2021.5, "'2021.5'"),
+            (202106, "'202106'"),
+            (20210615.5, "'20210615.5'"),
+            (21, "'21'"),
+            (True, "'True'"),
+        ],
+    )
+    def test_other_values_raise_with_the_date_column_name(self, bad_value, listed_value):
+        """Any other text or number raises ValueError that names the date column and the value."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'collectionDate' has 1 date value") as error_info:
+            _parse_and_validate_dates(_date_frame([bad_value]), date_column_name="collectionDate")
+        message = str(error_info.value)
+        assert f"cannot read: {listed_value}." in message
+        assert "Write these dates as YYYY-MM-DD." in message
+        # Numbers get a hint, because a file reader can store dates as numbers.
+        has_number_hint = "A number is read only when it is a whole number" in message
+        is_number = isinstance(bad_value, (int, float)) and not isinstance(bad_value, bool)
+        assert has_number_hint == is_number
+
+    @pytest.mark.parametrize("bad_value", ["2021-02-30", "2021-13-01", "20210230", "2021-0-10"])
+    def test_dates_that_do_not_exist_raise(self, bad_value):
+        """A value in an accepted form that is not a valid date raises and lists the value."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'collectionDate' has 1 date value") as error_info:
+            _parse_and_validate_dates(
+                _date_frame(["2021-06-15", bad_value]), date_column_name="collectionDate"
+            )
+        assert f"are not valid dates: '{bad_value}'." in str(error_info.value)
+
+    @pytest.mark.parametrize(
+        "bad_values",
+        [
+            # Twelve different values that are not in an accepted form, and one twice.
+            [f"{day:02d}.06.2021" for day in range(1, 13)] + ["01.06.2021"],
+            # Twelve different dates that do not exist, and one twice.
+            [f"2021-{month:02d}-32" for month in range(1, 13)] + ["2021-01-32"],
+        ],
+    )
+    def test_message_lists_at_most_ten_values_and_the_total(self, bad_values):
+        """Both errors list ten different values, the number of the others, and the total."""
+        from envoi._input_validation import _parse_and_validate_dates
+
+        with pytest.raises(ValueError, match="'eventDate' has 13 date value") as error_info:
+            _parse_and_validate_dates(_date_frame(bad_values))
+        message = str(error_info.value)
+        assert repr(bad_values[9]) in message
+        assert repr(bad_values[10]) not in message
+        assert "... and 2 more" in message
+
+    def test_extract_stops_before_any_output(self, sample_df, tmp_path):
+        """extract() raises for a date with an unknown order of day and month, and writes nothing."""
+        df = sample_df.copy()
+        df.loc[2, "eventDate"] = "02.04.1960"
+
+        with pytest.raises(ValueError, match="'eventDate' has 1 date value"):
+            extract(df, _tabular_mean_config("dot_dates"), output_dir=tmp_path)
+        assert not any(tmp_path.iterdir())
+
+
 # ------------------------------------------------------------------
 # Raster output
 # ------------------------------------------------------------------
@@ -620,6 +1560,41 @@ class TestRaster:
             with rasterio.open(tif) as src:
                 assert src.width == expected_pixels
                 assert src.height == expected_pixels
+
+    def test_odd_resampled_tile_has_the_point_in_its_centre_pixel(self, sample_df, tmp_path):
+        """A 200 m tile at resample_m=30 is 7 × 7, with the point in its centre pixel (3, 3)."""
+        from pyproj import Transformer
+
+        extract(
+            sample_df,
+            {
+                "batch_id": "odd_tiles",
+                "datasets": ["dem_local"],
+                "settings": {"output_type": "raster", "window_size_m": 200, "resample_m": 30},
+            },
+            output_dir=tmp_path,
+        )
+
+        # The points are in UTM zone 34N, the CRS of every tile.
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+        tile_dir = tmp_path / "odd_tiles" / "dem_local"
+        for sample_id, lat, lon in zip(
+            sample_df["occurrenceID"], sample_df["decimalLatitude"], sample_df["decimalLongitude"]
+        ):
+            point_x, point_y = to_utm.transform(lon, lat)
+            with rasterio.open(tile_dir / f"{sample_id}-dem_local.tif") as src:
+                assert (src.width, src.height) == (7, 7)
+                assert src.crs.to_epsg() == 32634
+                tile_transform = src.transform
+
+            # 30 m pixels, corners on multiples of 30 m.
+            assert (tile_transform.a, tile_transform.e) == (30.0, -30.0)
+            assert tile_transform.c / 30 == pytest.approx(round(tile_transform.c / 30))
+            assert tile_transform.f / 30 == pytest.approx(round(tile_transform.f / 30))
+            # Column and row of the point, counted from the tile's top-left corner.
+            column = math.floor((point_x - tile_transform.c) / 30.0)
+            row = math.floor((tile_transform.f - point_y) / 30.0)
+            assert (column, row) == (3, 3)
 
     def test_raster_metadata_json(self, sample_df, tmp_path):
         """Raster output writes a sidecar metadata JSON."""
@@ -991,6 +1966,242 @@ class TestErrors:
                 },
                 output_dir=tmp_path,
             )
+
+
+class TestRunConfigValidation:
+    """Every run config is checked before the first adapter is built."""
+
+    def test_duplicate_batch_id_raises_before_any_output(self, sample_df, tmp_path):
+        """Two run configs with the same batch_id raise, and nothing is written."""
+        with pytest.raises(ValueError, match=r"Duplicate batch_id value\(s\) \['terrain'\]"):
+            extract(
+                sample_df,
+                [_tabular_mean_config("terrain"), _tabular_mean_config("terrain")],
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    def test_default_batch_id_that_matches_an_explicit_one_raises(self, sample_df, tmp_path):
+        """The default name of the second run config, 'output2', collides with an explicit one."""
+        config_without_batch_id = _tabular_mean_config("unused")
+        del config_without_batch_id["batch_id"]
+
+        with pytest.raises(ValueError, match=r"Duplicate batch_id value\(s\) \['output2'\]"):
+            extract(
+                sample_df,
+                [_tabular_mean_config("output2"), config_without_batch_id],
+                output_dir=tmp_path,
+            )
+
+    def test_batch_ids_that_differ_only_in_case_raise(self, sample_df, tmp_path):
+        """'Terrain' and 'terrain' are one name on Windows and macOS, so they raise."""
+        with pytest.raises(
+            ValueError, match=r"Duplicate batch_id value\(s\) \['Terrain', 'terrain'\]"
+        ):
+            extract(
+                sample_df,
+                [_tabular_mean_config("Terrain"), _tabular_mean_config("terrain")],
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    def test_batch_ids_that_differ_only_in_case_raise_across_modes(self, sample_df, tmp_path):
+        """A raster batch_id and a tabular batch_id that differ only in case also raise."""
+        raster_config = {
+            "batch_id": "TILES",
+            "datasets": ["dem_local"],
+            "settings": {"output_type": "raster", "window_size_m": 200},
+        }
+
+        with pytest.raises(ValueError, match=r"\['TILES', 'tiles'\]"):
+            extract(
+                sample_df,
+                [_tabular_mean_config("tiles"), raster_config],
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    @pytest.mark.parametrize(
+        ("first_batch_id", "second_batch_id"),
+        [("terrain_qc", "terrain"), ("terrain", "terrain_qc"), ("Terrain", "terrain_QC")],
+        ids=["qc-first", "qc-second", "letter-case"],
+    )
+    def test_batch_id_with_the_name_of_a_qc_table_raises(
+        self, sample_df, tmp_path, first_batch_id, second_batch_id
+    ):
+        """Tabular batch_id 'X_qc' would write the QC table file of tabular batch_id 'X'."""
+        with pytest.raises(ValueError, match="would write the same file") as error_info:
+            extract(
+                sample_df,
+                [_tabular_mean_config(first_batch_id), _tabular_mean_config(second_batch_id)],
+                output_dir=tmp_path,
+            )
+        assert f"'{first_batch_id}'" in str(error_info.value)
+        assert f"'{second_batch_id}'" in str(error_info.value)
+        assert not any(tmp_path.iterdir())
+
+    def test_raster_batch_id_with_the_name_of_a_qc_table_is_allowed(self, sample_df, tmp_path):
+        """A raster output writes into its own folder, so 'X_qc' does not collide with 'X'."""
+        raster_config = {
+            "batch_id": "terrain_qc",
+            "datasets": ["dem_local"],
+            "settings": {"output_type": "raster", "window_size_m": 200},
+        }
+
+        extract(sample_df, [_tabular_mean_config("terrain"), raster_config], output_dir=tmp_path)
+
+        assert (tmp_path / "terrain_qc.csv").exists()
+        assert (tmp_path / "terrain_qc" / "dem_local" / "T2T1DJ-dem_local.tif").exists()
+
+    @pytest.mark.parametrize("output_type", ["tabular", "raster"])
+    @pytest.mark.parametrize(
+        "datasets",
+        [["dem_local", "dem_local"], ["dem_local", {"dem_local": [1]}]],
+        ids=["plain", "with-band-list"],
+    )
+    def test_dataset_listed_twice_raises(self, sample_df, tmp_path, output_type, datasets):
+        """One run config that lists a dataset twice raises in both modes."""
+        settings = {"output_type": output_type, "window_size_m": 200}
+        if output_type == "tabular":
+            settings["statistics"] = ["mean"]
+
+        with pytest.raises(
+            ValueError,
+            match=r"Output 'twice': dataset\(s\) \['dem_local'\] are listed more than once",
+        ):
+            extract(
+                sample_df,
+                {"batch_id": "twice", "datasets": datasets, "settings": settings},
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    def test_raster_datasets_that_differ_only_in_case_raise(self, sample_df, dem_tif, tmp_path):
+        """Two raster tile folders whose names differ only in case would be one folder."""
+        update_catalog(
+            {"datasets": {"DEM_local": {"data_source": "local", "path": str(dem_tif), "bands": 1}}}
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"Output 'case': datasets \['dem_local', 'DEM_local'\] differ only in letter",
+        ):
+            extract(
+                sample_df,
+                {
+                    "batch_id": "case",
+                    "datasets": ["dem_local", "DEM_local"],
+                    "settings": {"output_type": "raster", "window_size_m": 200},
+                },
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    def test_tabular_datasets_that_differ_only_in_case_are_allowed(
+        self, sample_df, dem_tif, tmp_path
+    ):
+        """Column names keep their letter case, so tabular mode allows such dataset names."""
+        update_catalog(
+            {"datasets": {"DEM_local": {"data_source": "local", "path": str(dem_tif), "bands": 1}}}
+        )
+
+        outputs = extract(
+            sample_df,
+            {
+                "batch_id": "case",
+                "datasets": ["dem_local", "DEM_local"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean"],
+                    "window_size_m": 100,
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        result = pd.read_csv(outputs["case"])
+        assert list(result["dem_local_mean_100m"]) == list(result["DEM_local_mean_100m"])
+
+    def test_invalid_second_run_config_raises_before_any_output(self, sample_df, tmp_path):
+        """An invalid setting in the second run config stops the call before the first runs."""
+        with pytest.raises(ValueError, match="Output 'second': invalid min_coverage_pct"):
+            extract(
+                sample_df,
+                [
+                    _tabular_mean_config("first"),
+                    _tabular_mean_config("second", min_coverage_pct="50"),
+                ],
+                output_dir=tmp_path,
+            )
+        assert not any(tmp_path.iterdir())
+
+    @pytest.mark.parametrize(
+        "resample_m",
+        ["30", True, float("nan"), float("inf"), 0, -5],
+        ids=["text", "bool", "nan", "inf", "zero", "negative"],
+    )
+    def test_invalid_resample_m_raises(self, sample_df, resample_m, tmp_path):
+        """resample_m must be a positive, finite number that is not a bool."""
+        with pytest.raises(ValueError, match="Output 'tiles': invalid resample_m"):
+            extract(
+                sample_df,
+                {
+                    "batch_id": "tiles",
+                    "datasets": ["dem_local"],
+                    "settings": {
+                        "output_type": "raster",
+                        "window_size_m": 200,
+                        "resample_m": resample_m,
+                    },
+                },
+                output_dir=tmp_path,
+            )
+
+    def test_numpy_resample_m_is_accepted(self, sample_df, tmp_path):
+        """A NumPy float resample_m runs and the sidecar records it as a plain number."""
+        extract(
+            sample_df,
+            {
+                "batch_id": "tiles",
+                "datasets": ["dem_local"],
+                "settings": {
+                    "output_type": "raster",
+                    "window_size_m": 200,
+                    "resample_m": np.float32(30),
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        meta = json.loads((tmp_path / "tiles" / "tiles_metadata.json").read_text())
+        assert meta["config"]["resample_m"] == 30.0
+        with rasterio.open(tmp_path / "tiles" / "dem_local" / "T2T1DJ-dem_local.tif") as src:
+            assert src.res == (30.0, 30.0)
+
+    @pytest.mark.parametrize(
+        "min_coverage_pct",
+        ["50", None, True, float("nan"), -1, 101],
+        ids=["text", "none", "bool", "nan", "below-range", "above-range"],
+    )
+    def test_invalid_min_coverage_pct_raises(self, sample_df, min_coverage_pct, tmp_path):
+        """min_coverage_pct must be a finite number from 0 to 100 that is not a bool."""
+        with pytest.raises(ValueError, match="Output 'coverage': invalid min_coverage_pct"):
+            extract(
+                sample_df,
+                _tabular_mean_config("coverage", min_coverage_pct=min_coverage_pct),
+                output_dir=tmp_path,
+            )
+
+    def test_numpy_min_coverage_pct_is_accepted(self, sample_df, tmp_path):
+        """A NumPy integer min_coverage_pct runs and the sidecar records it as a plain number."""
+        extract(
+            sample_df,
+            _tabular_mean_config("coverage", min_coverage_pct=np.int64(50)),
+            output_dir=tmp_path,
+        )
+
+        meta = json.loads((tmp_path / "coverage_metadata.json").read_text())
+        assert meta["config"]["min_coverage_pct"] == 50
 
 
 # ------------------------------------------------------------------
@@ -1405,8 +2616,8 @@ class TestNumericalCorrectness:
         assert stats_df["dem_constant_mean_100m"].iloc[0] == pytest.approx(constant_dem_value)
         assert stats_df["dem_constant_min_100m"].iloc[0] == pytest.approx(constant_dem_value)
         assert stats_df["dem_constant_max_100m"].iloc[0] == pytest.approx(constant_dem_value)
-        # Standard deviation of a single repeated value is exactly 0 (the
-        # sample-std denominator (n-1) cancels with the zero numerator).
+        # Standard deviation of a single repeated value is exactly 0 (every
+        # deviation from the mean is zero).
         assert stats_df["dem_constant_std_100m"].iloc[0] == pytest.approx(0.0)
 
     def test_mean_constant_across_all_points(
@@ -1489,6 +2700,774 @@ class TestNumericalCorrectness:
             stats_df["dem_constant_point"].to_numpy(),
             np.full(len(sample_df), constant_dem_value),
         )
+
+
+# ------------------------------------------------------------------
+# Point sample of NaN and infinite pixels
+# ------------------------------------------------------------------
+
+# Two points about 100 m apart in UTM zone 34N. The raster below puts the
+# first point in pixel (row 10, col 10) and the second in pixel (row 10, col 20).
+_NON_FINITE_POINTS = pd.DataFrame(
+    {
+        "occurrenceID": ["non_finite_pixel", "valid_pixel"],
+        "decimalLatitude": [62.976878, 62.976878],
+        "decimalLongitude": [18.026823, 18.028790],
+    }
+)
+
+
+def _write_raster_without_nodata(path: Path, first_point_pixel_values: list[float]) -> np.ndarray:
+    """Write a float32 UTM 34N raster (10 m pixels) that declares no nodata value.
+
+    The pixel of the first point of ``_NON_FINITE_POINTS`` gets
+    ``first_point_pixel_values`` (one value per band). The other pixels are
+    random values from a seeded generator. Returns the written array
+    (bands, rows, columns).
+    """
+    from pyproj import Transformer
+
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+    first_x, first_y = to_utm.transform(
+        _NON_FINITE_POINTS["decimalLongitude"][0], _NON_FINITE_POINTS["decimalLatitude"][0]
+    )
+    # 30 x 30 pixels of 10 m; the first point is in the middle of pixel (10, 10).
+    west, north = first_x - 105.0, first_y + 105.0
+    transform = from_bounds(west, north - 300.0, west + 300.0, north, 30, 30)
+
+    band_count = len(first_point_pixel_values)
+    rng = np.random.default_rng(seed=7)
+    pixel_values = rng.uniform(100.0, 200.0, (band_count, 30, 30)).astype(np.float32)
+    for band_index, pixel_value in enumerate(first_point_pixel_values):
+        pixel_values[band_index, 10, 10] = pixel_value
+
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=30,
+        width=30,
+        count=band_count,
+        dtype="float32",
+        crs="EPSG:32634",
+        transform=transform,
+    ) as dst:
+        dst.write(pixel_values)
+    return pixel_values
+
+
+class TestPointSampleNonFinitePixels:
+    """A NaN or infinite pixel is missing in the point sample, also without a declared nodata."""
+
+    def test_nan_pixel_without_nodata_is_missing(self, tmp_path):
+        """A NaN pixel gives a null point value and the QC values of a nodata pixel."""
+        raster_path = tmp_path / "nan_pixel.tif"
+        pixel_values = _write_raster_without_nodata(raster_path, [float("nan")])
+        update_catalog(
+            {"datasets": {"nan_raster": {"data_source": "local", "path": str(raster_path)}}}
+        )
+        with rasterio.open(raster_path) as src:
+            assert src.nodata is None
+
+        outputs = extract(
+            _NON_FINITE_POINTS,
+            {
+                "batch_id": "nan_point",
+                "datasets": ["nan_raster"],
+                "settings": {"output_type": "tabular", "statistics": ["point"]},
+            },
+            output_dir=tmp_path,
+        )
+
+        stats_df = pd.read_csv(outputs["nan_point"])
+        qc_df = pd.read_csv(tmp_path / "nan_point_qc.csv")
+        assert pd.isna(stats_df.loc[0, "nan_raster_point"])
+        assert stats_df.loc[1, "nan_raster_point"] == pytest.approx(float(pixel_values[0, 10, 20]))
+        assert qc_df["nan_raster_in_extent_point"].tolist() == [False, True]
+        assert qc_df["nan_raster_n_pixels_point"].tolist() == [0, 1]
+        assert qc_df["nan_raster_had_nodata_point"].tolist() == [True, False]
+        assert qc_df["nan_raster_coverage_pct_point"].tolist() == [0.0, 100.0]
+
+    @pytest.mark.parametrize("pixel_value", [float("nan"), float("inf"), float("-inf")])
+    def test_single_band_value_is_none(self, tmp_path, pixel_value):
+        """The adapter returns None (not NaN or infinity) for a non-finite pixel."""
+        from envoi.adapters.local_adapter import LocalRasterAdapter
+
+        raster_path = tmp_path / "non_finite_pixel.tif"
+        _write_raster_without_nodata(raster_path, [pixel_value])
+
+        with LocalRasterAdapter({"path": str(raster_path), "bands": 1}) as adapter:
+            values, meta = adapter._sample_point_single(
+                _NON_FINITE_POINTS["decimalLatitude"][0], _NON_FINITE_POINTS["decimalLongitude"][0]
+            )
+
+        assert values == {"point": None}
+        assert meta["in_extent"] is False
+        assert meta["n_pixels"] == 0
+        assert "error" not in meta
+
+    def test_multi_band_non_finite_values_are_none(self, tmp_path):
+        """In a multi-band raster, NaN and infinite bands are None, and a finite band keeps its value."""
+        from envoi.adapters.local_adapter import LocalRasterAdapter
+
+        raster_path = tmp_path / "multi_band.tif"
+        _write_raster_without_nodata(raster_path, [float("nan"), float("inf"), 42.5])
+        lat = _NON_FINITE_POINTS["decimalLatitude"][0]
+        lon = _NON_FINITE_POINTS["decimalLongitude"][0]
+
+        with LocalRasterAdapter({"path": str(raster_path), "bands": [1, 2, 3]}) as adapter:
+            values_with_finite_band, meta_with_finite_band = adapter._sample_point_single(lat, lon)
+        with LocalRasterAdapter({"path": str(raster_path), "bands": [1, 2]}) as adapter:
+            values_without_finite_band, meta_without_finite_band = adapter._sample_point_single(
+                lat, lon
+            )
+
+        assert values_with_finite_band == {"b1": None, "b2": None, "b3": 42.5}
+        assert meta_with_finite_band["in_extent"] is True
+        assert values_without_finite_band == {"b1": None, "b2": None}
+        assert meta_without_finite_band["in_extent"] is False
+        assert meta_without_finite_band["n_pixels"] == 0
+
+
+# ------------------------------------------------------------------
+# Windows smaller than one pixel, and pixel sizes in metres
+# ------------------------------------------------------------------
+
+# One point in UTM zone 34N (the first point of sample_df).
+_SUB_PIXEL_POINT = pd.DataFrame(
+    {
+        "occurrenceID": ["corner_point"],
+        "decimalLatitude": [62.976878],
+        "decimalLongitude": [18.026823],
+    }
+)
+
+
+def _write_coarse_raster_near_a_pixel_corner(path: Path) -> np.ndarray:
+    """Write a 10 × 10 float32 UTM 34N raster with 100 m pixels around ``_SUB_PIXEL_POINT``.
+
+    The point lies 10 m east of a pixel column edge and 10 m south of a pixel
+    row edge, inside pixel (row 5, column 5). The nearest pixel centres are
+    40 m and 60 m away in each direction, so a 50 m window contains no pixel
+    centre. A window of two pixels (200 m) contains the centres of rows 4-5
+    and columns 4-5. Returns the written array (rows, columns).
+    """
+    from pyproj import Transformer
+
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+    point_x, point_y = to_utm.transform(
+        _SUB_PIXEL_POINT["decimalLongitude"][0], _SUB_PIXEL_POINT["decimalLatitude"][0]
+    )
+    west, north = point_x - 10.0 - 500.0, point_y + 10.0 + 500.0
+    transform = from_bounds(west, north - 1000.0, west + 1000.0, north, 10, 10)
+
+    random_generator = np.random.default_rng(seed=20)
+    pixel_values = random_generator.uniform(100.0, 200.0, (10, 10)).astype(np.float32)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=10,
+        width=10,
+        count=1,
+        dtype="float32",
+        crs="EPSG:32634",
+        transform=transform,
+    ) as dst:
+        dst.write(pixel_values, 1)
+    return pixel_values
+
+
+class TestWindowSmallerThanOnePixel:
+    """A local window smaller than one native pixel is widened to two pixels, as on GEE."""
+
+    def test_window_gets_the_pixels_of_a_two_pixel_window(self, tmp_path):
+        """A 50 m window at 100 m pixels gives the four pixels around the point, named 50m."""
+        raster_path = tmp_path / "coarse.tif"
+        pixel_values = _write_coarse_raster_near_a_pixel_corner(raster_path)
+        update_catalog({"datasets": {"coarse": {"data_source": "local", "path": str(raster_path)}}})
+
+        outputs = extract(
+            _SUB_PIXEL_POINT,
+            {
+                "batch_id": "sub_pixel",
+                "datasets": ["coarse"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean", "count"],
+                    "window_size_m": 50,
+                },
+            },
+            output_dir=tmp_path,
+        )
+
+        stats_df = pd.read_csv(outputs["sub_pixel"])
+        qc_df = pd.read_csv(tmp_path / "sub_pixel_qc.csv")
+        sidecar = json.loads((tmp_path / "sub_pixel_metadata.json").read_text())
+        expected_mean = float(pixel_values[4:6, 4:6].astype(float).mean())
+        assert stats_df.loc[0, "coarse_mean_50m"] == pytest.approx(expected_mean)
+        assert stats_df.loc[0, "coarse_count_50m"] == 4
+        assert qc_df.loc[0, "coarse_in_extent_50m"]
+        assert qc_df.loc[0, "coarse_n_pixels_50m"] == 4
+        # The widened window has the 4 pixel centres, all with data.
+        assert qc_df.loc[0, "coarse_coverage_pct_50m"] == 100.0
+        assert not qc_df.loc[0, "coarse_had_nodata_50m"]
+        # The outputs keep the requested window, not the widened one.
+        assert sidecar["config"]["window_size_m"] == 50
+        assert set(sidecar["datasets"]["coarse"]["quality"]) == {"50m"}
+        assert sidecar["datasets"]["coarse"]["native_spatial_resolution_m"] == 100.0
+
+    def test_meta_keeps_the_requested_window(self, tmp_path):
+        """The adapter reads a 200 m window but reports ``window_m`` 50."""
+        from envoi.adapters.local_adapter import LocalRasterAdapter
+
+        raster_path = tmp_path / "coarse.tif"
+        _write_coarse_raster_near_a_pixel_corner(raster_path)
+
+        with LocalRasterAdapter({"path": str(raster_path), "bands": 1}) as adapter:
+            [(stats, meta)] = adapter.fetch_stats_batch(
+                _SUB_PIXEL_POINT["decimalLatitude"],
+                _SUB_PIXEL_POINT["decimalLongitude"],
+                50,
+                ["count"],
+                disable_progress=True,
+            )
+
+        assert stats["count"] == 4
+        assert meta["n_pixels"] == 4
+        assert meta["window_m"] == 50
+
+    def test_window_of_one_pixel_or_more_is_not_widened(self, tmp_path):
+        """A window of one pixel (100 m at 100 m pixels) is read as requested, not widened."""
+        from envoi.adapters.local_adapter import LocalRasterAdapter
+
+        raster_path = tmp_path / "coarse.tif"
+        _write_coarse_raster_near_a_pixel_corner(raster_path)
+
+        with LocalRasterAdapter({"path": str(raster_path), "bands": 1}) as adapter:
+            [(stats, meta)] = adapter.fetch_stats_batch(
+                _SUB_PIXEL_POINT["decimalLatitude"],
+                _SUB_PIXEL_POINT["decimalLongitude"],
+                100,
+                ["count"],
+                disable_progress=True,
+            )
+
+        # The 100 m window reaches 50 m from the point; the nearest centres are 40 m
+        # away in one direction and 60 m in the other, so it holds one pixel centre.
+        # A widened (200 m) window would hold four.
+        assert stats["count"] == 1
+        assert meta["n_pixels"] == 1
+        assert meta["window_m"] == 100
+
+
+# ------------------------------------------------------------------
+# Coverage of local windows: the pixels whose centre is inside the window
+# ------------------------------------------------------------------
+
+_COVERAGE_PIXEL_SIZE_M = 10.0
+_COVERAGE_RASTER_SIZE = 40  # pixels per side
+_COVERAGE_WINDOW_M = 100
+_COVERAGE_NODATA = -9999.0
+
+
+def _coverage_grid() -> tuple[float, float, float, float]:
+    """Return ``(west, north, point_x, point_y)`` of the coverage raster in EPSG:32634.
+
+    The point of ``_SUB_PIXEL_POINT`` is 2.5 m east of the west edge and 2.5 m
+    south of the north edge of pixel (row 20, column 20). No pixel centre is
+    then on the edge of a 100 m window, and the bounding box of the window
+    has pixels whose centre is outside the window.
+    """
+    from pyproj import Transformer
+
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+    point_x, point_y = to_utm.transform(
+        _SUB_PIXEL_POINT["decimalLongitude"][0], _SUB_PIXEL_POINT["decimalLatitude"][0]
+    )
+    return point_x - 202.5, point_y + 202.5, point_x, point_y
+
+
+def _pixels_inside_coverage_window() -> np.ndarray:
+    """Return a (rows, columns) mask of the pixels whose centre is inside the 100 m window."""
+    west, north, point_x, point_y = _coverage_grid()
+    pixel_numbers = np.arange(_COVERAGE_RASTER_SIZE)
+    centre_x = west + (pixel_numbers + 0.5) * _COVERAGE_PIXEL_SIZE_M
+    centre_y = north - (pixel_numbers + 0.5) * _COVERAGE_PIXEL_SIZE_M
+    half_window_m = _COVERAGE_WINDOW_M / 2
+    inside_columns = np.abs(centre_x - point_x) < half_window_m
+    inside_rows = np.abs(centre_y - point_y) < half_window_m
+    return inside_rows[:, np.newaxis] & inside_columns[np.newaxis, :]
+
+
+def _write_coverage_raster(
+    path: Path, pixel_values: np.ndarray, nodata=None, first_column: int = 0
+) -> None:
+    """Write ``pixel_values`` (bands, rows, columns) as a float32 GeoTIFF on the coverage grid.
+
+    The file has the columns from ``first_column`` on, so with a
+    ``first_column`` above 0 its west edge is east of the grid's west edge.
+    """
+    west, north, _, _ = _coverage_grid()
+    file_west = west + first_column * _COVERAGE_PIXEL_SIZE_M
+    file_width = _COVERAGE_RASTER_SIZE - first_column
+    profile = {
+        "driver": "GTiff",
+        "height": _COVERAGE_RASTER_SIZE,
+        "width": file_width,
+        "count": pixel_values.shape[0],
+        "dtype": "float32",
+        "crs": "EPSG:32634",
+        "transform": from_bounds(
+            file_west,
+            north - _COVERAGE_RASTER_SIZE * _COVERAGE_PIXEL_SIZE_M,
+            file_west + file_width * _COVERAGE_PIXEL_SIZE_M,
+            north,
+            file_width,
+            _COVERAGE_RASTER_SIZE,
+        ),
+    }
+    if nodata is not None:
+        profile["nodata"] = nodata
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(pixel_values[:, :, first_column:].astype(np.float32))
+
+
+def _run_coverage_extraction(raster_path: Path, bands, output_dir: Path) -> tuple:
+    """Run a tabular extraction of the coverage raster with ``min_coverage_pct`` 95.
+
+    Returns ``(stats_df, qc_df, low_coverage_warnings)``.
+    """
+    update_catalog(
+        {"datasets": {"cover": {"data_source": "local", "path": str(raster_path), "bands": bands}}}
+    )
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        outputs = extract(
+            _SUB_PIXEL_POINT,
+            {
+                "batch_id": "coverage",
+                "datasets": ["cover"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["mean", "count"],
+                    "window_size_m": _COVERAGE_WINDOW_M,
+                    "min_coverage_pct": 95,
+                },
+            },
+            output_dir=output_dir,
+        )
+    low_coverage_warnings = [
+        str(warning.message)
+        for warning in caught_warnings
+        if str(warning.message).startswith("Low coverage")
+    ]
+    stats_df = pd.read_csv(outputs["coverage"])
+    qc_df = pd.read_csv(output_dir / "coverage_qc.csv")
+    return stats_df, qc_df, low_coverage_warnings
+
+
+class TestLocalWindowCoverage:
+    """``coverage_pct`` and ``had_nodata`` count only the pixels whose centre is inside the window."""
+
+    def test_complete_window_has_full_coverage(self, tmp_path):
+        """A window without missing data gives 100 % coverage, no nodata, and no low-coverage warning."""
+        raster_path = tmp_path / "constant.tif"
+        _write_coverage_raster(
+            raster_path, np.full((1, _COVERAGE_RASTER_SIZE, _COVERAGE_RASTER_SIZE), 5.0)
+        )
+
+        stats_df, qc_df, low_coverage_warnings = _run_coverage_extraction(
+            raster_path, 1, tmp_path / "out"
+        )
+
+        # 10 × 10 pixel centres are inside the window. Its bounding box has
+        # 11 × 11 pixels, which gave 82.6 % before.
+        assert int(_pixels_inside_coverage_window().sum()) == 100
+        assert stats_df.loc[0, "cover_count_100m"] == 100
+        assert qc_df.loc[0, "cover_n_pixels_100m"] == 100
+        assert qc_df.loc[0, "cover_coverage_pct_100m"] == 100.0
+        assert not qc_df.loc[0, "cover_had_nodata_100m"]
+        assert low_coverage_warnings == []
+
+    @pytest.mark.parametrize("bands", [1, [1, 2]])
+    def test_nodata_pixels_inside_the_window_lower_the_coverage(self, tmp_path, bands):
+        """Nodata pixels inside the window lower the coverage; those outside it do not."""
+        inside_window = _pixels_inside_coverage_window()
+        random_generator = np.random.default_rng(seed=26)
+        pixel_values = random_generator.uniform(
+            100.0, 200.0, (2, _COVERAGE_RASTER_SIZE, _COVERAGE_RASTER_SIZE)
+        )
+        # Band 1: 7 nodata pixels inside the window, and 5 in the bounding box
+        # of the window whose centre is outside it (row 25, column 25).
+        for row, column in [(15, 15), (16, 22), (18, 18), (20, 20), (22, 16), (23, 24), (24, 24)]:
+            pixel_values[0, row, column] = _COVERAGE_NODATA
+        for row, column in [(25, 15), (25, 20), (25, 25), (15, 25), (20, 25)]:
+            pixel_values[0, row, column] = _COVERAGE_NODATA
+        # Band 2: 3 more nodata pixels inside the window.
+        for row, column in [(17, 19), (19, 21), (21, 23)]:
+            pixel_values[1, row, column] = _COVERAGE_NODATA
+        raster_path = tmp_path / "with_nodata.tif"
+        _write_coverage_raster(raster_path, pixel_values, nodata=_COVERAGE_NODATA)
+
+        stats_df, qc_df, low_coverage_warnings = _run_coverage_extraction(
+            raster_path, bands, tmp_path / "out"
+        )
+
+        # A pixel is valid when it has data in every selected band.
+        selected_values = pixel_values[:1] if bands == 1 else pixel_values
+        valid_pixels = inside_window & (selected_values != _COVERAGE_NODATA).all(axis=0)
+        expected_valid = int(valid_pixels.sum())
+        assert expected_valid == (93 if bands == 1 else 90)
+        expected_coverage = 100.0 * expected_valid / int(inside_window.sum())
+        count_column = "cover_count_100m" if bands == 1 else "cover_b1_count_100m"
+        assert stats_df.loc[0, count_column] == expected_valid
+        assert qc_df.loc[0, "cover_n_pixels_100m"] == expected_valid
+        assert qc_df.loc[0, "cover_coverage_pct_100m"] == pytest.approx(expected_coverage)
+        assert qc_df.loc[0, "cover_had_nodata_100m"]
+        assert len(low_coverage_warnings) == 1
+
+    def test_window_half_beyond_the_raster_edge_has_half_coverage(self, tmp_path):
+        """The part of the window beyond the raster edge counts as missing data, as on GEE."""
+        # The file starts at column 20 of the grid, the column of the point,
+        # so its west edge is 2.5 m west of the point.
+        raster_path = tmp_path / "edge.tif"
+        _write_coverage_raster(
+            raster_path,
+            np.full((1, _COVERAGE_RASTER_SIZE, _COVERAGE_RASTER_SIZE), 5.0),
+            first_column=20,
+        )
+
+        stats_df, qc_df, low_coverage_warnings = _run_coverage_extraction(
+            raster_path, 1, tmp_path / "out"
+        )
+
+        # The window has the centres of columns 15-24 of the grid; the file
+        # has columns 20-24 of them.
+        inside_window = _pixels_inside_coverage_window()
+        expected_valid = int(inside_window[:, 20:].sum())
+        expected_coverage = 100.0 * expected_valid / int(inside_window.sum())
+        assert (expected_valid, expected_coverage) == (50, 50.0)
+        assert stats_df.loc[0, "cover_count_100m"] == expected_valid
+        assert qc_df.loc[0, "cover_in_extent_100m"]
+        assert qc_df.loc[0, "cover_n_pixels_100m"] == expected_valid
+        assert qc_df.loc[0, "cover_coverage_pct_100m"] == pytest.approx(expected_coverage)
+        assert qc_df.loc[0, "cover_had_nodata_100m"]
+        assert len(low_coverage_warnings) == 1
+
+    def test_nan_pixels_of_a_file_without_nodata_are_missing(self, tmp_path):
+        """A single band without nodata: NaN pixels are not counted in n_pixels and lower the coverage."""
+        pixel_values = np.full((1, _COVERAGE_RASTER_SIZE, _COVERAGE_RASTER_SIZE), 5.0)
+        pixel_values[0, 18:20, 18:20] = np.nan  # 4 pixels inside the window
+        raster_path = tmp_path / "nan_pixels.tif"
+        _write_coverage_raster(raster_path, pixel_values)
+
+        stats_df, qc_df, _ = _run_coverage_extraction(raster_path, 1, tmp_path / "out")
+
+        assert stats_df.loc[0, "cover_count_100m"] == 96
+        assert qc_df.loc[0, "cover_n_pixels_100m"] == 96
+        assert qc_df.loc[0, "cover_coverage_pct_100m"] == 96.0
+        assert qc_df.loc[0, "cover_had_nodata_100m"]
+
+    @pytest.mark.parametrize("gdal_cuts_at_180", [True, False])
+    def test_window_across_the_antimeridian(self, tmp_path, monkeypatch, gdal_cuts_at_180):
+        """A window across 180° of a raster in degrees counts its part beyond 180° as missing."""
+        from pyproj import Transformer
+        from shapely.geometry import Point, Polygon, mapping, shape
+
+        from envoi.adapters import local_adapter
+
+        if not gdal_cuts_at_180:
+            # Some GDAL builds (the macOS wheels of rasterio in CI) do not cut a
+            # transformed geometry at 180°. Simulate them: project each corner
+            # on its own, so the window keeps corners on both sides of 180°.
+            def uncut_transform_geom(src_crs, dst_crs, geometry, precision=-1):
+                transformer = Transformer.from_crs(str(src_crs), str(dst_crs), always_xy=True)
+                ring = shape(geometry).exterior.coords
+                return mapping(Polygon([transformer.transform(x, y) for x, y in ring]))
+
+            monkeypatch.setattr(local_adapter, "transform_geom", uncut_transform_geom)
+
+        # 100 x 100 pixels of 0.0005° that end at 180°. The 1000 m window of
+        # the point reaches about 0.0025° beyond 180°.
+        pixel_size_deg = 0.0005
+        raster_path = tmp_path / "antimeridian.tif"
+        with rasterio.open(
+            raster_path,
+            "w",
+            driver="GTiff",
+            height=100,
+            width=100,
+            count=1,
+            dtype="float32",
+            crs="EPSG:4326",
+            transform=from_bounds(179.95, 0.0, 180.0, 0.05, 100, 100),
+        ) as dst:
+            dst.write(np.full((1, 100, 100), 5.0, dtype=np.float32))
+        update_catalog(
+            {"datasets": {"east_edge": {"data_source": "local", "path": str(raster_path)}}}
+        )
+        point_lat, point_lon = 0.025, 179.998
+
+        # Record the size of every mask, to check that no mask spans 360°.
+        mask_shapes = []
+        original_geometry_mask = local_adapter.geometry_mask
+
+        def recording_geometry_mask(*args, **kwargs):
+            mask_shapes.append(kwargs["out_shape"])
+            return original_geometry_mask(*args, **kwargs)
+
+        monkeypatch.setattr(local_adapter, "geometry_mask", recording_geometry_mask)
+
+        outputs = extract(
+            pd.DataFrame(
+                {
+                    "occurrenceID": ["edge"],
+                    "decimalLatitude": [point_lat],
+                    "decimalLongitude": [point_lon],
+                }
+            ),
+            {
+                "batch_id": "antimeridian",
+                "datasets": ["east_edge"],
+                "settings": {
+                    "output_type": "tabular",
+                    "statistics": ["count"],
+                    "window_size_m": 1000,
+                },
+            },
+            output_dir=tmp_path / "out",
+        )
+
+        # Independent count: the window corners in degrees (UTM zone 60N),
+        # with the longitudes continued past 180°, and the pixel centres of
+        # the raster grid continued 20 columns past 180°.
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32660", always_xy=True)
+        to_degrees = Transformer.from_crs("EPSG:32660", "EPSG:4326", always_xy=True)
+        point_x, point_y = to_utm.transform(point_lon, point_lat)
+        corners = [
+            to_degrees.transform(point_x + offset_x, point_y + offset_y)
+            for offset_x, offset_y in ((-500, -500), (500, -500), (500, 500), (-500, 500))
+        ]
+        window = Polygon([(corner_lon % 360.0, corner_lat) for corner_lon, corner_lat in corners])
+        inside_pixels = [
+            (row, column)
+            for row in range(100)
+            for column in range(120)
+            if window.contains(
+                Point(
+                    179.95 + (column + 0.5) * pixel_size_deg,
+                    0.05 - (row + 0.5) * pixel_size_deg,
+                )
+            )
+        ]
+        expected_total = len(inside_pixels)
+        expected_valid = sum(1 for _, column in inside_pixels if column < 100)
+        assert expected_valid < expected_total
+
+        stats_df = pd.read_csv(outputs["antimeridian"])
+        qc_df = pd.read_csv(tmp_path / "out" / "antimeridian_qc.csv")
+        assert stats_df.loc[0, "east_edge_count_1000m"] == expected_valid
+        assert qc_df.loc[0, "east_edge_n_pixels_1000m"] == expected_valid
+        assert qc_df.loc[0, "east_edge_coverage_pct_1000m"] == pytest.approx(
+            100.0 * expected_valid / expected_total
+        )
+        assert qc_df.loc[0, "east_edge_had_nodata_1000m"]
+        assert max(width for _, width in mask_shapes) < 1000
+
+
+class TestNativeResolutionInMetres:
+    """The sidecar field ``native_spatial_resolution_m`` is in metres for every CRS."""
+
+    def test_geographic_raster(self, tmp_path):
+        """A raster with 0.001° pixels reports 111.32 m (111 319.49 m per degree)."""
+        raster_path = tmp_path / "geographic.tif"
+        random_generator = np.random.default_rng(seed=22)
+        pixel_values = random_generator.uniform(0.0, 100.0, (50, 50)).astype(np.float32)
+        # 0.05° × 0.05° around the point (lat 62.98, lon 18.03).
+        transform = from_bounds(18.0, 62.95, 18.05, 63.0, 50, 50)
+        with rasterio.open(
+            raster_path,
+            "w",
+            driver="GTiff",
+            height=50,
+            width=50,
+            count=1,
+            dtype="float32",
+            crs="EPSG:4326",
+            transform=transform,
+        ) as dst:
+            dst.write(pixel_values, 1)
+        update_catalog(
+            {"datasets": {"geographic": {"data_source": "local", "path": str(raster_path)}}}
+        )
+
+        extract(
+            _SUB_PIXEL_POINT,
+            {
+                "batch_id": "geographic_run",
+                "datasets": ["geographic"],
+                "settings": {"output_type": "tabular", "statistics": ["mean"]},
+            },
+            output_dir=tmp_path,
+        )
+
+        sidecar = json.loads((tmp_path / "geographic_run_metadata.json").read_text())
+        assert sidecar["datasets"]["geographic"]["native_spatial_resolution_m"] == 111.32
+
+
+# ------------------------------------------------------------------
+# Tile CRS in the metadata sidecar of local raster runs
+# ------------------------------------------------------------------
+
+# Two points on both sides of 18° E, the border between UTM zones 33N and 34N.
+_TWO_ZONE_POINTS = pd.DataFrame(
+    {
+        "occurrenceID": ["zone33", "zone34"],
+        "decimalLatitude": [62.95, 62.95],
+        "decimalLongitude": [17.95, 18.05],
+    }
+)
+
+
+class TestLocalTileCrsMetadata:
+    """The sidecar ``tile_crs`` of a local dataset names the CRS of its tiles."""
+
+    @pytest.fixture
+    def two_zone_raster(self, tmp_path) -> str:
+        """Register a geographic raster that covers both points of ``_TWO_ZONE_POINTS``."""
+        raster_path = tmp_path / "two_zones.tif"
+        random_generator = np.random.default_rng(seed=31)
+        pixel_values = random_generator.uniform(0.0, 100.0, (100, 200)).astype(np.float32)
+        # 0.2° × 0.1° with 0.001° pixels, from 17.9° E to 18.1° E.
+        transform = from_bounds(17.9, 62.9, 18.1, 63.0, 200, 100)
+        with rasterio.open(
+            raster_path,
+            "w",
+            driver="GTiff",
+            height=100,
+            width=200,
+            count=1,
+            dtype="float32",
+            crs="EPSG:4326",
+            transform=transform,
+        ) as dst:
+            dst.write(pixel_values, 1)
+        update_catalog(
+            {"datasets": {"two_zones": {"data_source": "local", "path": str(raster_path)}}}
+        )
+        return "two_zones"
+
+    def _export_tiles(self, tmp_path, **settings) -> dict:
+        """Export the tiles of both points and return the sidecar entry of the dataset."""
+        extract(
+            _TWO_ZONE_POINTS,
+            {
+                "batch_id": "zones",
+                "datasets": ["two_zones"],
+                "settings": {"output_type": "raster", "window_size_m": 200, **settings},
+            },
+            output_dir=tmp_path,
+        )
+        sidecar = json.loads((tmp_path / "zones" / "zones_metadata.json").read_text())
+        return sidecar["datasets"]["two_zones"]
+
+    def test_resampled_tiles_list_the_utm_zone_of_each_point(self, two_zone_raster, tmp_path):
+        """With resample_m, tile_crs lists the UTM zones of the points, which the tiles use."""
+        dataset_meta = self._export_tiles(tmp_path, resample_m=30)
+
+        assert dataset_meta["tile_crs"] == ["EPSG:32633", "EPSG:32634"]
+        assert dataset_meta["native_crs"] == "EPSG:4326"
+        tile_dir = tmp_path / "zones" / "two_zones"
+        tile_crs_codes = []
+        for tile_name in ("zone33-two_zones.tif", "zone34-two_zones.tif"):
+            with rasterio.open(tile_dir / tile_name) as src:
+                tile_crs_codes.append(f"EPSG:{src.crs.to_epsg()}")
+        assert tile_crs_codes == ["EPSG:32633", "EPSG:32634"]
+
+    def test_native_tiles_keep_the_raster_crs(self, two_zone_raster, tmp_path):
+        """Without resample_m, tiles are in the raster CRS, and tile_crs names it."""
+        dataset_meta = self._export_tiles(tmp_path)
+
+        assert dataset_meta["tile_crs"] == "EPSG:4326"
+        with rasterio.open(tmp_path / "zones" / "two_zones" / "zone33-two_zones.tif") as src:
+            assert src.crs.to_epsg() == 4326
+
+
+# ------------------------------------------------------------------
+# Point sample without the deprecated affine "*" operator
+# ------------------------------------------------------------------
+
+
+class TestPointSampleWithoutAffineOperator:
+    """The point sample computes pixel coordinates from the inverse transform's coefficients."""
+
+    def test_rotated_raster_gives_the_pixel_of_the_point_without_warnings(self, tmp_path):
+        """On a rotated raster, the point sample reads the right pixel without affine warnings."""
+        from pyproj import Transformer
+        from rasterio.transform import Affine
+
+        from envoi.adapters.local_adapter import LocalRasterAdapter
+
+        # A raster rotated by 30°, with 10 m pixels: x = c + a·col + b·row,
+        # y = f + d·col + e·row. The first point is inside pixel (row 15,
+        # column 12). The second point is inside the raster's axis-aligned
+        # bounding box, but outside its rotated footprint (column -2).
+        pixel_m, angle = 10.0, math.radians(30)
+        a, b = pixel_m * math.cos(angle), pixel_m * math.sin(angle)
+        d, e = pixel_m * math.sin(angle), -pixel_m * math.cos(angle)
+        to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+        point_x, point_y = to_utm.transform(18.026823, 62.976878)
+        c = point_x - (a * 12.3 + b * 15.6)
+        f = point_y - (d * 12.3 + e * 15.6)
+        outside_x, outside_y = c + a * -2.0 + b * 20.0, f + d * -2.0 + e * 20.0
+
+        random_generator = np.random.default_rng(seed=23)
+        pixel_values = random_generator.uniform(100.0, 200.0, (30, 30)).astype(np.float32)
+        raster_path = tmp_path / "rotated.tif"
+        with rasterio.open(
+            raster_path,
+            "w",
+            driver="GTiff",
+            height=30,
+            width=30,
+            count=1,
+            dtype="float32",
+            crs="EPSG:32634",
+            transform=Affine(a, b, c, d, e, f),
+        ) as dst:
+            dst.write(pixel_values, 1)
+
+        # Independent check of the test geometry: the inverse of the 3 × 3
+        # affine matrix maps each point to its (column, row).
+        affine_matrix = np.array([[a, b, c], [d, e, f], [0.0, 0.0, 1.0]])
+        inside_column, inside_row, _ = np.linalg.solve(affine_matrix, [point_x, point_y, 1.0])
+        outside_column, outside_row, _ = np.linalg.solve(affine_matrix, [outside_x, outside_y, 1.0])
+        assert (math.floor(inside_column), math.floor(inside_row)) == (12, 15)
+        assert outside_column < 0 <= outside_row < 30
+        to_wgs84 = Transformer.from_crs("EPSG:32634", "EPSG:4326", always_xy=True)
+        outside_lon, outside_lat = to_wgs84.transform(outside_x, outside_y)
+        corner_xs = [c + a * column + b * row for column in (0, 30) for row in (0, 30)]
+        corner_ys = [f + d * column + e * row for column in (0, 30) for row in (0, 30)]
+        assert min(corner_xs) < outside_x < max(corner_xs)
+        assert min(corner_ys) < outside_y < max(corner_ys)
+
+        # affine 3 warns about "*" with PendingDeprecationWarning (and may move
+        # to DeprecationWarning). The filters apply to warnings that envoi's own
+        # code triggers, not to warnings inside other libraries.
+        with (
+            LocalRasterAdapter({"path": str(raster_path), "bands": 1}) as adapter,
+            warnings.catch_warnings(),
+        ):
+            warnings.filterwarnings("error", category=PendingDeprecationWarning, module=r"envoi\.")
+            warnings.filterwarnings("error", category=DeprecationWarning, module=r"envoi\.")
+            inside_values, inside_meta = adapter._sample_point_single(62.976878, 18.026823)
+            outside_values, outside_meta = adapter._sample_point_single(outside_lat, outside_lon)
+
+        assert inside_values == {"point": pytest.approx(float(pixel_values[15, 12]))}
+        assert inside_meta["in_extent"] is True
+        assert outside_values == {"point": None}
+        assert outside_meta["in_extent"] is False
 
 
 # ------------------------------------------------------------------
@@ -1734,7 +3713,7 @@ class TestAppendStatColumnsClassFill:
             ({"class_10_count": 5, "class_20_count": 3}, {}),
             ({"class_20_count": 4, "class_30_count": 2}, {}),
         ]
-        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+        result, _ = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
         # Union of classes across both rows.
         assert result["lulc_class_10_count_200m"].tolist() == [5, 0]
         assert result["lulc_class_20_count_200m"].tolist() == [3, 4]
@@ -1751,7 +3730,7 @@ class TestAppendStatColumnsClassFill:
             ({"class_10_fraction": 0.5, "class_20_fraction": 0.5}, {}),
             ({"class_10_fraction": 1.0}, {}),
         ]
-        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+        result, _ = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
         # Row 1's class_20 is absent — must be filled with the float 0.0
         # (not None / NaN / int 0).
         col = "lulc_class_20_fraction_200m"
@@ -1770,7 +3749,7 @@ class TestAppendStatColumnsClassFill:
             ({"mean": 1.5}, {}),
             ({}, {}),  # row 1 has no stats at all
         ]
-        result = _append_stat_columns(df, "dem", window_size_m=100, stats_results=stats_results)
+        result, _ = _append_stat_columns(df, "dem", window_size_m=100, stats_results=stats_results)
         # Row 1's mean is missing — must be NaN, not 0.
         assert pd.isna(result["dem_mean_100m"].iloc[1])
 
@@ -1785,11 +3764,55 @@ class TestAppendStatColumnsClassFill:
             ({"b1_class_10_count": 5, "b2_class_10_count": 4}, {}),
             ({"b1_class_20_count": 3}, {}),
         ]
-        result = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+        result, _ = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
         assert result["lulc_b1_class_10_count_200m"].tolist() == [5, 0]
         assert result["lulc_b1_class_20_count_200m"].tolist() == [0, 3]
         # b2_class_10 only appears in row 0; row 1 is zero-filled.
         assert result["lulc_b2_class_10_count_200m"].tolist() == [4, 0]
+
+    def test_named_band_class_columns_filled(self):
+        """Class keys with a named band prefix are zero-filled for rows without that class."""
+        from envoi._output_assembly import _append_stat_columns
+
+        # Earth Engine prefixes class keys with the real band name
+        # ("classification"), not with a generic "b{n}" index.
+        df = pd.DataFrame({"id": ["a", "b"]})
+        stats_results = [
+            ({"classification_class_10_count": 5, "classification_class_10_fraction": 0.25}, {}),
+            ({"classification_class_12_count": 20, "classification_class_12_fraction": 1.0}, {}),
+        ]
+        result, _ = _append_stat_columns(
+            df, "lulc_naturallands_2020", window_size_m=200, stats_results=stats_results
+        )
+        prefix = "lulc_naturallands_2020_classification"
+        assert result[f"{prefix}_class_10_count_200m"].tolist() == [5, 0]
+        assert result[f"{prefix}_class_12_count_200m"].tolist() == [0, 20]
+        assert result[f"{prefix}_class_10_fraction_200m"].tolist() == [0.25, 0.0]
+        assert result[f"{prefix}_class_12_fraction_200m"].tolist() == [0.0, 1.0]
+
+    def test_failed_point_gets_null_class_columns(self):
+        """A failed point (meta has "error") gets null class columns; other rows are zero-filled."""
+        from envoi._output_assembly import _append_stat_columns
+
+        df = pd.DataFrame({"id": ["a", "b", "c"]})
+        stats_results = [
+            ({"class_10_count": 5, "class_10_fraction": 1.0}, {}),
+            ({}, {"error": "RasterioIOError: stub: damaged block"}),
+            ({"class_20_count": 2, "class_20_fraction": 1.0}, {}),
+        ]
+        result, _ = _append_stat_columns(df, "lulc", window_size_m=200, stats_results=stats_results)
+
+        assert list(result.columns) == [
+            "id",
+            "lulc_class_10_count_200m",
+            "lulc_class_10_fraction_200m",
+            "lulc_class_20_count_200m",
+            "lulc_class_20_fraction_200m",
+        ]
+        assert result["lulc_class_10_count_200m"].tolist()[0::2] == [5, 0]
+        assert result["lulc_class_20_fraction_200m"].tolist()[0::2] == [0.0, 1.0]
+        for column in result.columns[1:]:
+            assert pd.isna(result.loc[1, column]), column
 
 
 # ------------------------------------------------------------------
@@ -1885,6 +3908,23 @@ class TestTileNaming:
         tile_dir = self._export(self._points_with_ids(["a/b", "a_b"]), tmp_path)
         assert len(list(tile_dir.glob("*.tif"))) == 2
 
+    def test_ids_that_differ_only_in_case_write_two_tiles(self, tmp_path):
+        """`Site1` and `site1` get hash suffixes, so both tiles exist on any file system."""
+        tile_dir = self._export(self._points_with_ids(["Site1", "site1", "Site2"]), tmp_path)
+
+        manifest = pd.read_csv(tile_dir / "tiles_manifest.csv")
+        tile_filename_by_id = dict(zip(manifest["occurrenceID"], manifest["tile_filename"]))
+        site1_upper = tile_filename_by_id["Site1"]
+        site1_lower = tile_filename_by_id["site1"]
+
+        assert re.fullmatch(r"Site1-[0-9a-f]{8}-dem_local\.tif", site1_upper)
+        assert re.fullmatch(r"site1-[0-9a-f]{8}-dem_local\.tif", site1_lower)
+        assert site1_upper.casefold() != site1_lower.casefold()
+        # An ID without a case collision keeps its historical name.
+        assert tile_filename_by_id["Site2"] == "Site2-dem_local.tif"
+        assert manifest["exported"].all()
+        assert {tile.name for tile in tile_dir.glob("*.tif")} == set(tile_filename_by_id.values())
+
     def test_clean_ids_keep_their_historical_filenames(self, sample_df, tmp_path):
         """Backward compatibility: unaffected inputs produce unchanged names."""
         tile_dir = self._export(sample_df, tmp_path)
@@ -1963,6 +4003,22 @@ class TestSampleIdValidation:
                 output_dir=tmp_path,
             )
         assert not (tmp_path / "id_check").exists()
+
+    def test_list_checks_ids_before_an_earlier_tabular_output(self, tmp_path):
+        """In a list, a raster config with duplicate IDs stops the call before the tabular config runs."""
+        tabular_config = {
+            "batch_id": "tabular_first",
+            "datasets": ["dem_local"],
+            "settings": {"output_type": "tabular", "window_size_m": 200, "statistics": ["mean"]},
+        }
+
+        with pytest.raises(ValueError, match="Output 'id_check': column 'occurrenceID' has dup"):
+            extract(
+                self._points_with_ids(["dup", "dup", "unique"]),
+                [tabular_config, self._raster_config()],
+                output_dir=tmp_path,
+            )
+        assert list(tmp_path.iterdir()) == []
 
     def test_tabular_mode_allows_duplicate_ids(self, tmp_path):
         """Tabular output puts IDs in a column, where duplicates are harmless."""

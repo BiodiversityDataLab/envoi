@@ -69,17 +69,25 @@ def r_sum(values: Iterable) -> float:
 
 
 def r_std(values: Iterable) -> float:
-    """Sample standard deviation of finite values in the window (ddof=1)."""
+    """Population standard deviation of finite values in the window (ddof=0).
+
+    The denominator is the number of values n, not n - 1, as in Earth Engine's
+    ``ee.Reducer.stdDev``, so both adapters give the same value. One value gives 0.
+    """
     finite_values = _finite(values)
     maybe = _nan_if_empty(finite_values)
-    return maybe if maybe is not None else float(np.std(finite_values, ddof=1))
+    return maybe if maybe is not None else float(np.std(finite_values, ddof=0))
 
 
 def r_var(values: Iterable) -> float:
-    """Sample variance of finite values in the window (ddof=1)."""
+    """Population variance of finite values in the window (ddof=0).
+
+    The denominator is the number of values n, not n - 1, as in Earth Engine's
+    ``ee.Reducer.variance``, so both adapters give the same value. One value gives 0.
+    """
     finite_values = _finite(values)
     maybe = _nan_if_empty(finite_values)
-    return maybe if maybe is not None else float(np.var(finite_values, ddof=1))
+    return maybe if maybe is not None else float(np.var(finite_values, ddof=0))
 
 
 def r_count(values: Iterable) -> int:

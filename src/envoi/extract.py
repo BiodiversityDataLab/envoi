@@ -1,6 +1,7 @@
 # src/envoi/extract.py
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -9,12 +10,16 @@ import pandas as pd
 from ._config_parsing import (
     RunSettings,
     _as_config_list,
-    _parse_run_config,
+    _parse_run_configs,
     _resolve_stats_for_dataset,
 )
+from ._filenames import format_id_list
 from ._input_validation import (
+    _MAX_IDS_IN_MESSAGE,
+    _build_reserved_column_renames,
     _parse_and_validate_dates,
     _validate_and_reproject_crs,
+    _validate_no_output_column_names,
     _validate_required_columns,
     _validate_sample_ids,
 )
@@ -26,10 +31,11 @@ from ._output_assembly import (
     _write_tabular,
 )
 from .adapters import get_adapter
+from .adapters.local_adapter import _resolve_local_raster_settings
 from .catalog import BUILTIN_EE_CATALOG, load_catalogs, load_defaults
 from .metadata import write_metadata_sidecar
 from .progress import ProgressCallback, ProgressEvent, ProgressStepCallback
-from .qc import attach_quality_control, split_stats_and_qc
+from .qc import attach_quality_control, split_stats_and_qc, summarize_point_errors
 from .reducers import validate_reducers
 
 # Default catalog tuple used when the caller does not supply one.
@@ -37,6 +43,14 @@ from .reducers import validate_reducers
 # bundled inside the installed package, so this works regardless of
 # the user's working directory.
 _DEFAULT_CATALOGS = (BUILTIN_EE_CATALOG,)
+
+# envoi warns when a point used an image of its own (the per-point fallback
+# of the Earth Engine adapter) that is more than this number of whole days
+# from its sample date. The value is the first search window of the fallback.
+# Images a few days away are common for collections whose images have
+# different dates at different places (for example Sentinel-2), and they
+# give no warning. See the decision log, "Warning for far fallback images".
+_FAR_IMAGE_GAP_DAYS = 32
 
 
 def _make_progress_step_callback(
@@ -97,12 +111,18 @@ def extract(
     A JSON metadata sidecar is written alongside the output file(s) by default.
     Pass ``write_metadata=False`` to suppress it.
 
+    When the data request or read of one point fails, the run continues: that
+    point gets empty statistics (or no tile), and its error text goes into the
+    QC error column (or the tile manifest) and the sidecar, with one warning
+    per dataset and window. When every point of one dataset and window fails,
+    ``extract()`` raises ``RuntimeError`` with the error of the first point.
+
     ``config`` can be a dict (single output), a list of dicts (multiple outputs),
     or a path to a YAML file containing either of those. Each dict must have the
     following structure::
 
         {
-            "batch_id": "terrain",          # used as the output file stem
+            "batch_id": "terrain",          # output file stem; unique within a list
             "datasets": ["dem_copernicus_glo30"],  # one or more dataset names from the catalog
             "settings": {
                 "output_type": "tabular",   # "tabular" or "raster"
@@ -128,9 +148,11 @@ def extract(
       reserved for future per-call settings; today only ``"bands"`` is
       accepted.
 
-    A single-element list (``{"sen2": ["B4"]}``) keeps the multi-band column
-    naming (``sen2_B4_mean_<window>m``); use the catalog if you want the
-    bare single-band naming (``sen2_mean_<window>m``).
+    Every per-call band list, also a single-element list (``{"sen2": ["B4"]}``),
+    gives band-named columns (``sen2_B4_mean_<window>m``); use the catalog if
+    you want the bare single-band naming (``sen2_mean_<window>m``). A list of
+    only derived bands (``{"dem_copernicus_glo30": ["aspect"]}``) replaces the
+    catalog's bands, so the output has only the derived bands.
 
     Parameters
     ----------
@@ -140,7 +162,16 @@ def extract(
         by default, following the GBIF / Darwin Core convention — override the
         names with the ``*_column`` parameters below). An optional date column
         (``eventDate``, YYYY-MM-DD strings) enables nearest-date image selection
-        for time-varying datasets.
+        for time-varying datasets; ``docs/advanced_usage.md`` lists the other
+        date forms that envoi reads, and any other value raises ``ValueError``.
+        Every latitude and longitude must be a finite number (text that holds
+        a number is converted); a missing, non-numeric, or infinite value
+        raises ``ValueError``. Other columns appear in the statistics table.
+        An unmapped column named ``id``, ``lat``, ``lon``, ``date``,
+        ``lat_original``, or ``lon_original`` keeps its name there and is not
+        used by envoi. An input column with the name of a column that the call
+        adds to its output tables (for example from an earlier envoi run)
+        raises ``ValueError``.
     config : str, Path, dict, or list
         Output specification — see above. A path string or ``Path`` is loaded as
         YAML before processing.
@@ -168,8 +199,9 @@ def extract(
         Name of the optional input column containing per-row dates.
         Defaults to ``"eventDate"`` (GBIF / Darwin Core). If absent from
         ``df`` the date branch is simply skipped — the extractor never
-        errors on a missing date column. The output tables will use the
-        same name.
+        errors on a missing date column. A column with another name, such
+        as ``date``, is not used as the date column. The output tables will
+        use the same name.
     write_metadata : bool, optional
         Whether to write the auxiliary files alongside the main output(s).
         When ``True`` (the default), the JSON metadata sidecar is written for
@@ -218,6 +250,19 @@ def extract(
         date_column: "date",
     }
     _validate_required_columns(df, id_column, latitude_column, longitude_column)
+    # The input column names as the user gave them, before the rename below.
+    input_column_names = list(df.columns)
+
+    # An unmapped input column can have the name of a working column, for
+    # example the "id" column of a Darwin Core file, or a "date" column when
+    # date_column names another column. Give such a column a temporary name in
+    # the same rename. Without this, the rename gives two columns the same name,
+    # or envoi reads the column as its own (an unmapped "date" column would
+    # become the sample date). _restore_user_column_names gives the column its
+    # original name again in the output tables.
+    column_name_map.update(
+        _build_reserved_column_renames(df.columns, mapped_columns=column_name_map.keys())
+    )
     df = df.rename(columns=column_name_map)
 
     # Load project-wide defaults from the bundled configs/defaults.yml once per call.
@@ -229,7 +274,13 @@ def extract(
     # missing or unparseable date column quote the name the caller actually
     # has in their DataFrame, not the canonical internal "date".
     df, dates, date_warnings = _parse_and_validate_dates(df, date_column_name=date_column)
-    df, crs_warnings = _validate_and_reproject_crs(df, input_crs)
+    df, crs_warnings = _validate_and_reproject_crs(
+        df,
+        input_crs,
+        id_column=id_column,
+        latitude_column=latitude_column,
+        longitude_column=longitude_column,
+    )
 
     # Merge the built-in catalogs with any datasets registered via update_catalog().
     # The user catalog is always applied last, so user entries override built-ins.
@@ -246,7 +297,58 @@ def extract(
     # {batch_id: df} dict the caller would have to index into.
     single_config = len(output_configs) == 1 and not isinstance(config, list)
 
-    for idx, run_config in enumerate(output_configs):
+    # Parse and validate the settings of every run config before the first
+    # adapter is built. ValueError is raised for any missing or invalid setting,
+    # and for two run configs with the same batch_id. An error in a later run
+    # config then stops the call before earlier outputs are written or any
+    # Earth Engine quota is used.
+    all_run_settings = _parse_run_configs(output_configs, defaults, catalog_datasets)
+
+    # A tabular output adds statistic and QC columns named after each dataset
+    # and window, and the "_wgs84" columns when the coordinates were
+    # reprojected (_validate_and_reproject_crs then added "lat_original"). An
+    # input column with such a name, for example from an earlier envoi run,
+    # would be overwritten without notice. Check the original input names
+    # before the first adapter is built.
+    _validate_no_output_column_names(
+        input_column_names,
+        all_run_settings,
+        catalog_datasets.keys(),
+        latitude_column=latitude_column,
+        longitude_column=longitude_column,
+        coordinates_reprojected="lat_original" in df.columns,
+    )
+
+    # Raster mode names one GeoTIFF per point after that point's ID, so
+    # blank or duplicated IDs would lose tiles. Every run config uses the same
+    # points, so check once, when any run config is raster: after any
+    # null-date rows have been dropped, but before the first adapter is built
+    # or any output is written. The run then fails with an actionable message
+    # instead of burning Earth Engine quota on an export that cannot be
+    # written. Tabular mode puts IDs in a column, where duplicates are harmless.
+    raster_batch_ids = [
+        run_settings.batch_id
+        for run_settings in all_run_settings
+        if run_settings.output_type == "raster"
+    ]
+    if raster_batch_ids:
+        quoted_batch_ids = ", ".join(f"'{batch_id}'" for batch_id in raster_batch_ids)
+        _validate_sample_ids(df["id"], id_column, context=f"Output {quoted_batch_ids}")
+
+    # Check the CRS and nodata settings of every local raster, with the bands
+    # that each run config selects, before the first adapter is built. A
+    # catalog `nodata` or `crs` that conflicts with the file, or a file
+    # without any CRS, then stops the call before any output is written.
+    for run_settings in all_run_settings:
+        for dataset, band_overrides in run_settings.datasets:
+            merged_config = {**catalog_datasets[dataset], **(band_overrides or {})}
+            if merged_config.get("data_source") == "local":
+                _resolve_local_raster_settings(
+                    merged_config,
+                    context=f"Output '{run_settings.batch_id}': dataset '{dataset}'",
+                )
+
+    for run_settings in all_run_settings:
         df_copy = df.copy()
 
         # Per-dataset metadata accumulator. Each adapter builds its own entry
@@ -254,9 +356,6 @@ def extract(
         dataset_metas: dict[str, Any] = {}
         warnings_backlog: dict[str, str] = {}
 
-        # Parse and validate all settings from this run's config dict.
-        # ValueError is raised for any missing or invalid setting
-        run_settings = _parse_run_config(run_config, defaults, idx, catalog_datasets)
         batch_id = run_settings.batch_id
         datasets = run_settings.datasets
         output_type = run_settings.output_type
@@ -264,15 +363,6 @@ def extract(
         window_sizes = run_settings.window_sizes
         min_coverage = run_settings.min_coverage
         resample_m = run_settings.resample_m
-
-        # Raster mode names one GeoTIFF per point after that point's ID, so
-        # blank or duplicated IDs would lose tiles. Check now — after any
-        # null-date rows have been dropped, but before the first adapter is
-        # built — so the run fails with an actionable message instead of
-        # burning Earth Engine quota on an export that cannot be written.
-        # Tabular mode puts IDs in a column, where duplicates are harmless.
-        if output_type == "raster":
-            _validate_sample_ids(df_copy["id"], id_column, context=f"Output '{batch_id}'")
 
         # When the user supplies more than one window size we need to keep the
         # window suffix on raster filenames and on the per-window quality
@@ -283,6 +373,9 @@ def extract(
         # Accumulate QC column names across all datasets and window sizes so that
         # split_stats_and_qc can use the explicit list rather than substring matching.
         all_qc_columns: list[str] = []
+        # The statistic columns that envoi adds, collected the same way. Only
+        # these are rounded, so the user's own columns keep their values.
+        all_stat_columns: list[str] = []
 
         for dataset, band_overrides in datasets:
             # Look up the dataset's catalog entry once; both processing modes need it.
@@ -297,8 +390,12 @@ def extract(
                     (
                         df_copy,
                         dataset_meta,
+                        dataset_stat_columns,
                         dataset_qc_columns,
+                        quality_key,
                         reducer_warning,
+                        failed_point_warning,
+                        far_image_warning,
                     ) = _process_dataset_tabular(
                         df_copy,
                         dataset,
@@ -307,6 +404,7 @@ def extract(
                         dates,
                         window_size,
                         band_overrides=band_overrides,
+                        write_metadata=write_metadata,
                         quiet=quiet,
                         progress_callback=_make_progress_step_callback(
                             callback=progress_callback,
@@ -317,6 +415,7 @@ def extract(
                             unit="pt",
                         ),
                     )
+                    all_stat_columns.extend(dataset_stat_columns)
                     all_qc_columns.extend(dataset_qc_columns)
                     # Record the reducer/data_type mismatch (if any) in the
                     # per-dataset warnings backlog. The message is identical
@@ -324,6 +423,15 @@ def extract(
                     # assignment naturally deduplicates repeat windows.
                     if reducer_warning:
                         warnings_backlog[f"reducer_{dataset}"] = reducer_warning
+                    # One failed-point warning per (dataset, window) batch. The
+                    # key ends like the batch's QC columns and quality summary:
+                    # "200m", or "point" for a point-only run.
+                    if failed_point_warning:
+                        warnings_backlog[f"failed_{dataset}_{quality_key}"] = failed_point_warning
+                    # One warning per (dataset, window) batch about images far
+                    # from the sample dates, with the same key ending.
+                    if far_image_warning:
+                        warnings_backlog[f"far_image_{dataset}_{quality_key}"] = far_image_warning
 
                 # In raster mode, the helper exports a folder of GeoTIFF tiles
                 # and returns the path plus the per-dataset metadata dict. With
@@ -332,7 +440,12 @@ def extract(
                 elif output_type == "raster":
                     tiles_root = Path(output_dir) / batch_id
                     suffix = f"{window_size}m" if is_multi_window else None
-                    tiles_path, dataset_meta = _process_dataset_raster(
+                    (
+                        tiles_path,
+                        dataset_meta,
+                        failed_point_warning,
+                        far_image_warning,
+                    ) = _process_dataset_raster(
                         dataset,
                         dataset_config,
                         run_settings,
@@ -345,6 +458,7 @@ def extract(
                         tiles_root=tiles_root,
                         filename_suffix=suffix,
                         band_overrides=band_overrides,
+                        write_metadata=write_metadata,
                         quiet=quiet,
                         progress_callback=_make_progress_step_callback(
                             callback=progress_callback,
@@ -363,6 +477,12 @@ def extract(
                         else f"{batch_id}:{dataset}"
                     )
                     output_paths[output_key] = tiles_path
+                    # One failed-tile warning, and one warning about images
+                    # far from the sample dates, per (dataset, window) batch.
+                    if failed_point_warning:
+                        warnings_backlog[f"failed_{dataset}_{window_size}m"] = failed_point_warning
+                    if far_image_warning:
+                        warnings_backlog[f"far_image_{dataset}_{window_size}m"] = far_image_warning
 
                 # Merge the per-window metadata into the dataset's accumulator.
                 # First window for a dataset → store as-is (including static
@@ -409,7 +529,7 @@ def extract(
             stats_df, qc_df = split_stats_and_qc(df_copy, core_columns, all_qc_columns)
 
             stats_df = _round_stat_columns(
-                stats_df, core_columns, defaults["stats_output_decimals"]
+                stats_df, all_stat_columns, defaults["stats_output_decimals"]
             )
 
             # When the coordinates were reprojected to WGS84 (input_crs was
@@ -448,7 +568,6 @@ def extract(
                 write_metadata_sidecar(
                     output_dir,
                     batch_id,
-                    output_type=output_type,
                     n_points=len(df_copy),
                     datasets=dataset_metas,
                     config={
@@ -470,7 +589,6 @@ def extract(
                 write_metadata_sidecar(
                     Path(output_dir) / batch_id,
                     batch_id,
-                    output_type=output_type,
                     n_points=len(df_copy),
                     datasets=dataset_metas,
                     config={
@@ -501,9 +619,10 @@ def _process_dataset_tabular(
     dates: list | None,
     window_size: int,
     band_overrides: dict[str, Any] | None = None,
+    write_metadata: bool = True,
     quiet: bool = False,
     progress_callback: ProgressStepCallback | None = None,
-) -> tuple[pd.DataFrame, dict, list[str], str | None]:
+) -> tuple[pd.DataFrame, dict, list[str], list[str], str, str | None, str | None, str | None]:
     """Fetch stats and QC columns for one dataset/window pair in tabular mode.
 
     Owns adapter instantiation, statistic computation, QC column assembly,
@@ -511,16 +630,32 @@ def _process_dataset_tabular(
     caller is responsible for looping over multiple window sizes and merging
     the resulting metadata dicts.
 
-    `band_overrides` is a dict of per-call settings (currently `bands` and/or
-    `derived_bands`) that replace the catalog values before adapter
-    instantiation. The catalog dict itself is never mutated — the override
-    is shallow-merged into a fresh dict per call.
+    `band_overrides` is a dict of per-call settings (`bands`, `derived_bands`
+    when the list has derived bands, and the mark `band_naming`, see
+    ``_normalize_dataset_entry``) that replace the catalog values before
+    adapter instantiation. The catalog dict itself is never mutated — the
+    override is shallow-merged into a fresh dict per call.
 
-    Returns ``(df, dataset_meta, qc_column_names, reducer_warning)`` where
-    ``reducer_warning`` is the message from :func:`validate_reducers` when
-    the requested stats don't match the dataset's data_type (e.g. ``mean``
-    on a categorical raster) — or ``None`` when everything is fine. The
-    caller threads this into the metadata sidecar's ``warnings`` section.
+    ``write_metadata`` tells whether ``extract()`` writes the QC table, so
+    that the warnings name a place where the errors and the image dates are.
+
+    Returns ``(df, dataset_meta, stat_column_names, qc_column_names,
+    quality_key, reducer_warning, failed_point_warning, far_image_warning)`` where
+    ``stat_column_names`` are the statistic columns that the batch added (the
+    caller rounds only these), ``quality_key`` is the key
+    of the batch's quality summary and the end of its QC column names
+    (``"200m"``, or ``"point"`` for a point-only run), and
+    ``reducer_warning`` is the message from
+    :func:`validate_reducers` when the requested stats don't match the
+    dataset's data_type (e.g. ``mean`` on a categorical raster) — or ``None``
+    when everything is fine. ``failed_point_warning`` is the warning about
+    the failed points of the batch, or ``None`` when no point failed.
+    ``far_image_warning`` is the warning about points that used an image far
+    from their sample date (see :func:`_warn_about_far_images`), or ``None``.
+    The caller threads the warnings into the metadata sidecar's ``warnings`` section.
+
+    Raises ``RuntimeError`` when every point of the batch failed (see
+    :func:`_raise_if_every_point_failed`).
     """
     # Build a fresh shallow-merged config so per-call band_overrides replace the
     # catalog values for this run only. The catalog dict itself is not
@@ -566,12 +701,17 @@ def _process_dataset_tabular(
             progress_callback=progress_callback,
         )
 
-        # Append stat columns to the output DataFrame based on the keys in
-        # stats_results, and assign values accordingly.
-        df = _append_stat_columns(df, dataset, window_size, stats_results)
-
         # Split the (stat, meta) tuples so meta_list can feed QC and dataset metadata.
         meta_list = [meta for _, meta in stats_results]
+
+        # A failed point has "error" in its meta dict. When every point of the
+        # batch failed, stop the run now, with the real error.
+        batch_label = _failed_point_batch_label(resolved_stats, window_size)
+        _raise_if_every_point_failed(meta_list, dataset=dataset, batch_label=batch_label)
+
+        # Append stat columns to the output DataFrame based on the keys in
+        # stats_results, and assign values accordingly.
+        df, stat_column_names = _append_stat_columns(df, dataset, window_size, stats_results)
 
         # Attach per-row QC columns and capture the coverage summary used below
         # when assembling the per-dataset metadata dict.
@@ -596,7 +736,56 @@ def _process_dataset_tabular(
             quality={quality_key: coverage_summary},
         )
 
-    return df, dataset_meta, qc_column_names, reducer_warning
+    # Warn once when some points failed. The QC error column, built by
+    # attach_quality_control above, has the error text of each failed point.
+    # extract() writes the QC table only with write_metadata=True.
+    error_column = f"{dataset}_error_{quality_key}"
+    if write_metadata:
+        error_location = f"The error of each failed point is in the QC column '{error_column}'."
+    else:
+        error_location = (
+            f"The QC table, whose column '{error_column}' has the error of each failed "
+            f"point, is not written because write_metadata is False."
+        )
+    failed_point_warning = _warn_about_failed_points(
+        meta_list,
+        df["id"].tolist(),
+        dataset=dataset,
+        batch_label=batch_label,
+        error_location=error_location,
+    )
+
+    # Warn once when some points used an image far from their sample date.
+    # The QC date columns, built by attach_quality_control above, name the
+    # image of each point.
+    date_columns = (
+        f"'{dataset}_image_time_start_{quality_key}' and '{dataset}_image_time_end_{quality_key}'"
+    )
+    if write_metadata:
+        date_location = f"The QC columns {date_columns} show the dates of each point's image."
+    else:
+        date_location = (
+            f"The QC table, whose columns {date_columns} show the dates of each point's "
+            f"image, is not written because write_metadata is False."
+        )
+    far_image_warning = _warn_about_far_images(
+        meta_list,
+        df["id"].tolist(),
+        dataset=dataset,
+        batch_label=batch_label,
+        date_location=date_location,
+    )
+
+    return (
+        df,
+        dataset_meta,
+        stat_column_names,
+        qc_column_names,
+        quality_key,
+        reducer_warning,
+        failed_point_warning,
+        far_image_warning,
+    )
 
 
 def _process_dataset_raster(
@@ -613,9 +802,10 @@ def _process_dataset_raster(
     tiles_root: Path,
     filename_suffix: str | None = None,
     band_overrides: dict[str, Any] | None = None,
+    write_metadata: bool = True,
     quiet: bool = False,
     progress_callback: ProgressStepCallback | None = None,
-) -> tuple[Path, dict]:
+) -> tuple[Path, dict, str | None, str | None]:
     """Export GeoTIFF tiles for one dataset/window pair in raster mode.
 
     When ``filename_suffix`` is set, it is appended to each tile's filename
@@ -625,9 +815,20 @@ def _process_dataset_raster(
     ``id_column`` is the caller's own name for the sample-ID column; it becomes
     the join key in the tile manifest written alongside the tiles.
 
-    `band_overrides` is a dict of per-call settings (currently `bands` and/or
-    `derived_bands`) that replace the catalog values before adapter
+    `band_overrides` is a dict of per-call settings (`bands`, `derived_bands`,
+    and `band_naming`) that replace the catalog values before adapter
     instantiation. See `_process_dataset_tabular` for details.
+
+    ``write_metadata`` tells whether ``extract()`` writes the metadata
+    sidecar, so that the warning about images far from the sample dates names
+    a place where the image dates are.
+
+    Returns ``(tiles_dir, dataset_meta, failed_point_warning, far_image_warning)``.
+    ``failed_point_warning`` is the warning about the failed tiles of the
+    batch, or ``None`` when no tile failed. ``far_image_warning`` is the
+    warning about points that used an image far from their sample date (see
+    :func:`_warn_about_far_images`), or ``None``. Raises ``RuntimeError`` when
+    every tile of the batch failed (see :func:`_raise_if_every_point_failed`).
     """
     # Build a fresh shallow-merged config so per-call band_overrides replace the
     # catalog values without mutating the catalog dict.
@@ -657,6 +858,12 @@ def _process_dataset_raster(
             progress_callback=progress_callback,
         )
 
+        # A failed tile has "error" in its meta dict. When every tile of the
+        # batch failed, stop the run now, with the real error.
+        _raise_if_every_point_failed(
+            meta_list, dataset=dataset, batch_label=f"window {window_size} m"
+        )
+
         # Adapter assembles the full per-dataset metadata dict, including
         # per-tile export info (paths, bounds, CRS). Pass the merged spec so
         # the metadata reflects the resolved bands the user actually ran with.
@@ -668,21 +875,60 @@ def _process_dataset_raster(
             lons=lons,
         )
 
+    # Count the failed tiles and list their IDs in the tile summary. The
+    # adapter has no IDs. tiles.n_failed keeps its meaning: the number of
+    # tiles not exported for any reason, failed tiles included.
+    dataset_meta["quality"]["tiles"].update(summarize_point_errors(meta_list, ids))
+
     # Write the manifest that maps each input row to the tile it produced.
     # Sample IDs containing characters that are not portable across operating
     # systems get sanitized on their way into a filename, so the filename is
     # not always reconstructible from the ID — the manifest is what lets a user
     # join their tiles back to their input table. It also records which points
-    # produced no tile at all.
-    _write_tile_manifest(
+    # produced no tile at all, and the error of each failed tile.
+    manifest_path = _write_tile_manifest(
         tiles_root / dataset,
         ids=ids,
         exported_paths=exported_paths,
         id_column_name=id_column,
         filename_suffix=filename_suffix,
+        errors=[tile_meta.get("error") for tile_meta in meta_list],
     )
 
-    return tiles_root / dataset, dataset_meta
+    # Warn once when some tiles failed. The manifest, which extract() writes
+    # also with write_metadata=False, has their error text.
+    failed_point_warning = _warn_about_failed_points(
+        meta_list,
+        ids,
+        dataset=dataset,
+        batch_label=f"window {window_size} m",
+        error_location=(
+            f"The error of each failed point is in the 'error' column of the tile "
+            f"manifest '{manifest_path}'."
+        ),
+    )
+
+    # Warn once when some tiles show an image far from their sample date.
+    # The sidecar date_info lists the dates of the images that the tiles show.
+    if write_metadata:
+        date_location = (
+            "The sidecar 'date_info' lists the dates of the images that the tiles show "
+            "('image_date_ranges_used')."
+        )
+    else:
+        date_location = (
+            "The metadata sidecar, whose 'date_info' lists the dates of the images that the "
+            "tiles show, is not written because write_metadata is False."
+        )
+    far_image_warning = _warn_about_far_images(
+        meta_list,
+        ids,
+        dataset=dataset,
+        batch_label=f"window {window_size} m",
+        date_location=date_location,
+    )
+
+    return tiles_root / dataset, dataset_meta, failed_point_warning, far_image_warning
 
 
 def _write_tile_manifest(
@@ -692,6 +938,7 @@ def _write_tile_manifest(
     exported_paths: list,
     id_column_name: str,
     filename_suffix: str | None = None,
+    errors: list[str | None] | None = None,
 ) -> Path:
     """Write a CSV mapping each sample ID to the tile file it produced.
 
@@ -699,6 +946,11 @@ def _write_tile_manifest(
     straight onto their input table with ``pandas.merge``. ``exported`` is
     False for points whose tile failed to export (outside the raster's extent,
     a GEE download error, ...), in which case ``tile_filename`` is empty.
+
+    ``errors`` holds the error text of each failed tile and ``None`` for the
+    other points. The manifest gets an ``error`` column only when at least one
+    tile failed. A tile that was not exported because its point is outside the
+    extent is not a failed tile, and has no error.
 
     The manifest carries the same ``filename_suffix`` as the tiles it
     describes, so a multi-window run writes one manifest per window into the
@@ -717,9 +969,165 @@ def _write_tile_manifest(
             "exported": [path is not None for path in exported_paths],
         }
     )
+    if errors is not None and any(error is not None for error in errors):
+        manifest_dataframe["error"] = errors
 
     # The adapter has already created this directory, but a run where every
     # single tile failed may not have reached that point.
     dataset_tiles_dir.mkdir(parents=True, exist_ok=True)
     manifest_dataframe.to_csv(manifest_path, index=False)
     return manifest_path
+
+
+def _failed_point_batch_label(reducer_names: list[str], window_size: int) -> str:
+    """Return how failed-point messages name one tabular batch.
+
+    A run whose only statistic is ``point`` samples one pixel per point and
+    has no window, so its messages say "point values" instead of a window size,
+    matching the ``_point`` suffix of its QC columns.
+    """
+    if all(reducer_name == "point" for reducer_name in reducer_names):
+        return "point values"
+    return f"window {window_size} m"
+
+
+def _raise_if_every_point_failed(meta_list: list[dict], *, dataset: str, batch_label: str) -> None:
+    """Stop the run when every point of one batch failed.
+
+    A failed point is a point whose data request or read raised an exception
+    that the adapter caught; its meta dict has ``error`` (the error text) and
+    ``exception`` (the exception). When every point failed, the cause usually
+    affects every point (for example a missing file or no network), and the
+    outputs would hold no result at all.
+
+    Args:
+        meta_list: One adapter meta dict per point of the batch, in input order.
+        dataset: The dataset name, for the message.
+        batch_label: The window ("window 200 m") or "point values" for a
+            point-only run, for the message (see :func:`_failed_point_batch_label`).
+
+    Raises:
+        RuntimeError: Every point of the batch failed. The message names the
+            dataset and the window, and contains the error text of the first
+            failed point (the lowest input index). The error is chained to
+            that point's exception. A batch with no points never raises.
+    """
+    if not meta_list or not all("error" in point_meta for point_meta in meta_list):
+        return
+    first_failed_meta = meta_list[0]
+    raise RuntimeError(
+        f"Dataset '{dataset}', {batch_label}: every point failed "
+        f"({len(meta_list)} of {len(meta_list)}), so the run stops. "
+        f"Correct the cause of the first error below (for example the network "
+        f"connection, your access to the dataset, or a damaged file), then run the "
+        f"extraction again. First error: {first_failed_meta['error']}"
+    ) from first_failed_meta.get("exception")
+
+
+def _warn_about_failed_points(
+    meta_list: list[dict],
+    ids: list,
+    *,
+    dataset: str,
+    batch_label: str,
+    error_location: str,
+) -> str | None:
+    """Emit one warning when some points of one batch failed, and return it.
+
+    The warning names the dataset, the window, the number of failed points
+    and the IDs of up to 10 of them, where the error of each failed point is
+    (``error_location``), and the error text of the first failed point (the
+    lowest input index). It is emitted with ``warnings.warn`` and returned, so
+    ``extract()`` can record it in the metadata sidecar. See
+    :func:`_raise_if_every_point_failed` for what a failed point is.
+
+    Args:
+        meta_list: One adapter meta dict per point of the batch, in input order.
+        ids: The input IDs, in the same order as ``meta_list``.
+        dataset: The dataset name, for the message.
+        batch_label: The window ("window 200 m") or "point values", for the message.
+        error_location: One or more sentences that say where the error of each
+            failed point is, or why it is not written.
+
+    Returns:
+        The warning text, or ``None`` when no point failed.
+    """
+    failed_metas = [point_meta for point_meta in meta_list if "error" in point_meta]
+    if not failed_metas:
+        return None
+    failed_ids = summarize_point_errors(meta_list, ids)["ids_errors"]
+    message = (
+        f"Dataset '{dataset}', {batch_label}: {len(failed_metas)} of "
+        f"{len(meta_list)} points failed (IDs: "
+        f"{format_id_list(failed_ids, limit=_MAX_IDS_IN_MESSAGE)}). "
+        f"{error_location} First error: {failed_metas[0]['error']}"
+    )
+    # stacklevel=4 points the warning at the caller of extract():
+    # this helper <- _process_dataset_* <- extract() <- caller.
+    warnings.warn(message, stacklevel=4)
+    return message
+
+
+def _warn_about_far_images(
+    meta_list: list[dict],
+    ids: list,
+    *,
+    dataset: str,
+    batch_label: str,
+    date_location: str,
+) -> str | None:
+    """Emit one warning when some points of one batch used an image far from their date.
+
+    A point is counted when its meta dict has ``fallback_image_gap_days``
+    greater than ``_FAR_IMAGE_GAP_DAYS``. The Earth Engine adapter adds this
+    internal key only for a point with a sample date that is not clamped and
+    whose image the per-point fallback selected, because the date range that
+    envoi selected for the batch had no image of the point (see
+    ``GeeRasterAdapter._resolve_date_info``). Such an image can be weeks or
+    months from the sample date, and without the warning only the image
+    dates in the outputs show it.
+
+    The warning names the dataset, the window, the number of these points,
+    the largest gap in days, the IDs of up to 10 of the points, and where the
+    image dates are (``date_location``). It is emitted with ``warnings.warn``
+    and returned, so ``extract()`` can record it in the metadata sidecar.
+
+    Args:
+        meta_list: One adapter meta dict per point of the batch, in input order.
+        ids: The input IDs, in the same order as ``meta_list``.
+        dataset: The dataset name, for the message.
+        batch_label: The window ("window 200 m") or "point values", for the message.
+        date_location: One or more sentences that say where the dates of each
+            point's image are, or why they are not written.
+
+    Returns:
+        The warning text, or ``None`` when no point used an image more than
+        ``_FAR_IMAGE_GAP_DAYS`` days from its sample date.
+    """
+    # Series.tolist() turns NumPy scalars (for example numeric IDs) into
+    # Python values, so the message shows 5, not np.int64(5).
+    # A list, not a dict by ID: tabular runs accept duplicate IDs, and each
+    # point counts.
+    id_values = pd.Series(list(ids)).tolist()
+    far_points = [
+        (sample_id, point_meta["fallback_image_gap_days"])
+        for sample_id, point_meta in zip(id_values, meta_list)
+        if point_meta.get("fallback_image_gap_days", 0) > _FAR_IMAGE_GAP_DAYS
+    ]
+    if not far_points:
+        return None
+    far_ids = [sample_id for sample_id, _ in far_points]
+    largest_gap_days = max(gap_days for _, gap_days in far_points)
+    message = (
+        f"Dataset '{dataset}', {batch_label}: {len(far_ids)} of {len(meta_list)} points "
+        f"used an image more than {_FAR_IMAGE_GAP_DAYS} days from their sample date "
+        f"(largest gap: {largest_gap_days} days; IDs: "
+        f"{format_id_list(far_ids, limit=_MAX_IDS_IN_MESSAGE)}). These points had no "
+        f"image in the date range that envoi selected for the batch, so envoi selected "
+        f"another image at each point's location. Check that these images suit your "
+        f"analysis. {date_location}"
+    )
+    # stacklevel=4 points the warning at the caller of extract():
+    # this helper <- _process_dataset_* <- extract() <- caller.
+    warnings.warn(message, stacklevel=4)
+    return message

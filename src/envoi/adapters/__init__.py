@@ -8,13 +8,13 @@ def register(name, cls):
 
 
 def get_adapter(name):
-    # Helpful error if the catalog entry references an unknown data_source.
-    # Bare KeyError leaves the user staring at a stack trace; this surfaces
-    # the offending name and the registered options in one message.
+    # Catalog loading and update_catalog() already reject an unknown
+    # data_source, so this is a last check. It raises ValueError (invalid
+    # config), with the offending name and the registered options.
     try:
         return _REG[name]
     except KeyError:
-        raise KeyError(
+        raise ValueError(
             f"Unknown data_source {name!r}. Registered adapters: {sorted(_REG)}."
         ) from None
 

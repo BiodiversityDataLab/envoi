@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from pyproj import CRS
 from pyproj.exceptions import CRSError
@@ -70,6 +71,9 @@ def validate_points_dataframe(df: pd.DataFrame) -> CsvValidationResult:
             raise ValueError(f"Column '{column}' must contain numeric coordinate values.") from exc
         if values.isna().any():
             raise ValueError(f"Column '{column}' contains missing coordinate values.")
+        # Text such as "inf" converts to infinity, which is not a coordinate.
+        if np.isinf(values).any():
+            raise ValueError(f"Column '{column}' contains infinite coordinate values.")
 
     # Raster output names one GeoTIFF per point after that point's
     # occurrenceID, so blank or duplicated IDs silently cost the user tiles.

@@ -37,6 +37,13 @@ datasets:
   #     use_utm_zone: true # true/false. for tiled collections, filter to the UTM zone of the point to avoid selecting the wrong tile.
   #     collection_date_policy: contains # for interval-based collections (e.g. monthly aggregates), use the image whose time range satisfies start <= date < end, instead of nearest start date.
   #
+  #   # Local rasters (data_source: local, path: a GeoTIFF file) need only
+  #   # data_source and path: envoi reads the CRS and the nodata value from the
+  #   # file. These two keys only fill a value that the file does not declare.
+  #   # A value that differs from the file's value stops the run with an error.
+  #   crs: "EPSG:32633"   # local only: the CRS of a file without a CRS (such a file needs it)
+  #   nodata: -9999       # local only: one number for all bands, used when the file declares no nodata value; it must fit the band data type (e.g. 0 to 255 for uint8)
+  #
   #   dataset_information:
   #     # Optional free-form metadata fields, written to metadata JSON.
   #     description: "A brief description of the dataset."

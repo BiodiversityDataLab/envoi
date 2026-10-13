@@ -3,7 +3,7 @@
 
 The free-function helpers used by this class live in the sibling modules:
 
-* ``_image`` — GEE init, geometry snapping, timestamp resolution, derived bands,
+* ``_image`` — GEE init, timestamp resolution, derived bands,
   per-point ``ee.Image`` construction (``_build_image``).
 * ``_reducers`` — combined-reducer assembly + result parsing + per-band
   coverage summary.
@@ -16,6 +16,7 @@ and how the per-dataset metadata is assembled.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,21 +31,23 @@ from tqdm.auto import tqdm
 
 from ..._filenames import build_tile_filenames
 from ...catalog import load_defaults
-from ...geo import build_tile_crs_zones, get_utm_crs
+from ...geo import build_tile_crs_zones, get_utm_crs, tile_pixel_count, tile_top_left
 from ...metadata import summarize_date_info, summarize_tile_export
 from ...progress import ProgressStepCallback, emit_progress_step
+from ...qc import format_point_error
 from ..base import BaseAdapter
 from ._image import (
     _build_image,
+    _count_gap_days,
     _ensure_gee_init,
     _find_nearest_timestamp,
     _get_collection_time_bounds,
     _is_mosaic_date_policy,
-    _snap_to_grid,
 )
 from ._reducers import (
     _CLASS_COUNT_KEY_RE,
     _build_combined_reducer,
+    _circular_aspect_statistics,
     _dedupe_categorical_for_ee,
     _extract_count_from_reduce_result,
     _extract_per_band_counts,
@@ -61,6 +64,16 @@ except Exception:
     _register = None
 
 logger = logging.getLogger(__name__)
+
+# The mark that a per-call band list puts in the merged config of its dataset
+# (``_normalize_dataset_entry`` in ``_config_parsing.py`` adds it to the band
+# overrides). With the mark, every statistic key is named after its band
+# (``{band}_{reducer}``, ``{band}_point``), also for one band, as the local
+# adapter does for a band list. Without it, the per-call list ``["B4"]`` would
+# give the bare keys of a single-band catalog default (``mean``), and the
+# column name would not say which band was selected.
+_BAND_NAMING_KEY = "band_naming"
+_PER_BAND_NAMING = "per_band"
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +107,10 @@ class GeeRasterAdapter(BaseAdapter):
     _static_image: Any = field(default=None, init=False, repr=False)
     _needs_per_point_date: bool = field(default=False, init=False, repr=False)
     _native_proj: Any = field(default=None, init=False, repr=False)
+    # True when the bands come from a per-call band list (the mark
+    # _BAND_NAMING_KEY in the spec): statistic keys are then named after their
+    # bands, also for one band.
+    _band_named_keys: bool = field(default=False, init=False, repr=False)
 
     # ------------------------------------------------------------------
     # Setup
@@ -126,10 +143,13 @@ class GeeRasterAdapter(BaseAdapter):
             else:
                 dataset_spec["image"] = asset_id
             logger.debug("Auto-detected %s as %s", asset_id, asset_type)
+        # An empty `bands` list (a per-call list of only derived bands) is not
+        # copied, so the image keeps only the derived bands (see _build_image).
         if self.spec.get("bands") and "bands" not in dataset_spec:
             dataset_spec["bands"] = self.spec["bands"]
         if self.spec.get("derived_bands") and "derived_bands" not in dataset_spec:
             dataset_spec["derived_bands"] = self.spec["derived_bands"]
+        self._band_named_keys = self.spec.get(_BAND_NAMING_KEY) == _PER_BAND_NAMING
 
         # Native scale resolution priority:
         #   1. catalog override `native_scale_m` under dataset_spec (set explicitly
@@ -160,9 +180,10 @@ class GeeRasterAdapter(BaseAdapter):
             self._native_proj = (
                 ee.ImageCollection(dataset_spec["collection"]).first().select(0).projection()
             )
-            # Optimistically assume timestamps are fetchable; the lazy fetch
-            # flips this to False (and builds a static-mosaic fallback) if
-            # GEE refuses to materialise the timestamp index.
+            # Assume per-point date selection. The lazy timestamp fetch flips
+            # this to False (and builds a static-mosaic fallback) when no
+            # image of the collection intersects the batch's points. A failed
+            # timestamp request stops the run instead.
             self._needs_per_point_date = True
 
             # ...unless the catalog declares the collection has no meaningful
@@ -186,10 +207,10 @@ class GeeRasterAdapter(BaseAdapter):
                 # probing, scale detection). Constructing it is lazy on GEE's
                 # side — nothing is computed until something reduces over a
                 # region — so this costs nothing here.
-                self._static_image = _build_image(dataset_spec)
+                self._static_image, _ = _build_image(dataset_spec)
         elif "image" in dataset_spec:
             self._native_proj = ee.Image(dataset_spec["image"]).select(0).projection()
-            self._static_image = _build_image(dataset_spec)
+            self._static_image, _ = _build_image(dataset_spec)
             self._needs_per_point_date = False
 
         # If the user didn't supply a native_scale_m override, sanity-check
@@ -212,8 +233,8 @@ class GeeRasterAdapter(BaseAdapter):
 
         Called by the public batch methods (``fetch_stats_batch``,
         ``export_tiles``) before any per-point work. Idempotent — subsequent
-        calls return immediately once the index is cached or has been proved
-        unfetchable.
+        calls return immediately once the index is cached, or once the fetch
+        found no image at the batch's points.
 
         Filters the collection by the batch's bounding geometry BEFORE the
         ``aggregate_array`` call so per-tile per-pass collections (e.g.
@@ -221,9 +242,13 @@ class GeeRasterAdapter(BaseAdapter):
         thousand-image index instead of timing out server-side. The ``dates``
         argument is accepted but intentionally NOT used as a filter — see
         the comment below.
+
+        Raises ``RuntimeError`` (from ``_get_collection_time_bounds``) when
+        Earth Engine cannot return the timestamps. Every point needs them,
+        so the error stops the run.
         """
         # Non-collections (single IMAGE assets) have no timestamp axis, and
-        # repeat calls after a successful (or proven-failed) fetch are no-ops.
+        # repeat calls after a completed fetch are no-ops.
         if not self._is_collection or self._timestamps_loaded:
             return
 
@@ -262,13 +287,14 @@ class GeeRasterAdapter(BaseAdapter):
         )
         self._collection_time_starts = start_times
         self._collection_time_ends = end_times
-        # If the filtered fetch still failed, flip back to the static-mosaic
+        # An empty index means that no image of the collection (with a start
+        # time) intersects the batch's points. Flip to the static-mosaic
         # fallback so per-point work doesn't crash trying to read a None
-        # timestamp index. This mirrors the eager-fetch fallback the adapter
-        # used to do in __post_init__ before timestamps went lazy.
+        # timestamp index. A failed request does not reach this line: it
+        # raises in _get_collection_time_bounds and stops the run.
         self._needs_per_point_date = start_times is not None
         if not self._needs_per_point_date:
-            self._static_image = _build_image(self._dataset_spec)
+            self._static_image, _ = _build_image(self._dataset_spec)
         self._timestamps_loaded = True
 
     def _validate_auto_detected_scale(self) -> None:
@@ -323,20 +349,37 @@ class GeeRasterAdapter(BaseAdapter):
     # Image resolution  (which ee.Image to sample, plus its band/scale)
     # ------------------------------------------------------------------
 
-    def _get_image(self, date=None, lat=None, lon=None) -> ee.Image:
-        """Return the ee.Image to sample, building per-point if needed.
+    def _get_image(
+        self, date=None, lat=None, lon=None, *, circular_aspect: bool = False
+    ) -> tuple[ee.Image, Any | None]:
+        """Return the ee.Image to sample, building per-point if needed, and its date request.
 
         For IMAGE assets the pre-built static image is always returned,
         regardless of date or coordinates.
 
         For ImageCollections:
         - date provided + coords → per-point image picked via
-          ``collection_date_policy`` (nearest/contains)
+          ``collection_date_policy`` (nearest/contains), with the per-point
+          fallback of ``_build_image``
         - date provided + no coords → server-side date filter only
           (no spatial selection — used when timestamps weren't cached
           or for global probes)
         - no date + coords → per-point most-recent image
         - no date + no coords → most-recent image, cached on first call
+
+        With ``circular_aspect=True``, returns the companion image for the
+        circular aspect statistics (``sin`` and ``cos`` bands, see
+        ``_build_image``), selected by the same rules. The same date and
+        coordinates select the same image as without the flag. This image is
+        built for each call and never read from or written to
+        ``_static_image``. Building it sends no request: Earth Engine
+        evaluates it only in the point's ``reduceRegion`` request.
+
+        Returns:
+            ``(image, image_dates)``. ``image_dates`` is the server-side value
+            for the dates of the selected image (see ``_build_image``), for a
+            collection with per-point date selection and coordinates. It is
+            ``None`` in every other case.
         """
         # Per-point branch has priority for collections that need spatial
         # filtering (e.g. tiled DEM collections). When coordinates are given,
@@ -357,6 +400,7 @@ class GeeRasterAdapter(BaseAdapter):
                 geometry=ee.Geometry.Point([lon, lat]),
                 lat=lat,
                 lon=lon,
+                circular_aspect=circular_aspect,
             )
 
         if self._needs_per_point_date and lat is not None and lon is not None:
@@ -372,6 +416,7 @@ class GeeRasterAdapter(BaseAdapter):
                 collection_time_ends=self._collection_time_ends,
                 lat=lat,
                 lon=lon,
+                circular_aspect=circular_aspect,
             )
 
         # IMAGE assets or already-cached no-coords fallback.
@@ -380,12 +425,15 @@ class GeeRasterAdapter(BaseAdapter):
         # no-coords call returns the same most-recent global image, which is
         # safe for band-name probing and global tile-export, but never for
         # per-point sampling (the per-point branch above runs first).
-        if date is None and self._static_image is not None:
-            return self._static_image
+        # The circular aspect image is never cached: it continues to the
+        # branches below, which build it from the same dataset spec.
+        if not circular_aspect and date is None and self._static_image is not None:
+            return self._static_image, None
 
         # Collection with no date and no coords: build (and cache) a global
         # most-recent fallback. Used by tile-export and band-name probing
-        # paths that don't have a specific point in mind.
+        # paths that don't have a specific point in mind. Without a point,
+        # there is no per-point date request.
         if date is None and self._needs_per_point_date:
             most_recent = self._collection_time_starts.max()
             logger.info(
@@ -393,22 +441,31 @@ class GeeRasterAdapter(BaseAdapter):
                 self._dataset_spec.get("collection"),
                 most_recent.strftime("%Y-%m-%d"),
             )
-            self._static_image = _build_image(
+            most_recent_image, _ = _build_image(
                 self._dataset_spec,
                 date=most_recent,
                 collection_time_starts=self._collection_time_starts,
                 collection_time_ends=self._collection_time_ends,
+                circular_aspect=circular_aspect,
             )
-            return self._static_image
+            if not circular_aspect:
+                self._static_image = most_recent_image
+            return most_recent_image, None
 
         # Final fallback — a date was provided but neither the per-point
         # branch (no coords) nor the static-image branch (date is None)
         # could handle it. Two real paths reach here:
-        #   1. Collection whose timestamp fetch failed and date is not
-        #      None (server-side date filter with no client-side index).
+        #   1. Collection whose timestamp index is empty (no image intersects
+        #      the batch's points) and date is not None (server-side date
+        #      filter with no client-side index).
         #   2. Collection with timestamps but no coords and date is not
         #      None (per-point date selection without a spatial filter).
-        dt = pd.to_datetime(date)
+        # The circular aspect image also reaches here without a date, in
+        # place of the static image. date None stays None (pd.to_datetime
+        # would give NaT, which _build_image reads as a date), so
+        # _build_image loads an IMAGE asset as the static image does, and
+        # mosaics a collection without date selection.
+        dt = pd.to_datetime(date) if date is not None else None
         geom = ee.Geometry.Point([lon, lat]) if lat is not None else None
         return _build_image(
             self._dataset_spec,
@@ -418,15 +475,20 @@ class GeeRasterAdapter(BaseAdapter):
             collection_time_ends=self._collection_time_ends,
             lat=lat,
             lon=lon,
+            circular_aspect=circular_aspect,
         )
 
     def _get_band_name(self, img: ee.Image) -> str:
         """Get the first band name from the image (needed for result parsing).
 
         Side effect: populates ``_cached_band_name``, ``_cached_band_names``,
-        and ``_cached_band_count`` on first call. Other methods
-        (``_empty_stats_result``, ``_fetch_stats_single``, ``build_dataset_meta``)
+        and ``_cached_band_count`` on the first successful call. Other methods
+        (``_fetch_stats_single``, ``_guard_tile_size``, ``build_dataset_meta``)
         rely on these caches being warm.
+
+        When the bands are not in the config, this asks Earth Engine for the
+        band names. If that request fails, the Earth Engine exception
+        propagates and nothing is cached, so the next call asks again.
         """
         band = self._dataset_spec.get("bands")
         derived = self._dataset_spec.get("derived_bands")
@@ -443,21 +505,21 @@ class GeeRasterAdapter(BaseAdapter):
         if combined:
             # Populate band cache from the config — no GEE API call needed.
             if not hasattr(self, "_cached_band_name"):
-                self._cached_band_name = combined[0]
                 self._cached_band_names = combined
                 self._cached_band_count = len(combined)
+                # Set last: worker threads read this attribute as "cache is filled".
+                self._cached_band_name = combined[0]
             return self._cached_band_name
-        # Fallback: ask GEE (costs one getInfo call, cached after first use)
+        # Fallback: ask GEE (costs one getInfo call, cached after first success).
+        # A failed request raises and caches nothing. Caching a fallback name
+        # would make every later point of the batch parse its result with a
+        # band name and band count that do not match the image.
         if not hasattr(self, "_cached_band_name"):
-            try:
-                names = img.bandNames().getInfo()
-                self._cached_band_name = names[0] if names else "value"
-                self._cached_band_names = names  # full list for metadata
-                self._cached_band_count = len(names)
-            except Exception:
-                self._cached_band_name = "value"
-                self._cached_band_names = []
-                self._cached_band_count = 1
+            names = img.bandNames().getInfo()
+            self._cached_band_names = names  # full list for metadata
+            self._cached_band_count = len(names)
+            # Set last: worker threads read this attribute as "cache is filled".
+            self._cached_band_name = names[0] if names else "value"
         return self._cached_band_name
 
     def _get_scale(self, img):
@@ -505,106 +567,131 @@ class GeeRasterAdapter(BaseAdapter):
     # Date metadata  (per-point image timestamps for the meta sidecar)
     # ------------------------------------------------------------------
 
-    def _make_date_info(
-        self,
-        image_start: pd.Timestamp,
-        *,
-        end_index: int | None,
-        clamped: bool,
-        source: str,
-    ) -> dict:
-        """Build the date metadata dict for one resolved image timestamp.
+    def _resolve_date_info(self, date, image_times: dict | None) -> dict:
+        """Return the date metadata of one point, for its meta dict.
 
-        ``end_index`` is the position of the matching end-time inside
-        ``_collection_time_ends``; pass ``None`` when no end-time should be
-        emitted. The ``image_time_end`` key is included only when the index
-        is valid for the cached end-times array.
+        ``date_clamped`` and ``date_source`` compare the sample date with the
+        batch index (see ``_resolve_date_source``). ``image_time_start`` and
+        ``image_time_end`` (``%Y-%m-%d``) name the image that the point's
+        request actually selected, which the per-point fallback can choose
+        instead of the batch-selected image. They come from ``image_times``.
+
+        Args:
+            date: The point's sample date, or None in a run without dates.
+            image_times: The ``image_dates`` value of ``_build_image`` that
+                Earth Engine returned for the point: ``{"start": ..., "end":
+                ..., "fallback": ...}``, the times in milliseconds since 1970,
+                with ``"end"`` None when the image has no end, and
+                ``"fallback"`` True when the per-point fallback selected the
+                image. None when the collection has no image at the point (the
+                masked image).
+
+        Returns:
+            The four date keys, without ``image_time_end`` when the image has
+            no end. An empty dict when there is no batch index (image assets,
+            mosaic collections, and collections without an image at the
+            batch's points), and when ``image_times`` is None: a point without
+            an image has no date fields, and ``date_info`` does not count it.
+
+            One internal key is added when the per-point fallback selected the
+            image, the point has a sample date, and the date is not clamped:
+            ``fallback_image_gap_days``, the whole days between the sample
+            date and the image (see ``_count_gap_days``). ``extract()`` warns
+            when it is large. It stays in memory: no output writes it.
         """
-        # Always include the start-of-image timestamp; this is the only
-        # mandatory field.
-        info = {
-            "date_clamped": clamped,
-            "date_source": source,
-            "image_time_start": image_start.strftime("%Y-%m-%d"),
-        }
-        # Only emit image_time_end when we have a cached end-times array
-        # AND the requested index is in-bounds. Defensive bounds check —
-        # _get_collection_time_bounds() returns time_ends=None whenever
-        # the start/end array lengths don't match, so by the time we
-        # reach here the index *should* always be valid; the guard is
-        # belt-and-braces in case that upstream invariant ever breaks.
-        end_times = self._collection_time_ends
-        if end_times is not None and end_index is not None and 0 <= end_index < len(end_times):
-            info["image_time_end"] = end_times[end_index].strftime("%Y-%m-%d")
-        return info
-
-    def _resolve_date_info(self, date=None) -> dict:
-        """Compute date metadata for a single point fetch.
-
-        Returns a dict with image_time_start, image_time_end, date_clamped,
-        date_source to be merged into the per-point meta dict.
-        """
-        if self._collection_time_starts is None:
+        if self._collection_time_starts is None or image_times is None:
             return {}
 
+        date_clamped, date_source = self._resolve_date_source(date)
+        # Every selection filter of _build_image uses system:time_start, so
+        # the selected image always has a start.
+        date_info = {
+            "date_clamped": date_clamped,
+            "date_source": date_source,
+            "image_time_start": pd.to_datetime(image_times["start"], unit="ms").strftime(
+                "%Y-%m-%d"
+            ),
+        }
+        if image_times.get("end") is not None:
+            date_info["image_time_end"] = pd.to_datetime(image_times["end"], unit="ms").strftime(
+                "%Y-%m-%d"
+            )
+
+        # The gap between the sample date and an image that the per-point
+        # fallback selected, for the warning about images far from the date.
+        # Only for a point with a sample date that is not clamped: without a
+        # date there is no gap, and a clamped date is outside the dates of
+        # the batch's images, which date_clamped already reports.
+        if image_times.get("fallback") and date is not None and not date_clamped:
+            policy = str(self._dataset_spec.get("collection_date_policy", "nearest")).lower()
+            date_info["fallback_image_gap_days"] = _count_gap_days(
+                date, image_times["start"], image_times.get("end"), policy
+            )
+        return date_info
+
+    def _resolve_date_source(self, date) -> tuple[bool, str]:
+        """Return ``(date_clamped, date_source)`` of a point, from its date and the batch index.
+
+        No request: the batch index is in memory. ``date_source`` is
+        ``most_recent_no_date`` without a date, ``clamped_to_nearest`` for a
+        date outside the collection's range, and otherwise
+        ``contains_sample_date`` ("contains") or ``nearest_to_sample``.
+
+        Uses attributes:
+            _collection_time_starts: The batch index start times (not None).
+            _collection_time_ends: The batch index end times, or None.
+        """
         time_starts = self._collection_time_starts
-        last_index = len(time_starts) - 1
 
         if date is None:
-            # No-date fallback: most recent image (last entry in the
-            # time_starts array).
-            return self._make_date_info(
-                time_starts.max(),
-                end_index=last_index,
-                clamped=False,
-                source="most_recent_no_date",
-            )
+            # No-date run: the most recent image of the batch index.
+            return False, "most_recent_no_date"
 
         dt = pd.to_datetime(date)
         policy = str(self._dataset_spec.get("collection_date_policy", "nearest")).lower()
 
         if policy == "contains":
-            # "contains" policy: pick the image whose time interval contains
-            # the sample date. When the date falls outside the collection's
-            # full range, clamp to the nearest boundary image.
-            if dt <= time_starts.min():
-                return self._make_date_info(
-                    time_starts.min(),
-                    end_index=0,
-                    clamped=True,
-                    source="clamped_to_nearest",
-                )
-            if dt >= time_starts.max():
-                return self._make_date_info(
-                    time_starts.max(),
-                    end_index=last_index,
-                    clamped=True,
-                    source="clamped_to_nearest",
-                )
+            # "contains" policy: the date is clamped when it falls outside the
+            # collection's full range. The range starts at the first image's
+            # start day and ends at the end of the last image interval, so a
+            # date on the first start day or inside the last interval is not
+            # clamped. Dates compare as whole days (the day rule): an image
+            # that starts at 10:00 on the sample day starts on or before that
+            # day. The range is the one that _resolve_date_filter_range
+            # selects from.
+            sample_day = dt.normalize()
+            if sample_day < time_starts.min().normalize():
+                return True, "clamped_to_nearest"
 
-            # In-range: find the latest start-time that's still <= dt.
-            idx = int(time_starts.searchsorted(dt, side="right") - 1)
-            idx = max(0, min(idx, last_index))
-            return self._make_date_info(
-                time_starts[idx],
-                end_index=idx,
-                clamped=False,
-                source="contains_sample_date",
+            # The last interval ends at the system:time_end of the image with
+            # the latest start. Without end times, it ends at the end of that
+            # start's day (the day rule), as the date range of
+            # _resolve_date_filter_range does: a later day is clamped, also
+            # when the image starts at 10:00.
+            # That function's date range also always covers the whole start
+            # day of the image, so an image whose end is on its start day (or
+            # equal to its start) is selected for a date on that day. Use the
+            # same day here, or such a date would be reported as clamped.
+            time_ends = self._collection_time_ends
+            last_start = time_starts.max()
+            if time_ends is not None and len(time_ends) == len(time_starts):
+                last_interval_end = time_ends[len(time_starts) - 1]
+            else:
+                last_interval_end = last_start.normalize() + pd.DateOffset(days=1)
+            last_interval_end = max(
+                last_interval_end, last_start.normalize() + pd.DateOffset(days=1)
             )
+            if sample_day >= last_interval_end:
+                return True, "clamped_to_nearest"
+            return False, "contains_sample_date"
 
-        # Default "nearest" policy: pick whichever image timestamp is closest
-        # to the sample date, even if the date is outside the range.
-        nearest, was_clamped = _find_nearest_timestamp(time_starts, dt)
-        nearest_index = int(time_starts.get_indexer([nearest])[0])
-        return self._make_date_info(
-            nearest,
-            end_index=nearest_index,
-            clamped=was_clamped,
-            source="clamped_to_nearest" if was_clamped else "nearest_to_sample",
-        )
+        # Default "nearest" policy: the date is clamped when it is before the
+        # first start or after the latest start of the batch index.
+        _, was_clamped = _find_nearest_timestamp(time_starts, dt)
+        return was_clamped, "clamped_to_nearest" if was_clamped else "nearest_to_sample"
 
     # ------------------------------------------------------------------
-    # Empty-result builders  (failure-path skeletons matching success shape)
+    # Empty-result builders  (results of a failed point)
     # ------------------------------------------------------------------
 
     def _empty_result(self, window_m: int):
@@ -624,60 +711,25 @@ class GeeRasterAdapter(BaseAdapter):
         }
         return vals, meta
 
-    def _empty_stats_result(
-        self,
-        window_m: int,
-        reducer_names: Sequence[str],
-        *,
-        want_point: bool = False,
-    ):
-        """Return a (stats, meta) tuple matching the merged success schema.
+    def _empty_stats_result(self, window_m: int, error: Exception):
+        """Return the ``(stats, meta)`` result of a failed point.
 
-        Used when a fetch fails so callers see the same dict shape they'd
-        get on a successful call. Includes a "point" / "{band}_point" key
-        when the original request asked for the point reducer, regardless
-        of which window reducers were combined alongside it.
+        The stats dict has no keys. ``_append_stat_columns`` then gives the
+        failed point a null value in every statistic column that the other
+        points of the batch create, and the failed point creates no column of
+        its own. (Placeholder keys would not match the success schema: a
+        multi-band point has ``{band}_{reducer}`` keys, and the band names are
+        not always known when a request fails.)
+
+        The meta dict has the QC values of a point outside the extent, plus the
+        error text (``error``) and the exception (``exception``), so that
+        ``extract()`` can report the point and stop the run when every point
+        failed. ``exception`` stays in memory and is never written to JSON.
         """
-        # Determine multiband once — the same flag governs both the point-side
-        # placeholder shape and the band_coverage_pct emit below. A single
-        # named band ("bands": "DEM") is always single-band, regardless of how
-        # many bands the underlying image carries; otherwise we trust the
-        # cached band count populated by _get_band_name on first fetch.
-        spec_band = self._dataset_spec.get("bands")
-        band_count = getattr(self, "_cached_band_count", 1)
-        multiband = not isinstance(spec_band, str) and band_count > 1
-
-        # Window-side: one None value per requested non-point reducer.
-        # Categorical class reducers are intentionally skipped — they produce
-        # *per-class* keys (e.g. "class_10_count") on success, so on failure
-        # we emit no class keys and let _append_stat_columns zero-fill the
-        # corresponding columns alongside any successful rows in the batch.
-        stats: dict[str, float | None] = {
-            r: None for r in reducer_names if r not in ("class_count", "class_fraction")
-        }
-
-        # Point-side: mirror the success-path shape — multi-band emits one
-        # "{band}_point" key per band; single-band emits a bare "point" key.
-        if want_point:
-            if multiband:
-                # We may not have the full band list cached here; emit one
-                # placeholder per cached band name, falling back to a single
-                # "point" key when band names aren't known yet.
-                band_names = getattr(self, "_cached_band_names", None) or []
-                if band_names:
-                    for band in band_names:
-                        stats[f"{band}_point"] = None
-                else:
-                    stats["point"] = None
-            else:
-                stats["point"] = None
-
         _, meta = self._empty_result(window_m)
-        # Emit an empty band_coverage_pct for multiband failure paths so
-        # callers always see a consistent schema regardless of success/failure.
-        if multiband:
-            meta["band_coverage_pct"] = {}
-        return stats, meta
+        meta["error"] = format_point_error(error)
+        meta["exception"] = error
+        return {}, meta
 
     # ------------------------------------------------------------------
     # Mode 1: Server-side stats  (reduceRegion with combined reducers)
@@ -698,21 +750,36 @@ class GeeRasterAdapter(BaseAdapter):
     ):
         """Compute server-side stats for a single point via reduceRegion.
 
-        Two reductions are issued together as a single ``ee.Dictionary``
+        Up to three reductions are issued together as a single ``ee.Dictionary``
         and resolved with one ``getInfo()`` round-trip:
 
         - **window** — runs only when *combined_reducer* is provided. The
           user's reducers are combined with ``ee.Reducer.count()`` for QC,
           and ``reduceRegion`` is applied over the buffered square region.
+        - **aspect_circular** — runs only when the derived ``aspect`` band is
+          reduced and ``mean``, ``std``, or ``var`` is a window reducer. It
+          reduces the sine and cosine of the aspect of the non-flat pixels
+          over the same region, and the circular values replace the linear
+          ``mean``, ``std``, and ``var`` of aspect
+          (see ``_circular_aspect_statistics``).
         - **point** — runs only when *want_point* is True. ``Reducer.first()``
           is applied over an ``ee.Geometry.Point`` at the exact (lat, lon)
           to fetch the value of the pixel containing the point.
 
-        When both branches run, GEE evaluates them in parallel server-side
-        so callers pay one round-trip for both. Returns a single
+        A fourth branch, **image_dates**, is no reduction: for collections
+        with per-point date selection, it returns the start and end of the
+        image that the date selection chose, and whether the per-point
+        fallback chose it, for the date fields of the meta dict (see
+        ``_resolve_date_info``).
+
+        GEE evaluates the branches in parallel server-side, so callers pay
+        one round-trip for all of them. Returns a single
         ``(stats_dict, meta_dict)`` tuple with merged keys:
         - window keys: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
         - point  keys: ``"point"``  (single band) or ``{band}_point``     (multi-band)
+        A per-call band list gives the multi-band keys, also for one band.
+        For a band whose window has no valid pixel, ``sum`` is None and
+        ``count`` is 0.
 
         ``original_reducer_names`` carries the *un-deduped* user request
         (i.e. with ``class_fraction`` still present if asked for). It is
@@ -724,7 +791,9 @@ class GeeRasterAdapter(BaseAdapter):
         # original — preserves the old single-reducer test entry points.
         if original_reducer_names is None:
             original_reducer_names = reducer_names
-        img = self._get_image(date, lat=lat, lon=lon)
+        # image_dates: the dates of the selected image, for collections with
+        # per-point date selection (None otherwise). See _build_image.
+        img, image_dates = self._get_image(date, lat=lat, lon=lon)
         region = self._make_region(lat, lon, window_m)
 
         utm_crs = get_utm_crs(lon, lat)
@@ -747,17 +816,44 @@ class GeeRasterAdapter(BaseAdapter):
         band_name = self._get_band_name(img)
         band_count = getattr(self, "_cached_band_count", 1)
 
-        # Use multi-band mode when: no band specified (auto-detect all bands), OR
-        # a list of bands was specified. A single named band keeps simple {reducer} naming.
+        # Use multi-band mode ({band}_{reducer} keys) when the bands come from
+        # a per-call band list, also with one band, so that the column names
+        # say which band the user selected. Otherwise use it when no band is
+        # specified (auto-detect all bands) or a list of bands is specified,
+        # and the image has more than one band. A single named band, and a
+        # catalog default with one band, keep simple {reducer} naming.
         spec_band = self._dataset_spec.get("bands")
-        multiband = not isinstance(spec_band, str) and band_count > 1
+        multiband = self._band_named_keys or (not isinstance(spec_band, str) and band_count > 1)
 
         if multiband:
             img_to_reduce = img
         else:
             img_to_reduce = img.select(band_name)
 
-        # Build up to two server-side reductions into a single ee.Dictionary.
+        # With "count" as the only window reducer, no QC count is combined
+        # with it, and Earth Engine names the output of a single reducer by
+        # the band name only ({"elevation": 247}), not "{band}_count".
+        count_only = list(reducer_names) == ["count"]
+
+        # Aspect is a direction, so its mean, std and var must be circular
+        # statistics: the linear mean of 350° and 10° is 180° (south), not 0°
+        # (north). They come from a companion image of the sine and cosine of
+        # the aspect (see _build_image), reduced in the same request. Only the
+        # derived aspect band qualifies: it is reduced when the run is
+        # multi-band (_build_image keeps every derived band, and a per-call
+        # band list makes even the aspect band alone multi-band) or when it
+        # is the single band.
+        derived_bands = self._dataset_spec.get("derived_bands") or []
+        derived_band_names = [derived_bands] if isinstance(derived_bands, str) else derived_bands
+        aspect_is_reduced = "aspect" in derived_band_names and (multiband or band_name == "aspect")
+        circular_reducer_names = [
+            reducer_name for reducer_name in ("mean", "std", "var") if reducer_name in reducer_names
+        ]
+        want_circular_aspect = (
+            combined_reducer is not None and aspect_is_reduced and bool(circular_reducer_names)
+        )
+
+        # Build up to three server-side reductions into a single ee.Dictionary.
         # GEE evaluates them in parallel and we pay one HTTP round-trip total.
         branches: dict[str, ee.Dictionary] = {}
 
@@ -781,6 +877,20 @@ class GeeRasterAdapter(BaseAdapter):
                 bestEffort=True,
             )
 
+        if want_circular_aspect:
+            # Circular aspect branch: mean sine, mean cosine, and the number of
+            # non-flat pixels, over the same region and grid as the window
+            # branch. Output keys: sin_mean, sin_count, cos_mean, cos_count.
+            # The same date and coordinates select the same image as above.
+            circular_aspect_image, _ = self._get_image(date, lat=lat, lon=lon, circular_aspect=True)
+            branches["aspect_circular"] = circular_aspect_image.reduceRegion(
+                reducer=ee.Reducer.mean().combine(reducer2=ee.Reducer.count(), sharedInputs=True),
+                geometry=region,
+                scale=native_m,
+                crs=utm_crs,
+                bestEffort=True,
+            )
+
         if want_point:
             # Point branch: exact pixel value at lat/lon. One pixel only —
             # no need for bestEffort. Output keys are bare band names.
@@ -791,7 +901,14 @@ class GeeRasterAdapter(BaseAdapter):
                 crs=utm_crs,
             )
 
-        # Single round-trip — both branches resolved server-side.
+        if image_dates is not None:
+            # Dates branch: system:time_start and system:time_end of the image
+            # that the date selection chose, or null for a point where the
+            # collection has no image. No extra request: it is a branch of
+            # the same dictionary.
+            branches["image_dates"] = image_dates
+
+        # Single round-trip — all branches resolved server-side.
         full_result = ee.Dictionary(branches).getInfo() or {}
 
         # ---- parse window branch ----
@@ -801,12 +918,30 @@ class GeeRasterAdapter(BaseAdapter):
         if combined_reducer is not None:
             window_raw = full_result.get("window") or {}
             if multiband:
-                window_stats = _parse_multiband_result(window_raw, reducer_names, suffixes)
+                window_stats = _parse_multiband_result(
+                    window_raw, reducer_names, suffixes, count_only=count_only
+                )
                 # Collect per-band counts for individual coverage reporting.
-                per_band_counts = _extract_per_band_counts(window_raw)
+                per_band_counts = _extract_per_band_counts(window_raw, count_only=count_only)
             else:
                 window_stats = _parse_reduce_result(window_raw, band_name, reducer_names, suffixes)
-            valid_count = _extract_count_from_reduce_result(window_raw, band_name, multiband)
+            valid_count = _extract_count_from_reduce_result(
+                window_raw, band_name, multiband, count_only=count_only
+            )
+
+            # ---- sum of a window without valid pixels ----
+            # Earth Engine gives sum 0, not null, for a band whose window has
+            # no valid pixel (seen live on 2026-10-09). A 0 would look like
+            # data, and the local adapter gives no value for the sum of no
+            # pixels. So the sum of a band with a pixel count of 0 becomes
+            # null. count stays 0: it is the true number of valid pixels.
+            if "sum" in reducer_names:
+                if multiband:
+                    for band, band_count in per_band_counts.items():
+                        if band_count == 0 and f"{band}_sum" in window_stats:
+                            window_stats[f"{band}_sum"] = None
+                elif valid_count == 0:
+                    window_stats["sum"] = None
 
             # ---- categorical post-process ----
             # We always ask GEE for `class_count` (frequencyHistogram) when
@@ -862,6 +997,27 @@ class GeeRasterAdapter(BaseAdapter):
         # Merged stats dict — window keys first, then point keys.
         stats = {**window_stats, **point_stats}
 
+        # ---- circular aspect statistics ----
+        # Replace the linear aspect mean, std and var that the user asked for
+        # with the circular values: "mean"/"std"/"var" when aspect is the
+        # single band, "aspect_mean"/... when the run is multi-band (also for
+        # a per-call band list of aspect alone). Only keys that exist are
+        # replaced, so the set of columns does not change. The other
+        # statistics of aspect stay linear. The QC values below read
+        # window_stats, which keeps the linear values, so QC does not change.
+        if want_circular_aspect:
+            circular_raw = full_result.get("aspect_circular") or {}
+            circular_values = _circular_aspect_statistics(
+                circular_raw.get("sin_mean"),
+                circular_raw.get("cos_mean"),
+                circular_raw.get("sin_count"),
+            )
+            key_prefix = "aspect_" if multiband else ""
+            for reducer_name in circular_reducer_names:
+                stat_key = f"{key_prefix}{reducer_name}"
+                if stat_key in stats:
+                    stats[stat_key] = circular_values[reducer_name]
+
         # ---- QC meta ----
         # When the window branch ran we have a real valid-pixel count from
         # GEE; otherwise we fall back to point-only semantics (n_pixels is
@@ -872,7 +1028,17 @@ class GeeRasterAdapter(BaseAdapter):
             # Clamp to 100% — the geometric total can be off by a cell or two,
             # so a fully-valid window can otherwise read as 101%.
             coverage_pct = min(coverage_pct, 100.0)
-            has_values = any(v is not None for v in window_stats.values())
+            # The window has data when at least one band has a valid pixel.
+            # Use the pixel counts, not the statistics: on a window without
+            # valid pixels, Earth Engine gives null for most statistics, but
+            # 0 for count (and for sum, which the step above sets to null), so
+            # a non-null statistic does not show data.
+            # The window branch always has a count for each band: the QC
+            # count, or the user's count.
+            if multiband:
+                has_values = any(count > 0 for count in per_band_counts.values())
+            else:
+                has_values = valid_count > 0
             n_pixels = int(valid_count)
             had_nodata = valid_count < total_cells
         else:
@@ -882,6 +1048,14 @@ class GeeRasterAdapter(BaseAdapter):
             coverage_pct = 100.0 if any_pt else 0.0
             has_values = any_pt
             had_nodata = not any_pt
+
+        # Date metadata: the dates of the image that the point used. Without
+        # per-point date selection, the point has no date fields.
+        date_info = (
+            self._resolve_date_info(date, full_result.get("image_dates"))
+            if image_dates is not None
+            else {}
+        )
 
         # Build per-band coverage breakdown for multiband datasets. Each entry
         # shows what fraction of window cells had valid data for that band —
@@ -908,7 +1082,7 @@ class GeeRasterAdapter(BaseAdapter):
             "nodata": None,
             "src_path": self._src_label(),
             "window_arr": None,
-            **self._resolve_date_info(date),
+            **date_info,
         }
         return stats, meta
 
@@ -927,18 +1101,24 @@ class GeeRasterAdapter(BaseAdapter):
         """Compute server-side statistics for many points in parallel (Mode 1).
 
         Each point is resolved with one server-side ``ee.Dictionary``
-        containing one or two reductions: a window reduction (whenever
-        any non-point reducer was requested) and a point reduction
-        (whenever ``"point"`` is in *reducer_names*). GEE evaluates the
-        branches in parallel server-side and we pull them back together
-        with one ``getInfo()`` round-trip, so the cost is one HTTP call
-        per point regardless of which combination the user requested.
+        containing up to three reductions: a window reduction (whenever
+        any non-point reducer was requested), a circular aspect reduction
+        (whenever the derived ``aspect`` band is reduced with ``mean``,
+        ``std``, or ``var``), and a point reduction (whenever ``"point"``
+        is in *reducer_names*). GEE evaluates the branches in parallel
+        server-side and we pull them back together with one ``getInfo()``
+        round-trip, so the cost is one HTTP call per point regardless of
+        which combination the user requested. See ``_fetch_stats_single``.
 
         Output keys per point:
           - window stats: ``{reducer}`` (single band) or ``{band}_{reducer}`` (multi-band)
           - point sample: ``"point"``  (single band) or ``{band}_point``     (multi-band)
+          A per-call band list gives the multi-band keys, also for one band.
 
         Returns a list of ``(stats_dict, meta_dict)`` tuples — one per point.
+        A point whose request failed gets an empty stats dict, and its meta
+        dict has the error text (``error``) and the exception (``exception``).
+        See ``_empty_stats_result``.
         """
         # Split "point" out of reducer_names — it doesn't go through the
         # combined window reducer; it gets its own server-side branch.
@@ -957,6 +1137,14 @@ class GeeRasterAdapter(BaseAdapter):
         lons = list(lons)
         date_list = list(dates) if dates is not None else [None] * n
 
+        # A batch without points needs no request. Without this return, the
+        # timestamp request below would have no points to filter the
+        # collection by, and would ask for the dates of every image of the
+        # collection, which can exceed Earth Engine's limits.
+        if n == 0:
+            emit_progress_step(progress_callback, 0, 0)
+            return []
+
         # Fetch the collection's timestamp index now that we know the
         # batch's spatial extent and date range — without this the fetch
         # would happen unfiltered in __post_init__ and time out for very
@@ -970,11 +1158,15 @@ class GeeRasterAdapter(BaseAdapter):
         else:
             combined_reducer, suffixes = None, []
 
-        # Warm the band cache once on the main thread so workers don't race
-        # to populate it (and we avoid an extra getInfo from inside a worker).
+        # Warm the band cache once on the main thread, so the workers find it
+        # filled and send no band-name request of their own. Broad catch for a
+        # harmless best-effort failure: a failed request is not cached, so each
+        # worker then asks again, and a worker whose request also fails gives
+        # a failed point.
         if not hasattr(self, "_cached_band_count"):
             try:
-                self._get_band_name(self._get_image())
+                batch_image, _ = self._get_image()
+                self._get_band_name(batch_image)
             except Exception:
                 pass
 
@@ -1011,14 +1203,15 @@ class GeeRasterAdapter(BaseAdapter):
                     idx = future_to_idx[future]
                     try:
                         results[idx] = future.result()
-                    except Exception as e:
-                        logger.warning("GEE stats fetch failed for point %d: %s", idx, e)
-                        # Use the original reducer list so the failure stub
-                        # mirrors what the user asked for (class reducers are
-                        # filtered inside _empty_stats_result).
-                        results[idx] = self._empty_stats_result(
-                            window_m, original_window_reducers, want_point=want_point
-                        )
+                    # Broad catch that replaces one point's failed result with
+                    # an empty result (docs/coding_guidelines.md, "Failures for
+                    # single points"): Earth Engine reports unrelated failures
+                    # with one exception type. The result keeps the error, so
+                    # extract() reports the point, and stops the run when every
+                    # point failed.
+                    except Exception as error:
+                        logger.warning("GEE stats fetch failed for point %d: %s", idx, error)
+                        results[idx] = self._empty_stats_result(window_m, error)
                     pbar.update(1)
                     emit_progress_step(progress_callback, completed, n)
 
@@ -1036,56 +1229,79 @@ class GeeRasterAdapter(BaseAdapter):
         output_path: Path,
         date=None,
         resample_m: float | None = None,
-    ):
-        """Export a GeoTIFF tile for one point with pixel-grid-snapped window.
+    ) -> tuple[Path, dict]:
+        """Export a GeoTIFF tile for one point, on a pixel grid in its UTM zone.
 
-        Snapping the centre coordinate to the nearest pixel grid multiple
-        ensures all exported tiles have identical dimensions.
+        The tile has n × n pixels, with n = :func:`~envoi.geo.tile_pixel_count`
+        (``window_m`` / pixel size, rounded to the nearest whole number with
+        ties rounded up, at least 1). The pixel size is ``resample_m`` when it
+        is set, otherwise the image's native scale. The tile edges lie on
+        multiples of the pixel size (:func:`~envoi.geo.tile_top_left`): for
+        odd n, the pixel that contains the point is the centre pixel; for even
+        n, the tile centre is the grid line nearest to the point. The local
+        adapter uses the same grid when ``resample_m`` is set.
 
-        If resample_m is set, the tile is exported at that resolution instead
-        of the native image resolution — all tiles will be exactly
-        round(window_m / resample_m) × round(window_m / resample_m) pixels.
+        For a collection with per-point date selection, one small request
+        before the download returns the dates of the image that the point's
+        selection chose (``image_dates`` of ``_build_image``). When this
+        request fails, the error propagates, so the tile is a failed tile, and
+        a tile with the same name from an earlier run is removed, as for a
+        failed download.
+
+        Returns:
+            ``(output_path, date_info)``. ``date_info`` holds the point's date
+            fields (see ``_resolve_date_info``). It is empty without per-point
+            date selection, and for a point where the collection has no image.
         """
-        img = self._get_image(date, lat=lat, lon=lon)
+        output_path = Path(output_path)
+        img, image_dates = self._get_image(date, lat=lat, lon=lon)
+
+        # Dates of the selected image, so that the tile meta names the image
+        # that the tile shows. The download request cannot return them.
+        date_info: dict = {}
+        if image_dates is not None:
+            try:
+                selected_image_times = image_dates.getInfo()
+            # Broad catch that re-raises the error unchanged after a cleanup:
+            # Earth Engine reports unrelated failures with one exception type.
+            # export_tiles makes the tile a failed tile. Remove a tile with
+            # the same name from an earlier run, so that the folder matches
+            # the tile manifest, which marks the tile as not exported.
+            except Exception:
+                with contextlib.suppress(OSError):
+                    output_path.unlink(missing_ok=True)
+                raise
+            date_info = self._resolve_date_info(date, selected_image_times)
+
         # Use resample_m as the export scale when provided; fall back to native.
         scale_m = float(resample_m) if resample_m is not None else self._get_scale_value(img)
         utm = get_utm_crs(lon, lat)
 
-        # Project to UTM, snap to pixel grid, compute window corners
+        # Project the point to its UTM zone (x first), then compute the tile's
+        # pixel count and its corners on the pixel grid.
         from pyproj import Transformer
 
         transformer = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
-        cx, cy = transformer.transform(lon, lat)
-        cx = _snap_to_grid(cx, scale_m)
-        cy = _snap_to_grid(cy, scale_m)
+        point_x_m, point_y_m = transformer.transform(lon, lat)
+        n_pixels = tile_pixel_count(window_m, scale_m)
+        tile_left_m, tile_top_m = tile_top_left(point_x_m, point_y_m, n_pixels, scale_m)
 
-        # Snap half-window to nearest whole pixel count so output dimensions
-        # are consistent across points (window_m is approximate, not exact).
-        half_pixels = max(1, round(window_m / 2 / scale_m))
-        half_m = half_pixels * scale_m
-        region = ee.Geometry.Rectangle(
-            [cx - half_m, cy - half_m, cx + half_m, cy + half_m],
-            proj=ee.Projection(utm),
-            geodesic=False,
-        )
-
-        output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # output_path is laid out as <root>/<batch_id>/<dataset_name>/<file>.tif
-        # by export_tiles, so the parent directory's name is the dataset name —
-        # used purely for the error message in _guard_tile_size.
-        dataset_name = output_path.parent.name
-
-        # Fail fast (with actionable guidance) before asking GEE for a URL,
-        # so oversized tiles surface as a clean ValueError instead of an
-        # opaque HTTP 400 from getDownloadURL.
-        self._guard_tile_size(img, window_m=window_m, scale_m=scale_m, dataset_name=dataset_name)
-
+        # Request the exact pixel grid (transform and dimensions), not a region
+        # and a scale. With a region, Earth Engine adds every pixel that the
+        # region touches, so rounding at the region edges can add a row or a
+        # column (seen live on 2026-10-09 with the 30.92 m native scale of
+        # the GLO-30 DEM: 7 × 7 pixels, or 7 rows of 6 pixels, instead of 6 × 6).
+        # export_tiles has already checked the tile size once for the batch.
         _download_tile_via_url(
-            img, region=region, scale_m=scale_m, crs=utm, output_path=output_path
+            img,
+            crs=utm,
+            crs_transform=[scale_m, 0.0, tile_left_m, 0.0, -scale_m, tile_top_m],
+            dimensions=f"{n_pixels}x{n_pixels}",
+            output_path=output_path,
         )
-        return output_path
+        return output_path, date_info
 
     # ------------------------------------------------------------------
     # Mode 2 helper: pre-flight size check
@@ -1105,11 +1321,15 @@ class GeeRasterAdapter(BaseAdapter):
         fetch the band count off the GEE image (which requires a live
         adapter), then hands the pure-Python size check to the module-level
         function so the latter stays unit-testable without GEE creds.
+
+        ``export_tiles`` calls it once per batch, before any tile download.
+        Every tile of a batch has the same size and the same bands.
         """
-        # _get_band_name populates _cached_band_count as a side effect. It
-        # may already be warm (export_tiles primes it in line ~1773), but we
-        # call it here so the size guard is self-contained and works even
-        # for callers that didn't go through export_tiles.
+        # _get_band_name populates _cached_band_count as a side effect. It is
+        # usually warm already (export_tiles primes it), but a failed request
+        # is not cached, so this call asks Earth Engine again. If it fails
+        # again, the exception propagates and stops the run: without the band
+        # count, the size of every tile is unknown.
         self._get_band_name(img)
         band_count = getattr(self, "_cached_band_count", 1) or 1
 
@@ -1138,8 +1358,11 @@ class GeeRasterAdapter(BaseAdapter):
     ) -> tuple[list[Path | None], list[dict]]:
         """Export GeoTIFF tiles for many points in parallel (Mode 2).
 
-        If resample_m is set, all tiles are exported at that resolution so they
-        are exactly round(window_m / resample_m) × round(window_m / resample_m) pixels.
+        Each tile has n × n pixels, where n is ``window_m`` divided by the
+        pixel size, rounded to the nearest whole number with ties rounded up
+        (at least 1). If resample_m is set, it is the pixel size, so every tile
+        has the same size. For odd n, the pixel that contains the point is the
+        centre pixel. See :meth:`_export_single` for the pixel grid.
 
         ``filename_suffix`` is inserted before the .tif extension so multi-
         window runs can place every window's tiles in the same folder
@@ -1147,6 +1370,16 @@ class GeeRasterAdapter(BaseAdapter):
 
         Returns ``(paths, meta_list)`` — one entry per input point in each
         list. ``paths[i]`` is ``None`` when the export for that point failed.
+        ``meta_list[i]`` holds the point's date information (the dates of the
+        image in the tile, see :meth:`_export_single`). For a failed export, it
+        holds only the error text (``error``) and the exception (``exception``).
+
+        For collections with per-point date selection, each tile sends one
+        small date request before its download, in its worker thread.
+
+        Raises ``ValueError`` before any tile download when the tiles would
+        exceed GEE's synchronous download limit. A failed request for the band
+        names or the native scale also propagates before any download.
         """
         output_dir = Path(output_dir) / dataset_name
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1158,18 +1391,45 @@ class GeeRasterAdapter(BaseAdapter):
         id_list = list(ids) if ids is not None else [str(i) for i in range(n)]
         results: list = [None] * n
 
+        # A batch without points needs no request (see fetch_stats_batch).
+        if n == 0:
+            emit_progress_step(progress_callback, 0, 0)
+            return [], []
+
         # Fetch the collection's timestamp index now that we know the
         # batch's spatial extent and date range — see fetch_stats_batch
         # for why this is deferred from __post_init__ to here.
         self._ensure_collection_timestamps(lats, lons, date_list)
 
+        # The image without point coordinates (see _get_image). The band-name
+        # request and the tile-size check below use it.
+        batch_image, _ = self._get_image()
+
         # Warm the band-name cache so build_dataset_meta can read it later.
+        # Broad catch for a harmless best-effort failure: a failed request is
+        # not cached, and the tile-size check below asks again.
         try:
-            self._get_band_name(self._get_image())
+            self._get_band_name(batch_image)
         except Exception:
             pass
 
-        meta_list = [self._resolve_date_info(d) for d in date_list]
+        # Check the tile size once, before any download. Every tile of the
+        # batch has the same size and bands, so an oversized request would
+        # make every tile fail, and the run would end without tiles.
+        # This needs the band count and the export scale. In a raster run, a
+        # failed request for either one stops the run here: it affects every
+        # tile. Do not catch the ValueError of the size check.
+        export_scale_m = (
+            float(resample_m) if resample_m is not None else self._get_scale_value(batch_image)
+        )
+        self._guard_tile_size(
+            batch_image, window_m=window_m, scale_m=export_scale_m, dataset_name=dataset_name
+        )
+
+        # One meta dict per point. Each worker returns the date fields of its
+        # tile, because only the point's own request knows which image the
+        # date selection chose.
+        meta_list: list[dict] = [{} for _ in range(n)]
 
         # Build every tile filename up front. Sample IDs come from the user's
         # input table and can contain anything (URL-style occurrenceIDs with
@@ -1177,8 +1437,10 @@ class GeeRasterAdapter(BaseAdapter):
         # into a character set that is valid on Windows, macOS and Linux
         # alike. When the caller passes "200m", filenames become
         # "<id>-<dataset>-200m.tif"; with no suffix we keep the historical
-        # "<id>-<dataset>.tif" naming, and IDs that were already safe are left
-        # untouched, so existing outputs are unaffected.
+        # "<id>-<dataset>.tif" naming. IDs that were already safe are left
+        # untouched, unless two of them differ only in letter case (then both
+        # get a hash suffix, so they cannot overwrite each other on Windows
+        # and macOS).
         tile_filenames = build_tile_filenames(id_list, dataset_name, filename_suffix)
 
         emit_progress_step(progress_callback, 0, n)
@@ -1203,10 +1465,19 @@ class GeeRasterAdapter(BaseAdapter):
                 for completed, future in enumerate(as_completed(future_to_idx), start=1):
                     idx = future_to_idx[future]
                     try:
-                        results[idx] = future.result()
-                    except Exception as e:
-                        logger.warning("GEE export failed for point %d: %s", idx, e)
+                        results[idx], meta_list[idx] = future.result()
+                    # Broad catch that replaces one point's failed tile with an
+                    # empty result (no path; docs/coding_guidelines.md,
+                    # "Failures for single points"): Earth Engine reports
+                    # unrelated failures with one exception type. A failed
+                    # date request or download comes here. The point's meta
+                    # dict keeps the error, so extract() reports the tile, and
+                    # stops the run when every tile failed.
+                    except Exception as error:
+                        logger.warning("GEE export failed for point %d: %s", idx, error)
                         results[idx] = None
+                        meta_list[idx]["error"] = format_point_error(error)
+                        meta_list[idx]["exception"] = error
                     pbar.update(1)
                     emit_progress_step(progress_callback, completed, n)
 

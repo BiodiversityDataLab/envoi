@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 
 from ..progress import ProgressStepCallback
 
 
 class BaseAdapter:
+    """The adapter interface that ``extract()`` uses, and nothing else.
+
+    Every adapter subclasses this class and overrides ``fetch_stats_batch``,
+    ``export_tiles``, and ``build_dataset_meta`` with the same parameter names,
+    kinds, and defaults (``tests/test_adapters.py`` checks this).
+    ``docs/architecture.md`` ("Adapter interface") describes each method.
+    """
+
     # ---- resource lifecycle -------------------------------------------------
     # Adapters may hold external resources (e.g. an open rasterio dataset) that
     # need to be released when processing for a given dataset finishes. The
@@ -28,9 +37,6 @@ class BaseAdapter:
         # Returning False (or None) propagates any in-flight exception.
         return False
 
-    def fetch_values(self, lat: float, lon: float, window_m: int, *, return_meta: bool = False):
-        raise NotImplementedError
-
     def fetch_stats_batch(
         self,
         lats: Sequence[float],
@@ -43,27 +49,27 @@ class BaseAdapter:
         disable_progress: bool = False,
         progress_callback: ProgressStepCallback | None = None,
     ) -> list[tuple[dict, dict]]:
+        """Return one ``(stats_dict, meta_dict)`` pair for each point, in input order."""
         raise NotImplementedError
 
-    def fetch_batch(
+    def export_tiles(
         self,
         lats: Sequence[float],
         lons: Sequence[float],
         window_m: int,
+        output_dir: str | Path,
         *,
+        ids: Sequence[str] | None = None,
         dates: Sequence | None = None,
-        return_meta: bool = False,
-    ) -> list:
-        """Fetch values for multiple points.
-
-        Default implementation: sequential loop over fetch_values.
-        Adapters that benefit from parallelism (e.g. GEE) override this.
-        """
-        results = []
-        for lat, lon in zip(lats, lons):
-            result = self.fetch_values(lat, lon, window_m, return_meta=return_meta)
-            results.append(result)
-        return results
+        dataset_name: str = "dataset",
+        resample_m: float | None = None,
+        filename_suffix: str | None = None,
+        progress_desc: str | None = None,
+        disable_progress: bool = False,
+        progress_callback: ProgressStepCallback | None = None,
+    ) -> tuple[list[Path | None], list[dict]]:
+        """Export a GeoTIFF tile for each point. Return ``(paths, meta_list)``, in input order."""
+        raise NotImplementedError
 
     def build_dataset_meta(
         self,

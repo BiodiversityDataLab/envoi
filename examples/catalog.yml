@@ -33,6 +33,14 @@ datasets:
     data_type: continuous
     bands: [B4, B8]
     dataset_spec:
-      # Interval-based collection: pick the image whose time range contains
-      # the point's date, rather than the nearest start timestamp.
+      # Sentinel-2 images are single acquisitions, not time ranges. Each image
+      # covers the day on which it was acquired. This example uses "contains"
+      # to prefer images acquired on or before the point's date. A point gets
+      # its image of that date when there is one. Otherwise it gets its latest
+      # image before that date. It gets an image after the date only when no
+      # earlier image is within 32 days. "nearest" would take the closest
+      # image, also one acquired after the date. Sentinel-2 tiles have
+      # different dates at different places, so each point can get an image
+      # of its own. See docs/advanced_usage.md, "Images with different dates
+      # at different places", for the exact rules.
       collection_date_policy: contains

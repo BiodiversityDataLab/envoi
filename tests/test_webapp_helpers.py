@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -60,6 +61,18 @@ def test_validate_points_dataframe_accepts_optional_date_absent():
 def test_validate_points_dataframe_rejects_missing_gbif_columns():
     with pytest.raises(ValueError, match="missing required column"):
         validate_points_dataframe(pd.DataFrame({"x": [1], "y": [2]}))
+
+
+@pytest.mark.parametrize("infinite_value", [float("inf"), float("-inf"), "inf"])
+def test_validate_points_dataframe_rejects_infinite_coordinates(infinite_value):
+    """An infinite coordinate, also as the text "inf", is rejected at upload."""
+    df = _points_df()
+    df["decimalLongitude"] = [18.1, infinite_value]
+
+    with pytest.raises(
+        ValueError, match="Column 'decimalLongitude' contains infinite coordinate values"
+    ):
+        validate_points_dataframe(df)
 
 
 def test_validate_points_dataframe_rejects_duplicate_occurrence_ids():
@@ -205,8 +218,11 @@ def test_temporary_service_account_file_exists_during_context_and_is_private():
 
     with temporary_service_account_file(payload) as path:
         assert path.exists()
-        mode = stat.S_IMODE(path.stat().st_mode)
-        assert mode == 0o600
+        # Windows has no POSIX permission bits: os.chmod there only sets the
+        # read-only flag, so the file mode is not 0o600.
+        if os.name != "nt":
+            mode = stat.S_IMODE(path.stat().st_mode)
+            assert mode == 0o600
         assert json.loads(path.read_text())["private_key_id"] == "private-key-id"
 
     assert not path.exists()
