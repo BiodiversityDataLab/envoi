@@ -12,9 +12,10 @@ Public surface re-imported by ``extract.py``:
   with :func:`_parse_run_config` and reject batch_id values whose output
   files or folders would collide.
 * :func:`_parse_run_config` — turn one raw config dict into RunSettings,
-  raising ValueError for any malformed setting.
+  raising ValueError for any malformed setting or unknown key.
 * :func:`_as_config_list` — load YAML (if given a path) and normalize the
-  result into a list of output config dicts.
+  result into a list of output config dicts, rejecting an item that is not
+  a mapping.
 
 Most other helpers (``_normalize_dataset_entry``, ``_validate_*``,
 ``_parse_statistics``, ``_resolve_stats_for_dataset``, ``_load_yaml``) are
@@ -27,8 +28,10 @@ registry in ``envoi.adapters``. They build no adapter.
 
 from __future__ import annotations
 
+import difflib
 import math
 import numbers
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +40,7 @@ import yaml
 from ._filenames import describe_unsafe_path_component, is_safe_path_component
 from .adapters import all_computable_derived_bands, get_adapter
 from .adapters.base import _BAND_NAMING_KEY, _PER_BAND_NAMING
+from .catalog import _DATA_TYPES
 from .reducers import KNOWN_REDUCERS
 
 # Keys allowed inside the full-form dict value
@@ -45,10 +49,21 @@ from .reducers import KNOWN_REDUCERS
 # entry-normalization helper below.
 _ALLOWED_OVERRIDE_KEYS = frozenset({"bands"})
 
-# Recognised data_type values for the statistics dispatch. A dataset whose
-# data_type doesn't match one of these falls back to "continuous" — the
-# common case for ecological rasters that don't bother declaring a type.
-_VALID_STAT_TYPES = frozenset({"continuous", "categorical"})
+# The keys of one run config, and the keys of its `settings` mapping:
+# exactly the keys that _parse_run_config reads. Any other key is rejected,
+# because an ignored key, for example a typing error in `window_size_m`,
+# would give a silently different run.
+_RUN_CONFIG_KEYS = frozenset({"batch_id", "datasets", "settings"})
+_SETTINGS_KEYS = frozenset(
+    {
+        "output_type",
+        "output_file_format",
+        "min_coverage_pct",
+        "statistics",
+        "window_size_m",
+        "resample_m",
+    }
+)
 
 
 @dataclass
@@ -383,9 +398,11 @@ def _parse_run_config(
     """Parse and validate a single output run config dict into a RunSettings instance.
 
     Raises ValueError for any invalid or missing setting so callers don't need
-    to do any further validation on the returned object. This includes a
-    setting that the adapter of a dataset does not support, by its capability
-    declarations: the output_type, a reducer, or a derived band.
+    to do any further validation on the returned object. This includes a key
+    that is not in ``_RUN_CONFIG_KEYS`` or, inside ``settings``, not in
+    ``_SETTINGS_KEYS``, and a setting that the adapter of a dataset does not
+    support, by its capability declarations: the output_type, a reducer, or a
+    derived band.
     """
     # Use a numbered fallback batch_id when the user didn't provide one.
     batch_id = run_config.get("batch_id", f"output{index + 1}")
@@ -403,6 +420,17 @@ def _parse_run_config(
             f"letters, digits, '.', '_' and '-'."
         )
 
+    # Reject unknown keys before the checks of the required keys, so that a
+    # typing error such as 'setting' gets a message that names it, not
+    # "missing required 'settings' dict".
+    _validate_known_keys(
+        run_config,
+        _RUN_CONFIG_KEYS,
+        "the run config",
+        batch_id,
+        settings_keys=_SETTINGS_KEYS,
+    )
+
     # datasets is required — must be a non-empty list. Each entry is normalized
     # into a (name, band_overrides) tuple by the helper, which also handles all
     # validation (catalog existence, malformed dicts, derived bands that the
@@ -410,12 +438,20 @@ def _parse_run_config(
     raw_datasets = run_config.get("datasets", [])
     if not raw_datasets:
         raise ValueError(f"Output '{batch_id}': missing required 'datasets' list")
+    _validate_datasets_is_list(raw_datasets, batch_id)
     datasets = [_normalize_dataset_entry(e, batch_id, catalog_datasets) for e in raw_datasets]
 
-    # settings is required — must be a non-empty dict.
+    # settings is required — must be a non-empty mapping with known keys.
     settings = run_config.get("settings", {}) or {}
+    if not isinstance(settings, Mapping):
+        raise ValueError(
+            f"Output '{batch_id}': 'settings' must be a mapping of setting names to values "
+            f"(a dict in Python, or indented 'key: value' lines in YAML), got "
+            f"{type(settings).__name__}: {settings!r}. Allowed keys: {sorted(_SETTINGS_KEYS)}."
+        )
     if not settings:
         raise ValueError(f"Output '{batch_id}': missing required 'settings' dict")
+    _validate_known_keys(settings, _SETTINGS_KEYS, "'settings'", batch_id)
 
     # output_type controls the entire processing path (stats vs tile export).
     output_type = settings.get("output_type")
@@ -535,6 +571,107 @@ def _parse_run_config(
     )
 
 
+def _validate_known_keys(
+    config: Mapping,
+    allowed_keys: frozenset[str],
+    location: str,
+    batch_id: str,
+    *,
+    settings_keys: frozenset[str] = frozenset(),
+) -> None:
+    """Raise ValueError if ``config`` has a key that is not in ``allowed_keys``.
+
+    ``_parse_run_config`` would ignore such a key, so a typing error
+    (``window_size`` for ``window_size_m``) would give a silently different
+    run. For each unknown key, the message says that it belongs inside
+    ``settings`` when it is in ``settings_keys``, or else suggests the closest
+    allowed key when one is close enough.
+
+    Args:
+        config: The run config, or its ``settings`` mapping.
+        allowed_keys: The keys that ``_parse_run_config`` reads at this level.
+        location: Where the keys are, for the message: ``"the run config"``
+            or ``"'settings'"``.
+        batch_id: The run config's batch_id, used in the error message.
+        settings_keys: The keys of ``settings``, when ``config`` is the run
+            config. Empty when ``config`` is ``settings``.
+
+    Raises:
+        ValueError: If ``config`` has a key that is not in ``allowed_keys``.
+    """
+    unknown_keys = [key for key in config if key not in allowed_keys]
+    if not unknown_keys:
+        return
+
+    # Name the unknown keys in config order. A key can be other than text (the
+    # YAML key "1:" gives an int), so compare its text. The cutoff 0.6 (the
+    # difflib default) suggests 'window_size_m' for 'window_size' and
+    # 'statistics' for 'stats', and nothing for an unrelated key such as
+    # 'max_workers'.
+    key_descriptions = []
+    for key in unknown_keys:
+        # A setting written next to 'datasets' is a common error, and no
+        # run-config key is close to it.
+        if key in settings_keys:
+            key_descriptions.append(f"{key!r} (this setting belongs inside 'settings')")
+            continue
+        close_matches = difflib.get_close_matches(str(key), sorted(allowed_keys), n=1, cutoff=0.6)
+        if close_matches:
+            key_descriptions.append(f"{key!r} (did you mean {close_matches[0]!r}?)")
+        else:
+            key_descriptions.append(repr(key))
+    raise ValueError(
+        f"Output '{batch_id}': {location} has the unknown key(s) "
+        f"{', '.join(key_descriptions)}. Allowed keys: {sorted(allowed_keys)}. Correct or "
+        f"remove the unknown key(s). envoi does not ignore them, because an ignored key "
+        f"would silently change the run."
+    )
+
+
+def _validate_datasets_is_list(raw_datasets: Any, batch_id: str) -> None:
+    """Raise ValueError if the ``datasets`` value of a run config is not a list or tuple.
+
+    Without this check, a mapping such as ``{"dem": ["slope"]}`` would give its
+    keys and silently drop the band lists, and a text value such as ``"dem"``
+    would give its letters as dataset names. For a mapping or a text value,
+    the message shows the same entries as a list.
+
+    Args:
+        raw_datasets: The non-empty ``datasets`` value from the run config.
+        batch_id: The run config's batch_id, used in the error message.
+
+    Raises:
+        ValueError: If ``raw_datasets`` is not a list or tuple.
+    """
+    if isinstance(raw_datasets, (list, tuple)):
+        return
+
+    message = (
+        f"Output '{batch_id}': 'datasets' must be a list of dataset entries, got "
+        f"{type(raw_datasets).__name__}: {raw_datasets!r}."
+    )
+
+    # Show the list form: one single-key dict per dataset of a mapping, or a
+    # list with the one dataset name.
+    if isinstance(raw_datasets, Mapping):
+        list_form = [{name: value} for name, value in raw_datasets.items()]
+    elif isinstance(raw_datasets, str):
+        list_form = [raw_datasets]
+    else:
+        raise ValueError(message)
+    # A Python value without a YAML form (for example a Path) cannot be
+    # written as YAML. The message then shows the Python form only.
+    try:
+        yaml_text = yaml.safe_dump(list_form, default_flow_style=True, width=10**6).strip()
+    except yaml.YAMLError:
+        yaml_text = None
+    if yaml_text is None:
+        raise ValueError(f"{message} Write it as a list: {list_form!r}.")
+    raise ValueError(
+        f"{message} Write it as a list: datasets: {yaml_text} (YAML) or {list_form!r} (Python)."
+    )
+
+
 def _validate_unique_dataset_names(
     datasets: list[tuple[str, dict[str, Any]]],
     output_type: str,
@@ -649,16 +786,16 @@ def _parse_statistics(
 
     # ---- typed dict ----
     if isinstance(raw, dict):
-        unknown_keys = set(raw.keys()) - _VALID_STAT_TYPES
+        unknown_keys = set(raw.keys()) - _DATA_TYPES
         if unknown_keys:
             raise ValueError(
                 f"Output '{batch_id}': unknown 'statistics' key(s) {sorted(unknown_keys)}. "
-                f"Allowed: {sorted(_VALID_STAT_TYPES)}."
+                f"Allowed: {sorted(_DATA_TYPES)}."
             )
         if not raw:
             raise ValueError(
                 f"Output '{batch_id}': 'statistics' dict must contain at least one of "
-                f"{sorted(_VALID_STAT_TYPES)}."
+                f"{sorted(_DATA_TYPES)}."
             )
         normalized: dict[str, list[str]] = {}
         for key, reducers in raw.items():
@@ -698,7 +835,7 @@ def _resolve_stats_for_dataset(
     local datasets. Raises ValueError when the resolved list would be empty
     so the user gets a clear message rather than a run with no output columns.
     """
-    resolved_type = data_type if data_type in _VALID_STAT_TYPES else "continuous"
+    resolved_type = data_type if data_type in _DATA_TYPES else "continuous"
     reducers = stats.get(resolved_type)
     if not reducers:
         raise ValueError(
@@ -773,10 +910,24 @@ def _load_yaml(path_or_dict):
 
 
 def _as_config_list(config) -> list[dict]:
-    """Load and normalize config into a list of output config dicts."""
+    """Load and normalize config into a list of output config dicts.
+
+    Raises ValueError if ``config`` is not a dict, a list, or a path to a YAML
+    file, or if an item of the list is not a mapping.
+    """
     raw = _load_yaml(config)
     if isinstance(raw, dict):
         return [raw]
     if isinstance(raw, list):
+        # Each item must be one run config. Without this check, an item such
+        # as a dataset name fails later with an AttributeError.
+        for index, run_config in enumerate(raw):
+            if not isinstance(run_config, Mapping):
+                raise ValueError(
+                    f"Item {index + 1} of the config list (counting from 1) is a "
+                    f"{type(run_config).__name__}, not a run config: {run_config!r}. Each "
+                    f"run config must be a mapping (a dict in Python, or 'key: value' lines "
+                    f"in YAML) with the keys {sorted(_RUN_CONFIG_KEYS)}."
+                )
         return raw
     raise ValueError("config must be a dict, list, or path to a YAML file.")

@@ -2204,6 +2204,183 @@ class TestRunConfigValidation:
         assert meta["config"]["min_coverage_pct"] == 50
 
 
+# The text of the allowed keys in the error messages of TestRunConfigKeys.
+_RUN_CONFIG_KEYS_TEXT = "['batch_id', 'datasets', 'settings']"
+_SETTINGS_KEYS_TEXT = (
+    "['min_coverage_pct', 'output_file_format', 'output_type', 'resample_m', "
+    "'statistics', 'window_size_m']"
+)
+
+
+class TestRunConfigKeys:
+    """A run config with a wrong shape or an unknown key raises before any adapter."""
+
+    @pytest.mark.parametrize(
+        "item", ["dem_local", None, ["dem_local"]], ids=["text", "none", "list"]
+    )
+    def test_item_that_is_not_a_mapping_raises(self, sample_df, tmp_path, no_adapter, item):
+        """A config-list item that is not a mapping raises with its position and type."""
+        with pytest.raises(ValueError, match=re.escape("Item 2 of the config list")) as error_info:
+            extract(sample_df, [_tabular_mean_config("first"), item], output_dir=tmp_path)
+
+        message = str(error_info.value)
+        assert f"is a {type(item).__name__}, not a run config" in message
+        assert f"with the keys {_RUN_CONFIG_KEYS_TEXT}" in message
+        assert not any(tmp_path.iterdir())
+
+    def test_unknown_run_config_key_suggests_closest_key(self, sample_df, tmp_path, no_adapter):
+        """'setting' instead of 'settings' raises with the key, a suggestion, and the allowed keys."""
+        run_config = _tabular_mean_config("terrain")
+        run_config["setting"] = run_config.pop("settings")
+
+        expected_message = (
+            "Output 'terrain': the run config has the unknown key(s) 'setting' (did you mean "
+            f"'settings'?). Allowed keys: {_RUN_CONFIG_KEYS_TEXT}."
+        )
+        with pytest.raises(ValueError, match=re.escape(expected_message)):
+            extract(sample_df, run_config, output_dir=tmp_path)
+        assert not any(tmp_path.iterdir())
+
+    def test_setting_next_to_datasets_says_it_belongs_inside_settings(
+        self, sample_df, tmp_path, no_adapter
+    ):
+        """A settings key in the run config raises with a hint to move it into 'settings'."""
+        run_config = _tabular_mean_config("terrain")
+        run_config["window_size_m"] = run_config["settings"].pop("window_size_m")
+
+        expected_message = (
+            "Output 'terrain': the run config has the unknown key(s) 'window_size_m' (this "
+            f"setting belongs inside 'settings'). Allowed keys: {_RUN_CONFIG_KEYS_TEXT}."
+        )
+        with pytest.raises(ValueError, match=re.escape(expected_message)):
+            extract(sample_df, run_config, output_dir=tmp_path)
+        assert not any(tmp_path.iterdir())
+
+    @pytest.mark.parametrize(
+        ("datasets", "expected_list_form"),
+        [
+            (
+                {"multi_band_local": [1, 2]},
+                (
+                    "got dict: {'multi_band_local': [1, 2]}. Write it as a list: datasets: "
+                    "[{multi_band_local: [1, 2]}] (YAML) or [{'multi_band_local': [1, 2]}] "
+                    "(Python)."
+                ),
+            ),
+            (
+                "dem_local",
+                (
+                    "got str: 'dem_local'. Write it as a list: datasets: [dem_local] (YAML) or "
+                    "['dem_local'] (Python)."
+                ),
+            ),
+        ],
+        ids=["mapping", "text"],
+    )
+    def test_datasets_that_is_not_a_list_raises(
+        self, sample_df, tmp_path, no_adapter, datasets, expected_list_form
+    ):
+        """A mapping or a text 'datasets' value raises and shows the same entries as a list.
+
+        Before the check, the mapping silently lost its band list, and the text
+        gave its letters as dataset names.
+        """
+        run_config = _tabular_mean_config("terrain")
+        run_config["datasets"] = datasets
+
+        expected_message = (
+            "Output 'terrain': 'datasets' must be a list of dataset entries, "
+            f"{expected_list_form}"
+        )
+        with pytest.raises(ValueError, match=re.escape(expected_message)):
+            extract(sample_df, run_config, output_dir=tmp_path)
+        assert not any(tmp_path.iterdir())
+
+    @pytest.mark.parametrize(
+        ("typed_key", "allowed_key"),
+        [("window_size", "window_size_m"), ("statistic", "statistics"), ("output", "output_type")],
+    )
+    def test_unknown_settings_key_suggests_closest_key(
+        self, sample_df, tmp_path, no_adapter, typed_key, allowed_key
+    ):
+        """A typing error in a settings key raises with a suggestion of the allowed key."""
+        run_config = _tabular_mean_config("terrain")
+        run_config["settings"][typed_key] = run_config["settings"].pop(allowed_key)
+
+        expected_message = (
+            f"Output 'terrain': 'settings' has the unknown key(s) '{typed_key}' (did you mean "
+            f"'{allowed_key}'?). Allowed keys: {_SETTINGS_KEYS_TEXT}."
+        )
+        with pytest.raises(ValueError, match=re.escape(expected_message)):
+            extract(sample_df, run_config, output_dir=tmp_path)
+        assert not any(tmp_path.iterdir())
+
+    def test_unknown_key_without_close_match_has_no_suggestion(
+        self, sample_df, tmp_path, no_adapter
+    ):
+        """'max_workers' is not close to any settings key, so the message suggests none."""
+        expected_message = (
+            f"'settings' has the unknown key(s) 'max_workers'. Allowed keys: {_SETTINGS_KEYS_TEXT}."
+        )
+        with pytest.raises(ValueError, match=re.escape(expected_message)) as error_info:
+            extract(sample_df, _tabular_mean_config("terrain", max_workers=4), output_dir=tmp_path)
+
+        assert "did you mean" not in str(error_info.value)
+        assert not any(tmp_path.iterdir())
+
+    def test_every_unknown_key_is_named_in_config_order(self, sample_df, tmp_path, no_adapter):
+        """Two unknown settings keys are both named, each with its own suggestion or none."""
+        run_config = _tabular_mean_config("terrain", max_workers=4, resample=30)
+
+        expected_message = (
+            "'settings' has the unknown key(s) 'max_workers', 'resample' (did you mean "
+            "'resample_m'?). Allowed keys:"
+        )
+        with pytest.raises(ValueError, match=re.escape(expected_message)):
+            extract(sample_df, run_config, output_dir=tmp_path)
+
+    def test_settings_that_is_not_a_mapping_raises(self, sample_df, tmp_path, no_adapter):
+        """A list of settings (a YAML '- key: value' list) raises with its type and the allowed keys."""
+        run_config = _tabular_mean_config("terrain")
+        run_config["settings"] = [run_config["settings"]]
+
+        with pytest.raises(
+            ValueError, match=re.escape("Output 'terrain': 'settings' must be a mapping")
+        ) as error_info:
+            extract(sample_df, run_config, output_dir=tmp_path)
+
+        message = str(error_info.value)
+        assert "got list:" in message
+        assert f"Allowed keys: {_SETTINGS_KEYS_TEXT}." in message
+        assert not any(tmp_path.iterdir())
+
+    def test_example_run_config_parses(self):
+        """``examples/run.yml`` passes every run-config check with the built-in catalog."""
+        from envoi._config_parsing import _as_config_list, _parse_run_configs
+        from envoi.catalog import BUILTIN_EE_CATALOG, load_catalogs, load_defaults
+
+        example_run_path = Path(__file__).parents[1] / "examples" / "run.yml"
+        all_run_settings = _parse_run_configs(
+            _as_config_list(example_run_path),
+            load_defaults(),
+            load_catalogs(BUILTIN_EE_CATALOG)["datasets"],
+        )
+
+        assert [
+            (run_settings.batch_id, run_settings.output_type, run_settings.window_sizes)
+            for run_settings in all_run_settings
+        ] == [
+            ("terrain_stats", "tabular", [200]),
+            ("terrain_tiles", "raster", [200]),
+            ("terrain_and_landcover", "tabular", [500]),
+        ]
+        assert all_run_settings[1].resample_m == 10
+        assert all_run_settings[2].stats_by_dataset == {
+            "dem_copernicus_glo30": ["mean", "std"],
+            "lulc_worldcover_2021": ["mode", "class_fraction"],
+        }
+
+
 # ------------------------------------------------------------------
 # Per-call band overrides
 # ------------------------------------------------------------------

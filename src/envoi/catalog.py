@@ -34,7 +34,8 @@ _GENERIC_CATALOG_KEYS = frozenset(
 # The values of `data_type`. It selects the continuous or the categorical
 # reducer list of the `statistics` setting. A null or absent data_type uses
 # the continuous list. Another value is rejected, because it would also use
-# the continuous list, without a message.
+# the continuous list, without a message. The same values are the keys of a
+# typed `statistics` dict in a run config (`_config_parsing.py`).
 _DATA_TYPES = frozenset({"continuous", "categorical"})
 
 # Module-level cache so each bundled YAML is only read once per process.
