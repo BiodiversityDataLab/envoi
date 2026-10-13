@@ -6,9 +6,10 @@ data provider needs only its adapter module. The module also tests the checks
 of ``envoi.adapters.register()``, the pre-flight checks that ``extract()``
 runs with the adapter declarations and ``check_dataset`` before it builds any
 adapter, the catalog checks with the adapter's ``catalog_keys`` and
-catalog hooks, and the checks of the adapter results with variants of the
-fake adapter that break the result contract. No test uses the network or a
-raster file.
+catalog hooks, the checks of the adapter results with variants of the
+fake adapter that break the result contract, and the lifetime of the adapter:
+one instance for each run config and dataset, used for every window size. No
+test uses the network or a raster file.
 """
 
 from __future__ import annotations
@@ -234,16 +235,19 @@ def _register_fake_datasets() -> None:
 
 
 def _fake_tabular_config(
-    batch_id: str, datasets: list, statistics: list | dict | None = None
+    batch_id: str,
+    datasets: list,
+    statistics: list | dict | None = None,
+    window_size_m: int | list[int] = 100,
 ) -> dict[str, Any]:
-    """Return a tabular run config with a 100 m window, and ``["mean"]`` without ``statistics``."""
+    """Return a tabular run config, with ``["mean"]`` without ``statistics``."""
     return {
         "batch_id": batch_id,
         "datasets": datasets,
         "settings": {
             "output_type": "tabular",
             "statistics": statistics or ["mean"],
-            "window_size_m": 100,
+            "window_size_m": window_size_m,
         },
     }
 
@@ -919,4 +923,151 @@ class TestAdapterResultChecks:
             extract(three_points, _fake_raster_config("broken_tiles"), output_dir=tmp_path)
 
         assert str(error_info.value) == _contract_error_message(adapter_class, "export_tiles", rule)
+        assert not any(tmp_path.iterdir())
+
+
+# Variants of the fake adapter that record their lifetime: the build, the
+# window of each statistics request, and each close() call.
+
+
+class WindowRecordingAdapter(FakeStatsAdapter):
+    """Records ``"build"``, ``"fetch <window> m"``, and ``"close"`` in ``events``, in call order."""
+
+    # The events of every instance of this class and its subclasses. Each test clears it.
+    events: ClassVar[list[str]] = []
+
+    def __init__(self, spec: dict[str, Any]) -> None:
+        super().__init__(spec)
+        WindowRecordingAdapter.events.append("build")
+
+    def fetch_stats_batch(
+        self, lats: Any, lons: Any, window_m: int, reducer_names: Any, **kwargs: Any
+    ) -> Any:
+        WindowRecordingAdapter.events.append(f"fetch {window_m} m")
+        return super().fetch_stats_batch(lats, lons, window_m, reducer_names, **kwargs)
+
+    def close(self) -> None:
+        WindowRecordingAdapter.events.append("close")
+
+
+class SecondWindowFailsAdapter(WindowRecordingAdapter):
+    """Raises ``RuntimeError`` in ``fetch_stats_batch`` for the 200 m window."""
+
+    def fetch_stats_batch(
+        self, lats: Any, lons: Any, window_m: int, reducer_names: Any, **kwargs: Any
+    ) -> Any:
+        results = super().fetch_stats_batch(lats, lons, window_m, reducer_names, **kwargs)
+        if window_m == 200:
+            raise RuntimeError("stub: the request of the 200 m window failed")
+        return results
+
+
+class TestAdapterLifetime:
+    """``extract()`` builds one adapter for each (run config, dataset) pair.
+
+    The adapter serves every window size of the pair, and its ``close()``
+    runs once, after the last window, also when a window raises.
+    """
+
+    def test_three_window_sizes_build_one_adapter(self, fake_provider, three_points, tmp_path):
+        """Three window sizes build the fake adapter once, and each window has its own columns."""
+        _register_fake_datasets()
+        run_config = _fake_tabular_config(
+            "fake_windows", ["fake_climate"], ["mean", "max"], window_size_m=[100, 200, 300]
+        )
+
+        outputs = extract(three_points, run_config, output_dir=tmp_path)
+
+        assert fake_provider.built_specs == [_fake_climate_entry()]
+
+        # One statistic column for each window, band, and reducer, in this order.
+        stats_table = pd.read_csv(outputs["fake_windows"])
+        assert [column for column in stats_table.columns if column.startswith("fake_climate_")] == [
+            f"fake_climate_{band}_{reducer}_{window_size}m"
+            for window_size in (100, 200, 300)
+            for band in ("temp", "precip")
+            for reducer in ("mean", "max")
+        ]
+        # The fake statistics do not depend on the window: mean = band base
+        # value + lat; max = mean + lon.
+        expected_values = {
+            "temp_mean": [10.0, 20.0, 30.0],
+            "temp_max": [11.0, 22.0, 33.0],
+            "precip_mean": [110.0, 120.0, 130.0],
+            "precip_max": [111.0, 122.0, 133.0],
+        }
+        for window_size in (100, 200, 300):
+            for statistic_key, values in expected_values.items():
+                column = f"fake_climate_{statistic_key}_{window_size}m"
+                assert stats_table[column].tolist() == values, column
+
+        # The QC columns and the quality summary of each window.
+        qc_table = pd.read_csv(tmp_path / "fake_windows_qc.csv")
+        assert [column for column in qc_table.columns if column.startswith("fake_climate_")] == [
+            f"fake_climate_{qc_name}_{window_size}m"
+            for window_size in (100, 200, 300)
+            for qc_name in ("in_extent", "n_pixels", "had_nodata", "coverage_pct")
+        ]
+        sidecar = _read_sidecar(tmp_path / "fake_windows_metadata.json")
+        quality = sidecar["datasets"]["fake_climate"]["quality"]
+        assert list(quality) == ["100m", "200m", "300m"]
+        assert [quality[window_key]["n_full"] for window_key in quality] == [3, 3, 3]
+
+    def test_two_run_configs_build_one_adapter_each(self, fake_provider, three_points, tmp_path):
+        """Two run configs with the same dataset build one adapter each, with their own bands."""
+        _register_fake_datasets()
+        run_configs = [
+            _fake_tabular_config("all_bands", ["fake_climate"], window_size_m=[100, 200]),
+            _fake_tabular_config(
+                "precip_only", [{"fake_climate": ["precip"]}], window_size_m=[100, 200]
+            ),
+        ]
+
+        outputs = extract(three_points, run_configs, output_dir=tmp_path)
+
+        assert fake_provider.built_specs == [
+            _fake_climate_entry(),
+            _fake_climate_entry(bands=["precip"], band_naming="per_band"),
+        ]
+        all_bands_table = pd.read_csv(outputs["all_bands"])
+        assert [
+            column for column in all_bands_table.columns if column.startswith("fake_climate_")
+        ] == [
+            "fake_climate_temp_mean_100m",
+            "fake_climate_precip_mean_100m",
+            "fake_climate_temp_mean_200m",
+            "fake_climate_precip_mean_200m",
+        ]
+        precip_table = pd.read_csv(outputs["precip_only"])
+        assert [
+            column for column in precip_table.columns if column.startswith("fake_climate_")
+        ] == ["fake_climate_precip_mean_100m", "fake_climate_precip_mean_200m"]
+        assert precip_table["fake_climate_precip_mean_200m"].tolist() == [110.0, 120.0, 130.0]
+
+    def test_close_runs_once_after_the_last_window(self, isolated_registry, three_points, tmp_path):
+        """``close()`` runs once, after the statistics requests of all three windows."""
+        WindowRecordingAdapter.events.clear()
+        _register_fake_variant(WindowRecordingAdapter)
+        run_config = _fake_tabular_config("closed", ["fake_climate"], window_size_m=[100, 200, 300])
+
+        extract(three_points, run_config, output_dir=tmp_path)
+
+        assert WindowRecordingAdapter.events == [
+            "build",
+            "fetch 100 m",
+            "fetch 200 m",
+            "fetch 300 m",
+            "close",
+        ]
+
+    def test_close_runs_once_when_a_window_raises(self, isolated_registry, three_points, tmp_path):
+        """When the 200 m window raises, ``close()`` runs once, and the error reaches the caller."""
+        WindowRecordingAdapter.events.clear()
+        _register_fake_variant(SecondWindowFailsAdapter)
+        run_config = _fake_tabular_config("failed", ["fake_climate"], window_size_m=[100, 200, 300])
+
+        with pytest.raises(RuntimeError, match="^stub: the request of the 200 m window failed$"):
+            extract(three_points, run_config, output_dir=tmp_path)
+
+        assert WindowRecordingAdapter.events == ["build", "fetch 100 m", "fetch 200 m", "close"]
         assert not any(tmp_path.iterdir())

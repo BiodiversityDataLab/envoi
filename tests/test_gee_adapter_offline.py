@@ -1701,6 +1701,253 @@ class TestFailedPointsThroughExtract:
 
 
 # ------------------------------------------------------------------
+# One adapter for every window size of a dataset
+# ------------------------------------------------------------------
+
+# The time index that the stub timestamp request returns: one image a month.
+_MONTHLY_TIME_STARTS = pd.DatetimeIndex(["2021-01-01", "2021-02-01", "2021-03-01", "2021-04-01"])
+
+# The (lon, lat) pairs of the three stub points, as the timestamp request gets them.
+_THREE_LON_LAT_PAIRS = [[lon, lat] for lat, lon in zip(_THREE_LATS, _THREE_LONS)]
+
+
+def _stub_window_statistics_requests(adapter: GeeRasterAdapter) -> None:
+    """Replace the per-point statistics request of ``adapter`` with a window-dependent stub.
+
+    Point i gets ``B1_mean`` = window_m + i and ``B2_mean`` = 2 × window_m + i,
+    the pixel count of a window of 10 m pixels, and the date fields of an
+    image that starts on the point's sample date. ``_resolve_date_info``
+    computes the date fields from the adapter's timestamp index, so a point
+    gets them only when the index is loaded.
+    """
+
+    def request(lat, lon, window_m, *args, date=None, **kwargs):
+        point_index = _THREE_LATS.index(lat)
+        stats = {
+            "B1_mean": float(window_m + point_index),
+            "B2_mean": float(2 * window_m + point_index),
+        }
+        meta = {
+            "in_extent": True,
+            "n_pixels": (window_m // 10) ** 2,
+            "had_nodata": False,
+            "coverage_pct": 100.0,
+            "window_m": window_m,
+            **adapter._resolve_date_info(date, {"start": _epoch_ms(date), "end": None}),
+        }
+        return stats, meta
+
+    adapter._fetch_stats_single = request
+
+
+@pytest.fixture
+def counting_stub_gee_collection(monkeypatch, stub_combined_reducer) -> SimpleNamespace:
+    """Register the Earth Engine collection ``stub_gee``, whose adapter class records each build.
+
+    ``extract()`` gets the class ``CountingStubAdapter`` through its
+    ``get_adapter`` lookup. Each build runs the constructor of
+    ``GeeRasterAdapter`` with a setup that sends no request: the attributes of
+    a two-band collection at 10 m whose timestamps are not loaded yet, and the
+    stubs of the per-point statistics requests and tile exports. The batch
+    methods, the timestamp load on the first batch, and the caches of the
+    adapter are the real ones. The timestamp request is a stub that returns
+    ``_MONTHLY_TIME_STARTS``.
+
+    Returns the records: ``built_adapters`` (each built adapter, in build
+    order) and ``timestamp_requests`` (the collection and the point
+    coordinates of each timestamp request).
+    """
+    update_catalog(
+        {
+            "datasets": {
+                "stub_gee": {
+                    "data_source": "earth_engine",
+                    "path": "users/test/collection",
+                    "data_type": "continuous",
+                    "bands": ["B1", "B2"],
+                }
+            }
+        }
+    )
+    records = SimpleNamespace(built_adapters=[], timestamp_requests=[])
+
+    def request_timestamps(collection_id, bounds_geometry=None):
+        records.timestamp_requests.append((collection_id, bounds_geometry))
+        return _MONTHLY_TIME_STARTS, None
+
+    # The timestamp load builds the geometry of the batch's points with
+    # ee.Geometry.MultiPoint, which would load the API from the server. The
+    # stub gives the coordinate pairs themselves.
+    monkeypatch.setattr(adapter_module, "_get_collection_time_bounds", request_timestamps)
+    monkeypatch.setattr(
+        adapter_module,
+        "ee",
+        SimpleNamespace(Geometry=SimpleNamespace(MultiPoint=lambda point_pairs: point_pairs)),
+    )
+
+    class CountingStubAdapter(GeeRasterAdapter):
+        """Records each build, and sets up a collection adapter without a request."""
+
+        def __post_init__(self):
+            records.built_adapters.append(self)
+            prepared_adapter = _tile_export_adapter(
+                _dataset_spec={"collection": "users/test/collection", "bands": ["B1", "B2"]},
+                _is_collection=True,
+                _timestamps_loaded=False,
+                _needs_per_point_date=True,
+            )
+            # Take the attributes of the prepared offline adapter. The
+            # constructor has already set `spec`, which the prepared adapter
+            # does not have.
+            vars(self).update(vars(prepared_adapter))
+            _stub_window_statistics_requests(self)
+            _stub_tile_exports(self, set())
+
+    monkeypatch.setattr(_extract_module, "get_adapter", lambda data_source: CountingStubAdapter)
+    return records
+
+
+def _dated_three_point_frame() -> pd.DataFrame:
+    """The three stub points, with a sample date in each month of the stub time index."""
+    return _three_point_frame().assign(eventDate=["2021-01-02", "2021-02-02", "2021-03-02"])
+
+
+def _stub_gee_window_config(batch_id: str, output_type: str, window_size_m) -> dict:
+    """Return a run config for ``stub_gee`` with the window size or sizes ``window_size_m``."""
+    run_config = _stub_gee_config(batch_id, output_type)
+    run_config["settings"]["window_size_m"] = window_size_m
+    return run_config
+
+
+def _dataset_entry_without_quality(sidecar_path) -> dict:
+    """Return the sidecar entry of ``stub_gee`` without its ``quality`` key."""
+    dataset_entry = json.loads(sidecar_path.read_text())["datasets"]["stub_gee"]
+    return {key: value for key, value in dataset_entry.items() if key != "quality"}
+
+
+class TestOneAdapterForEveryWindow:
+    """``extract()`` builds one Earth Engine adapter for every window size of a dataset.
+
+    The second window uses the timestamp index that the first window loaded,
+    and the results of each window equal those of a run with only that window.
+    """
+
+    def test_gee_multi_window_builds_one_adapter(self, counting_stub_gee_collection, tmp_path):
+        """Tabular: one build and one timestamp request; each window equals a single-window run."""
+        records = counting_stub_gee_collection
+        points = _dated_three_point_frame()
+
+        multi_window_outputs = extract(
+            points,
+            _stub_gee_window_config("multi", "tabular", [100, 200]),
+            output_dir=tmp_path,
+            quiet=True,
+        )
+
+        assert len(records.built_adapters) == 1
+        assert records.timestamp_requests == [("users/test/collection", _THREE_LON_LAT_PAIRS)]
+        multi_window_stats = pd.read_csv(multi_window_outputs["multi"])
+        multi_window_qc = pd.read_csv(tmp_path / "multi_qc.csv")
+        multi_window_quality = json.loads((tmp_path / "multi_metadata.json").read_text())[
+            "datasets"
+        ]["stub_gee"]["quality"]
+        # The stub values depend on the window: B1_mean = window + point index.
+        assert multi_window_stats["stub_gee_B1_mean_100m"].tolist() == [100.0, 101.0, 102.0]
+        assert multi_window_stats["stub_gee_B1_mean_200m"].tolist() == [200.0, 201.0, 202.0]
+        # The second window has the date fields, so it used the loaded index.
+        assert multi_window_qc["stub_gee_date_source_200m"].tolist() == ["nearest_to_sample"] * 3
+
+        for window_size in (100, 200):
+            batch_id = f"single_{window_size}"
+            single_window_outputs = extract(
+                points,
+                _stub_gee_window_config(batch_id, "tabular", window_size),
+                output_dir=tmp_path,
+                quiet=True,
+            )
+
+            # The statistic and QC columns of the window, and its quality
+            # summary, equal those of the single-window run.
+            single_window_stats = pd.read_csv(single_window_outputs[batch_id])
+            single_window_qc = pd.read_csv(tmp_path / f"{batch_id}_qc.csv")
+            pd.testing.assert_frame_equal(
+                multi_window_stats[single_window_stats.columns], single_window_stats
+            )
+            pd.testing.assert_frame_equal(
+                multi_window_qc[single_window_qc.columns], single_window_qc
+            )
+            single_window_quality = json.loads(
+                (tmp_path / f"{batch_id}_metadata.json").read_text()
+            )["datasets"]["stub_gee"]["quality"]
+            window_key = f"{window_size}m"
+            assert multi_window_quality[window_key] == single_window_quality[window_key]
+            assert _dataset_entry_without_quality(
+                tmp_path / "multi_metadata.json"
+            ) == _dataset_entry_without_quality(tmp_path / f"{batch_id}_metadata.json")
+
+        # Each single-window run builds its own adapter.
+        assert len(records.built_adapters) == 3
+
+    def test_gee_multi_window_tiles_build_one_adapter(self, counting_stub_gee_collection, tmp_path):
+        """Raster: one build and one timestamp request; each window equals a single-window run."""
+        records = counting_stub_gee_collection
+        points = _dated_three_point_frame()
+
+        extract(
+            points,
+            _stub_gee_window_config("multi", "raster", [100, 200]),
+            output_dir=tmp_path,
+            quiet=True,
+        )
+
+        assert len(records.built_adapters) == 1
+        assert records.timestamp_requests == [("users/test/collection", _THREE_LON_LAT_PAIRS)]
+        multi_window_sidecar_path = tmp_path / "multi" / "multi_metadata.json"
+        multi_window_quality = json.loads(multi_window_sidecar_path.read_text())["datasets"][
+            "stub_gee"
+        ]["quality"]
+
+        for window_size in (100, 200):
+            batch_id = f"single_{window_size}"
+            extract(
+                points,
+                _stub_gee_window_config(batch_id, "raster", window_size),
+                output_dir=tmp_path,
+                quiet=True,
+            )
+
+            # The manifest of the window names tiles with the window suffix,
+            # and otherwise equals the manifest of the single-window run.
+            multi_window_manifest = pd.read_csv(
+                tmp_path / "multi" / "stub_gee" / f"tiles_manifest-{window_size}m.csv"
+            )
+            single_window_manifest = pd.read_csv(
+                tmp_path / batch_id / "stub_gee" / "tiles_manifest.csv"
+            )
+            assert multi_window_manifest["tile_filename"].tolist() == [
+                f"{sample_id}-stub_gee-{window_size}m.tif" for sample_id in _THREE_IDS
+            ]
+            pd.testing.assert_frame_equal(
+                multi_window_manifest.drop(columns="tile_filename"),
+                single_window_manifest.drop(columns="tile_filename"),
+            )
+
+            # The tile summary of the window, and the other fields of the
+            # dataset entry (with date_info), equal those of the single-window run.
+            single_window_sidecar_path = tmp_path / batch_id / f"{batch_id}_metadata.json"
+            single_window_quality = json.loads(single_window_sidecar_path.read_text())["datasets"][
+                "stub_gee"
+            ]["quality"]
+            assert multi_window_quality[f"{window_size}m"] == single_window_quality
+            assert _dataset_entry_without_quality(
+                multi_window_sidecar_path
+            ) == _dataset_entry_without_quality(single_window_sidecar_path)
+
+        # Each single-window run builds its own adapter.
+        assert len(records.built_adapters) == 3
+
+
+# ------------------------------------------------------------------
 # Statistics of one point — count-only runs and circular aspect statistics
 # ------------------------------------------------------------------
 

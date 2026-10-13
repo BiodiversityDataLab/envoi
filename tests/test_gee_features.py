@@ -21,6 +21,7 @@ import math
 import warnings
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 import rasterio
@@ -887,6 +888,145 @@ class TestAutoDateSelection:
         assert stats.loc["ocean", sum_columns].isna().all()
         # Land: the sum of valid pixels is a value.
         assert stats.loc["land", sum_columns].notna().all()
+
+
+# ------------------------------------------------------------------
+# One adapter for every window size of a dataset.
+# ------------------------------------------------------------------
+#
+# extract() builds one adapter for each (run config, dataset) pair, so the
+# second window of a run reuses the timestamp index, the band names, and the
+# native scale that the adapter loaded for the first window.
+
+_ERA5_DATASET = "climate_era5_monthly"
+
+# The two Swedish points, with sample dates in different months, so that each
+# point selects its own monthly image.
+_ERA5_DATED_POINTS = SWEDEN_SAMPLE_DF.assign(eventDate=["2015-06-15", "2018-01-10"])
+
+
+def _era5_run_config(batch_id: str, output_type: str, window_size_m: int | list[int]) -> dict:
+    """Return a run config for the built-in ERA5 monthly dataset, with its default bands.
+
+    Tabular run configs compute the mean and the maximum. Raster run configs
+    use 50 m pixels (``resample_m``): an ERA5 pixel is about 28 km wide, so
+    at the native scale every tile of a window below 28 km is the same single
+    pixel, and the tiles of two windows would not differ.
+    """
+    settings: dict = {"output_type": output_type, "window_size_m": window_size_m}
+    if output_type == "tabular":
+        settings["statistics"] = ["mean", "max"]
+    else:
+        settings["resample_m"] = 50
+    return {"batch_id": batch_id, "datasets": [_ERA5_DATASET], "settings": settings}
+
+
+class TestMultiWindowRuns:
+    """Each window of a multi-window run gives the values of a run with only that window."""
+
+    def test_multi_window_matches_single_window_runs(self, tmp_path):
+        """ERA5 with dated points, windows of 100 m and 500 m, tabular and raster.
+
+        Each call has three run configs: one with both windows, which builds
+        one adapter for both, and one for each window alone. Tabular: the
+        statistic and QC columns of each window equal those of the
+        single-window run. Raster: the tiles of each window have the same
+        grid and pixels, and the sidecar the same date information. Both
+        windows are smaller than an ERA5 pixel, so the statistics of the two
+        windows are also equal to each other; the tiles are not (2 × 2 and
+        10 × 10 pixels).
+        """
+        # ---- tabular ----
+        outputs = extract(
+            _ERA5_DATED_POINTS,
+            [
+                _era5_run_config("stats_multi", "tabular", [100, 500]),
+                _era5_run_config("stats_100", "tabular", 100),
+                _era5_run_config("stats_500", "tabular", 500),
+            ],
+            output_dir=tmp_path,
+            quiet=True,
+        )
+        multi_window_stats = pd.read_csv(outputs["stats_multi"])
+        multi_window_qc = pd.read_csv(tmp_path / "stats_multi_qc.csv")
+        for window_size in (100, 500):
+            batch_id = f"stats_{window_size}"
+            single_window_stats = pd.read_csv(outputs[batch_id])
+            single_window_qc = pd.read_csv(tmp_path / f"{batch_id}_qc.csv")
+
+            # Every statistic has a value, and each point used the monthly
+            # image of its own sample date.
+            statistic_columns = [
+                column
+                for column in single_window_stats.columns
+                if column.startswith(f"{_ERA5_DATASET}_")
+            ]
+            assert statistic_columns
+            assert single_window_stats[statistic_columns].notna().all().all()
+            image_starts = single_window_qc[
+                f"{_ERA5_DATASET}_image_time_start_{window_size}m"
+            ].tolist()
+            assert [image_start[:7] for image_start in image_starts] == ["2015-06", "2018-01"]
+
+            pd.testing.assert_frame_equal(
+                multi_window_stats[single_window_stats.columns], single_window_stats
+            )
+            pd.testing.assert_frame_equal(
+                multi_window_qc[single_window_qc.columns], single_window_qc
+            )
+
+        # ---- raster ----
+        extract(
+            _ERA5_DATED_POINTS,
+            [
+                _era5_run_config("tiles_multi", "raster", [100, 500]),
+                _era5_run_config("tiles_100", "raster", 100),
+                _era5_run_config("tiles_500", "raster", 500),
+            ],
+            output_dir=tmp_path,
+            quiet=True,
+        )
+        multi_window_tiles_dir = tmp_path / "tiles_multi" / _ERA5_DATASET
+        multi_window_sidecar = json.loads(
+            (tmp_path / "tiles_multi" / "tiles_multi_metadata.json").read_text()
+        )
+        for window_size in (100, 500):
+            batch_id = f"tiles_{window_size}"
+            single_window_tiles_dir = tmp_path / batch_id / _ERA5_DATASET
+            multi_window_manifest = pd.read_csv(
+                multi_window_tiles_dir / f"tiles_manifest-{window_size}m.csv"
+            )
+            single_window_manifest = pd.read_csv(single_window_tiles_dir / "tiles_manifest.csv")
+            assert multi_window_manifest["exported"].all()
+            assert single_window_manifest["exported"].all()
+
+            # The manifests list the points in input order, so the rows pair
+            # the tiles of the same point.
+            for multi_window_filename, single_window_filename in zip(
+                multi_window_manifest["tile_filename"], single_window_manifest["tile_filename"]
+            ):
+                with (
+                    rasterio.open(multi_window_tiles_dir / multi_window_filename) as multi_tile,
+                    rasterio.open(single_window_tiles_dir / single_window_filename) as single_tile,
+                ):
+                    expected_pixels = tile_pixel_count(window_size, 50)
+                    assert (multi_tile.width, multi_tile.height) == (
+                        expected_pixels,
+                        expected_pixels,
+                    )
+                    assert multi_tile.crs == single_tile.crs
+                    assert multi_tile.transform == single_tile.transform
+                    np.testing.assert_array_equal(multi_tile.read(), single_tile.read())
+
+            single_window_sidecar = json.loads(
+                (tmp_path / batch_id / f"{batch_id}_metadata.json").read_text()
+            )
+            multi_window_entry = multi_window_sidecar["datasets"][_ERA5_DATASET]
+            single_window_entry = single_window_sidecar["datasets"][_ERA5_DATASET]
+            assert multi_window_entry["date_info"] == single_window_entry["date_info"]
+            assert (
+                multi_window_entry["quality"][f"{window_size}m"] == single_window_entry["quality"]
+            )
 
 
 # ------------------------------------------------------------------

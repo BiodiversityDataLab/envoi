@@ -379,134 +379,154 @@ def extract(
         all_stat_columns: list[str] = []
 
         for dataset, band_overrides in datasets:
-            # Look up the dataset's catalog entry once; both processing modes need it.
-            dataset_config = catalog_datasets[dataset]
+            # Build a fresh shallow-merged config, so that the per-call
+            # band_overrides replace the catalog values for this run only. The
+            # catalog dict itself is not changed, so repeat calls stay
+            # isolated. The adapter and the dataset metadata use this config.
+            merged_config = {**catalog_datasets[dataset], **(band_overrides or {})}
 
-            for window_size in window_sizes:
-                # Dispatch to the mode-specific helper. Each helper owns adapter
-                # instantiation, data fetching, and per-dataset metadata assembly
-                # for one (dataset, window_size) pair.
+            # Build one adapter for the dataset, and use it for every window
+            # size. Its setup (for example the Earth Engine asset lookup, or
+            # the open file of a local raster) and its caches then serve all
+            # windows, so an adapter must not cache anything that depends on
+            # the window size. The `with` block calls close() once, after the
+            # last window, also when a window raises.
+            adapter_class = get_adapter(merged_config["data_source"])
+            with adapter_class(merged_config) as adapter:
+                for window_size in window_sizes:
+                    # Dispatch to the mode-specific helper. Each helper owns data
+                    # fetching with the adapter, the checks of the adapter results,
+                    # and per-dataset metadata assembly for one (dataset,
+                    # window_size) pair.
 
-                if output_type == "tabular":
-                    (
-                        df_copy,
-                        dataset_meta,
-                        dataset_stat_columns,
-                        dataset_qc_columns,
-                        quality_key,
-                        reducer_warning,
-                        failed_point_warning,
-                        far_image_warning,
-                    ) = _process_dataset_tabular(
-                        df_copy,
-                        dataset,
-                        dataset_config,
-                        run_settings,
-                        dates,
-                        window_size,
-                        band_overrides=band_overrides,
-                        write_metadata=write_metadata,
-                        quiet=quiet,
-                        progress_callback=_make_progress_step_callback(
-                            callback=progress_callback,
-                            batch_id=batch_id,
-                            dataset=dataset,
-                            window_size_m=window_size,
-                            mode=output_type,
-                            unit="pt",
-                        ),
-                    )
-                    all_stat_columns.extend(dataset_stat_columns)
-                    all_qc_columns.extend(dataset_qc_columns)
-                    # Record the reducer/data_type mismatch (if any) in the
-                    # per-dataset warnings backlog. The message is identical
-                    # across windows for the same dataset, so a dict
-                    # assignment naturally deduplicates repeat windows.
-                    if reducer_warning:
-                        warnings_backlog[f"reducer_{dataset}"] = reducer_warning
-                    # One failed-point warning per (dataset, window) batch. The
-                    # key ends like the batch's QC columns and quality summary:
-                    # "200m", or "point" for a point-only run.
-                    if failed_point_warning:
-                        warnings_backlog[f"failed_{dataset}_{quality_key}"] = failed_point_warning
-                    # One warning per (dataset, window) batch about images far
-                    # from the sample dates, with the same key ending.
-                    if far_image_warning:
-                        warnings_backlog[f"far_image_{dataset}_{quality_key}"] = far_image_warning
+                    if output_type == "tabular":
+                        (
+                            df_copy,
+                            dataset_meta,
+                            dataset_stat_columns,
+                            dataset_qc_columns,
+                            quality_key,
+                            reducer_warning,
+                            failed_point_warning,
+                            far_image_warning,
+                        ) = _process_dataset_tabular(
+                            df_copy,
+                            dataset,
+                            adapter,
+                            merged_config,
+                            run_settings,
+                            dates,
+                            window_size,
+                            write_metadata=write_metadata,
+                            quiet=quiet,
+                            progress_callback=_make_progress_step_callback(
+                                callback=progress_callback,
+                                batch_id=batch_id,
+                                dataset=dataset,
+                                window_size_m=window_size,
+                                mode=output_type,
+                                unit="pt",
+                            ),
+                        )
+                        all_stat_columns.extend(dataset_stat_columns)
+                        all_qc_columns.extend(dataset_qc_columns)
+                        # Record the reducer/data_type mismatch (if any) in the
+                        # per-dataset warnings backlog. The message is identical
+                        # across windows for the same dataset, so a dict
+                        # assignment naturally deduplicates repeat windows.
+                        if reducer_warning:
+                            warnings_backlog[f"reducer_{dataset}"] = reducer_warning
+                        # One failed-point warning per (dataset, window) batch. The
+                        # key ends like the batch's QC columns and quality summary:
+                        # "200m", or "point" for a point-only run.
+                        if failed_point_warning:
+                            warnings_backlog[f"failed_{dataset}_{quality_key}"] = (
+                                failed_point_warning
+                            )
+                        # One warning per (dataset, window) batch about images far
+                        # from the sample dates, with the same key ending.
+                        if far_image_warning:
+                            warnings_backlog[f"far_image_{dataset}_{quality_key}"] = (
+                                far_image_warning
+                            )
 
-                # In raster mode, the helper exports a folder of GeoTIFF tiles
-                # and returns the path plus the per-dataset metadata dict. With
-                # multiple windows the filename suffix keeps each window's
-                # tiles distinct inside the same dataset folder.
-                elif output_type == "raster":
-                    tiles_root = Path(output_dir) / batch_id
-                    suffix = f"{window_size}m" if is_multi_window else None
-                    (
-                        tiles_path,
-                        dataset_meta,
-                        failed_point_warning,
-                        far_image_warning,
-                    ) = _process_dataset_raster(
-                        dataset,
-                        dataset_config,
-                        run_settings,
-                        dates,
-                        window_size,
-                        lats=df_copy.lat,
-                        lons=df_copy.lon,
-                        ids=df_copy["id"].tolist(),
-                        id_column=id_column,
-                        tiles_root=tiles_root,
-                        filename_suffix=suffix,
-                        band_overrides=band_overrides,
-                        write_metadata=write_metadata,
-                        quiet=quiet,
-                        progress_callback=_make_progress_step_callback(
-                            callback=progress_callback,
-                            batch_id=batch_id,
-                            dataset=dataset,
-                            window_size_m=window_size,
-                            mode=output_type,
-                            unit="tile",
-                        ),
-                    )
-                    # Single-window: same key as before. Multi-window: append
-                    # the window so callers can locate each window's tiles.
-                    output_key = (
-                        f"{batch_id}:{dataset}:{window_size}m"
-                        if is_multi_window
-                        else f"{batch_id}:{dataset}"
-                    )
-                    output_paths[output_key] = tiles_path
-                    # One failed-tile warning, and one warning about images
-                    # far from the sample dates, per (dataset, window) batch.
-                    if failed_point_warning:
-                        warnings_backlog[f"failed_{dataset}_{window_size}m"] = failed_point_warning
-                    if far_image_warning:
-                        warnings_backlog[f"far_image_{dataset}_{window_size}m"] = far_image_warning
+                    # In raster mode, the helper exports a folder of GeoTIFF tiles
+                    # and returns the path plus the per-dataset metadata dict. With
+                    # multiple windows the filename suffix keeps each window's
+                    # tiles distinct inside the same dataset folder.
+                    elif output_type == "raster":
+                        tiles_root = Path(output_dir) / batch_id
+                        suffix = f"{window_size}m" if is_multi_window else None
+                        (
+                            tiles_path,
+                            dataset_meta,
+                            failed_point_warning,
+                            far_image_warning,
+                        ) = _process_dataset_raster(
+                            dataset,
+                            adapter,
+                            merged_config,
+                            run_settings,
+                            dates,
+                            window_size,
+                            lats=df_copy.lat,
+                            lons=df_copy.lon,
+                            ids=df_copy["id"].tolist(),
+                            id_column=id_column,
+                            tiles_root=tiles_root,
+                            filename_suffix=suffix,
+                            write_metadata=write_metadata,
+                            quiet=quiet,
+                            progress_callback=_make_progress_step_callback(
+                                callback=progress_callback,
+                                batch_id=batch_id,
+                                dataset=dataset,
+                                window_size_m=window_size,
+                                mode=output_type,
+                                unit="tile",
+                            ),
+                        )
+                        # Single-window: same key as before. Multi-window: append
+                        # the window so callers can locate each window's tiles.
+                        output_key = (
+                            f"{batch_id}:{dataset}:{window_size}m"
+                            if is_multi_window
+                            else f"{batch_id}:{dataset}"
+                        )
+                        output_paths[output_key] = tiles_path
+                        # One failed-tile warning, and one warning about images
+                        # far from the sample dates, per (dataset, window) batch.
+                        if failed_point_warning:
+                            warnings_backlog[f"failed_{dataset}_{window_size}m"] = (
+                                failed_point_warning
+                            )
+                        if far_image_warning:
+                            warnings_backlog[f"far_image_{dataset}_{window_size}m"] = (
+                                far_image_warning
+                            )
 
-                # Merge the per-window metadata into the dataset's accumulator.
-                # First window for a dataset → store as-is (including static
-                # fields like data_source, native_crs). Subsequent windows →
-                # only their quality entries are merged in, since static
-                # fields are identical across windows for the same dataset.
-                if dataset not in dataset_metas:
-                    if is_multi_window and output_type == "raster":
-                        # Wrap the raster quality dict (currently {"tiles": ...})
-                        # under the window key so each window's tile summary
-                        # lands at quality["{window}m"]["tiles"].
-                        existing_quality = dataset_meta.get("quality", {})
-                        dataset_meta["quality"] = {f"{window_size}m": existing_quality}
-                    dataset_metas[dataset] = dataset_meta
-                else:
-                    accumulated_quality = dataset_metas[dataset].setdefault("quality", {})
-                    new_quality = dataset_meta.get("quality", {})
-                    if is_multi_window and output_type == "raster":
-                        accumulated_quality[f"{window_size}m"] = new_quality
+                    # Merge the per-window metadata into the dataset's accumulator.
+                    # First window for a dataset → store as-is (including static
+                    # fields like data_source, native_crs). Subsequent windows →
+                    # only their quality entries are merged in, since static
+                    # fields are identical across windows for the same dataset.
+                    if dataset not in dataset_metas:
+                        if is_multi_window and output_type == "raster":
+                            # Wrap the raster quality dict (currently {"tiles": ...})
+                            # under the window key so each window's tile summary
+                            # lands at quality["{window}m"]["tiles"].
+                            existing_quality = dataset_meta.get("quality", {})
+                            dataset_meta["quality"] = {f"{window_size}m": existing_quality}
+                        dataset_metas[dataset] = dataset_meta
                     else:
-                        # Tabular quality is already keyed by window size, so
-                        # merging dicts gives the right structure for free.
-                        accumulated_quality.update(new_quality)
+                        accumulated_quality = dataset_metas[dataset].setdefault("quality", {})
+                        new_quality = dataset_meta.get("quality", {})
+                        if is_multi_window and output_type == "raster":
+                            accumulated_quality[f"{window_size}m"] = new_quality
+                        else:
+                            # Tabular quality is already keyed by window size, so
+                            # merging dicts gives the right structure for free.
+                            accumulated_quality.update(new_quality)
 
         # --- after all datasets processed for this run, write outputs and metadata ---
 
@@ -615,27 +635,27 @@ def extract(
 def _process_dataset_tabular(
     df: pd.DataFrame,
     dataset: str,
-    dataset_config: dict,
+    adapter: BaseAdapter,
+    merged_config: dict,
     run_settings: RunSettings,
     dates: list | None,
     window_size: int,
-    band_overrides: dict[str, Any] | None = None,
     write_metadata: bool = True,
     quiet: bool = False,
     progress_callback: ProgressStepCallback | None = None,
 ) -> tuple[pd.DataFrame, dict, list[str], list[str], str, str | None, str | None, str | None]:
     """Fetch stats and QC columns for one dataset/window pair in tabular mode.
 
-    Owns adapter instantiation, statistic computation, QC column assembly,
-    and per-dataset metadata construction for a single window size. The
-    caller is responsible for looping over multiple window sizes and merging
-    the resulting metadata dicts.
+    Owns statistic computation, the checks of the adapter results, QC column
+    assembly, and per-dataset metadata construction for a single window size.
+    The caller builds ``adapter`` once for the dataset and uses it for every
+    window size, loops over the window sizes, merges the resulting metadata
+    dicts, and closes the adapter.
 
-    `band_overrides` is a dict of per-call settings (`bands`, `derived_bands`
-    when the list has derived bands, and the mark `band_naming`, see
-    ``_normalize_dataset_entry``) that replace the catalog values before
-    adapter instantiation. The catalog dict itself is never mutated — the
-    override is shallow-merged into a fresh dict per call.
+    ``merged_config`` is the dataset's catalog entry merged with the run
+    config's per-call settings (`bands`, `derived_bands` when the list has
+    derived bands, and the mark `band_naming`, see
+    ``_normalize_dataset_entry``): the config that ``adapter`` was built from.
 
     ``write_metadata`` tells whether ``extract()`` writes the QC table, so
     that the warnings name a place where the errors and the image dates are.
@@ -659,88 +679,76 @@ def _process_dataset_tabular(
     :func:`_raise_if_every_point_failed`), and when a result of the adapter
     breaks the adapter result contract (see :func:`_check_adapter_result`).
     """
-    # Build a fresh shallow-merged config so per-call band_overrides replace the
-    # catalog values for this run only. The catalog dict itself is not
-    # mutated, so concurrent runs / repeat calls remain isolated.
-    merged_config = {**dataset_config, **(band_overrides or {})}
+    # The reducer list of this dataset, which config parsing resolved
+    # from the dataset's data_type and checked against the adapter's
+    # supported reducers. For typed-dict statistics configs, a continuous
+    # dataset uses the "continuous" list and a categorical dataset uses
+    # "categorical". For flat-list configs both keys map to the same list.
+    data_type = merged_config.get("data_type")
+    resolved_stats = run_settings.stats_by_dataset[dataset]
 
-    # Instantiate the adapter from the dataset's declared data_source
-    # (earth_engine or local). The adapter encapsulates all source-specific
-    # fetching and validation logic. The `with` block guarantees that any
-    # adapter-held resources (e.g. an open rasterio dataset) are released
-    # even if the per-point batch raises mid-flight.
-    AdapterClass = get_adapter(merged_config["data_source"])
-    with AdapterClass(merged_config) as adapter:
-        # The reducer list of this dataset, which config parsing resolved
-        # from the dataset's data_type and checked against the adapter's
-        # supported reducers. For typed-dict statistics configs, a continuous
-        # dataset uses the "continuous" list and a categorical dataset uses
-        # "categorical". For flat-list configs both keys map to the same list.
-        data_type = merged_config.get("data_type")
-        resolved_stats = run_settings.stats_by_dataset[dataset]
+    # Flag reducer/data_type mismatches (e.g. `mean` on a categorical
+    # raster, or `class_count` on a continuous one). The message is
+    # emitted via warnings.warn inside validate_reducers and also
+    # returned here so the caller can persist it in the metadata
+    # sidecar alongside the date / CRS warnings.
+    reducer_warning = validate_reducers(resolved_stats, data_type, dataset)
 
-        # Flag reducer/data_type mismatches (e.g. `mean` on a categorical
-        # raster, or `class_count` on a continuous one). The message is
-        # emitted via warnings.warn inside validate_reducers and also
-        # returned here so the caller can persist it in the metadata
-        # sidecar alongside the date / CRS warnings.
-        reducer_warning = validate_reducers(resolved_stats, data_type, dataset)
+    # Ask the adapter to compute all requested statistics for every sample.
+    # Returns a list of (stats_dict, meta_dict) — one tuple per row in df.
+    # progress_desc is shown in the per-point tqdm bar so the user can tell at
+    # a glance which dataset/window the bar belongs to when several run in series.
+    stats_results = adapter.fetch_stats_batch(
+        df.lat,
+        df.lon,
+        window_size,
+        resolved_stats,
+        dates=dates,
+        progress_desc=f"{dataset} | {window_size}m | tabular",
+        disable_progress=quiet,
+        progress_callback=progress_callback,
+    )
+    # Check the shape of the result before it is used: one (stats, meta)
+    # pair for each row of df, and the QC keys in each meta dict.
+    _check_adapter_result(
+        adapter, "fetch_stats_batch", stats_results, dataset=dataset, n_points=len(df)
+    )
 
-        # Ask the adapter to compute all requested statistics for every sample.
-        # Returns a list of (stats_dict, meta_dict) — one tuple per row in df.
-        # progress_desc is shown in the per-point tqdm bar so the user can tell at
-        # a glance which dataset/window the bar belongs to when several run in series.
-        stats_results = adapter.fetch_stats_batch(
-            df.lat,
-            df.lon,
-            window_size,
-            resolved_stats,
-            dates=dates,
-            progress_desc=f"{dataset} | {window_size}m | tabular",
-            disable_progress=quiet,
-            progress_callback=progress_callback,
-        )
-        # Check the shape of the result before it is used: one (stats, meta)
-        # pair for each row of df, and the QC keys in each meta dict.
-        _check_adapter_result(
-            adapter, "fetch_stats_batch", stats_results, dataset=dataset, n_points=len(df)
-        )
+    # Split the (stat, meta) tuples so meta_list can feed QC and dataset metadata.
+    meta_list = [meta for _, meta in stats_results]
 
-        # Split the (stat, meta) tuples so meta_list can feed QC and dataset metadata.
-        meta_list = [meta for _, meta in stats_results]
+    # A failed point has "error" in its meta dict. When every point of the
+    # batch failed, stop the run now, with the real error.
+    batch_label = _failed_point_batch_label(resolved_stats, window_size)
+    _raise_if_every_point_failed(meta_list, dataset=dataset, batch_label=batch_label)
 
-        # A failed point has "error" in its meta dict. When every point of the
-        # batch failed, stop the run now, with the real error.
-        batch_label = _failed_point_batch_label(resolved_stats, window_size)
-        _raise_if_every_point_failed(meta_list, dataset=dataset, batch_label=batch_label)
+    # Append stat columns to the output DataFrame based on the keys in
+    # stats_results, and assign values accordingly.
+    df, stat_column_names = _append_stat_columns(df, dataset, window_size, stats_results)
 
-        # Append stat columns to the output DataFrame based on the keys in
-        # stats_results, and assign values accordingly.
-        df, stat_column_names = _append_stat_columns(df, dataset, window_size, stats_results)
+    # Attach per-row QC columns and capture the coverage summary used below
+    # when assembling the per-dataset metadata dict.
+    df, quality_key, coverage_summary, qc_column_names = attach_quality_control(
+        df,
+        meta_list=meta_list,
+        dataset_name=dataset,
+        reducer_names=resolved_stats,
+        window_size_m=window_size,
+        min_coverage_pct=run_settings.min_coverage,
+    )
 
-        # Attach per-row QC columns and capture the coverage summary used below
-        # when assembling the per-dataset metadata dict.
-        df, quality_key, coverage_summary, qc_column_names = attach_quality_control(
-            df,
-            meta_list=meta_list,
-            dataset_name=dataset,
-            reducer_names=resolved_stats,
-            window_size_m=window_size,
-            min_coverage_pct=run_settings.min_coverage,
-        )
-
-        # Adapter assembles quality stats and date-selection info (GEE) into
-        # one per-dataset dict. The quality dict is keyed by window_size (or
-        # "point") so multiple window sizes can coexist within the same dataset
-        # metadata when the caller loops and merges across windows.
-        # Pass the merged spec (catalog + band_overrides) so the metadata reflects
-        # the resolved bands the user actually ran with.
-        dataset_meta = adapter.build_dataset_meta(
-            merged_config,
-            meta_list=meta_list,
-            quality={quality_key: coverage_summary},
-        )
-        _check_adapter_result(adapter, "build_dataset_meta", dataset_meta, dataset=dataset)
+    # Adapter assembles quality stats and date-selection info (GEE) into
+    # one per-dataset dict. The quality dict is keyed by window_size (or
+    # "point") so multiple window sizes can coexist within the same dataset
+    # metadata when the caller loops and merges across windows.
+    # Pass the merged spec (catalog + band_overrides) so the metadata reflects
+    # the resolved bands the user actually ran with.
+    dataset_meta = adapter.build_dataset_meta(
+        merged_config,
+        meta_list=meta_list,
+        quality={quality_key: coverage_summary},
+    )
+    _check_adapter_result(adapter, "build_dataset_meta", dataset_meta, dataset=dataset)
 
     # Warn once when some points failed. The QC error column, built by
     # attach_quality_control above, has the error text of each failed point.
@@ -796,7 +804,8 @@ def _process_dataset_tabular(
 
 def _process_dataset_raster(
     dataset: str,
-    dataset_config: dict,
+    adapter: BaseAdapter,
+    merged_config: dict,
     run_settings: RunSettings,
     dates: list | None,
     window_size: int,
@@ -807,7 +816,6 @@ def _process_dataset_raster(
     id_column: str,
     tiles_root: Path,
     filename_suffix: str | None = None,
-    band_overrides: dict[str, Any] | None = None,
     write_metadata: bool = True,
     quiet: bool = False,
     progress_callback: ProgressStepCallback | None = None,
@@ -821,9 +829,9 @@ def _process_dataset_raster(
     ``id_column`` is the caller's own name for the sample-ID column; it becomes
     the join key in the tile manifest written alongside the tiles.
 
-    `band_overrides` is a dict of per-call settings (`bands`, `derived_bands`,
-    and `band_naming`) that replace the catalog values before adapter
-    instantiation. See `_process_dataset_tabular` for details.
+    The caller builds ``adapter`` once for the dataset from ``merged_config``
+    (the catalog entry merged with the per-call settings, see
+    `_process_dataset_tabular`), uses it for every window size, and closes it.
 
     ``write_metadata`` tells whether ``extract()`` writes the metadata
     sidecar, so that the warning about images far from the sample dates names
@@ -841,56 +849,45 @@ def _process_dataset_raster(
     This helper, not the adapter, adds the tile summary ``quality["tiles"]``
     to ``dataset_meta``, so that it is the same for every adapter.
     """
-    # Build a fresh shallow-merged config so per-call band_overrides replace the
-    # catalog values without mutating the catalog dict.
-    merged_config = {**dataset_config, **(band_overrides or {})}
+    # Ask the adapter to export a tile per sample, writing GeoTIFFs under
+    # tiles_root / dataset / ... and returning the paths it wrote.
+    # progress_desc is shown in the per-tile tqdm bar so the user can tell at
+    # a glance which dataset/window the bar belongs to when several run in series.
+    tile_results = adapter.export_tiles(
+        lats,
+        lons,
+        window_size,
+        tiles_root,
+        ids=ids,
+        dates=dates,
+        dataset_name=dataset,
+        resample_m=run_settings.resample_m,
+        filename_suffix=filename_suffix,
+        progress_desc=f"{dataset} | {window_size}m | raster",
+        disable_progress=quiet,
+        progress_callback=progress_callback,
+    )
+    # Check the shape of the result before it is used: one path (or
+    # None) and one meta dict for each point.
+    _check_adapter_result(
+        adapter, "export_tiles", tile_results, dataset=dataset, n_points=len(lats)
+    )
+    exported_paths, meta_list = tile_results
 
-    # Instantiate the adapter from the dataset's declared data_source. The
-    # `with` block guarantees that any adapter-held resources (e.g. an open
-    # rasterio dataset) are released after tile export, even if it raises.
-    AdapterClass = get_adapter(merged_config["data_source"])
-    with AdapterClass(merged_config) as adapter:
-        # Ask the adapter to export a tile per sample, writing GeoTIFFs under
-        # tiles_root / dataset / ... and returning the paths it wrote.
-        # progress_desc is shown in the per-tile tqdm bar so the user can tell at
-        # a glance which dataset/window the bar belongs to when several run in series.
-        tile_results = adapter.export_tiles(
-            lats,
-            lons,
-            window_size,
-            tiles_root,
-            ids=ids,
-            dates=dates,
-            dataset_name=dataset,
-            resample_m=run_settings.resample_m,
-            filename_suffix=filename_suffix,
-            progress_desc=f"{dataset} | {window_size}m | raster",
-            disable_progress=quiet,
-            progress_callback=progress_callback,
-        )
-        # Check the shape of the result before it is used: one path (or
-        # None) and one meta dict for each point.
-        _check_adapter_result(
-            adapter, "export_tiles", tile_results, dataset=dataset, n_points=len(lats)
-        )
-        exported_paths, meta_list = tile_results
+    # A failed tile has "error" in its meta dict. When every tile of the
+    # batch failed, stop the run now, with the real error.
+    _raise_if_every_point_failed(meta_list, dataset=dataset, batch_label=f"window {window_size} m")
 
-        # A failed tile has "error" in its meta dict. When every tile of the
-        # batch failed, stop the run now, with the real error.
-        _raise_if_every_point_failed(
-            meta_list, dataset=dataset, batch_label=f"window {window_size} m"
-        )
-
-        # Adapter assembles the per-dataset metadata dict, including the
-        # tile CRS of the points. Pass the merged spec so the metadata
-        # reflects the resolved bands the user actually ran with.
-        dataset_meta = adapter.build_dataset_meta(
-            merged_config,
-            meta_list=meta_list,
-            lats=lats,
-            lons=lons,
-        )
-        _check_adapter_result(adapter, "build_dataset_meta", dataset_meta, dataset=dataset)
+    # Adapter assembles the per-dataset metadata dict, including the
+    # tile CRS of the points. Pass the merged spec so the metadata
+    # reflects the resolved bands the user actually ran with.
+    dataset_meta = adapter.build_dataset_meta(
+        merged_config,
+        meta_list=meta_list,
+        lats=lats,
+        lons=lons,
+    )
+    _check_adapter_result(adapter, "build_dataset_meta", dataset_meta, dataset=dataset)
 
     # The tile summary, the same for every adapter: the numbers of exported
     # and not exported tiles, and the failed tiles with their IDs (the
