@@ -135,14 +135,21 @@ def extract(
             },
         }
 
+    These are the only keys. Any other key, in the run config or in its
+    ``settings``, raises ``ValueError`` that lists the allowed keys, because
+    an ignored key would silently change the run. ``datasets`` must be a list.
+
     Each item inside ``datasets`` can take three shapes:
 
     - A plain dataset name (string) — uses the catalog's default bands.
     - A shorthand single-key dict ``{"sen2": ["B4", "B8"]}`` — the list is a
       unified band list. Names recognised as derived (currently ``"slope"``
       and ``"aspect"``) are split out internally and computed from the
-      dataset's first band; the rest are selected as source bands. The
-      override **replaces** the catalog's bands for this run only.
+      dataset's first band; the rest are selected as source bands. A derived
+      band that the dataset's data source cannot compute raises
+      ``ValueError`` (today only Earth Engine datasets compute derived
+      bands). The override **replaces** the catalog's bands for this run
+      only.
     - A full-form single-key dict ``{"sen2": {"bands": ["B4", "B8"]}}`` —
       reserved for future per-call settings; today only ``"bands"`` is
       accepted.

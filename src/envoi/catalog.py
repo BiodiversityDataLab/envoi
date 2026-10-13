@@ -283,25 +283,29 @@ def load_catalog(path: str | Path) -> dict[str, Any]:
     Required structure:
       datasets:
         <dataset_name>:
-          data_source: <str>   # earth_engine or local
-          path: <str>          # GEE asset ID, or local raster file path
+          data_source: <str>   # the name of a registered adapter, e.g. earth_engine
+          path: <str>          # e.g. a GEE asset ID, or a local raster file path
           # earth_engine entries also need data_type (continuous or categorical).
           # For the optional keys, see the example entry at the top of
-          # src/envoi/configs/ee_catalog.yml.
+          # src/envoi/configs/ee_catalog.yml. Other keys are rejected.
 
-    For each local entry whose file exists, the raster's ``crs``,
-    ``resolution_m`` (in metres), ``nodata``, and ``band_count`` are added to
-    the entry when the entry does not set them. A raster that cannot be read
-    gives a logged warning, not an error. ``resolution_m`` and ``band_count``
-    are for information only. An extraction uses the file's own CRS and
-    nodata value; the entry's ``crs`` and ``nodata`` only fill a value that
-    the file does not declare, and ``extract()`` raises ``ValueError`` when
-    they differ from the file's values.
+    ``_validate_catalog_entry`` checks each entry. Then the
+    ``inspect_catalog_entry`` of the entry's adapter can add values that it
+    reads from the data source. For each local entry whose file
+    exists, the local adapter adds the raster's ``crs``, ``resolution_m`` (in
+    metres), ``nodata``, and ``band_count`` when the entry does not set them.
+    A raster that cannot be read gives a logged warning, not an error.
+    ``resolution_m`` and ``band_count`` are for information only. An
+    extraction uses the file's own CRS and nodata value; the entry's ``crs``
+    and ``nodata`` only fill a value that the file does not declare, and
+    ``extract()`` raises ``ValueError`` when they differ from the file's
+    values.
 
     Raises:
         CatalogError: if the file does not exist, the YAML cannot be parsed, or
-            an entry is invalid, for example without a required key, or with an
-            unknown ``data_source`` or ``dataset_spec.collection_date_policy``.
+            an entry is invalid, for example without a required key, with an
+            unknown key, or with an unknown value of ``data_source``,
+            ``data_type``, or ``dataset_spec.collection_date_policy``.
     """
     p = Path(path)
     if not p.exists():
@@ -397,9 +401,10 @@ def update_catalog(source: str | Path | dict) -> None:
     to (or updates) the existing user catalog.
 
     A catalog file goes through ``load_catalog()``, which also adds the
-    metadata of local rasters to their entries. Entries of a dict get the same
-    checks, but are stored without reading the raster files. envoi stores
-    copies of the entries, so a later change to ``source`` has no effect.
+    metadata of local rasters to their entries (the adapter's
+    ``inspect_catalog_entry``). Entries of a dict get the same checks, but are
+    stored without this inspection. envoi stores copies of the entries, so a
+    later change to ``source`` has no effect.
     In both cases, the local adapter reads the CRS, pixel size, nodata,
     and band count from the file when an extraction opens it. The entry's
     ``crs`` and ``nodata`` only fill a CRS or nodata value that the file does
@@ -413,9 +418,10 @@ def update_catalog(source: str | Path | dict) -> None:
     Raises:
         CatalogError: if the source is invalid (also a dict without a
             ``datasets`` mapping), an entry is missing a required key, has an
-            unknown key, or has an unknown value of ``data_source``,
-            ``data_type``, or ``dataset_spec.collection_date_policy``, or a
-            dataset name cannot be used as a folder name.
+            unknown key, has an unknown value of ``data_source``,
+            ``data_type``, or ``dataset_spec.collection_date_policy``, or
+            breaks another rule of its adapter, or a dataset name cannot be
+            used as a folder name.
 
     Example:
         update_catalog("my_catalog.yml")

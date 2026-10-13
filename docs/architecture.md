@@ -1,7 +1,8 @@
 # Architecture Overview
 
 This document describes how envoi is put together: which module owns what, how data flows
-through `extract()`, the adapter interface, and how the Earth Engine adapter builds an image.
+through `extract()`, the adapter interface, how to add a data provider, and how the Earth Engine
+adapter builds an image.
 For coding conventions, see `docs/coding_guidelines.md`. For user-facing output details
 (column names, return values), see `README.md` and `docs/advanced_usage.md`.
 Update this document when you add a module or change the adapter interface.
@@ -18,13 +19,17 @@ Update this document when you add a module or change the adapter interface.
  _input_validation.py           _config_parsing.py                   catalog.py
  required columns,              load run-config YAML,                load + validate catalogs
  sample IDs (raster mode),      normalize to RunSettings,            (built-in + update_catalog()),
- dates, CRS reprojection        validate batch_id, bands, reducers   cache defaults.yml,
-                                                                     inspect local rasters
-                                                                           |
-                                                                configs/ee_catalog.yml
+ dates, CRS reprojection        reject unknown keys, validate        call the adapters' catalog
+                                batch_id, bands, reducers, and       hooks, cache defaults.yml
+                                output_type against the adapter's          |
+                                capability declarations         configs/ee_catalog.yml
                                                                 configs/defaults.yml
                                          |
-                   For each run config, for each (dataset, window_size):
+            Pre-flight, for every dataset of every run config, before any adapter exists:
+                     get_adapter(data_source).check_dataset(merged spec)
+                                         |
+          For each run config, for each dataset: build one adapter, and use it
+          for every window_size. extract() checks each result of the adapter.
                                          |
                                adapters/__init__.py
                                get_adapter(data_source)
@@ -42,10 +47,13 @@ Update this document when you add a module or change the adapter interface.
               |                                                     |
               +--------------------------+--------------------------+
                                          |
-           Shared by both adapters: geo.py (UTM zones), _filenames.py (tile names),
-           metadata.py (date and tile summaries), progress.py (progress events)
+           Shared by the adapters: geo.py (UTM zones), _filenames.py (tile names),
+           metadata.py (date summary), progress.py (progress events)
                                          |
              returns (stats, meta) for each point, or writes GeoTIFF tiles
+                                         |
+          extract.py: checks each result against the result contract,
+          and computes the tile summary quality.tiles (metadata.py)
                                          |
         +--------------------------------+--------------------------------+
         |                                |                                |
@@ -92,25 +100,39 @@ Update this document when you add a module or change the adapter interface.
            |     reject coordinates outside ±90° / ±180°.
            |  5. load_catalogs() merges the built-in catalog with datasets registered
            |     through update_catalog(). User entries override built-in entries.
+           |     The entries are copies, so the run cannot change the stored catalog.
            |  6. _as_config_list() turns the config into a list of run configs.
            |     _parse_run_configs() builds a RunSettings for every run config, and
            |     rejects duplicate batch_id values, before the first adapter exists.
+           |     _parse_run_config() rejects unknown keys in a run config and in its
+           |     settings. It checks the output_type, the reducers, and the derived
+           |     bands of each dataset against the capability declarations of the
+           |     dataset's adapter class, and stores the reducer list of each tabular
+           |     dataset (RunSettings.stats_by_dataset). It builds no adapter.
            |     _validate_no_output_column_names() rejects input columns (original
            |     names) that a tabular run config would add to its output tables.
            |  7. For each RunSettings: raster mode runs _validate_sample_ids(), before
            |     the adapters of that run config exist.
-           |     For every local dataset of every run config (catalog entry plus band
-           |     overrides): _resolve_local_raster_settings() checks the catalog crs
-           |     and nodata against the file, before the first adapter exists.
-           |  8. For each (dataset, window_size) pair:
+           |     For every dataset of every run config (catalog entry plus band
+           |     overrides): the class method check_dataset() of the dataset's adapter
+           |     runs the adapter's own pre-flight check, before the first adapter
+           |     exists. The local adapter checks the file, the bands, and the catalog
+           |     crs and nodata against the file (_resolve_local_raster_settings()).
+           |  8. For each dataset of a run config: build one adapter
+           |     (with AdapterClass(merged_config) as adapter:), and use it for every
+           |     window_size. close() runs once, after the last window.
+           |     For each window_size:
            |
            +---> [tabular] _process_dataset_tabular()
            |       adapter.fetch_stats_batch() -> (stats, meta) for each point
            |         GEE: server-side reducers; local: Python reducers (reducers.py)
            |         The "point" reducer adds an exact-pixel sample in the same call.
+           |       _check_adapter_result(): RuntimeError when the result breaks the
+           |         result contract (a bug in the adapter)
            |       _raise_if_every_point_failed(): RuntimeError when every point failed
            |       _append_stat_columns() -> attach_quality_control()
-           |       -> adapter.build_dataset_meta() -> _warn_about_failed_points()
+           |       -> adapter.build_dataset_meta() -> _check_adapter_result()
+           |       -> _warn_about_failed_points()
            |
            +---> [raster]  _process_dataset_raster()
            |       adapter.export_tiles() -> one GeoTIFF for each point
@@ -118,9 +140,12 @@ Update this document when you add a module or change the adapter interface.
            |         raises ValueError before any download), then getDownloadURL +
            |         requests; local: rasterio (native grid, or
            |         rasterio.warp.reproject onto a UTM grid when resample_m is set)
+           |       _check_adapter_result(): RuntimeError when the result breaks the
+           |         result contract (a bug in the adapter)
            |       _raise_if_every_point_failed(): RuntimeError when every tile failed
-           |       adapter.build_dataset_meta() -> _write_tile_manifest()
-           |       -> _warn_about_failed_points()
+           |       adapter.build_dataset_meta() -> _check_adapter_result()
+           |       -> summarize_tile_export(): the tile summary quality.tiles
+           |       -> _write_tile_manifest() -> _warn_about_failed_points()
            |
            v
   9. Write outputs and the metadata sidecar:
@@ -150,25 +175,25 @@ Update this document when you add a module or change the adapter interface.
 | Module | Role |
 |---|---|
 | `__init__.py` | The public API (`__all__`): `extract`, `update_catalog`, `list_datasets`, `reset_catalog`, `list_reducers`, `catalog_markdown`, `init_gee`, `CatalogError`, `ProgressEvent`, `__version__`. |
-| `extract.py` | Orchestrator. Renames user columns to canonical names, delegates input validation, parses every run config into `RunSettings` before the first adapter is built, loops over (dataset, window) pairs, dispatches to the mode helpers (`_process_dataset_tabular`, `_process_dataset_raster`), writes the tile manifest, and assembles the stats and QC tables and the metadata sidecar. Wraps adapter progress updates into public `ProgressEvent`s. |
+| `extract.py` | Orchestrator. Renames user columns to canonical names, delegates input validation, parses every run config into `RunSettings` before the first adapter is built, runs the pre-flight check (`check_dataset`) of every dataset's adapter, builds one adapter for each run config and dataset and uses it for every window size, dispatches to the mode helpers (`_process_dataset_tabular`, `_process_dataset_raster`), checks each adapter result against the result contract (`_check_adapter_result`, `RuntimeError` for a broken rule), computes the tile summary `quality.tiles` in raster mode, writes the tile manifest, and assembles the stats and QC tables and the metadata sidecar. Wraps adapter progress updates into public `ProgressEvent`s. Names no built-in `data_source`. |
 | `_input_validation.py` | Validates the input DataFrame: required id/lat/lon columns, temporary names for unmapped columns that have a working-column name (`_build_reserved_column_renames`), sample IDs for raster mode (`_validate_sample_ids`, also used by the web app), GBIF / ISO 8601 date parsing (only the listed forms; every other value raises), coordinates: missing, non-numeric, and infinite values are rejected, then CRS reprojection to WGS84 with a coordinate range check, and input columns with the name of an output column of the call (`_validate_no_output_column_names`). Returns warnings that the orchestrator records in the metadata sidecar. |
-| `_config_parsing.py` | Run-config validation. Defines `RunSettings`, normalizes a dict / list / YAML path into a list of run configs (`_as_config_list`), parses one raw dict into `RunSettings` (`_parse_run_config`), parses all run configs of a call and rejects `batch_id` values whose output files would collide, also when letter case is ignored (`_parse_run_configs`), and resolves the reducer list for a dataset's `data_type` (`_resolve_stats_for_dataset`). Expands the dataset-entry shorthand (string / `{name: [bands]}` / `{name: {bands: [...]}}`; a band list replaces the catalog's bands, also when it has only derived bands, and marks the dataset for band-named columns with `band_naming: per_band`), rejects unsafe `batch_id` values, rejects a dataset listed twice in one run config (and, in raster mode, dataset names that differ only in letter case), and rejects derived bands for local datasets. |
+| `_config_parsing.py` | Run-config validation. Defines `RunSettings`, normalizes a dict / list / YAML path into a list of run configs (`_as_config_list`), parses one raw dict into `RunSettings` (`_parse_run_config`), parses all run configs of a call and rejects `batch_id` values whose output files would collide, also when letter case is ignored (`_parse_run_configs`), and resolves the reducer list of each tabular dataset for its `data_type` (`_resolve_stats_for_dataset`, stored in `RunSettings.stats_by_dataset`). Rejects a run config or `settings` that is not a mapping, a `datasets` value that is not a list, and unknown keys in a run config and in `settings` (`_RUN_CONFIG_KEYS`, `_SETTINGS_KEYS`). The message suggests the closest allowed key. Expands the dataset-entry shorthand (string / `{name: [bands]}` / `{name: {bands: [...]}}`; a band list replaces the catalog's bands, also when it has only derived bands, and marks the dataset for band-named columns with `band_naming: per_band`), rejects unsafe `batch_id` values, and rejects a dataset listed twice in one run config (and, in raster mode, dataset names that differ only in letter case). Checks each dataset against the capability declarations of its adapter class (`get_adapter(data_source)`): the `output_type`, the reducers, and the derived bands of a band list. It splits a band list on the derived bands of all registered adapters (`all_computable_derived_bands()`). It builds no adapter, and names no built-in `data_source`. |
 | `_output_assembly.py` | Tabular-output post-processing. Turns per-point `(stats_dict, meta_dict)` results into named columns (including the per-class `class_count` / `class_fraction` expansion), rounds only these statistic columns (the user's own columns keep their values), restores the user's column names, records the bands each dataset actually used for the sidecar, and writes the CSV / Parquet file. |
 | `_filenames.py` | Portable output names. `build_tile_filenames` and `sanitize_filename_component` turn sample IDs into names that use only `[A-Za-z0-9._-]`, adding a hash suffix to rewritten IDs. `build_tile_filenames` also adds the hash suffix to every ID whose name is equal to another ID's name when letter case is ignored (`Site1` and `site1`), because Windows and macOS treat such names as one file. Other IDs keep their names. `is_safe_path_component` rejects unsafe `batch_id` values and dataset keys. Both adapters use it, so tiles are named identically. |
-| `catalog.py` | Loads and validates catalogs (built-in `ee_catalog.yml` and datasets registered through `update_catalog()`, including that each `data_source` has a registered adapter and that each `dataset_spec.collection_date_policy` is `nearest`, `contains`, or `mosaic`), caches `defaults.yml`, exposes `list_datasets()` / `reset_catalog()`, and, for catalog files (not dicts), auto-detects CRS, resolution, nodata, and band count for local rasters through rasterio (`resolution_m` in metres, from `geo.pixel_size_m()`). Earth Engine asset inspection happens in the GEE adapter, not here. |
+| `catalog.py` | Loads and validates catalogs (built-in `ee_catalog.yml` and datasets registered through `update_catalog()`), caches `defaults.yml`, and exposes `list_datasets()` / `reset_catalog()`. One function, `_validate_catalog_entry`, checks each entry of a catalog file and of a catalog dict, in this order: the generic rules (the entry is a mapping, its `data_source` has a registered adapter, each key is in `_GENERIC_CATALOG_KEYS` or in the adapter's `catalog_keys`, `path` is a non-empty text or an `os.PathLike`, `data_type` is absent, null, or in `_DATA_TYPES`, and `derived_bands` and `supported_derived_bands` name only the adapter's `computable_derived_bands`), then the adapter's `validate_catalog_entry`, then, for catalog files only (not dicts), the adapter's `inspect_catalog_entry`. It raises `CatalogError`, also for a `ValueError` of a hook. It stores `path` as text, and stores and returns copies of the entries. A catalog dict without a `datasets` mapping raises `CatalogError`. Names no built-in `data_source`: the Earth Engine rules are in `GeeRasterAdapter.validate_catalog_entry`, and the inspection of local rasters is in `LocalRasterAdapter.inspect_catalog_entry`. Earth Engine asset inspection happens in the GEE adapter's `__post_init__`. |
 | `catalog_docs.py` | Renders catalog entries as a Markdown document (theme sections, summary tables, per-dataset details). Exposed as `catalog_markdown()`. `scripts/generate_dataset_docs.py` uses it to regenerate `docs/datasets.md`. |
 | `geo.py` | UTM helpers: `get_utm_crs()` (both adapters build metre-accurate windows with it), `get_utm_zone_label()` (the GEE `use_utm_zone` filter), and `build_tile_crs_zones()` (the sidecar `tile_crs`: the UTM zones of the points, for GEE tiles and for local tiles with `resample_m`; local tiles without `resample_m` keep the raster CRS). The tile grid of both adapters: `tile_pixel_count()` (pixels per side, also used by the GEE tile-size check) and `tile_top_left()` (tile corners on the pixel grid, with the point's pixel at the centre for odd sizes). `pixel_size_m()` converts a local raster's pixel width from CRS units to metres. |
 | `progress.py` | `ProgressEvent` (public) and the low-level `(completed, total)` callback that adapters call through `emit_progress_step()`. Independent of the `quiet` progress bars. |
-| `adapters/__init__.py` | Adapter registry. Maps `data_source` strings (`earth_engine`, `local`) to adapter classes through `register()` / `get_adapter()`. Imports the built-in adapters so they register themselves. |
-| `adapters/base.py` | `BaseAdapter`, which declares the members that `extract()` uses and nothing else: `fetch_stats_batch`, `export_tiles`, and `build_dataset_meta` (with their shared signatures), and the context-manager lifecycle (`close()`, `__enter__` / `__exit__`). See "Adapter interface". |
-| `adapters/local_adapter.py` | Local raster adapter. Reads GeoTIFFs through rasterio, crops a UTM-zone square around each point, supports per-band nodata (including NaN), uses the catalog `crs` and `nodata` only where the file declares none and rejects values that differ from the file (`_resolve_local_raster_settings`, which `extract()` also calls before the first adapter), widens a statistics window smaller than one native pixel to two pixels (as the GEE adapter does), and exports tiles at native resolution, or resampled onto the shared UTM tile grid of `geo.py` with `rasterio.warp.reproject` for parity with GEE. |
-| `adapters/earth_engine/adapter.py` | `GeeRasterAdapter`. Detects the asset type, checks the native scale, runs per-point work in a `ThreadPoolExecutor`, composes the sibling helpers, and builds the per-dataset metadata. Caches collection-level state for the lifetime of the adapter instance (see "GEE image building pipeline"). |
+| `adapters/__init__.py` | Adapter registry. Maps `data_source` strings to adapter classes through `register()` / `get_adapter()`. `register()` raises `ValueError` for a name that does not match `^[a-z][a-z0-9_]*$`, a class that is not a subclass of `BaseAdapter`, a name that another class has, and a capability declaration that is not valid. It is internal: it is not in `envoi.__all__`. `all_computable_derived_bands()` returns the union of the registered adapters' `computable_derived_bands`. Imports the built-in adapters (`earth_engine`, `local`) so they register themselves. |
+| `adapters/base.py` | `BaseAdapter`, which declares what `extract()`, `_config_parsing.py`, and `catalog.py` use of an adapter: the capability declarations (`output_types`, `supported_reducers`, `computable_derived_bands`, `catalog_keys`), the class-method hooks (`check_dataset`, `validate_catalog_entry`, `inspect_catalog_entry`), the calls `fetch_stats_batch`, `export_tiles`, and `build_dataset_meta` (with their shared signatures), and the context-manager lifecycle (`close()`, `__enter__` / `__exit__`). Its docstring holds the result contract. `REQUIRED_POINT_META_KEYS` holds the meta keys that every point has, and `_BAND_NAMING_KEY` / `_PER_BAND_NAMING` the mark of a per-call band list. See "Adapter interface". |
+| `adapters/local_adapter.py` | Local raster adapter. Reads GeoTIFFs through rasterio, crops a UTM-zone square around each point, supports per-band nodata (including NaN), uses the catalog `crs` and `nodata` only where the file declares none and rejects values that differ from the file (`_resolve_local_raster_settings`, which its `check_dataset` also calls before the first adapter is built), widens a statistics window smaller than one native pixel to two pixels (as the GEE adapter does), and exports tiles at native resolution, or resampled onto the shared UTM tile grid of `geo.py` with `rasterio.warp.reproject` for parity with GEE. For catalog files, `inspect_catalog_entry` adds the CRS, resolution, nodata, and band count of the raster to the entry (`resolution_m` in metres, from `geo.pixel_size_m()`). |
+| `adapters/earth_engine/adapter.py` | `GeeRasterAdapter`. Detects the asset type, checks the native scale, runs per-point work in a `ThreadPoolExecutor`, composes the sibling helpers, and builds the per-dataset metadata. Its `validate_catalog_entry` checks the Earth Engine catalog rules: `data_type` is required and not null, `dataset_spec` has only its allowed keys (`dataset_spec.bands` and `dataset_spec.derived_bands` are rejected), and `collection_date_policy` is `nearest`, `contains`, or `mosaic`. Caches collection-level state for the lifetime of the adapter instance (see "GEE image building pipeline"). |
 | `adapters/earth_engine/_image.py` | GEE initialization on first use (calls `auth.init_gee()` when Earth Engine is not yet initialized) and the session-pool patch, the collection timestamp index, `nearest` / `contains` / `mosaic` image selection, derived-band registration (`KNOWN_DERIVED_BANDS`: slope, aspect), and the central `_build_image` pipeline, which also builds the companion image for circular aspect statistics (`circular_aspect=True`: the sine and cosine of the aspect, without flat pixels). |
 | `adapters/earth_engine/_reducers.py` | Server-side reducer registry, `_build_combined_reducer` (so all statistics for a point resolve in one round-trip), `reduceRegion` result parsing (single-band, multi-band, per-class histogram), the circular mean, standard deviation, and variance of `aspect` (`_circular_aspect_statistics`), and the per-band coverage summary. |
 | `adapters/earth_engine/_tiles.py` | Size guard for synchronous downloads (`_check_tile_size`) and the retrying tile downloader (`_download_tile_via_url`, which wraps `ee.Image.getDownloadURL` + `requests` with exponential backoff for 429 / 5xx responses and connection errors, raises any status other than 200 at once with Earth Engine's error message, writes each tile through a temporary file, and leaves no file (also no tile of an earlier run) when a download fails, and requests the exact tile grid with `crs_transform` and `dimensions`). |
-| `reducers.py` | Python-side reducer registry (mean, median, min, max, sum, std, var, count, mode, class_count, class_fraction, q05..q95), used by the local adapter. Also `list_reducers()` (public) and `validate_reducers()`, which warns about reducer / `data_type` mismatches such as `mean` on a categorical raster. `point` is not in the registry; the adapters handle it. |
+| `reducers.py` | Python-side reducer registry (mean, median, min, max, sum, std, var, count, mode, class_count, class_fraction, q05..q95), used by the local adapter. `KNOWN_REDUCERS` is the closed set of reducer names that a run config can request: the registry plus `point`. Config parsing, `register()` (each adapter's `supported_reducers` must be a subset), and the adapters use it. Also `list_reducers()` (public) and `validate_reducers()`, which warns about reducer / `data_type` mismatches such as `mean` on a categorical raster. `point` is not in the registry; the adapters handle it. |
 | `qc.py` | Builds per-dataset QC columns from the adapters' meta dicts (core flags, plus date, CRS, per-band coverage, and the error of failed points where available), warns when points fall below `min_coverage_pct`, and splits the merged DataFrame into the stats and QC tables. Also formats the error text of a failed point for both adapters (`format_point_error`), and counts failed points for the sidecar (`summarize_point_errors`). |
-| `metadata.py` | Writes the sidecar JSON (`run` / `config` / `datasets` / optional `warnings`) and provides the summaries that adapters put into it (`summarize_date_info`, `summarize_tile_export`). |
+| `metadata.py` | Writes the sidecar JSON (`run` / `config` / `datasets` / optional `warnings`) and provides summaries for it: `summarize_date_info`, which an adapter can call in `build_dataset_meta` (the GEE adapter does), and `summarize_tile_export`, which `extract.py` calls for the tile summary `quality.tiles` of every adapter. |
 | `auth.py` | `init_gee()`: initializes Earth Engine from a service-account JSON, found through `ENVOI_EE_CREDENTIALS`, the user config directory, or `./credentials/` (see `README.md`). |
 | `_version.py` | `__version__`. Change it only as part of a release. |
 | `envoi_webapp/app.py` | Streamlit interface, started with `envoi-webapp`. |
@@ -176,17 +201,74 @@ Update this document when you add a module or change the adapter interface.
 
 ## Adapter interface
 
-`extract()` uses an adapter only through these members:
+An adapter class has three parts:
+
+- capability declarations: class attributes that state what the adapter supports,
+- class-method hooks: the provider's own rules, which run before any adapter instance exists,
+- the calls that `extract()` makes on an adapter instance during a run.
+
+`BaseAdapter` (`adapters/base.py`) declares all three. Its docstring holds the result contract.
+
+### Capability declarations
+
+Each adapter sets these class attributes. Each one is a `frozenset` of `str`, and `register()` checks it.
+The built-in adapters are dataclasses, so they set the declarations without a type annotation: in a dataclass, an annotation makes the attribute a field.
+
+| Declaration | Meaning | `earth_engine` | `local` |
+|---|---|---|---|
+| `output_types` | The output types that the adapter supports. A non-empty subset of `{"tabular", "raster"}`. | `tabular`, `raster` | `tabular`, `raster` |
+| `supported_reducers` | The reducers that `fetch_stats_batch` supports. A subset of `reducers.KNOWN_REDUCERS`. Empty only when `output_types` has no `"tabular"`. | all of `KNOWN_REDUCERS` | all of `KNOWN_REDUCERS` |
+| `computable_derived_bands` | The derived bands that the adapter computes from a source band. | `slope`, `aspect` | none |
+| `catalog_keys` | The top-level catalog keys that the adapter accepts in addition to the generic keys (`_GENERIC_CATALOG_KEYS` in `catalog.py`). It includes the keys that `inspect_catalog_entry` adds. | `dataset_spec`, `max_workers`, `crs` | `crs`, `nodata`, `resolution_m`, `type`, `band_count` |
+
+The generic modules use the declarations before any adapter is built:
+
+- `_parse_run_config()` raises `ValueError` for an `output_type`, a reducer, or a derived band of a band list that the dataset's adapter does not declare.
+- `_parse_run_config()` splits a per-call band list on the derived bands of all registered adapters (`all_computable_derived_bands()`).
+  So a band list cannot select a source band that has the name of a derived band, also for a dataset whose adapter computes no derived bands.
+- `catalog.py` raises `CatalogError` for a key that is not a generic key and not in `catalog_keys`.
+  It also raises it for a `derived_bands` or `supported_derived_bands` value that is not in `computable_derived_bands`.
+
+### Class-method hooks
+
+These class methods run before any adapter instance exists.
+The defaults check nothing, and the default `inspect_catalog_entry` returns an unchanged copy of the entry.
+No hook sends a network request or changes its input. The catalog hooks never import an optional SDK.
+
+| Hook | Called by, and when | Errors |
+|---|---|---|
+| `validate_catalog_entry(name, entry)` | `catalog.py`, for each entry of the adapter's `data_source` in a catalog file or dict, after the generic checks. It checks the adapter's own catalog rules. | `CatalogError`, which `catalog.py` raises unchanged. Or `ValueError`, which `catalog.py` raises as a `CatalogError` with the same message after `datasets.<name>: `. |
+| `inspect_catalog_entry(name, entry)` | `catalog.py`, for each entry of a catalog file (not of a dict), after `validate_catalog_entry`. It returns a new dict with the values that it reads from the data source. It adds only keys of `catalog_keys`, and replaces no value that the entry sets. When it cannot read the data source, it logs a warning and returns the entry without the missing values, so that the catalog still loads. | As for `validate_catalog_entry`. |
+| `check_dataset(spec, *, context)` | `extract()`, for every dataset of every run config, after it parsed the run configs and before it builds the first adapter. `spec` is the catalog entry merged with the band overrides of the run config. The hook checks what it can check without a data request. Each message starts with `context`. | `ValueError` for a configuration that is not valid. `FileNotFoundError` or another `OSError` for a missing resource, for example a file. |
+
+### Calls on an adapter instance
+
+`extract()` uses an adapter instance only through these members:
 
 | Member | Used in | Returns |
 |---|---|---|
-| `with AdapterClass(spec) as adapter:` | both modes | The adapter. `close()` runs on exit, even when the batch raises. `spec` is the catalog entry merged with any per-run band override. |
+| `with AdapterClass(spec) as adapter:` | both modes | The adapter. `extract()` builds one instance for each (run config, dataset) pair, and uses it for every window size of that pair. `close()` runs once on exit, after the last window, also when a window raises. `spec` is the catalog entry merged with any per-run band override. |
 | `fetch_stats_batch(lats, lons, window_m, reducer_names, *, dates=None, progress_desc=None, disable_progress=False, progress_callback=None)` | tabular | A list with one `(stats_dict, meta_dict)` pair for each point, in input order. |
 | `export_tiles(lats, lons, window_m, output_dir, *, ids=None, dates=None, dataset_name="dataset", resample_m=None, filename_suffix=None, progress_desc=None, disable_progress=False, progress_callback=None)` | raster | `(paths, meta_list)`, one entry for each point. Tiles go to `output_dir/<dataset_name>/`. `paths[i]` is `None` when no tile was written for that point (failed export, point outside the extent, or no pixels). |
-| `build_dataset_meta(spec, meta_list=None, exported_paths=None, quality=None, lats=None, lons=None)` | both modes | The dataset's entry in the sidecar's `datasets` section: source information, native CRS and resolution, band names, date-selection summary, and quality statistics. Local datasets also record the nodata value that envoi used (`nodata`: a number, `"nan"`, `"inf"`, or `"-inf"` for a value that is not finite, or `null`) and its source (`nodata_source`: `"file"`, `"catalog"`, or `null`). |
+| `build_dataset_meta(spec, meta_list=None, quality=None, lats=None, lons=None)` | both modes | The dataset's entry in the sidecar's `datasets` section: source information, native CRS and resolution, band names, date-selection summary, and, in tabular mode, the coverage summary that `extract()` passes as `quality`, as the last key. In raster mode, `extract()` adds the tile summary `quality.tiles` to the returned dict itself. Local datasets also record the nodata value that envoi used (`nodata`: a number, `"nan"`, `"inf"`, or `"-inf"` for a value that is not finite, or `null`) and its source (`nodata_source`: `"file"`, `"catalog"`, or `null`). |
 
-`BaseAdapter` declares these members, and nothing else. Both adapters implement them with identical signatures.
-`tests/test_adapters.py` checks the parameter names, kinds, and defaults of each registered adapter against `BaseAdapter`. Notes:
+An adapter overrides `build_dataset_meta`, `fetch_stats_batch` when it declares `"tabular"`, and `export_tiles` when it declares `"raster"`, with the parameters of `BaseAdapter`.
+`tests/test_adapters.py` checks each registered adapter: the parameter names, kinds, and defaults of each call and each class-method hook against `BaseAdapter`, that each hook is still a class method, and that the adapter overrides the calls of its output types.
+
+**Result checks.** `extract.py` checks the result of each call before it uses the result (`_check_adapter_result`).
+A broken rule raises `RuntimeError`. The message names the dataset, the adapter class, the call, and the rule, and says that the problem is a bug in the adapter.
+The rules (the `BaseAdapter` docstring states them in full):
+
+- `fetch_stats_batch` returns a list with one `(stats, meta)` pair of dicts for each point, in input order.
+  Each meta dict has every key of `REQUIRED_POINT_META_KEYS`: `in_extent`, `n_pixels`, `had_nodata`, and `coverage_pct`.
+- `export_tiles` returns `(paths, meta_list)`, two lists with one entry for each point. Each path is a `pathlib.Path` or `None`, and each meta is a dict.
+- `build_dataset_meta` returns a dict.
+
+**Lifetime.** One adapter instance serves every window size of its (run config, dataset) pair.
+So the setup of the adapter (for example the Earth Engine asset lookup, or the open file of a local raster) runs once for the dataset.
+An adapter must not cache a value that depends on the window size.
+
+Notes:
 
 - `LocalRasterAdapter.fetch_values` (raw pixels for one window) is not part of the interface.
   Only the local adapter has it, and it uses it internally.
@@ -208,8 +290,86 @@ Update this document when you add a module or change the adapter interface.
   (see `image_dates` below) is more than 32 days from their sample date. `qc.py` adds the `<dataset>_error_<N>m` QC column, `_write_tile_manifest`
   adds the manifest's `error` column, and both modes add `n_errors` and `ids_errors` to the sidecar's quality summaries.
 - Each adapter module registers itself at the end with `register("<data_source>", AdapterClass)`.
-  `update_catalog()` and catalog loading raise `CatalogError` for a `data_source` without a registered adapter, and for an unknown `dataset_spec.collection_date_policy`.
+  `update_catalog()` and catalog loading raise `CatalogError` for a `data_source` without a registered adapter, and for an entry that breaks a generic rule or a rule of its adapter.
   `get_adapter()` raises `ValueError` for an unknown `data_source`, as a last check.
+
+## Adding a data provider
+
+A data provider is a source of environmental data with its own access method, for example Earth Engine or local GeoTIFF files.
+In code, a provider is one `data_source` value with one registered adapter class.
+A new provider is one new adapter module. The generic modules do not change: `extract.py`, `_config_parsing.py`, `catalog.py`,
+`_input_validation.py`, `_output_assembly.py`, `qc.py`, `metadata.py`, `reducers.py`, `geo.py`, and `_filenames.py`.
+`tests/test_provider_contract.py` shows this with a test-only fake provider (`FakeStatsAdapter`), which runs through `envoi.extract()`.
+Use it as a model, together with "Adapters" in `docs/coding_guidelines.md`.
+
+1. **Module.** Put the adapter in `src/envoi/adapters/<provider>.py`.
+   When it needs helper modules, use a subpackage `src/envoi/adapters/<provider>/` (model: `adapters/earth_engine/`).
+   New providers live in the envoi source tree: `register()` is internal, and envoi has no plugin API.
+2. **Class.** Subclass `BaseAdapter`. The constructor takes one argument, `spec`: the catalog entry merged with the band overrides of the run config.
+   Read the settings from `spec`, and store them as attributes.
+3. **Capability declarations.** Set `output_types`, `supported_reducers`, `computable_derived_bands`, and `catalog_keys` (see "Capability declarations").
+   Declare only what the adapter supports. The generic checks then reject the rest before any adapter is built.
+   Options of the provider go into the catalog entry, through `catalog_keys`. A run config has no provider-specific settings.
+4. **Registration.** At the end of the module, call `register("<data_source>", AdapterClass)`. The built-in modules import it as `_register`.
+   Import the module at the end of `adapters/__init__.py`, so that `import envoi` registers the adapter.
+   The `data_source` name must match `^[a-z][a-z0-9_]*$`. Users type it in catalog entries.
+5. **Calls.** Override `build_dataset_meta`, `fetch_stats_batch` for `"tabular"`, and `export_tiles` for `"raster"`, with the parameters of `BaseAdapter`.
+   Override `close()` when the adapter holds a resource, and make it safe to call more than once.
+6. **Hooks.** Override a class-method hook when the provider has a rule for it (see "Class-method hooks"):
+   - `validate_catalog_entry`: the provider's catalog rules, for example a required key, or the allowed keys and values of a nested option.
+   - `inspect_catalog_entry`: values that the adapter reads from the data source of an entry in a catalog file, for example the CRS of a file.
+   - `check_dataset`: each check that needs no data request, for example that a file exists or that a band is valid.
+
+   Each hook raises the errors of the hook table, with a message that says how to fix the problem.
+7. **Result contract.** Return the results that "Result contract" in the `BaseAdapter` docstring describes. In summary:
+   - Each statistic key becomes an output column: `<dataset>_<key>_<N>m`, or `<dataset>_<key>` for `point` and `{band}_point`.
+     The key forms are `{reducer}`, `{band}_{reducer}`, `point`, `{band}_point`, `class_<value>_count`, and `class_<value>_fraction` (with an optional `{band}_` prefix).
+   - A per-call band list puts `bands`, `derived_bands`, and the mark `band_naming: "per_band"` (`_BAND_NAMING_KEY`) in `spec`.
+     With the mark, every statistic key starts with `{band}_`, also for one band.
+   - Each meta dict has every key of `REQUIRED_POINT_META_KEYS`.
+     Generic code also reads these optional keys: `error`, `exception`, `date_clamped`, `date_source`, `image_time_start`, `image_time_end`, `region_crs`, `band_coverage_pct`, and `fallback_image_gap_days`.
+     The docstring says which QC column, sidecar field, or warning each one gives. Use each key only with that meaning.
+   - A failed point has an empty stats dict, the QC values of a point outside the extent, and `error` and `exception` in its meta dict.
+
+   `extract()` checks the shape of each result (see "Result checks").
+8. **Optional SDKs and credentials.**
+   - Import an optional SDK only inside the functions that use it. `import envoi`, catalog loading, and the catalog hooks never import it.
+   - In `check_dataset`, check that the SDK can be imported and that the required credentials exist, without a network request.
+     The message says what to install or what to set.
+   - Read the credentials on first use, as the Earth Engine adapter initializes Earth Engine on first use.
+   - Never put credentials in the catalog, the run config, or the metadata sidecar.
+   - A new SDK is a new dependency. Discuss it before you add it (see "Tool preferences" in `docs/coding_guidelines.md`).
+
+   `earthengine-api` and `rasterio` are required dependencies, so the built-in adapters import them at module level.
+9. **Lifetime.** `extract()` builds one instance for each (run config, dataset) pair, and uses it for every window size.
+   Do not cache a value that depends on the window size.
+10. **Tests.** Add tests that use no network, as `tests/test_provider_contract.py` does:
+    - Registration and signatures: `tests/test_adapters.py` checks every registered adapter automatically.
+      Add the expected declarations of the adapter to `TestBuiltInCapabilityDeclarations`.
+    - Catalog: an entry with the provider's own keys loads. An unknown key and each rule of `validate_catalog_entry` raise `CatalogError` that names the key.
+      `inspect_catalog_entry` returns a new dict and does not change its input.
+    - Pre-flight: each failure of `check_dataset`, also a missing SDK or missing credentials, raises before any adapter is built.
+      Count the constructor calls, as `TestPreFlightChecks` does.
+    - Extraction: a run through `envoi.extract()` with stubbed data requests gives the exact statistic columns, QC columns, and sidecar entry.
+      Also test a failed point and a run with several window sizes.
+    - Register test variants of an adapter in a copy of the registry (the `isolated_registry` fixture), so that no other test sees them.
+    - Tests that need the network or credentials need a pytest marker and a credential skip, as the `gee` tests have.
+      Tests without a marker must not use the network.
+11. **Documentation.** Update this document: the module map, "Module responsibilities", and the declaration table.
+    Describe in `docs/advanced_usage.md` how users register a dataset of the provider: its catalog keys and its credentials.
+    Update `README.md` when the setup changes. Add a `CHANGELOG.md` entry under `Added`. Record lasting decisions in `docs/decision_log.md`.
+
+Known limitations:
+
+- Only `src/envoi/configs/ee_catalog.yml` is a built-in catalog (`catalog.BUILTIN_EE_CATALOG`).
+  Users register the datasets of a new provider with `update_catalog()`.
+  The specification of the first provider of another kind decides where its built-in entries go.
+- The web app (`src/envoi_webapp/`) lists every catalog dataset and always uses an Earth Engine key.
+  It offers every reducer and both output types for every dataset. So a request that the provider does not support fails when the run starts, not in the form.
+- A per-call band list cannot select a source band that has the name of a derived band of any registered adapter.
+- `update_catalog()` with a dict does not call `inspect_catalog_entry`.
+- The contract has no per-point status other than `error`, no retry policy, no job context, and no cancellation.
+  The decision log entry "2026-10-13 — Provider contract" gives the reasons.
 
 ## GEE image building pipeline
 
@@ -288,7 +448,7 @@ The circular aspect image is built for each point from the same image as the mai
 This pipeline lives in `adapters/earth_engine/_image.py` (`_build_image`, `_build_fallback_image`, `_resolve_date_filter_range`, `_find_nearest_timestamp`, `_get_collection_time_bounds`).
 `GeeRasterAdapter._get_image()` in `adapter.py` decides which branch applies to each point.
 
-State cached on the adapter instance (`extract()` creates one instance per (dataset, window size) pair):
+State cached on the adapter instance (`extract()` creates one instance for each (run config, dataset) pair, and uses it for every window size, so none of this state depends on the window size):
 
 - Set in `__post_init__`: the resolved `dataset_spec` (`_dataset_spec`), the native projection (`_native_proj`),
   the prebuilt image for IMAGE assets and mosaic-policy collections (`_static_image`),

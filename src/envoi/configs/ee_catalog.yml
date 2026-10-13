@@ -3,7 +3,9 @@ datasets:
   # ── Example / reference entry ────────────────────────────────────────────
   # Copy this block (uncommented) when adding a real dataset.
   # Required keys for earth_engine datasets: data_source, path, data_type.
-  # All other fields are optional.
+  # All other fields are optional. These are the only keys: envoi rejects any
+  # other key, also inside dataset_spec, when it loads or registers a catalog.
+  # Put free text, for example notes about the dataset, under dataset_information.
   #
   # dataset_name:  # provide a unique name for this dataset e.g. "sentinel_2_l2a"
   #   display_name: "Sentinel-2 Level-2A"  # human-readable label (usually the dataset's title in the GEE catalog); shown in docs/datasets.md and in the web app's dataset menu. Falls back to dataset_name if omitted.
@@ -32,16 +34,23 @@ datasets:
   #   # for the dataset, otherwise the call is rejected up front.
   #
   #   dataset_spec:
-  #     # Dataset-specific options
+  #     # Dataset-specific options (earth_engine only). Allowed keys: native_scale_m,
+  #     # use_utm_zone, collection_date_policy, and image or collection (the asset ID
+  #     # as an image or a collection, without the automatic detection of the asset
+  #     # type). bands and derived_bands belong at the top level, not here.
   #     native_scale_m: 10            # native spatial resolution in meters (only needed for datasets that lack a native scale property in GEE metadata, e.g. composites stored in EPSG:4326)
   #     use_utm_zone: true # true/false. for tiled collections, filter to the UTM zone of the point to avoid selecting the wrong tile.
   #     collection_date_policy: contains # for interval-based collections (e.g. monthly aggregates), use the image whose time range satisfies start <= date < end, instead of nearest start date.
+  #
+  #   max_workers: 20     # earth_engine only: the number of parallel requests (default: max_workers in defaults.yml)
   #
   #   # Local rasters (data_source: local, path: a GeoTIFF file) need only
   #   # data_source and path: envoi reads the CRS and the nodata value from the
   #   # file. These two keys only fill a value that the file does not declare.
   #   # A value that differs from the file's value stops the run with an error.
-  #   crs: "EPSG:32633"   # local only: the CRS of a file without a CRS (such a file needs it)
+  #   # When envoi reads a local raster of a catalog file, it also adds
+  #   # resolution_m, type, and band_count to the entry, for information only.
+  #   crs: "EPSG:32633"   # local: the CRS of a file without a CRS (such a file needs it). earth_engine: the CRS that the metadata records when Earth Engine cannot report the asset's projection (default EPSG:4326)
   #   nodata: -9999       # local only: one number for all bands, used when the file declares no nodata value; it must fit the band data type (e.g. 0 to 255 for uint8)
   #
   #   dataset_information:

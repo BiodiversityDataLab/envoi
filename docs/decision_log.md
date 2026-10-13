@@ -289,3 +289,118 @@ This decision extends the "Day rule" of the 2026-10-12 entry to the `nearest` po
 - **Consequence:** collections whose images start at 00:00 (all built-in date-based datasets) select the same images as before. Collections with images later in the day can select another image when two images are within one day of the date.
 - **Rejected:** keep exact times for `nearest` and change only `date_clamped`: the selection and the flag would then follow different rules.
 
+## 2026-10-13 — Provider contract
+
+These decisions came from the multi-provider findings of the combined review (F4–F9, F11–F13, F16, and the provider parts of F10 and F14), on the branch `provider-contract`. The user approved the specification and the plan on 2026-10-13.
+The specification of this work is in a task folder that is not committed, so each decision is stated in full here.
+Terms: a data provider is a source of environmental data with its own access method, for example Earth Engine. In code, it is one `data_source` value with one registered adapter class.
+The generic modules are `extract.py`, `_config_parsing.py`, `catalog.py`, `_input_validation.py`, `_output_assembly.py`, `qc.py`, `metadata.py`, `reducers.py`, `geo.py`, and `_filenames.py`.
+
+### Depth of the change
+
+- **Decision:** a minimal provider contract on the existing adapter classes. The user decided this on 2026-10-13.
+  - Each adapter declares its capabilities as class attributes: `output_types`, `supported_reducers`, `computable_derived_bands`, and `catalog_keys`.
+  - Each adapter owns its rules in class methods: `validate_catalog_entry`, `inspect_catalog_entry`, and `check_dataset`.
+  - `register()` checks the name, the class, and the declarations. `extract()` checks each adapter result, and builds one adapter for each run config and dataset.
+  - The generic modules use the declarations and the hooks, and never compare `data_source` with a built-in value. A new provider is then one adapter module.
+  - A test-only fake provider (`tests/test_provider_contract.py`) runs through `envoi.extract()` and shows that no generic module must change.
+- **Reason:** the team wants to add providers such as CHELSA, Copernicus services, and national data services. Before, a new provider needed changes in generic modules, and some provider mistakes failed late or without an error. One adapter class is now the complete description of one provider.
+- **Rejected:**
+  - The target architecture of the review (`ProviderDefinition`, `ExtractionPlan`, `ExtractionEngine`, `ExtractionContext`, typed results, artifact stores): it rewrites the orchestration and both adapters before a second provider exists. Each part can still come later behind `extract()`.
+  - A separate `ProviderDefinition` object next to the adapter class: it splits one provider over two objects, and the adapter class already exists.
+  - The minimal contract plus an inspectable `ExtractionPlan`: it restructures `extract()` before any code uses the plan.
+
+### Unknown keys
+
+- **Decision:** catalog entries, run configs, and `settings` accept only known keys. Any other key raises an error. The user decided this on 2026-10-13.
+  - Catalog entries: the generic keys (`data_source`, `path`, `data_type`, `display_name`, `category`, `bands`, `derived_bands`, `supported_derived_bands`, `dataset_information`) and the adapter's `catalog_keys`. Any other key raises `CatalogError`, which lists the allowed keys and says that free text goes under `dataset_information`.
+  - Earth Engine `dataset_spec`: only `image`, `collection`, `native_scale_m`, `use_utm_zone`, and `collection_date_policy`. `dataset_spec.bands` and `dataset_spec.derived_bands` raise an error that says to move them to the top level.
+  - Run configs: `batch_id`, `datasets`, and `settings`. `settings`: `output_type`, `output_file_format`, `min_coverage_pct`, `statistics`, `window_size_m`, and `resample_m`. Any other key raises `ValueError` that lists the allowed keys and suggests the closest one (`difflib`). A setting next to `datasets` gets the hint that it belongs inside `settings`.
+  - Added during the implementation, with the same goal: a run config and its `settings` must be mappings, and `datasets` must be a list or a tuple. Before, a `datasets` mapping such as `{"dem": ["slope"]}` gave its keys as the dataset names and silently dropped the band lists.
+  - With the same goal, `data_type` must be `continuous` or `categorical`, and `data_type: null` counts as absent. Before, any other value, for example a typing error, selected the continuous reducers without a message.
+- **Reason:** an ignored key gives a silently wrong run, which the coding guidelines forbid. For example, `window_size: 100` gave the default window of 500 m without a message. envoi is alpha (0.2.x), and `CHANGELOG.md` explains the change.
+- **Rejected:** warn now and raise in a later release: it needs a second change and a second release note.
+
+### Deferred items
+
+- **Decision:** these parts of the review wait until the first provider that needs them. The user decided this on 2026-10-13.
+  - A per-point status vocabulary, retries, and a strict or best-effort failure policy (rest of F8). The `error` meta key, the error columns, and the stop of a batch in which every point failed stay.
+  - A job-scoped execution context (`ExtractionContext`), a shared worker budget, and cooperative cancellation (F10).
+  - A typed `ExtractionResult` and artifact stores (F15).
+  - Web-app credentials for each provider, provider-neutral wording, and reducer and output-type choices from the adapter declarations (rest of F14).
+  - Schema versions for catalogs and run configs, a public plugin API (a public `register()`, entry points), and provider-specific settings in the run config.
+- **Reason:**
+  - F8: the error column and the stop of a batch in which every point failed already make failures visible. A status column changes the QC contract. Rate limits and retries matter first for queued providers such as Copernicus CDS.
+  - F10: PR #75 separates credentials by worker process. Adapters read their own credentials on first use, as the Earth Engine adapter does. A context object becomes useful with credentials of several users in one process, or with cooperative cancellation.
+  - F15: it changes the public return value, and no provider needs it.
+  - F14: it depends on PR #75 and on a second provider in the web app.
+  - Schema versions: the strict keys catch typing errors now. A version key is useful when a breaking schema change is planned.
+- **Rejected:** do all items now: they add structure that no current provider uses, and they change public contracts without a need.
+
+### First real provider
+
+- **Decision:** CHELSA is the first new provider, in its own specification after this work. The user decided this on 2026-10-13.
+- **Reason:** CHELSA V2.1 serves public cloud-optimized GeoTIFFs (CC0) without credentials and without a job queue, and rasterio reads them as the local adapter reads files. A probe on 2026-10-13 read a 10 km window of one file over HTTPS in 0.1 s.
+- **Consequence:** CHELSA needs two changes that are out of the scope of this work: a remote `path` (the local adapter accepts only an existing file) and the scale and offset of a GeoTIFF (CHELSA stores temperatures as `uint16` with `scale 0.1` and `offset -273.15`). The scale and offset also affect local rasters today, and need their own specification, because they change output values.
+- **Rejected:** a Copernicus service first: these services need credentials and job handling, which depend on the deferred items.
+
+### Capabilities and hooks on the adapter class
+
+- **Decision:** the capability declarations are class attributes (`ClassVar[frozenset[str]]` on `BaseAdapter`), and the hooks are class methods. The built-in adapters are dataclasses, so they set the declarations without a type annotation.
+- **Reason:** the checks run before any adapter instance exists, so they cannot be instance methods. One class then holds everything about one provider.
+- **Rejected:** module-level functions registered next to the class: they add a second registration step.
+
+### Optional SDKs
+
+- **Decision:** an adapter imports an optional SDK only inside the functions that use it. `import envoi`, catalog loading, and the catalog hooks never import it. The registry stays eager: `adapters/__init__.py` imports every adapter module.
+- **Reason:** with lazy SDK imports, an eager registry is safe and simpler.
+- **Rejected:**
+  - A lazy registry with `"module:Class"` strings: not needed when the SDK imports are lazy.
+  - Make `earthengine-api` or `rasterio` optional now: it breaks `pip install envoi-geospatial` for current users, and `auth.py` (which imports `ee`) belongs to PR #75.
+
+### Error types of the contract
+
+- **Decision:**
+  - A result that breaks the adapter result contract raises `RuntimeError` in `extract()`. The message names the dataset, the adapter class, the call, and the rule, and says that the problem is a bug in the adapter.
+  - `check_dataset` raises `ValueError` for a configuration that is not valid, and `FileNotFoundError` or another `OSError` for a missing resource.
+  - A catalog hook raises `CatalogError` or `ValueError`. `catalog.py` raises a `ValueError` of a hook as a `CatalogError` that names the dataset, and raises a `CatalogError` unchanged. (The Earth Engine hook raises `CatalogError` itself, so that its messages stay as before.)
+- **Reason:** a broken result is a programming error in the adapter, not invalid user input. Invalid user input and config raise `ValueError` (`CatalogError` is a `ValueError`), as the coding guidelines require.
+- **Rejected:** no check of the results (the old behavior): a wrong number of results put values in the wrong rows without an error, or raised a pandas error far from its cause.
+
+### Tile summary in extract()
+
+- **Decision:** `extract.py` computes the tile summary `quality.tiles` (`summarize_tile_export` and the failed-point counts) for every adapter. `build_dataset_meta` no longer has the `exported_paths` parameter. The sidecar does not change, and `quality` stays the last key of a dataset entry.
+- **Reason:** both adapters computed the summary in the same way, so it is shared behavior. A new adapter then cannot compute it in a different way.
+- **Rejected:** keep a copy of the summary in each adapter (the old behavior): each new adapter would need a third copy of the same rule.
+
+### Derived bands in band lists
+
+- **Decision:** a per-call band list is split on the union of `computable_derived_bands` of all registered adapters (`all_computable_derived_bands()`). Then a derived band that the dataset's adapter does not compute raises `ValueError`. The message names the batch, the dataset, its `data_source`, and the derived bands that its adapter computes.
+- **Reason:** with the union, `slope` in the band list of a local dataset is still a derived band, and gets a clear message before any data request.
+- **Consequence:** a band list cannot select a source band whose name is the name of a derived band of any registered adapter. This limit already existed for `slope` and `aspect`.
+- **Rejected:** split on the derived bands of the dataset's own adapter: for `local` and other providers without derived bands, `slope` would become a source band and fail late with an unclear message.
+
+### Bands in the Earth Engine dataset_spec
+
+- **Decision:** `GeeRasterAdapter.validate_catalog_entry` rejects `dataset_spec.bands` and `dataset_spec.derived_bands`, with a message to move them to the top level of the entry.
+- **Reason:** these keys are not documented, and no built-in entry or example uses them. In `dataset_spec`, they replaced the bands of a per-call band list, and skipped the derived-band checks of config parsing. This follows the user decision on unknown keys.
+- **Rejected:** accept them as before: per-call band lists would still be silently replaced.
+
+### Path types in catalog entries
+
+- **Decision:** a catalog entry's `path` is a non-empty `str` or an `os.PathLike` (for example a `pathlib.Path`). envoi stores it as `str`.
+- **Reason:** before, a `Path` in a dict passed to `update_catalog()` was accepted, and the extraction ran. Only the write of the metadata sidecar (JSON) then failed. Stored as text, the path works everywhere.
+- **Rejected:** reject a `Path`: code that worked until the sidecar write would now fail at registration, although the value is valid.
+
+### Credentials check before the run
+
+- **Decision:** the `check_dataset` of a provider that needs an optional SDK or credentials checks that the SDK can be imported and that the credentials exist. It sends no network request. The adapter reads the credentials on first use. Credentials never go into the catalog, the run config, or the sidecar.
+- **Reason:** this keeps the rule "validate before any quota is used" for queued providers. So the deferred execution context (F10) does not block a provider such as Copernicus CDS.
+- **Rejected:** check the credentials only on first use: a missing credential would then stop the run after other datasets used time and quota.
+
+### Built-in catalog of other providers
+
+- **Decision:** where the built-in catalog entries of a provider other than Earth Engine go is decided in the CHELSA specification. Today only `ee_catalog.yml` is a built-in catalog.
+- **Reason:** no provider of another kind exists yet, so no requirement for its built-in entries is known.
+- **Consequence:** the web app lists every catalog dataset and always uses an Earth Engine key. The first provider in the web app needs the deferred F14 work.
+- **Rejected:** decide the location in this work: it would set a requirement of CHELSA before its specification exists.

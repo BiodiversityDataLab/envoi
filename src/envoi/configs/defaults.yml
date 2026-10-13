@@ -1,8 +1,12 @@
 # ============================================================
 # envoi: project-wide defaults
 # ============================================================
-# These values are used by extract() when not explicitly set
-# in the run config dict or as keyword arguments to the call.
+# extract() uses these values as follows:
+#   - output_file_format, window_size_m, min_coverage_pct: when the
+#     `settings` of a run config do not set them.
+#   - max_workers: for an Earth Engine dataset whose catalog entry does
+#     not set `max_workers`.
+#   - stats_output_decimals: always. No run config setting changes it.
 # Edit here to change defaults without touching Python source.
 
 # Output file format for tabular results: "csv" or "parquet".

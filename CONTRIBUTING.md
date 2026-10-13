@@ -129,6 +129,14 @@ Built-in Earth Engine datasets live in [src/envoi/configs/ee_catalog.yml](src/en
 
 ---
 
+## Adding a new data provider
+
+A data provider is a source of environmental data with its own access method, for example Earth Engine or local GeoTIFF files. In envoi, each provider is one adapter class, registered under one `data_source` value. A new provider is one new adapter module in `src/envoi/adapters/`. The generic modules, such as `extract.py`, `catalog.py`, and `_config_parsing.py`, do not change.
+
+Open an issue first, because a new provider needs a design discussion: its access method, its credentials, and its dependencies. Then follow the checklist in [docs/architecture.md, "Adding a data provider"](docs/architecture.md#adding-a-data-provider).
+
+---
+
 ## Submitting a pull request
 
 1. Fork the repository and create a feature branch (`git checkout -b feature/my-change`).

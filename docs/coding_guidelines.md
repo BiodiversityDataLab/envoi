@@ -53,7 +53,8 @@ The "Data flow" section of `docs/architecture.md` shows the stages.
 
 - Keep the stage sequence visible in the orchestrator. Do not hide it behind a single `_run_everything()` call.
 - Give each output mode its own helper (`_process_dataset_tabular`, `_process_dataset_raster`), and dispatch with a plain `if`/`elif`.
-- Each helper owns one unit of work, for example one `(dataset, window_size)` pair. The caller owns the loops and the merging of results.
+- Each helper owns one unit of work, for example one `(dataset, window_size)` pair with an adapter that the caller built.
+  The caller owns the loops, the adapter (one for each run config and dataset), and the merging of results.
 - Move pure logic into the private modules (`_input_validation.py`, `_config_parsing.py`, `_output_assembly.py`).
   The orchestrator shows the stages of a run, not every branch of every stage.
 
@@ -94,20 +95,40 @@ For example, the web app calls `_validate_sample_ids`.
 
 ### Adapters
 
-An adapter reads one kind of data source: `GeeRasterAdapter` (Earth Engine) or `LocalRasterAdapter` (GeoTIFF).
-Each subclasses `BaseAdapter`. `docs/architecture.md` lists the method contract.
+An adapter reads one kind of data source (one data provider): `GeeRasterAdapter` (Earth Engine) or `LocalRasterAdapter` (GeoTIFF).
+Each subclasses `BaseAdapter`. "Adapter interface" in `docs/architecture.md` lists the contract,
+and "Adding a data provider" there is the checklist for a new adapter.
 `LocalRasterAdapter.__post_init__` is the model for setup and cleanup.
 
 Interface and registration:
 - Keep method signatures identical across adapters. **[Contract]**
-  To add a keyword, add it to `BaseAdapter` and both adapters in the same change. Check every caller first.
-  `tests/test_adapters.py` compares the parameter names, kinds, and defaults of each adapter with `BaseAdapter`.
-- Return one `(stats_dict, meta_dict)` pair per input point, in input order. **[Contract]**
+  To add a keyword, add it to `BaseAdapter` and every adapter in the same change. Check every caller first.
+  `tests/test_adapters.py` compares the parameter names, kinds, and defaults of each adapter's calls and class-method hooks with `BaseAdapter`.
+- Return one `(stats_dict, meta_dict)` pair per input point, in input order, with every key of `REQUIRED_POINT_META_KEYS` in each meta dict. **[Contract]**
   The GEE adapter finishes requests out of order and writes each result back to its input index.
+  `extract()` checks each adapter result against the result contract in the `BaseAdapter` docstring.
+  It raises `RuntimeError` for a broken rule, because the cause is a bug in the adapter, not in the user's input.
+- Declare the capabilities of the adapter as class attributes: `output_types`, `supported_reducers`, `computable_derived_bands`, and `catalog_keys`.
+  Each one is a `frozenset` of `str`. In a dataclass adapter, set them without a type annotation, so that they do not become fields.
+  The generic modules read the declarations. They never compare `data_source` with the name of a built-in adapter.
 - Register the adapter at the end of its module with `_register("<data_source>", AdapterClass)`, and import the module in `adapters/__init__.py`.
+  `register()` raises `ValueError` for a name that does not match `^[a-z][a-z0-9_]*$`, a class that is not a `BaseAdapter`,
+  a name that another class has, and a declaration that is not valid.
   Catalog validation in `catalog.py` accepts only a `data_source` that has a registered adapter.
-- If only one source supports a feature, reject it for the other source with a clear `ValueError`.
-  Example: `_config_parsing.py` rejects the GEE-only derived bands (`slope`, `aspect`) for local datasets.
+- Put the rules of a provider in the class-method hooks of its adapter, not in a generic module:
+  `validate_catalog_entry` and `inspect_catalog_entry` for catalog entries, and `check_dataset` for the pre-flight check before any adapter is built.
+  A hook never sends a network request and never changes its input. A catalog hook never imports an optional SDK.
+- Error types of the hooks: `check_dataset` raises `ValueError` for a configuration that is not valid, and `FileNotFoundError` or another `OSError` for a missing resource.
+  A catalog hook raises `CatalogError`, or a `ValueError`, which `catalog.py` raises as a `CatalogError` that names the dataset.
+- If only one source supports a feature, declare it only in that adapter. The generic checks then reject it for the other sources with a clear `ValueError`.
+  Example: only `GeeRasterAdapter.computable_derived_bands` has `slope` and `aspect`, so `_config_parsing.py` rejects them for local datasets.
+
+Optional SDKs and credentials:
+- Import an optional SDK only inside the functions that use it. `import envoi` and catalog loading must not import it.
+  (`earthengine-api` and `rasterio` are required dependencies, so the built-in adapters import them at module level.)
+- In `check_dataset`, check that the SDK can be imported and that the required credentials exist, without a network request.
+  Say in the message what to install or what to set.
+- Read the credentials on first use. Never put credentials in the catalog, the run config, or the metadata sidecar.
 
 Setup, caching, and cleanup:
 - Read settings from `spec` (the merged catalog entry) in `__post_init__`, and store derived values as attributes.
@@ -115,11 +136,13 @@ Setup, caching, and cleanup:
   Defer expensive inspection that becomes cheaper with batch information.
   Example: the GEE adapter loads collection timestamps on the first batch, filtered by that batch's area and dates.
   Without the filter, large collections exceed Earth Engine's compute limits.
-- Cache values that are expensive to fetch and used across points. A cache lives as long as the adapter instance,
-  and `extract()` builds one instance per `(dataset, window_size)` pair.
+- Cache values that are expensive to fetch and used across points. A cache lives as long as the adapter instance.
+  `extract()` builds one instance for each (run config, dataset) pair, and uses it for every window size.
+  So a cache must not depend on the window size.
 - If setup opens a resource and then fails, release it before re-raising.
   The orchestrator's `with` block cannot do this, because `__exit__` never runs when the constructor fails.
 - If the adapter holds a resource, override `close()`, and make it safe to call more than once.
+  The `with` block of `extract()` calls it once, after the last window.
 
 Failures for single points (one bad point must not cost the whole batch; a programming error must still stop the run):
 - Continue the batch when the point is outside the raster, its read fails, or its Earth Engine request fails.
@@ -164,12 +187,17 @@ Examples are Earth Engine reducers, rasterio windows, image selection by date, b
 | Custom dataset definition | A catalog registered through `update_catalog()` | A local GeoTIFF |
 | Per-run choice | The run config passed to `extract()` | `batch_id`, `statistics`, `output_type` |
 | Per-call option that is not part of a run | A keyword argument of `extract()` | `input_crs`, `id_column`, `quiet` |
-| Fixed rule or closed set of values | Module-level constant in code | `_ALL_KNOWN_REDUCERS`, `_ALLOWED_CHARACTERS_PATTERN` |
+| Fixed rule or closed set of values | Module-level constant in code | `KNOWN_REDUCERS`, `_ALLOWED_CHARACTERS_PATTERN` |
 
 Do not add a setting for every implementation detail.
 
 - User-registered catalog entries override built-in entries with the same name. **[Contract]**
-- Local raster metadata detection lives in `catalog.py`. GEE asset type detection runs in `GeeRasterAdapter.__post_init__`.
+- Catalog entries, run configs, and their `settings` accept only known keys. Any other key raises an error, because an ignored key would silently change the run.
+  When code starts to read a new key, add it to the allowed keys in the same change:
+  `_GENERIC_CATALOG_KEYS` (`catalog.py`), the adapter's `catalog_keys` (for Earth Engine `dataset_spec`: `_DATASET_SPEC_KEYS`),
+  or `_RUN_CONFIG_KEYS` and `_SETTINGS_KEYS` (`_config_parsing.py`).
+- Local raster metadata detection lives in `LocalRasterAdapter.inspect_catalog_entry`, which `catalog.py` calls for catalog files.
+  GEE asset type detection runs in `GeeRasterAdapter.__post_init__`.
 - GEE datasets identify bands by name (`DEM`, `B4`). Local rasters use integer band indices that start at 1.
 
 Parsed settings (model: `RunSettings` in `_config_parsing.py`):
@@ -178,7 +206,7 @@ Parsed settings (model: `RunSettings` in `_config_parsing.py`):
 - When the sidecar must record the user's original form of a setting, store it in a separate field (`user_stats`). Do not reconstruct it later.
 - Name fields after their config keys, except where the shape changes: `window_size_m` (one value or a list) becomes `window_sizes`.
 
-Module-level constants (model: `_ALL_KNOWN_REDUCERS` in `_config_parsing.py`):
+Module-level constants (model: `KNOWN_REDUCERS` in `reducers.py`):
 - Use upper case, with a leading underscore when private. Use `frozenset` for closed sets and compiled `re` patterns.
 - When the purpose or value is not obvious, put a comment above it that says what it controls and why.
 - Avoid module-level mutable state, except documented caches and registries.
@@ -237,6 +265,7 @@ Earth Engine requests (in addition to the GEE dataset pitfalls in `AGENTS.md`):
 
 Validation lives in `_input_validation.py` (input dataframe), `_config_parsing.py` (run config),
 `catalog.py` (catalog entries), and `_filenames.py` (path components).
+The rules of one provider live in the class-method hooks of its adapter, which these modules call (see "Adapters").
 Reuse these helpers. Do not write a second version in an adapter or the web app.
 
 Raster mode's sample-ID check does not apply to tabular mode, where duplicate IDs are harmless.
@@ -256,7 +285,7 @@ what envoi found and what it allows, and, when not obvious, what to do.
 # Good
 raise ValueError(
     f"Output '{batch_id}': unknown reducer(s) {unknown} in '{context}'. "
-    f"Valid reducers: {sorted(_ALL_KNOWN_REDUCERS)}."
+    f"Valid reducers: {sorted(KNOWN_REDUCERS)}."
 )
 
 # Bad
@@ -272,7 +301,7 @@ Use the module logger for diagnostics that do not change results (`logger.debug`
 Avoid `print()` in package code. **[Proposed]** (One `print()` remains in `_parse_and_validate_dates`.)
 
 Broad exceptions: `except Exception` is allowed only when the handler re-raises a clear `ValueError`,
-downgrades a harmless best-effort failure to a logged warning (for example raster inspection in `catalog.py`),
+downgrades a harmless best-effort failure to a logged warning (for example raster inspection in `LocalRasterAdapter.inspect_catalog_entry`),
 or replaces one point's failed result with an empty result (see "Adapters").
 Put a comment above the `except` that says which case applies.
 
@@ -284,6 +313,7 @@ Runtime code in `src/envoi/` never imports from `tests/`.
 
 - Record what a run actually used: requested settings, resolved datasets and bands, source information, date decisions, coverage, and export results.
 - Write metadata only through `metadata.py` and the adapters' `build_dataset_meta()`. Do not create a second sidecar format.
+  `extract.py` computes a summary that is the same for every adapter, such as the tile summary `quality.tiles`, with the helpers of `metadata.py`. An adapter does not compute it.
 - Keep structured progress events (`progress_callback`) independent of the terminal progress bars (`quiet`). **[Contract]**
 
 ### Paths and output filenames

@@ -136,6 +136,8 @@ Adapted from
 - Support configurable input column names through the public `*_column` parameters.
 - Register custom datasets through `update_catalog()` and the existing catalog machinery.
 - When adding built-in datasets, follow the [dataset checklist in CONTRIBUTING.md](CONTRIBUTING.md#adding-a-new-built-in-dataset).
+- When adding a data provider (a new `data_source` and adapter), follow the checklist "Adding a data provider" in `docs/architecture.md`.
+  Keep the provider's rules in its adapter module, not in generic modules.
 - Keep shared behavior outside source-specific adapters where practical.
 - Preserve automatic GEE asset inspection and local raster metadata inspection.
 - Keep presentation fields such as `display_name` and `category` separate from extraction behavior.
