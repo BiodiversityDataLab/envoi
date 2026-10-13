@@ -178,9 +178,9 @@ def _resolve_local_raster_settings(
     catalog entry never raise: a GeoTIFF has one nodata value for all bands,
     and the CRS comparison uses the same ``to_epsg()`` rule as that function.
 
-    ``extract()`` calls this for every local dataset of every run config
-    before the first adapter is built, and ``LocalRasterAdapter`` calls it
-    again to store the result.
+    ``LocalRasterAdapter.check_dataset`` calls this for every local dataset
+    of every run config before ``extract()`` builds the first adapter, and
+    ``LocalRasterAdapter.__post_init__`` calls it again to store the result.
 
     Args:
         spec: The merged catalog entry: the catalog entry plus the run
@@ -377,6 +377,33 @@ class LocalRasterAdapter(BaseAdapter):
     computable_derived_bands = frozenset()
 
     spec: dict[str, Any]
+
+    # ------------------------------------------------------------------
+    # Pre-flight check
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def check_dataset(cls, spec: dict, *, context: str) -> None:
+        """Check the file, the selected bands, and the CRS and nodata settings of a local raster.
+
+        Calls ``_resolve_local_raster_settings`` and discards its result, so
+        that a missing file, a band that is not in the file, or a catalog
+        ``nodata`` or ``crs`` that conflicts with the file stops
+        ``extract()`` before any adapter is built. ``__post_init__`` calls it
+        again and stores the result. Opens the file and closes it again.
+
+        Args:
+            spec: The merged catalog entry: the catalog entry plus the run
+                config's band overrides. Not changed.
+            context: The start of each error message, for example
+                ``"Output 'terrain': dataset 'my_dem'"``.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+            ValueError: If a setting is not valid (see
+                ``_resolve_local_raster_settings``).
+        """
+        _resolve_local_raster_settings(spec, context=context)
 
     # ------------------------------------------------------------------
     # Setup / lifecycle

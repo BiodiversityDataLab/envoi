@@ -3,7 +3,9 @@
 ``FakeStatsAdapter`` is a third adapter that only this module registers. It
 runs through ``envoi.extract()`` with no change to a generic module, so a new
 data provider needs only its adapter module. The module also tests the checks
-of ``envoi.adapters.register()``. No test uses the network or a raster file.
+of ``envoi.adapters.register()``, and the pre-flight checks that ``extract()``
+runs with the adapter declarations and ``check_dataset`` before it builds any
+adapter. No test uses the network or a raster file.
 """
 
 from __future__ import annotations
@@ -36,7 +38,8 @@ class FakeStatsAdapter(BaseAdapter):
     value plus ``lat``, and the ``max`` is the ``mean`` plus ``lon``. The
     statistic keys are ``{band}_{reducer}``. Every point is in the extent and
     has full coverage. The class records the merged spec of each instance in
-    ``built_specs``.
+    ``built_specs``. Its pre-flight check accepts only a ``path`` that starts
+    with ``fake://``, and records its arguments in ``checked_specs``.
     """
 
     output_types = frozenset({"tabular"})
@@ -44,6 +47,20 @@ class FakeStatsAdapter(BaseAdapter):
 
     # The merged spec of each instance, in build order. The fixture clears it.
     built_specs: ClassVar[list[dict[str, Any]]] = []
+    # The (merged spec, context) of each check_dataset call, in call order.
+    # The fixture clears it.
+    checked_specs: ClassVar[list[tuple[dict[str, Any], str]]] = []
+
+    @classmethod
+    def check_dataset(cls, spec: dict, *, context: str) -> None:
+        """Raise ValueError when the ``path`` of the dataset does not start with ``fake://``."""
+        FakeStatsAdapter.checked_specs.append((dict(spec), context))
+        if not str(spec["path"]).startswith("fake://"):
+            raise ValueError(
+                f"{context}: the path {spec['path']!r} is not an address of the fake "
+                f"provider. Set 'path' in the catalog entry to an address that starts "
+                f"with 'fake://'."
+            )
 
     def __init__(self, spec: dict[str, Any]) -> None:
         # A per-call band list sets `bands`. Without one, the provider uses all its bands.
@@ -117,6 +134,7 @@ def isolated_registry(monkeypatch) -> dict[str, type[BaseAdapter]]:
 def fake_provider(isolated_registry) -> type[FakeStatsAdapter]:
     """Register ``FakeStatsAdapter`` as the data source ``fake`` through ``register()``."""
     FakeStatsAdapter.built_specs.clear()
+    FakeStatsAdapter.checked_specs.clear()
     register("fake", FakeStatsAdapter)
     return FakeStatsAdapter
 
@@ -139,12 +157,60 @@ def _read_sidecar(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def _register_fake_datasets() -> None:
+    """Register the datasets ``fake_climate`` and ``fake_remote`` of the data source ``fake``.
+
+    The path of ``fake_remote`` does not start with ``fake://``, so it fails
+    the pre-flight check of the fake provider.
+    """
+    update_catalog(
+        {
+            "datasets": {
+                "fake_climate": {
+                    "data_source": "fake",
+                    "path": "fake://climate",
+                    "data_type": "continuous",
+                },
+                "fake_remote": {
+                    "data_source": "fake",
+                    "path": "https://example.org/climate.tif",
+                    "data_type": "continuous",
+                },
+            }
+        }
+    )
+
+
+def _fake_tabular_config(
+    batch_id: str, datasets: list, statistics: list | dict | None = None
+) -> dict[str, Any]:
+    """Return a tabular run config with a 100 m window, and ``["mean"]`` without ``statistics``."""
+    return {
+        "batch_id": batch_id,
+        "datasets": datasets,
+        "settings": {
+            "output_type": "tabular",
+            "statistics": statistics or ["mean"],
+            "window_size_m": 100,
+        },
+    }
+
+
+def _fake_raster_config(batch_id: str) -> dict[str, Any]:
+    """Return a raster run config of ``fake_climate`` with a 100 m window."""
+    return {
+        "batch_id": batch_id,
+        "datasets": ["fake_climate"],
+        "settings": {"output_type": "raster", "window_size_m": 100},
+    }
+
+
 class TestFakeProviderThroughExtract:
     """A provider that is only an adapter class runs through ``envoi.extract()``."""
 
     def test_fake_adapter_keeps_base_adapter_signatures(self):
         """The fake adapter calls have the signatures of ``BaseAdapter``, annotations included."""
-        for method_name in ("fetch_stats_batch", "build_dataset_meta"):
+        for method_name in ("fetch_stats_batch", "build_dataset_meta", "check_dataset"):
             fake_signature = inspect.signature(getattr(FakeStatsAdapter, method_name))
             base_signature = inspect.signature(getattr(BaseAdapter, method_name))
             assert fake_signature == base_signature, method_name
@@ -176,16 +242,19 @@ class TestFakeProviderThroughExtract:
 
         outputs = extract(three_points, run_config, output_dir=tmp_path, write_metadata=True)
 
-        # The adapter receives the catalog entry merged with the per-call band list.
-        assert fake_provider.built_specs == [
-            {
-                "data_source": "fake",
-                "path": "fake://climate",
-                "data_type": "continuous",
-                "bands": ["precip", "temp"],
-                "band_naming": "per_band",
-            }
+        # The pre-flight check and the adapter receive the catalog entry merged
+        # with the per-call band list.
+        merged_spec = {
+            "data_source": "fake",
+            "path": "fake://climate",
+            "data_type": "continuous",
+            "bands": ["precip", "temp"],
+            "band_naming": "per_band",
+        }
+        assert fake_provider.checked_specs == [
+            (merged_spec, "Output 'fake_run': dataset 'fake_climate'")
         ]
+        assert fake_provider.built_specs == [merged_spec]
 
         # Statistic keys "{band}_{reducer}" become "<dataset>_{band}_{reducer}_<N>m" columns.
         stats_table = pd.read_csv(outputs["fake_run"])
@@ -248,6 +317,133 @@ class TestFakeProviderThroughExtract:
             {"name": "fake_climate", "bands": ["precip", "temp"], "derived_bands": None}
         ]
         assert "warnings" not in sidecar
+
+
+class TestPreFlightChecks:
+    """A run config that the fake provider does not support raises before any adapter is built.
+
+    The capability declarations and ``check_dataset`` of the fake adapter
+    decide. Each error is a ``ValueError`` that names the output and the
+    dataset, and the call writes no output.
+    """
+
+    def test_raster_output_type_is_rejected(self, fake_provider, three_points, tmp_path):
+        """A raster run config raises, because the fake adapter declares only ``"tabular"``."""
+        _register_fake_datasets()
+
+        with pytest.raises(ValueError) as error_info:
+            extract(three_points, _fake_raster_config("fake_tiles"), output_dir=tmp_path)
+
+        message = str(error_info.value)
+        assert message.startswith(
+            "Output 'fake_tiles': dataset 'fake_climate' has data_source 'fake', whose adapter "
+            "does not support output_type 'raster'. Supported output types: ['tabular']."
+        )
+        assert fake_provider.built_specs == []
+        assert not any(tmp_path.iterdir())
+
+    def test_unsupported_reducer_is_rejected(self, fake_provider, three_points, tmp_path):
+        """A reducer outside the fake adapter's ``supported_reducers`` raises and lists them."""
+        _register_fake_datasets()
+        run_config = _fake_tabular_config("fake_run", ["fake_climate"], ["mean", "median"])
+
+        with pytest.raises(ValueError) as error_info:
+            extract(three_points, run_config, output_dir=tmp_path)
+
+        message = str(error_info.value)
+        assert message.startswith(
+            "Output 'fake_run': dataset 'fake_climate' has data_source 'fake', whose adapter "
+            "does not support the reducer(s) ['median']. Supported reducers: ['max', 'mean']."
+        )
+        assert "Remove ['median'] from 'statistics'" in message
+        assert fake_provider.built_specs == []
+        assert not any(tmp_path.iterdir())
+
+    def test_only_the_reducers_of_the_dataset_data_type_are_checked(
+        self, fake_provider, three_points, tmp_path
+    ):
+        """An unsupported reducer of the other data_type does not raise or reach the adapter."""
+        _register_fake_datasets()
+        statistics = {"continuous": ["max"], "categorical": ["mode"]}
+        run_config = _fake_tabular_config("fake_run", ["fake_climate"], statistics)
+
+        outputs = extract(three_points, run_config, output_dir=tmp_path)
+
+        # The continuous dataset gets the continuous list only.
+        stats_table = pd.read_csv(outputs["fake_run"])
+        assert [column for column in stats_table.columns if column.startswith("fake_")] == [
+            "fake_climate_temp_max_100m",
+            "fake_climate_precip_max_100m",
+        ]
+        assert stats_table["fake_climate_temp_max_100m"].tolist() == [11.0, 22.0, 33.0]
+        assert len(fake_provider.built_specs) == 1
+
+    def test_derived_band_is_rejected(self, fake_provider, three_points, tmp_path):
+        """A derived band in a per-call band list raises, because the fake adapter computes none."""
+        _register_fake_datasets()
+        run_config = _fake_tabular_config("fake_run", [{"fake_climate": ["temp", "slope"]}])
+
+        with pytest.raises(ValueError) as error_info:
+            extract(three_points, run_config, output_dir=tmp_path)
+
+        message = str(error_info.value)
+        assert message.startswith(
+            "Output 'fake_run': dataset 'fake_climate' has data_source 'fake', whose adapter "
+            "cannot compute the derived band(s) ['slope']."
+        )
+        assert "Derived bands that this adapter computes: none." in message
+        assert "Remove ['slope'] from the band list of 'fake_climate'." in message
+        assert fake_provider.built_specs == []
+        assert not any(tmp_path.iterdir())
+
+    def test_failing_check_dataset_stops_the_call(self, fake_provider, three_points, tmp_path):
+        """The ``ValueError`` of the fake adapter's ``check_dataset`` reaches the caller."""
+        _register_fake_datasets()
+
+        with pytest.raises(ValueError) as error_info:
+            extract(
+                three_points,
+                _fake_tabular_config("fake_run", ["fake_remote"]),
+                output_dir=tmp_path,
+            )
+
+        assert str(error_info.value).startswith(
+            "Output 'fake_run': dataset 'fake_remote': the path "
+            "'https://example.org/climate.tif' is not an address of the fake provider."
+        )
+        assert [context for _, context in fake_provider.checked_specs] == [
+            "Output 'fake_run': dataset 'fake_remote'"
+        ]
+        assert fake_provider.built_specs == []
+        assert not any(tmp_path.iterdir())
+
+    @pytest.mark.parametrize(
+        "invalid_run_config",
+        [
+            pytest.param(_fake_raster_config("second"), id="raster"),
+            pytest.param(
+                _fake_tabular_config("second", ["fake_climate"], ["median"]),
+                id="unsupported_reducer",
+            ),
+            pytest.param(
+                _fake_tabular_config("second", [{"fake_climate": ["slope"]}]),
+                id="derived_band",
+            ),
+            pytest.param(_fake_tabular_config("second", ["fake_remote"]), id="failing_check"),
+        ],
+    )
+    def test_invalid_second_run_config_stops_the_call_before_any_build(
+        self, fake_provider, three_points, tmp_path, invalid_run_config
+    ):
+        """An invalid second run config raises before the adapter of the valid first one is built."""
+        _register_fake_datasets()
+        run_configs = [_fake_tabular_config("first", ["fake_climate"]), invalid_run_config]
+
+        with pytest.raises(ValueError, match="^Output 'second': dataset 'fake_"):
+            extract(three_points, run_configs, output_dir=tmp_path)
+
+        assert fake_provider.built_specs == []
+        assert not any(tmp_path.iterdir())
 
 
 class TestRegister:

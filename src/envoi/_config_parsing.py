@@ -13,13 +13,16 @@ Public surface re-imported by ``extract.py``:
   files or folders would collide.
 * :func:`_parse_run_config` — turn one raw config dict into RunSettings,
   raising ValueError for any malformed setting.
-* :func:`_resolve_stats_for_dataset` — pick the right reducer list for a
-  dataset based on its catalog data_type.
 * :func:`_as_config_list` — load YAML (if given a path) and normalize the
   result into a list of output config dicts.
 
 Most other helpers (``_normalize_dataset_entry``, ``_validate_*``,
-``_parse_statistics``, ``_load_yaml``) are private to this file.
+``_parse_statistics``, ``_resolve_stats_for_dataset``, ``_load_yaml``) are
+private to this file.
+
+The checks against the capability declarations of each dataset's adapter
+(output types, reducers, derived bands) read the adapter class from the
+registry in ``envoi.adapters``. They build no adapter.
 """
 
 from __future__ import annotations
@@ -32,8 +35,8 @@ from typing import Any
 import yaml
 
 from ._filenames import describe_unsafe_path_component, is_safe_path_component
-from .adapters.earth_engine import KNOWN_DERIVED_BANDS
-from .adapters.earth_engine.adapter import _BAND_NAMING_KEY, _PER_BAND_NAMING
+from .adapters import all_computable_derived_bands, get_adapter
+from .adapters.base import _BAND_NAMING_KEY, _PER_BAND_NAMING
 from .reducers import KNOWN_REDUCERS
 
 # Keys allowed inside the full-form dict value
@@ -68,9 +71,14 @@ class RunSettings:
     min_coverage: float  # 0–100 — threshold for low-coverage QC flag
     # Normalized stats dict: {"continuous": [...], "categorical": [...]}.
     # A flat list from the user is normalized to identical lists on both keys.
-    # Downstream code calls _resolve_stats_for_dataset() to pick the right list
-    # per dataset rather than reading this dict directly.
+    # Downstream code reads the list of each dataset from `stats_by_dataset`
+    # rather than reading this dict directly.
     stats: dict[str, list[str]]
+    # The reducer list of each dataset of a tabular output, keyed by dataset
+    # name: the `stats` list of the dataset's data_type (see
+    # _resolve_stats_for_dataset). Every reducer is in the `supported_reducers`
+    # of the dataset's adapter. Empty for raster output.
+    stats_by_dataset: dict[str, list[str]]
     # Original user-supplied form (flat list or typed dict), stored verbatim
     # so the metadata sidecar round-trips it without normalizing it away.
     user_stats: list | dict[str, list[str]]
@@ -89,9 +97,10 @@ def _normalize_dataset_entry(
       * A plain string  -> ("name", {})
       * Shorthand dict  -> {"name": [bands...]}
                           where the list is a unified band list (source +
-                          derived bands mixed). Names recognised as derived
-                          (KNOWN_DERIVED_BANDS) are split into the
-                          `derived_bands` override; the rest go to `bands`.
+                          derived bands mixed). Names that a registered
+                          adapter can compute (all_computable_derived_bands)
+                          are split into the `derived_bands` override; the
+                          rest go to `bands`.
       * Full-form dict  -> {"name": {"bands": [...]}}
                           where the inner dict accepts the keys listed in
                           `_ALLOWED_OVERRIDE_KEYS`. Reserved for future
@@ -101,12 +110,12 @@ def _normalize_dataset_entry(
     empty list when the list has only derived bands (``{"dem": ["aspect"]}``
     then gives only the aspect band, not the catalog's source band too). The
     band_overrides of a band list also get the mark ``band_naming: "per_band"``
-    (``_BAND_NAMING_KEY`` of the Earth Engine adapter), so the Earth Engine
-    output columns are named after the bands, also for one band. The local
-    adapter names the columns of every band list after the bands anyway.
+    (``_BAND_NAMING_KEY`` in ``adapters/base.py``), so the output columns are
+    named after the bands, also for one band.
 
-    Raises ValueError for any malformed entry or unknown dataset name, so a
-    single ``except ValueError`` covers every config-shape failure mode.
+    Raises ValueError for any malformed entry or unknown dataset name, and for
+    a derived band that the dataset's adapter does not compute, so a single
+    ``except ValueError`` covers every config-shape failure mode.
     """
     # ---- shape 1: plain string ----
     if isinstance(entry, str):
@@ -185,20 +194,31 @@ def _normalize_dataset_entry(
 
     # Split the unified list into source bands and derived bands. Order is
     # preserved within each side so the resulting output band order matches
-    # what the user wrote.
-    derived_bands = [b for b in unified_bands if b in KNOWN_DERIVED_BANDS]
-    source_bands = [b for b in unified_bands if b not in KNOWN_DERIVED_BANDS]
+    # what the user wrote. A name that any registered adapter can compute
+    # counts as a derived band, also for a dataset whose adapter computes
+    # none. Without this, "slope" would become a source band of such a
+    # dataset and fail late with an unclear error. So a band list cannot
+    # select a source band that has the name of a derived band.
+    known_derived_bands = all_computable_derived_bands()
+    derived_bands = [band for band in unified_bands if band in known_derived_bands]
+    source_bands = [band for band in unified_bands if band not in known_derived_bands]
 
-    # Local rasters cannot have derived bands (no slope/aspect computation
-    # path exists in LocalRasterAdapter). Surface this clearly so the user
-    # knows the catalog is the right place for that.
+    # Each adapter declares the derived bands that it can compute. Reject
+    # the others before any adapter is built.
     dataset_config = catalog_datasets[name]
     data_source = dataset_config.get("data_source")
-    if derived_bands and data_source != "earth_engine":
+    computable_derived_bands = get_adapter(data_source).computable_derived_bands
+    uncomputable_derived_bands = sorted(set(derived_bands) - computable_derived_bands)
+    if uncomputable_derived_bands:
+        computable_text = (
+            str(sorted(computable_derived_bands)) if computable_derived_bands else "none"
+        )
         raise ValueError(
-            f"Output '{batch_id}': dataset '{name}' is a {data_source!r} raster — "
-            f"derived bands {sorted(set(derived_bands))} are only supported for "
-            f"earth_engine datasets."
+            f"Output '{batch_id}': dataset '{name}' has data_source '{data_source}', whose "
+            f"adapter cannot compute the derived band(s) {uncomputable_derived_bands}. "
+            f"Derived bands that this adapter computes: {computable_text}. Remove "
+            f"{uncomputable_derived_bands} from the band list of '{name}'. In a band list, "
+            f"the names {sorted(known_derived_bands)} always mean derived bands."
         )
 
     # Enforce the catalog's per-dataset applicability whitelist. A derived
@@ -363,7 +383,9 @@ def _parse_run_config(
     """Parse and validate a single output run config dict into a RunSettings instance.
 
     Raises ValueError for any invalid or missing setting so callers don't need
-    to do any further validation on the returned object.
+    to do any further validation on the returned object. This includes a
+    setting that the adapter of a dataset does not support, by its capability
+    declarations: the output_type, a reducer, or a derived band.
     """
     # Use a numbered fallback batch_id when the user didn't provide one.
     batch_id = run_config.get("batch_id", f"output{index + 1}")
@@ -383,7 +405,8 @@ def _parse_run_config(
 
     # datasets is required — must be a non-empty list. Each entry is normalized
     # into a (name, band_overrides) tuple by the helper, which also handles all
-    # validation (catalog existence, malformed dicts, derived-on-local, ...).
+    # validation (catalog existence, malformed dicts, derived bands that the
+    # dataset's adapter cannot compute, ...).
     raw_datasets = run_config.get("datasets", [])
     if not raw_datasets:
         raise ValueError(f"Output '{batch_id}': missing required 'datasets' list")
@@ -403,6 +426,20 @@ def _parse_run_config(
     # entries of one dataset, or two raster folders whose names differ only in
     # letter case, would overwrite each other.
     _validate_unique_dataset_names(datasets, output_type, batch_id)
+
+    # Each adapter declares the output types that it supports. Reject the
+    # others here, before any adapter is built or any quota is used.
+    for dataset_name, _ in datasets:
+        data_source = catalog_datasets[dataset_name].get("data_source")
+        supported_output_types = get_adapter(data_source).output_types
+        if output_type not in supported_output_types:
+            raise ValueError(
+                f"Output '{batch_id}': dataset '{dataset_name}' has data_source "
+                f"'{data_source}', whose adapter does not support output_type "
+                f"'{output_type}'. Supported output types: {sorted(supported_output_types)}. "
+                f"Set output_type to one of these, or move '{dataset_name}' to a run config "
+                f"with a supported output_type."
+            )
 
     # resample_m is only meaningful for raster output.
     resample_m = settings.get("resample_m")
@@ -441,8 +478,12 @@ def _parse_run_config(
         raise ValueError("Statistics cannot be computed when output_type is 'raster'.")
     if output_type == "tabular":
         stats, user_stats = _parse_statistics(raw_stats, batch_id)
+        stats_by_dataset = _resolve_and_validate_stats_by_dataset(
+            datasets, stats, catalog_datasets, batch_id
+        )
     else:
         stats, user_stats = {}, None
+        stats_by_dataset = {}
 
     # window_size_m can be either one size or a list. Sizes are positive except
     # for the explicit zero sentinel used by point-only tabular sampling.
@@ -487,6 +528,7 @@ def _parse_run_config(
         window_sizes=window_sizes,
         min_coverage=min_coverage,
         stats=stats,
+        stats_by_dataset=stats_by_dataset,
         user_stats=user_stats,
         resample_m=resample_m,
         user_window_size=user_window_size,
@@ -666,6 +708,60 @@ def _resolve_stats_for_dataset(
             f"for output '{batch_id}'."
         )
     return reducers
+
+
+def _resolve_and_validate_stats_by_dataset(
+    datasets: list[tuple[str, dict[str, Any]]],
+    stats: dict[str, list[str]],
+    catalog_datasets: dict,
+    batch_id: str,
+) -> dict[str, list[str]]:
+    """Return the reducer list of each dataset of a tabular output, and check it.
+
+    Each list is the ``stats`` list of the dataset's data_type (see
+    ``_resolve_stats_for_dataset``). Each reducer must be in the
+    ``supported_reducers`` declaration of the dataset's adapter. No adapter
+    is built.
+
+    Args:
+        datasets: The normalized ``(dataset_name, band_overrides)`` pairs.
+        stats: The normalized ``statistics`` setting from ``_parse_statistics``.
+        catalog_datasets: The merged catalog's ``datasets`` dict.
+        batch_id: The run config's batch_id, used in the error messages.
+
+    Returns:
+        The reducer list of each dataset, keyed by dataset name.
+
+    Raises:
+        ValueError: If the ``statistics`` setting has no list for the data_type
+            of a dataset, or if a reducer is not supported by the adapter of
+            a dataset.
+    """
+    stats_by_dataset: dict[str, list[str]] = {}
+    for dataset_name, _ in datasets:
+        dataset_config = catalog_datasets[dataset_name]
+        reducers = _resolve_stats_for_dataset(
+            dataset_config.get("data_type"), stats, dataset_name, batch_id
+        )
+
+        # Each adapter declares the reducers that it supports. An unsupported
+        # reducer would otherwise fail inside the adapter, after other
+        # datasets possibly used quota.
+        data_source = dataset_config.get("data_source")
+        supported_reducers = get_adapter(data_source).supported_reducers
+        unsupported_reducers = [
+            reducer for reducer in reducers if reducer not in supported_reducers
+        ]
+        if unsupported_reducers:
+            raise ValueError(
+                f"Output '{batch_id}': dataset '{dataset_name}' has data_source "
+                f"'{data_source}', whose adapter does not support the reducer(s) "
+                f"{unsupported_reducers}. Supported reducers: {sorted(supported_reducers)}. "
+                f"Remove {unsupported_reducers} from 'statistics', or move '{dataset_name}' "
+                f"to a run config without them."
+            )
+        stats_by_dataset[dataset_name] = reducers
+    return stats_by_dataset
 
 
 def _load_yaml(path_or_dict):

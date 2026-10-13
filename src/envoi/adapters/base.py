@@ -6,6 +6,16 @@ from typing import ClassVar
 
 from ..progress import ProgressStepCallback
 
+# The mark that a per-call band list puts in the merged config of its dataset
+# (``_normalize_dataset_entry`` in ``_config_parsing.py`` adds it to the band
+# overrides). With the mark, an adapter names every statistic key after its
+# band (``{band}_{reducer}``, ``{band}_point``), also for one band. Without
+# it, the per-call list ``["B4"]`` could give the bare keys of a single-band
+# catalog default (``mean``), and the column name would not say which band was
+# selected.
+_BAND_NAMING_KEY = "band_naming"
+_PER_BAND_NAMING = "per_band"
+
 
 class BaseAdapter:
     """The adapter interface: the calls that ``extract()`` makes, and the capability declarations.
@@ -15,7 +25,9 @@ class BaseAdapter:
     ``export_tiles`` when it declares ``"raster"``, with the same parameter
     names, kinds, and defaults (``tests/test_adapters.py`` checks this).
     It sets the capability declarations below as class attributes, and
-    ``envoi.adapters.register`` checks them.
+    ``envoi.adapters.register`` checks them. It can override the class method
+    ``check_dataset``, the pre-flight check of one dataset, with the same
+    parameters.
     ``docs/architecture.md`` ("Adapter interface") describes each method.
     """
 
@@ -38,6 +50,36 @@ class BaseAdapter:
     # The top-level catalog keys that the adapter accepts in addition to the
     # generic keys that every catalog entry can have.
     catalog_keys: ClassVar[frozenset[str]] = frozenset()
+
+    # ---- pre-flight check ---------------------------------------------------
+    @classmethod
+    def check_dataset(cls, spec: dict, *, context: str) -> None:
+        """Check one dataset of a run config before ``extract()`` builds any adapter.
+
+        ``extract()`` calls this for every dataset of every run config, after
+        it parsed the run configs and before it builds the first adapter. An
+        adapter overrides it to check what it can check without a data
+        request, so that an error stops the call before any output is written
+        or any quota is used. The default checks nothing.
+
+        An override must not send a network request and must not change
+        ``spec``. It can check that an optional SDK can be imported and that
+        the required credentials exist.
+
+        Args:
+            spec: The merged catalog entry: the catalog entry plus the run
+                config's band overrides.
+            context: The start of each error message, for example
+                ``"Output 'terrain': dataset 'my_dem'"``.
+
+        Raises:
+            ValueError: If the configuration of the dataset is not valid. The
+                message starts with ``context`` and says how to fix it.
+            FileNotFoundError: If a resource that the dataset needs, for
+                example a file, does not exist. An override can raise another
+                ``OSError`` for another problem with such a resource.
+        """
+        return
 
     # ---- resource lifecycle -------------------------------------------------
     # Adapters may hold external resources (e.g. an open rasterio dataset) that

@@ -1,10 +1,11 @@
 """Tests of the adapter contract that ``extract()`` relies on.
 
-``BaseAdapter`` declares the members that ``extract()`` calls and the
-capability declarations, and every registered adapter keeps the same
-signatures. The adapter registry rejects an unknown ``data_source`` with a
-``ValueError``. No test builds an adapter, so none needs Earth Engine or a
-raster file. ``tests/test_provider_contract.py`` tests ``register()``.
+``BaseAdapter`` declares the members that ``extract()`` calls, the
+capability declarations, and the class-method hooks, and every registered
+adapter keeps the same signatures. The adapter registry rejects an unknown
+``data_source`` with a ``ValueError``. No test builds an adapter, so none
+needs Earth Engine or a raster file. ``tests/test_provider_contract.py``
+tests ``register()``.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ _LIFECYCLE_METHODS = frozenset({"close", "__enter__", "__exit__"})
 _CAPABILITY_ATTRIBUTES = frozenset(
     {"output_types", "supported_reducers", "computable_derived_bands", "catalog_keys"}
 )
+# The class-method hooks that extract() calls before it builds any adapter.
+_CLASS_METHOD_HOOKS = frozenset({"check_dataset"})
 
 
 def _public_methods(cls: type) -> set[str]:
@@ -83,11 +86,31 @@ def _class_method_mismatches(adapter_class: type, base_class: type) -> list[str]
 
 class TestBaseAdapterInterface:
     def test_base_adapter_declares_only_the_contract_members(self):
-        """``BaseAdapter`` declares the adapter calls, the lifecycle, and the capabilities only."""
+        """``BaseAdapter`` declares the calls, the lifecycle, the capabilities, and the hooks only."""
         assert _public_methods(BaseAdapter) == _INTERFACE_METHODS | {"close"}
+        assert _public_class_methods(BaseAdapter) == _CLASS_METHOD_HOOKS
         assert _LIFECYCLE_METHODS <= set(vars(BaseAdapter))
         public_members = {name for name in vars(BaseAdapter) if not name.startswith("_")}
-        assert public_members == _INTERFACE_METHODS | {"close"} | _CAPABILITY_ATTRIBUTES
+        assert (
+            public_members
+            == _INTERFACE_METHODS | {"close"} | _CAPABILITY_ATTRIBUTES | _CLASS_METHOD_HOOKS
+        )
+
+    def test_default_check_dataset_accepts_any_spec(self):
+        """The default pre-flight check of ``BaseAdapter`` checks nothing and returns None."""
+        spec = {"data_source": "any", "path": "not/a/file"}
+        assert BaseAdapter.check_dataset(spec, context="Output 'x': dataset 'y'") is None
+        assert spec == {"data_source": "any", "path": "not/a/file"}
+
+    def test_parity_check_covers_inherited_and_overridden_check_dataset(self):
+        """The Earth Engine adapter inherits ``check_dataset`` and the local adapter overrides it.
+
+        ``TestAdapterSignatureParity.test_class_methods_match_base_adapter``
+        then checks both cases.
+        """
+        assert "check_dataset" not in vars(_REG["earth_engine"])
+        assert isinstance(inspect.getattr_static(_REG["local"], "check_dataset"), classmethod)
+        assert "check_dataset" in vars(_REG["local"])
 
     def test_capability_declarations_default_to_empty_frozensets(self):
         """Each capability declaration of ``BaseAdapter`` is an empty ``frozenset``."""

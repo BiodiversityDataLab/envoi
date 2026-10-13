@@ -36,7 +36,7 @@ from ...metadata import summarize_date_info, summarize_tile_export
 from ...progress import ProgressStepCallback, emit_progress_step
 from ...qc import format_point_error
 from ...reducers import KNOWN_REDUCERS
-from ..base import BaseAdapter
+from ..base import _BAND_NAMING_KEY, _PER_BAND_NAMING, BaseAdapter
 from ._image import (
     KNOWN_DERIVED_BANDS,
     _build_image,
@@ -66,16 +66,6 @@ except Exception:
     _register = None
 
 logger = logging.getLogger(__name__)
-
-# The mark that a per-call band list puts in the merged config of its dataset
-# (``_normalize_dataset_entry`` in ``_config_parsing.py`` adds it to the band
-# overrides). With the mark, every statistic key is named after its band
-# (``{band}_{reducer}``, ``{band}_point``), also for one band, as the local
-# adapter does for a band list. Without it, the per-call list ``["B4"]`` would
-# give the bare keys of a single-band catalog default (``mean``), and the
-# column name would not say which band was selected.
-_BAND_NAMING_KEY = "band_naming"
-_PER_BAND_NAMING = "per_band"
 
 
 # ---------------------------------------------------------------------------

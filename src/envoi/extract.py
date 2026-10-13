@@ -11,7 +11,6 @@ from ._config_parsing import (
     RunSettings,
     _as_config_list,
     _parse_run_configs,
-    _resolve_stats_for_dataset,
 )
 from ._filenames import format_id_list
 from ._input_validation import (
@@ -31,7 +30,6 @@ from ._output_assembly import (
     _write_tabular,
 )
 from .adapters import get_adapter
-from .adapters.local_adapter import _resolve_local_raster_settings
 from .catalog import BUILTIN_EE_CATALOG, load_catalogs, load_defaults
 from .metadata import write_metadata_sidecar
 from .progress import ProgressCallback, ProgressEvent, ProgressStepCallback
@@ -299,9 +297,10 @@ def extract(
 
     # Parse and validate the settings of every run config before the first
     # adapter is built. ValueError is raised for any missing or invalid setting,
-    # and for two run configs with the same batch_id. An error in a later run
-    # config then stops the call before earlier outputs are written or any
-    # Earth Engine quota is used.
+    # for a setting that the adapter of a dataset does not support (by its
+    # capability declarations), and for two run configs with the same
+    # batch_id. An error in a later run config then stops the call before
+    # earlier outputs are written or any Earth Engine quota is used.
     all_run_settings = _parse_run_configs(output_configs, defaults, catalog_datasets)
 
     # A tabular output adds statistic and QC columns named after each dataset
@@ -335,18 +334,19 @@ def extract(
         quoted_batch_ids = ", ".join(f"'{batch_id}'" for batch_id in raster_batch_ids)
         _validate_sample_ids(df["id"], id_column, context=f"Output {quoted_batch_ids}")
 
-    # Check the CRS and nodata settings of every local raster, with the bands
-    # that each run config selects, before the first adapter is built. A
-    # catalog `nodata` or `crs` that conflicts with the file, or a file
-    # without any CRS, then stops the call before any output is written.
+    # Run the pre-flight check of each dataset's adapter
+    # (BaseAdapter.check_dataset) for every dataset of every run config, with
+    # the bands that the run config selects, before the first adapter is
+    # built. Each adapter checks there what it can check without a data
+    # request. A failed check then stops the call before any output is
+    # written or any quota is used.
     for run_settings in all_run_settings:
         for dataset, band_overrides in run_settings.datasets:
             merged_config = {**catalog_datasets[dataset], **(band_overrides or {})}
-            if merged_config.get("data_source") == "local":
-                _resolve_local_raster_settings(
-                    merged_config,
-                    context=f"Output '{run_settings.batch_id}': dataset '{dataset}'",
-                )
+            get_adapter(merged_config["data_source"]).check_dataset(
+                merged_config,
+                context=f"Output '{run_settings.batch_id}': dataset '{dataset}'",
+            )
 
     for run_settings in all_run_settings:
         df_copy = df.copy()
@@ -669,15 +669,13 @@ def _process_dataset_tabular(
     # even if the per-point batch raises mid-flight.
     AdapterClass = get_adapter(merged_config["data_source"])
     with AdapterClass(merged_config) as adapter:
-        # Select the reducer list appropriate for this dataset's data_type.
-        # For typed-dict statistics configs, a continuous dataset uses the
-        # "continuous" list and a categorical dataset uses "categorical".
-        # For flat-list configs both keys map to the same list, so the result
-        # is unchanged from the previous behaviour.
+        # The reducer list of this dataset, which config parsing resolved
+        # from the dataset's data_type and checked against the adapter's
+        # supported reducers. For typed-dict statistics configs, a continuous
+        # dataset uses the "continuous" list and a categorical dataset uses
+        # "categorical". For flat-list configs both keys map to the same list.
         data_type = merged_config.get("data_type")
-        resolved_stats = _resolve_stats_for_dataset(
-            data_type, run_settings.stats, dataset, run_settings.batch_id
-        )
+        resolved_stats = run_settings.stats_by_dataset[dataset]
 
         # Flag reducer/data_type mismatches (e.g. `mean` on a categorical
         # raster, or `class_count` on a continuous one). The message is

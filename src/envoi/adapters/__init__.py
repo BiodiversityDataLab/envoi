@@ -130,6 +130,21 @@ def get_adapter(name):
         ) from None
 
 
+def all_computable_derived_bands() -> frozenset[str]:
+    """Return the derived bands that at least one registered adapter can compute.
+
+    This is the union of ``computable_derived_bands`` of the registered
+    adapters. Config parsing splits a per-call band list on this set, so a
+    derived band of another provider (for example ``slope`` for a local
+    raster) is rejected with a clear message instead of being read as a
+    source band. The registry is read at call time.
+    """
+    derived_bands: frozenset[str] = frozenset()
+    for adapter_class in _REG.values():
+        derived_bands |= adapter_class.computable_derived_bands
+    return derived_bands
+
+
 # --- import built-in adapters so they self-register on import ---
 from . import (
     earth_engine,  # noqa: F401

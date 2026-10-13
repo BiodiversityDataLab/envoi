@@ -1538,9 +1538,12 @@ class TestBatchWithoutPoints:
 def stub_gee_dataset(monkeypatch, stub_combined_reducer) -> GeeRasterAdapter:
     """Register the Earth Engine dataset ``stub_gee``, whose adapter is an offline stub.
 
-    ``extract()`` gets this adapter through its ``get_adapter`` lookup, so the
-    test runs the real per-point result loops of the Earth Engine adapter.
-    Returns the adapter, so the test can stub its per-point requests.
+    ``extract()`` gets the class ``PreparedStubAdapter`` through its
+    ``get_adapter`` lookup. The class has the capability declarations and the
+    pre-flight check of ``GeeRasterAdapter``, and each build gives the prepared
+    offline adapter, so the test runs the real per-point result loops of the
+    Earth Engine adapter. Returns the adapter, so the test can stub its
+    per-point requests.
     """
     update_catalog(
         {
@@ -1555,10 +1558,19 @@ def stub_gee_dataset(monkeypatch, stub_combined_reducer) -> GeeRasterAdapter:
         }
     )
     adapter = _tile_export_adapter()
+
+    class PreparedStubAdapter(GeeRasterAdapter):
+        """Gives the prepared offline adapter for each build."""
+
+        def __new__(cls, spec):
+            # The adapter is not an instance of this subclass, so Python does
+            # not call __init__ on it, and __post_init__ sends no request.
+            return adapter
+
     # The package exports the function extract() under the module's name, so
     # get the module itself from the import system.
     extract_module = importlib.import_module("envoi.extract")
-    monkeypatch.setattr(extract_module, "get_adapter", lambda data_source: lambda spec: adapter)
+    monkeypatch.setattr(extract_module, "get_adapter", lambda data_source: PreparedStubAdapter)
     return adapter
 
 

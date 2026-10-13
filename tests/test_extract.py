@@ -2284,10 +2284,29 @@ class TestPerCallBandOverrides:
                 tmp_path,
             )
 
-    def test_derived_band_on_local_raises(self, sample_df, tmp_path):
-        """Derived band names ('slope') on local rasters raise a clear ValueError."""
-        with pytest.raises(ValueError, match="slope"):
-            _run_with_datasets(sample_df, [{"dem_local": ["slope"]}], tmp_path)
+    @pytest.mark.parametrize(
+        ("band_list", "rejected_bands"),
+        [(["slope"], "['slope']"), ([1, "aspect"], "['aspect']")],
+    )
+    def test_derived_band_on_local_raises(
+        self, sample_df, tmp_path, no_adapter, band_list, rejected_bands
+    ):
+        """A derived band on a local raster raises ValueError before any adapter is built.
+
+        The message names the batch, the dataset, its data_source, and the
+        derived bands that the local adapter computes (none).
+        """
+        with pytest.raises(ValueError) as error_info:
+            _run_with_datasets(sample_df, [{"dem_local": band_list}], tmp_path)
+
+        message = str(error_info.value)
+        assert message.startswith(
+            "Output 'bands_test': dataset 'dem_local' has data_source 'local', whose adapter "
+            f"cannot compute the derived band(s) {rejected_bands}."
+        )
+        assert "Derived bands that this adapter computes: none." in message
+        assert f"Remove {rejected_bands} from the band list of 'dem_local'." in message
+        assert not any(tmp_path.iterdir())
 
     def test_empty_bands_list_raises(self, sample_df, tmp_path):
         """An empty bands list is rejected (a band override must select at least one band)."""
