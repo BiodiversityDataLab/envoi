@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -217,8 +218,11 @@ def test_temporary_service_account_file_exists_during_context_and_is_private():
 
     with temporary_service_account_file(payload) as path:
         assert path.exists()
-        mode = stat.S_IMODE(path.stat().st_mode)
-        assert mode == 0o600
+        # Windows has no POSIX permission bits: os.chmod there only sets the
+        # read-only flag, so the file mode is not 0o600.
+        if os.name != "nt":
+            mode = stat.S_IMODE(path.stat().st_mode)
+            assert mode == 0o600
         assert json.loads(path.read_text())["private_key_id"] == "private-key-id"
 
     assert not path.exists()

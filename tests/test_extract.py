@@ -3169,12 +3169,24 @@ class TestLocalWindowCoverage:
         assert qc_df.loc[0, "cover_coverage_pct_100m"] == 96.0
         assert qc_df.loc[0, "cover_had_nodata_100m"]
 
-    def test_window_across_the_antimeridian(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("gdal_cuts_at_180", [True, False])
+    def test_window_across_the_antimeridian(self, tmp_path, monkeypatch, gdal_cuts_at_180):
         """A window across 180° of a raster in degrees counts its part beyond 180° as missing."""
         from pyproj import Transformer
-        from shapely.geometry import Point, Polygon
+        from shapely.geometry import Point, Polygon, mapping, shape
 
         from envoi.adapters import local_adapter
+
+        if not gdal_cuts_at_180:
+            # Some GDAL builds (the macOS wheels of rasterio in CI) do not cut a
+            # transformed geometry at 180°. Simulate them: project each corner
+            # on its own, so the window keeps corners on both sides of 180°.
+            def uncut_transform_geom(src_crs, dst_crs, geometry, precision=-1):
+                transformer = Transformer.from_crs(str(src_crs), str(dst_crs), always_xy=True)
+                ring = shape(geometry).exterior.coords
+                return mapping(Polygon([transformer.transform(x, y) for x, y in ring]))
+
+            monkeypatch.setattr(local_adapter, "transform_geom", uncut_transform_geom)
 
         # 100 x 100 pixels of 0.0005° that end at 180°. The 1000 m window of
         # the point reaches about 0.0025° beyond 180°.

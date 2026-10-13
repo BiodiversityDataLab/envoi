@@ -20,7 +20,8 @@ from rasterio.mask import mask as rio_mask
 from rasterio.warp import transform_geom
 from rasterio.windows import Window
 from rasterio.windows import transform as window_transform
-from shapely.geometry import box, mapping
+from shapely.affinity import translate
+from shapely.geometry import MultiPolygon, Polygon, box, mapping, shape
 from tqdm.auto import tqdm
 
 from .._filenames import build_tile_filenames
@@ -338,6 +339,34 @@ def _resolve_local_raster_settings(
     return file_crs, nodata, nodata_source
 
 
+def _cut_window_at_antimeridian(window_geojson: dict) -> dict:
+    """Return a window polygon in degrees, cut at 180° longitude when GDAL left it uncut.
+
+    ``transform_geom`` cuts a geometry at the antimeridian only in some GDAL
+    builds: in CI on 2026-10-13 the Linux wheels of rasterio 1.5.2 cut it and
+    the macOS wheels did not. An uncut window of a point near 180° has corners
+    on both sides of 180°, so as plane coordinates it spans almost 360° of
+    longitude and covers the wrong side of the raster. A window of a few
+    kilometres never spans 180° of longitude, so a wider polygon is such an
+    uncut window. Its western longitudes are moved by +360°, and the polygon
+    is cut at 180° into a western part and an eastern part, which is moved
+    back by -360°. Any other geometry is returned unchanged.
+    """
+    window = shape(window_geojson)
+    min_lon, _, max_lon, _ = window.bounds
+    if window.geom_type != "Polygon" or max_lon - min_lon <= 180.0:
+        return window_geojson
+    continuous_window = Polygon(
+        [(lon + 360.0 if lon < 0 else lon, lat) for lon, lat in window.exterior.coords]
+    )
+    western_part = continuous_window.intersection(box(-180.0, -90.0, 180.0, 90.0))
+    eastern_part = translate(
+        continuous_window.intersection(box(180.0, -90.0, 540.0, 90.0)), xoff=-360.0
+    )
+    parts = [part for part in (western_part, eastern_part) if part.geom_type == "Polygon"]
+    return mapping(parts[0] if len(parts) == 1 else MultiPolygon(parts))
+
+
 @dataclass
 class LocalRasterAdapter(BaseAdapter):
     spec: dict[str, Any]
@@ -584,6 +613,8 @@ class LocalRasterAdapter(BaseAdapter):
         square_raster_geojson = transform_geom(
             metric_crs, self.raster_crs, mapping(square_in_metric_crs), precision=6
         )
+        if self.raster_crs.is_geographic:
+            square_raster_geojson = _cut_window_at_antimeridian(square_raster_geojson)
         return square_raster_geojson
 
     def _count_window_pixels_beyond_raster(self, window_geometry: dict) -> int:

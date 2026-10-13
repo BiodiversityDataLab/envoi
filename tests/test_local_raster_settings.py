@@ -865,3 +865,47 @@ class TestSettingsCheckedBeforeTheFirstAdapter:
             LocalRasterAdapter({"path": str(raster_path), "nodata": _NODATA})
         assert opened_datasets
         assert all(dataset.closed for dataset in opened_datasets)
+
+
+class TestCutWindowAtAntimeridian:
+    """An uncut window in degrees near 180° is cut into a western and an eastern part."""
+
+    def test_uncut_window_is_cut_at_180(self):
+        """A polygon with corners on both sides of 180° becomes two parts that meet at 180°."""
+        from shapely.geometry import shape
+
+        from envoi.adapters.local_adapter import _cut_window_at_antimeridian
+
+        uncut_window = {
+            "type": "Polygon",
+            "coordinates": [
+                [(179.99, 0.0), (-179.995, 0.0), (-179.995, 0.01), (179.99, 0.01), (179.99, 0.0)]
+            ],
+        }
+
+        cut_window = shape(_cut_window_at_antimeridian(uncut_window))
+
+        assert cut_window.geom_type == "MultiPolygon"
+        western_part, eastern_part = sorted(cut_window.geoms, key=lambda part: -part.bounds[0])
+        assert western_part.bounds == pytest.approx((179.99, 0.0, 180.0, 0.01))
+        assert eastern_part.bounds == pytest.approx((-180.0, 0.0, -179.995, 0.01))
+        assert cut_window.area == pytest.approx(0.015 * 0.01)
+
+    def test_ordinary_and_already_cut_windows_are_unchanged(self):
+        """A small window, and a window that GDAL already cut, are returned as they are."""
+        from envoi.adapters.local_adapter import _cut_window_at_antimeridian
+
+        small_window = {
+            "type": "Polygon",
+            "coordinates": [[(10.0, 0.0), (10.01, 0.0), (10.01, 0.01), (10.0, 0.01), (10.0, 0.0)]],
+        }
+        cut_window = {
+            "type": "MultiPolygon",
+            "coordinates": [
+                [[(179.99, 0.0), (180.0, 0.0), (180.0, 0.01), (179.99, 0.01), (179.99, 0.0)]],
+                [[(-180.0, 0.0), (-179.995, 0.0), (-179.995, 0.01), (-180.0, 0.01), (-180.0, 0.0)]],
+            ],
+        }
+
+        assert _cut_window_at_antimeridian(small_window) is small_window
+        assert _cut_window_at_antimeridian(cut_window) is cut_window
