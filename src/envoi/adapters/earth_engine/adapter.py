@@ -35,8 +35,10 @@ from ...geo import build_tile_crs_zones, get_utm_crs, tile_pixel_count, tile_top
 from ...metadata import summarize_date_info, summarize_tile_export
 from ...progress import ProgressStepCallback, emit_progress_step
 from ...qc import format_point_error
+from ...reducers import KNOWN_REDUCERS
 from ..base import BaseAdapter
 from ._image import (
+    KNOWN_DERIVED_BANDS,
     _build_image,
     _count_gap_days,
     _ensure_gee_init,
@@ -102,6 +104,12 @@ class GeeRasterAdapter(BaseAdapter):
     sample date. When no date is provided, the most recent image is
     used.
     """
+
+    # Capability declarations (see BaseAdapter). No annotations: in this
+    # dataclass, an annotation would make them fields.
+    output_types = frozenset({"tabular", "raster"})
+    supported_reducers = KNOWN_REDUCERS
+    computable_derived_bands = KNOWN_DERIVED_BANDS
 
     spec: dict[str, Any]
     _static_image: Any = field(default=None, init=False, repr=False)

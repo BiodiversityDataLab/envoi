@@ -215,6 +215,14 @@ _REGISTRY: dict[str, Callable] = {
 SPECIAL_REDUCERS = frozenset({"point"})
 
 
+# Every reducer name that a run config can request: the reducers of the
+# registry above and the adapter-level ones. The set is closed. Config parsing
+# rejects any other name, because an unknown name would give no output without
+# an error. The ``supported_reducers`` of each adapter must be a subset of this
+# set (``envoi.adapters.register`` checks it).
+KNOWN_REDUCERS = frozenset(_REGISTRY) | SPECIAL_REDUCERS
+
+
 # Reducers that assume continuous data and are inappropriate for categorical data.
 # Used by validate_reducers() to warn users about incompatible reducer/data_type combinations.
 CONTINUOUS_ONLY_REDUCERS = {
@@ -334,7 +342,11 @@ def validate_reducers(
 
 
 def list_reducers() -> list[str]:
-    """Return sorted names of registered reducers."""
+    """Return sorted names of registered reducers.
+
+    The adapter-level ``point`` reducer is not in the list. ``KNOWN_REDUCERS``
+    holds every reducer name that a run config can request.
+    """
     return sorted(_REGISTRY.keys())
 
 

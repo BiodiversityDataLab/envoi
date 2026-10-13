@@ -1,13 +1,15 @@
 """Tests of the adapter contract that ``extract()`` relies on.
 
-``BaseAdapter`` declares the members that ``extract()`` calls, and every
-registered adapter keeps the same signatures. The adapter registry rejects an
-unknown ``data_source`` with a ``ValueError``. No test builds an adapter, so
-none needs Earth Engine or a raster file.
+``BaseAdapter`` declares the members that ``extract()`` calls and the
+capability declarations, and every registered adapter keeps the same
+signatures. The adapter registry rejects an unknown ``data_source`` with a
+``ValueError``. No test builds an adapter, so none needs Earth Engine or a
+raster file. ``tests/test_provider_contract.py`` tests ``register()``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 from typing import Any
 
@@ -15,17 +17,35 @@ import pytest
 
 from envoi.adapters import _REG, get_adapter
 from envoi.adapters.base import BaseAdapter
+from envoi.reducers import KNOWN_REDUCERS
 
 # The members that extract() uses: the three adapter calls, and the
 # context-manager lifecycle of `with AdapterClass(spec) as adapter:`.
 _INTERFACE_METHODS = frozenset({"fetch_stats_batch", "export_tiles", "build_dataset_meta"})
 _LIFECYCLE_METHODS = frozenset({"close", "__enter__", "__exit__"})
+# The capability declarations that each adapter sets as class attributes.
+_CAPABILITY_ATTRIBUTES = frozenset(
+    {"output_types", "supported_reducers", "computable_derived_bands", "catalog_keys"}
+)
 
 
 def _public_methods(cls: type) -> set[str]:
     """Return the names of the public methods that ``cls`` itself declares."""
     return {
         name for name, member in vars(cls).items() if callable(member) and not name.startswith("_")
+    }
+
+
+def _public_class_methods(cls: type) -> set[str]:
+    """Return the names of the public class methods that ``cls`` itself declares.
+
+    ``_public_methods`` does not find them: a ``classmethod`` object in the
+    class namespace is not callable.
+    """
+    return {
+        name
+        for name, member in vars(cls).items()
+        if isinstance(member, classmethod) and not name.startswith("_")
     }
 
 
@@ -40,11 +60,41 @@ def _parameters_without_annotations(method: Any) -> list[tuple[str, Any, Any]]:
     ]
 
 
+def _class_method_mismatches(adapter_class: type, base_class: type) -> list[str]:
+    """Return a description of each class method of ``base_class`` that ``adapter_class`` changes.
+
+    Each class method of ``base_class`` must stay a class method in
+    ``adapter_class``, inherited or overridden, with the same parameter names,
+    kinds, and defaults. An empty list means that every class method matches.
+    """
+    mismatches = []
+    for method_name in sorted(_public_class_methods(base_class)):
+        # getattr_static returns the classmethod object itself. A plain
+        # getattr returns a bound method, also for an instance method.
+        if not isinstance(inspect.getattr_static(adapter_class, method_name), classmethod):
+            mismatches.append(f"{method_name} is not a classmethod")
+            continue
+        adapter_parameters = _parameters_without_annotations(getattr(adapter_class, method_name))
+        base_parameters = _parameters_without_annotations(getattr(base_class, method_name))
+        if adapter_parameters != base_parameters:
+            mismatches.append(f"{method_name} has different parameters")
+    return mismatches
+
+
 class TestBaseAdapterInterface:
-    def test_base_adapter_declares_only_the_members_extract_uses(self):
-        """``BaseAdapter`` declares the three adapter calls and the lifecycle, nothing else."""
+    def test_base_adapter_declares_only_the_contract_members(self):
+        """``BaseAdapter`` declares the adapter calls, the lifecycle, and the capabilities only."""
         assert _public_methods(BaseAdapter) == _INTERFACE_METHODS | {"close"}
         assert _LIFECYCLE_METHODS <= set(vars(BaseAdapter))
+        public_members = {name for name in vars(BaseAdapter) if not name.startswith("_")}
+        assert public_members == _INTERFACE_METHODS | {"close"} | _CAPABILITY_ATTRIBUTES
+
+    def test_capability_declarations_default_to_empty_frozensets(self):
+        """Each capability declaration of ``BaseAdapter`` is an empty ``frozenset``."""
+        for attribute_name in sorted(_CAPABILITY_ATTRIBUTES):
+            declaration = vars(BaseAdapter)[attribute_name]
+            assert type(declaration) is frozenset, attribute_name
+            assert declaration == frozenset(), attribute_name
 
     def test_interface_methods_raise_not_implemented(self):
         """The three adapter calls of ``BaseAdapter`` raise ``NotImplementedError``."""
@@ -61,17 +111,102 @@ class TestBaseAdapterInterface:
         assert {"earth_engine", "local"} <= set(_REG)
 
 
+class TestBuiltInCapabilityDeclarations:
+    @pytest.mark.parametrize(
+        ("data_source", "expected_derived_bands"),
+        [("earth_engine", {"slope", "aspect"}), ("local", set())],
+    )
+    def test_built_in_adapter_declarations(self, data_source, expected_derived_bands):
+        """Both built-in adapters support both output types and all known reducers."""
+        adapter_class = _REG[data_source]
+        assert adapter_class.output_types == {"tabular", "raster"}
+        assert adapter_class.supported_reducers == KNOWN_REDUCERS
+        assert adapter_class.computable_derived_bands == expected_derived_bands
+        assert adapter_class.catalog_keys == frozenset()
+
+
+# Stand-in classes for the test of the class-method check: a base class with
+# one class-method hook, and subclasses that keep or change it.
+class _HookBase:
+    @classmethod
+    def check_spec(cls, spec, *, context=None):
+        return None
+
+
+class _InheritsHook(_HookBase):
+    pass
+
+
+class _OverridesHook(_HookBase):
+    @classmethod
+    def check_spec(cls, spec, *, context=None):
+        return spec
+
+
+class _HookAsInstanceMethod(_HookBase):
+    def check_spec(self, spec, *, context=None):
+        return None
+
+
+class _HookWithOtherParameters(_HookBase):
+    @classmethod
+    def check_spec(cls, spec, context=None):
+        return None
+
+
+class TestClassMethodCheck:
+    """The class-method check of the parity tests finds a changed hook.
+
+    Stand-in classes show that the check works, independent of the class
+    methods that ``BaseAdapter`` declares.
+    """
+
+    def test_inherited_or_matching_hook_passes(self):
+        """An inherited hook, and an override with the same parameters, are no mismatch."""
+        assert _class_method_mismatches(_InheritsHook, _HookBase) == []
+        assert _class_method_mismatches(_OverridesHook, _HookBase) == []
+
+    def test_hook_that_is_no_class_method_is_found(self):
+        """An override as an instance method is a mismatch."""
+        assert _class_method_mismatches(_HookAsInstanceMethod, _HookBase) == [
+            "check_spec is not a classmethod"
+        ]
+
+    def test_hook_with_other_parameters_is_found(self):
+        """An override with a different parameter kind is a mismatch."""
+        assert _class_method_mismatches(_HookWithOtherParameters, _HookBase) == [
+            "check_spec has different parameters"
+        ]
+
+
 @pytest.mark.parametrize("data_source", sorted(_REG))
 class TestAdapterSignatureParity:
     def test_adapter_subclasses_base_adapter(self, data_source):
         """Every registered adapter is a ``BaseAdapter``."""
         assert issubclass(_REG[data_source], BaseAdapter)
 
-    def test_adapter_overrides_each_interface_method(self, data_source):
-        """Every registered adapter defines its own version of each adapter call."""
+    def test_adapter_overrides_the_calls_of_its_output_types(self, data_source):
+        """An adapter overrides ``build_dataset_meta``, and the call of each output type it declares.
+
+        ``fetch_stats_batch`` for ``"tabular"``, ``export_tiles`` for ``"raster"``.
+        """
         adapter_class = _REG[data_source]
-        for method_name in sorted(_INTERFACE_METHODS):
-            assert getattr(adapter_class, method_name) is not getattr(BaseAdapter, method_name)
+        required_methods = {"build_dataset_meta"}
+        if "tabular" in adapter_class.output_types:
+            required_methods.add("fetch_stats_batch")
+        if "raster" in adapter_class.output_types:
+            required_methods.add("export_tiles")
+        for method_name in sorted(required_methods):
+            assert getattr(adapter_class, method_name) is not getattr(
+                BaseAdapter, method_name
+            ), method_name
+
+    def test_capability_declarations_are_not_dataclass_fields(self, data_source):
+        """A capability declaration of a dataclass adapter is a class attribute, not a field."""
+        adapter_class = _REG[data_source]
+        if dataclasses.is_dataclass(adapter_class):
+            field_names = {field.name for field in dataclasses.fields(adapter_class)}
+            assert field_names.isdisjoint(_CAPABILITY_ATTRIBUTES)
 
     def test_public_method_signatures_match_base_adapter(self, data_source):
         """Each public ``BaseAdapter`` method has the same parameter names, kinds, defaults."""
@@ -82,6 +217,10 @@ class TestAdapterSignatureParity:
             adapter_parameters = _parameters_without_annotations(adapter_method)
             base_parameters = _parameters_without_annotations(base_method)
             assert adapter_parameters == base_parameters, method_name
+
+    def test_class_methods_match_base_adapter(self, data_source):
+        """Each class method of ``BaseAdapter`` stays a class method with the same parameters."""
+        assert _class_method_mismatches(_REG[data_source], BaseAdapter) == []
 
 
 class TestAdapterRegistry:

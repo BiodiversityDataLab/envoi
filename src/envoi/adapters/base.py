@@ -2,18 +2,42 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+from typing import ClassVar
 
 from ..progress import ProgressStepCallback
 
 
 class BaseAdapter:
-    """The adapter interface that ``extract()`` uses, and nothing else.
+    """The adapter interface: the calls that ``extract()`` makes, and the capability declarations.
 
-    Every adapter subclasses this class and overrides ``fetch_stats_batch``,
-    ``export_tiles``, and ``build_dataset_meta`` with the same parameter names,
-    kinds, and defaults (``tests/test_adapters.py`` checks this).
+    Every adapter subclasses this class. It overrides ``build_dataset_meta``,
+    ``fetch_stats_batch`` when it declares the ``"tabular"`` output type, and
+    ``export_tiles`` when it declares ``"raster"``, with the same parameter
+    names, kinds, and defaults (``tests/test_adapters.py`` checks this).
+    It sets the capability declarations below as class attributes, and
+    ``envoi.adapters.register`` checks them.
     ``docs/architecture.md`` ("Adapter interface") describes each method.
     """
+
+    # ---- capability declarations --------------------------------------------
+    # Each adapter sets these as plain class attributes (frozensets of str),
+    # without an annotation: the built-in adapters are dataclasses, and in a
+    # dataclass an annotation makes the attribute a field. The empty defaults
+    # declare nothing.
+
+    # The output types that the adapter supports: a non-empty subset of
+    # {"tabular", "raster"}.
+    output_types: ClassVar[frozenset[str]] = frozenset()
+    # The reducer names that fetch_stats_batch supports: a subset of
+    # envoi.reducers.KNOWN_REDUCERS. Empty only when "tabular" is not in
+    # output_types.
+    supported_reducers: ClassVar[frozenset[str]] = frozenset()
+    # The derived bands that the adapter can compute from a source band, for
+    # example "slope". Empty when the adapter computes none.
+    computable_derived_bands: ClassVar[frozenset[str]] = frozenset()
+    # The top-level catalog keys that the adapter accepts in addition to the
+    # generic keys that every catalog entry can have.
+    catalog_keys: ClassVar[frozenset[str]] = frozenset()
 
     # ---- resource lifecycle -------------------------------------------------
     # Adapters may hold external resources (e.g. an open rasterio dataset) that

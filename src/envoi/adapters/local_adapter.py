@@ -35,7 +35,7 @@ from ..geo import (
 from ..metadata import summarize_tile_export
 from ..progress import ProgressStepCallback, emit_progress_step
 from ..qc import format_point_error
-from ..reducers import get_reducer
+from ..reducers import KNOWN_REDUCERS, get_reducer
 from .base import BaseAdapter
 
 try:
@@ -369,6 +369,13 @@ def _cut_window_at_antimeridian(window_geojson: dict) -> dict:
 
 @dataclass
 class LocalRasterAdapter(BaseAdapter):
+    # Capability declarations (see BaseAdapter). No annotations: in this
+    # dataclass, an annotation would make them fields. The local adapter
+    # computes no derived bands (such as slope) from a raster band.
+    output_types = frozenset({"tabular", "raster"})
+    supported_reducers = KNOWN_REDUCERS
+    computable_derived_bands = frozenset()
+
     spec: dict[str, Any]
 
     # ------------------------------------------------------------------

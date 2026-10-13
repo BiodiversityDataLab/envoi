@@ -34,6 +34,7 @@ import yaml
 from ._filenames import describe_unsafe_path_component, is_safe_path_component
 from .adapters.earth_engine import KNOWN_DERIVED_BANDS
 from .adapters.earth_engine.adapter import _BAND_NAMING_KEY, _PER_BAND_NAMING
+from .reducers import KNOWN_REDUCERS
 
 # Keys allowed inside the full-form dict value
 # (e.g. {"sen2": {"bands": [...]}}). Adding more per-call band_overrides in the
@@ -45,34 +46,6 @@ _ALLOWED_OVERRIDE_KEYS = frozenset({"bands"})
 # data_type doesn't match one of these falls back to "continuous" — the
 # common case for ecological rasters that don't bother declaring a type.
 _VALID_STAT_TYPES = frozenset({"continuous", "categorical"})
-
-# Every reducer name extract() will accept. The set is closed because each
-# name maps to a specific server-side reducer (in the GEE adapter) or a
-# Python-side reducer (in the local adapter); an unknown name would silently
-# produce no output, so we surface it early as a validation error instead.
-_ALL_KNOWN_REDUCERS = frozenset(
-    {
-        "mean",
-        "median",
-        "min",
-        "max",
-        "sum",
-        "std",
-        "var",
-        "count",
-        "mode",
-        "point",
-        "class_count",
-        "class_fraction",
-        "q05",
-        "q10",
-        "q25",
-        "q50",
-        "q75",
-        "q90",
-        "q95",
-    }
-)
 
 
 @dataclass
@@ -662,11 +635,11 @@ def _parse_statistics(
 
 def _validate_reducer_names(reducers: list, batch_id: str, context: str) -> None:
     """Raise ValueError if any reducer name is not in the known set."""
-    unknown = [r for r in reducers if r not in _ALL_KNOWN_REDUCERS]
+    unknown = [r for r in reducers if r not in KNOWN_REDUCERS]
     if unknown:
         raise ValueError(
             f"Output '{batch_id}': unknown reducer(s) {unknown} in '{context}'. "
-            f"Valid reducers: {sorted(_ALL_KNOWN_REDUCERS)}."
+            f"Valid reducers: {sorted(KNOWN_REDUCERS)}."
         )
 
 

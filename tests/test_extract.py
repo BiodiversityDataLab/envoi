@@ -3816,7 +3816,7 @@ class TestAppendStatColumnsClassFill:
 
 
 # ------------------------------------------------------------------
-# _ALL_KNOWN_REDUCERS — make sure the registry sets agree.
+# KNOWN_REDUCERS — make sure the registry sets agree.
 # ------------------------------------------------------------------
 
 
@@ -3824,10 +3824,10 @@ def test_all_known_reducers_includes_class_reducers():
     # Regression check: the validator's allow-list must include the new
     # categorical reducers, otherwise _validate_reducer_names rejects them
     # before the adapter ever sees them.
-    from envoi._config_parsing import _ALL_KNOWN_REDUCERS
+    from envoi.reducers import KNOWN_REDUCERS
 
-    assert "class_count" in _ALL_KNOWN_REDUCERS
-    assert "class_fraction" in _ALL_KNOWN_REDUCERS
+    assert "class_count" in KNOWN_REDUCERS
+    assert "class_fraction" in KNOWN_REDUCERS
 
 
 # ------------------------------------------------------------------
