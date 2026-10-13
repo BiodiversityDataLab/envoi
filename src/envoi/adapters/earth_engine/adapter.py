@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,7 +30,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from ..._filenames import build_tile_filenames
-from ...catalog import load_defaults
+from ...catalog import _DATA_TYPES, CatalogError, load_defaults
 from ...geo import build_tile_crs_zones, get_utm_crs, tile_pixel_count, tile_top_left
 from ...metadata import summarize_date_info, summarize_tile_export
 from ...progress import ProgressStepCallback, emit_progress_step
@@ -67,6 +67,23 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+# The options that `dataset_spec` of an Earth Engine catalog entry can set.
+# `image` and `collection` replace the asset type that __post_init__ detects.
+_DATASET_SPEC_KEYS = frozenset(
+    {"image", "collection", "native_scale_m", "use_utm_zone", "collection_date_policy"}
+)
+
+# Keys that belong at the top level of a catalog entry, not in `dataset_spec`.
+# In dataset_spec they would replace the bands of a per-call band list (see
+# __post_init__) and skip the derived-band checks of config parsing.
+_TOP_LEVEL_BAND_KEYS = ("bands", "derived_bands")
+
+# The values of dataset_spec.collection_date_policy. The adapter compares them
+# without letter case. An unknown value would be read as "contains" by one
+# part of the date selection and as "nearest" by another, so it is rejected
+# when the catalog is loaded or registered.
+_COLLECTION_DATE_POLICIES = frozenset({"nearest", "contains", "mosaic"})
+
 
 # ---------------------------------------------------------------------------
 # Adapter
@@ -100,6 +117,12 @@ class GeeRasterAdapter(BaseAdapter):
     output_types = frozenset({"tabular", "raster"})
     supported_reducers = KNOWN_REDUCERS
     computable_derived_bands = KNOWN_DERIVED_BANDS
+    # The catalog keys that __post_init__ reads in addition to the generic
+    # keys: the options of `dataset_spec`, the number of parallel requests
+    # (`max_workers`, default from defaults.yml), and `crs`, the CRS that the
+    # metadata records when Earth Engine cannot resolve the asset's projection
+    # (default EPSG:4326).
+    catalog_keys = frozenset({"dataset_spec", "max_workers", "crs"})
 
     spec: dict[str, Any]
     _static_image: Any = field(default=None, init=False, repr=False)
@@ -109,6 +132,68 @@ class GeeRasterAdapter(BaseAdapter):
     # _BAND_NAMING_KEY in the spec): statistic keys are then named after their
     # bands, also for one band.
     _band_named_keys: bool = field(default=False, init=False, repr=False)
+
+    # ------------------------------------------------------------------
+    # Catalog rules
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def validate_catalog_entry(cls, name: str, entry: dict) -> None:
+        """Check the Earth Engine rules of one catalog entry.
+
+        ``data_type`` is required and not null, because it selects the
+        continuous or categorical reducers and Earth Engine cannot tell it.
+        ``dataset_spec``, when set, is a mapping with only the keys of
+        ``_DATASET_SPEC_KEYS``, and its ``collection_date_policy`` is one of
+        ``_COLLECTION_DATE_POLICIES`` in any letter case. Sends no request.
+
+        Args:
+            name: The name of the dataset (its key under ``datasets``).
+            entry: A copy of the catalog entry. Not changed.
+
+        Raises:
+            CatalogError: If a rule is broken. The message names the dataset,
+                the key, and the allowed values or keys.
+        """
+        if entry.get("data_type") is None:
+            raise CatalogError(
+                f"datasets.{name}: missing required key 'data_type' for data_source "
+                f"'earth_engine' (null is not allowed). "
+                f"Valid values are: {', '.join(sorted(_DATA_TYPES))}."
+            )
+
+        if "dataset_spec" not in entry:
+            return
+        dataset_spec = entry["dataset_spec"]
+        if not isinstance(dataset_spec, Mapping):
+            raise CatalogError(
+                f"datasets.{name}: dataset_spec must be a mapping of options, got "
+                f"{dataset_spec!r}. Allowed keys: {sorted(_DATASET_SPEC_KEYS)}. Remove "
+                f"'dataset_spec' when the dataset needs no option."
+            )
+        for key in _TOP_LEVEL_BAND_KEYS:
+            if key in dataset_spec:
+                raise CatalogError(
+                    f"datasets.{name}: dataset_spec.{key} is not allowed. Move '{key}' to "
+                    f"the top level of the catalog entry, next to 'path'."
+                )
+        unknown_keys = sorted(
+            (key for key in dataset_spec if key not in _DATASET_SPEC_KEYS), key=str
+        )
+        if unknown_keys:
+            raise CatalogError(
+                f"datasets.{name}: unknown dataset_spec key(s) {unknown_keys}. "
+                f"Allowed keys: {sorted(_DATASET_SPEC_KEYS)}."
+            )
+
+        if "collection_date_policy" in dataset_spec:
+            policy = dataset_spec["collection_date_policy"]
+            if not isinstance(policy, str) or policy.lower() not in _COLLECTION_DATE_POLICIES:
+                raise CatalogError(
+                    f"datasets.{name}: unknown dataset_spec.collection_date_policy "
+                    f"{policy!r}. Valid values are: "
+                    f"{', '.join(sorted(_COLLECTION_DATE_POLICIES))}."
+                )
 
     # ------------------------------------------------------------------
     # Setup

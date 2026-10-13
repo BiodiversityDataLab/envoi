@@ -3,9 +3,10 @@
 ``FakeStatsAdapter`` is a third adapter that only this module registers. It
 runs through ``envoi.extract()`` with no change to a generic module, so a new
 data provider needs only its adapter module. The module also tests the checks
-of ``envoi.adapters.register()``, and the pre-flight checks that ``extract()``
+of ``envoi.adapters.register()``, the pre-flight checks that ``extract()``
 runs with the adapter declarations and ``check_dataset`` before it builds any
-adapter. No test uses the network or a raster file.
+adapter, and the catalog checks with the adapter's ``catalog_keys`` and
+catalog hooks. No test uses the network or a raster file.
 """
 
 from __future__ import annotations
@@ -18,11 +19,13 @@ from typing import Any, ClassVar
 
 import pandas as pd
 import pytest
+import yaml
 
 from envoi import adapters, update_catalog
 from envoi.adapters import register
 from envoi.adapters.base import BaseAdapter
 from envoi.adapters.local_adapter import LocalRasterAdapter
+from envoi.catalog import CatalogError, load_catalog, load_catalogs
 from envoi.extract import extract
 from envoi.progress import ProgressStepCallback
 
@@ -39,11 +42,13 @@ class FakeStatsAdapter(BaseAdapter):
     statistic keys are ``{band}_{reducer}``. Every point is in the extent and
     has full coverage. The class records the merged spec of each instance in
     ``built_specs``. Its pre-flight check accepts only a ``path`` that starts
-    with ``fake://``, and records its arguments in ``checked_specs``.
+    with ``fake://``, and records its arguments in ``checked_specs``. Its
+    catalog entries can have the key ``fake_product``, which must be text.
     """
 
     output_types = frozenset({"tabular"})
     supported_reducers = frozenset({"mean", "max"})
+    catalog_keys = frozenset({"fake_product"})
 
     # The merged spec of each instance, in build order. The fixture clears it.
     built_specs: ClassVar[list[dict[str, Any]]] = []
@@ -60,6 +65,15 @@ class FakeStatsAdapter(BaseAdapter):
                 f"{context}: the path {spec['path']!r} is not an address of the fake "
                 f"provider. Set 'path' in the catalog entry to an address that starts "
                 f"with 'fake://'."
+            )
+
+    @classmethod
+    def validate_catalog_entry(cls, name: str, entry: dict) -> None:
+        """Raise ValueError when the entry sets ``fake_product`` to a value that is not text."""
+        fake_product = entry.get("fake_product")
+        if fake_product is not None and not isinstance(fake_product, str):
+            raise ValueError(
+                f"fake_product must be the name of a product as text, got {fake_product!r}."
             )
 
     def __init__(self, spec: dict[str, Any]) -> None:
@@ -210,13 +224,22 @@ class TestFakeProviderThroughExtract:
 
     def test_fake_adapter_keeps_base_adapter_signatures(self):
         """The fake adapter calls have the signatures of ``BaseAdapter``, annotations included."""
-        for method_name in ("fetch_stats_batch", "build_dataset_meta", "check_dataset"):
+        for method_name in (
+            "fetch_stats_batch",
+            "build_dataset_meta",
+            "check_dataset",
+            "validate_catalog_entry",
+        ):
             fake_signature = inspect.signature(getattr(FakeStatsAdapter, method_name))
             base_signature = inspect.signature(getattr(BaseAdapter, method_name))
             assert fake_signature == base_signature, method_name
 
     def test_tabular_run_with_per_call_band_list(self, fake_provider, three_points, tmp_path):
-        """A per-call list of two bands gives the exact statistic, QC, and sidecar outputs."""
+        """A per-call list of two bands gives the exact statistic, QC, and sidecar outputs.
+
+        The catalog entry has the fake provider's own catalog key, which
+        reaches the pre-flight check and the adapter.
+        """
         update_catalog(
             {
                 "datasets": {
@@ -224,6 +247,7 @@ class TestFakeProviderThroughExtract:
                         "data_source": "fake",
                         "path": "fake://climate",
                         "data_type": "continuous",
+                        "fake_product": "reanalysis",
                     }
                 }
             }
@@ -248,6 +272,7 @@ class TestFakeProviderThroughExtract:
             "data_source": "fake",
             "path": "fake://climate",
             "data_type": "continuous",
+            "fake_product": "reanalysis",
             "bands": ["precip", "temp"],
             "band_naming": "per_band",
         }
@@ -444,6 +469,128 @@ class TestPreFlightChecks:
 
         assert fake_provider.built_specs == []
         assert not any(tmp_path.iterdir())
+
+
+def _fake_climate_entry(**keys: Any) -> dict[str, Any]:
+    """Return the catalog entry of ``fake_climate``, with more ``keys``."""
+    return {
+        "data_source": "fake",
+        "path": "fake://climate",
+        "data_type": "continuous",
+        **keys,
+    }
+
+
+def _write_catalog_file(directory: Path, datasets: dict[str, Any]) -> Path:
+    """Write ``datasets`` as a catalog file in ``directory`` and return its path."""
+    catalog_path = directory / "catalog.yml"
+    catalog_path.write_text(yaml.safe_dump({"datasets": datasets}), encoding="utf-8")
+    return catalog_path
+
+
+class TestCatalogRules:
+    """The fake provider's ``catalog_keys`` and catalog hooks decide its catalog rules.
+
+    ``envoi.catalog`` checks an entry when it is loaded or registered, so an
+    invalid entry stops before ``extract()`` and before any adapter is built.
+    """
+
+    def test_own_catalog_key_is_accepted(self, fake_provider):
+        """The key that the fake adapter declares in ``catalog_keys`` registers unchanged."""
+        update_catalog({"datasets": {"fake_climate": _fake_climate_entry(fake_product="era")}})
+
+        stored_entry = load_catalogs()["datasets"]["fake_climate"]
+        assert stored_entry == _fake_climate_entry(fake_product="era")
+
+    def test_unknown_catalog_key_is_rejected(self, fake_provider):
+        """A key that is not generic and not in ``catalog_keys`` raises and lists allowed keys."""
+        with pytest.raises(CatalogError) as error_info:
+            update_catalog({"datasets": {"fake_climate": _fake_climate_entry(fake_prodcut="era")}})
+
+        message = str(error_info.value)
+        assert message.startswith(
+            "datasets.fake_climate: unknown key(s) ['fake_prodcut'] for data_source 'fake'. "
+            "Allowed keys: ["
+        )
+        assert "'fake_product'" in message
+        assert "Put free text, for example notes about the dataset, under " in message
+        assert "fake_climate" not in load_catalogs()["datasets"]
+        assert fake_provider.checked_specs == []
+        assert fake_provider.built_specs == []
+
+    def test_catalog_key_of_another_adapter_is_rejected(self, fake_provider):
+        """A key of the local adapter (``nodata``) is an unknown key for the fake provider."""
+        with pytest.raises(CatalogError, match=r"unknown key\(s\) \['nodata'\]"):
+            update_catalog({"datasets": {"fake_climate": _fake_climate_entry(nodata=-9999)}})
+
+    def test_value_error_of_the_hook_becomes_a_catalog_error(self, fake_provider, tmp_path):
+        """A ``ValueError`` of the hook becomes a ``CatalogError`` that names the dataset.
+
+        A catalog file and a catalog dict give the same message.
+        """
+        entry = _fake_climate_entry(fake_product=3)
+        expected_message = (
+            "datasets.fake_climate: fake_product must be the name of a product as text, got 3."
+        )
+
+        with pytest.raises(CatalogError) as dict_error_info:
+            update_catalog({"datasets": {"fake_climate": entry}})
+        with pytest.raises(CatalogError) as file_error_info:
+            load_catalog(_write_catalog_file(tmp_path, {"fake_climate": entry}))
+
+        for error_info in (dict_error_info, file_error_info):
+            assert str(error_info.value) == expected_message
+            assert type(error_info.value.__cause__) is ValueError
+        assert "fake_climate" not in load_catalogs()["datasets"]
+
+    def test_catalog_error_of_the_hook_is_not_wrapped_again(self, isolated_registry):
+        """A ``CatalogError`` of a hook reaches the caller unchanged, without a second prefix."""
+
+        def reject_every_entry(cls, name: str, entry: dict) -> None:
+            raise CatalogError(f"datasets.{name}: the fake provider rejects every entry.")
+
+        register(
+            "fake_strict",
+            _fake_adapter_with(validate_catalog_entry=classmethod(reject_every_entry)),
+        )
+
+        with pytest.raises(CatalogError) as error_info:
+            update_catalog(
+                {"datasets": {"fake_climate": _fake_climate_entry(data_source="fake_strict")}}
+            )
+
+        assert str(error_info.value) == (
+            "datasets.fake_climate: the fake provider rejects every entry."
+        )
+        assert error_info.value.__cause__ is None
+
+    def test_inspection_runs_for_catalog_files_only(self, isolated_registry, tmp_path):
+        """``inspect_catalog_entry`` fills a key for a catalog file, not for a catalog dict.
+
+        The hook runs once, for the file, and the stored entry is the dict
+        that it returns.
+        """
+        inspected_inputs: list[dict[str, Any]] = []
+
+        def fill_fake_product(cls, name: str, entry: dict) -> dict:
+            inspected_inputs.append(entry)
+            return {**entry, "fake_product": f"read from {entry['path']}"}
+
+        register(
+            "fake_inspected",
+            _fake_adapter_with(inspect_catalog_entry=classmethod(fill_fake_product)),
+        )
+        entry = _fake_climate_entry(data_source="fake_inspected")
+
+        file_entry = load_catalog(_write_catalog_file(tmp_path, {"fake_climate": entry}))[
+            "datasets"
+        ]["fake_climate"]
+        update_catalog({"datasets": {"fake_climate": entry}})
+        dict_entry = load_catalogs()["datasets"]["fake_climate"]
+
+        assert file_entry == {**entry, "fake_product": "read from fake://climate"}
+        assert dict_entry == entry
+        assert inspected_inputs == [entry]
 
 
 class TestRegister:

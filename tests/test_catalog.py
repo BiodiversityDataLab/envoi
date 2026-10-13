@@ -8,14 +8,19 @@ through the full extract() pipeline.
 
 from __future__ import annotations
 
+import copy
+import json
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import pytest
 import rasterio
 import yaml
 from rasterio.transform import from_origin
 
 from envoi import adapters as adapter_registry
-from envoi import list_datasets, reset_catalog, update_catalog
+from envoi import extract, list_datasets, reset_catalog, update_catalog
 from envoi.catalog import (
     BUILTIN_EE_CATALOG,
     CatalogError,
@@ -23,6 +28,32 @@ from envoi.catalog import (
     load_catalog,
     load_catalogs,
 )
+
+# The catalog keys that every entry can have, whatever its data_source.
+_GENERIC_KEYS = {
+    "data_source",
+    "path",
+    "data_type",
+    "display_name",
+    "category",
+    "bands",
+    "derived_bands",
+    "supported_derived_bands",
+    "dataset_information",
+}
+# The catalog keys that each built-in adapter accepts in addition.
+_LOCAL_KEYS = {"crs", "nodata", "resolution_m", "type", "band_count"}
+_EARTH_ENGINE_KEYS = {"dataset_spec", "max_workers", "crs"}
+# The keys of an Earth Engine dataset_spec.
+_DATASET_SPEC_KEYS = [
+    "collection",
+    "collection_date_policy",
+    "image",
+    "native_scale_m",
+    "use_utm_zone",
+]
+
+_EXAMPLES_DIR = Path(__file__).parents[1] / "examples"
 
 # ------------------------------------------------------------------
 # Shared cleanup: every test starts with an empty user catalog. Tests that
@@ -85,8 +116,8 @@ class TestCatalogDictValidation:
 
     def test_local_dataset_does_not_require_data_type(self):
         # Confirm the looser local-source rule — no data_type, no error.
-        # The path is fake so _inspect_raster will silently skip auto-detect,
-        # but the validator itself must accept the entry.
+        # A dict entry is not inspected, so the fake path is not read; the
+        # validator itself must accept the entry.
         catalog = _load_catalog_any(
             {"datasets": {"x": {"data_source": "local", "path": "/tmp/nonexistent.tif"}}}
         )
@@ -104,12 +135,25 @@ class TestCatalogDictValidation:
         result = _load_catalog_any(None)
         assert result == {"datasets": {}}
 
-    def test_dict_without_datasets_key_normalised(self):
-        # A user dict that forgets the top-level "datasets" key is still
-        # accepted; the helper adds an empty datasets dict so downstream
-        # code can iterate without a key-check.
-        result = _load_catalog_any({"other_key": "ignored"})
-        assert result["datasets"] == {}
+    @pytest.mark.parametrize(
+        "catalog_dict",
+        [{"other_key": "ignored"}, {"datasets": None}, {"datasets": ["my_dem"]}],
+    )
+    def test_dict_without_datasets_mapping_raises(self, catalog_dict):
+        """A catalog dict without a ``datasets`` mapping raises, as a catalog file does."""
+        expected_message = "A catalog dict needs the top-level key 'datasets', a mapping"
+        with pytest.raises(CatalogError, match=expected_message):
+            _load_catalog_any(catalog_dict)
+        with pytest.raises(CatalogError, match=expected_message):
+            update_catalog(catalog_dict)
+
+    def test_dict_with_empty_datasets_mapping_is_accepted(self):
+        """``{"datasets": {}}`` is a valid catalog dict that registers nothing."""
+        assert _load_catalog_any({"datasets": {}}) == {"datasets": {}}
+
+        update_catalog({"datasets": {}})
+
+        assert load_catalogs() == {"datasets": {}}
 
 
 # ------------------------------------------------------------------
@@ -533,3 +577,409 @@ class TestLocalRasterResolution:
         )
 
         assert dataset_entry["resolution_m"] == 100
+
+
+# ------------------------------------------------------------------
+# Catalog entry rules — the same checks for catalog files and dicts.
+# ------------------------------------------------------------------
+
+
+def _local_entry(**keys) -> dict:
+    """Return a local catalog entry whose file does not exist, with more ``keys``."""
+    return {"data_source": "local", "path": "missing/my_dem.tif", **keys}
+
+
+def _earth_engine_dem_entry(**keys) -> dict:
+    """Return an Earth Engine catalog entry of a DEM, with more ``keys``."""
+    return {
+        "data_source": "earth_engine",
+        "path": "USGS/GTOPO30",
+        "data_type": "continuous",
+        **keys,
+    }
+
+
+def _catalog_error_of_file(tmp_path, entry: dict) -> str:
+    """Load ``entry`` as the dataset ``my_dem`` of a catalog file and return the error."""
+    catalog_path = tmp_path / "catalog.yml"
+    catalog_path.write_text(yaml.safe_dump({"datasets": {"my_dem": entry}}), encoding="utf-8")
+    with pytest.raises(CatalogError) as error_info:
+        load_catalog(catalog_path)
+    return str(error_info.value)
+
+
+def _catalog_error_of_dict(entry: dict) -> str:
+    """Register ``entry`` as the dataset ``my_dem`` of a catalog dict, and return the error."""
+    with pytest.raises(CatalogError) as error_info:
+        update_catalog({"datasets": {"my_dem": entry}})
+    assert "my_dem" not in load_catalogs()["datasets"]
+    return str(error_info.value)
+
+
+class TestUnknownCatalogKeys:
+    """A top-level key that is not generic and not in the adapter's ``catalog_keys`` raises."""
+
+    @pytest.mark.parametrize(
+        ("entry", "data_source", "allowed_keys"),
+        [
+            (_local_entry(notes="from the field survey"), "local", _GENERIC_KEYS | _LOCAL_KEYS),
+            (
+                _earth_engine_dem_entry(notes="from the field survey"),
+                "earth_engine",
+                _GENERIC_KEYS | _EARTH_ENGINE_KEYS,
+            ),
+        ],
+    )
+    def test_unknown_key_raises_and_lists_the_allowed_keys(self, entry, data_source, allowed_keys):
+        """The message names the dataset and the key, lists the allowed keys, and the fix."""
+        message = _catalog_error_of_dict(entry)
+
+        assert message == (
+            f"datasets.my_dem: unknown key(s) ['notes'] for data_source '{data_source}'. "
+            f"Allowed keys: {sorted(allowed_keys)}. Put free text, for example notes about "
+            f"the dataset, under 'dataset_information'."
+        )
+
+    @pytest.mark.parametrize(
+        ("entry", "unknown_key"),
+        [
+            (_local_entry(dataset_spec={"native_scale_m": 30}), "dataset_spec"),
+            (_local_entry(max_workers=4), "max_workers"),
+            (_earth_engine_dem_entry(nodata=-9999), "nodata"),
+            (_earth_engine_dem_entry(resolution_m=30), "resolution_m"),
+        ],
+    )
+    def test_key_of_the_other_adapter_raises(self, entry, unknown_key):
+        """A key of one built-in adapter is an unknown key for the other one."""
+        message = _catalog_error_of_dict(entry)
+        assert message.startswith(f"datasets.my_dem: unknown key(s) ['{unknown_key}']")
+
+    def test_typing_error_in_a_generic_key_raises(self):
+        """A typing error in a generic key (``data_typ``) raises instead of being ignored."""
+        message = _catalog_error_of_dict(_local_entry(data_typ="categorical"))
+        assert message.startswith("datasets.my_dem: unknown key(s) ['data_typ']")
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            _local_entry(
+                display_name="My DEM",
+                category="Terrain",
+                data_type="continuous",
+                bands=[1],
+                derived_bands=[],
+                supported_derived_bands=[],
+                dataset_information={"description": "A DEM.", "notes": "free text"},
+                crs="EPSG:32633",
+                nodata=-9999,
+                resolution_m=10.0,
+                type="raster",
+                band_count=1,
+            ),
+            _earth_engine_dem_entry(
+                display_name="GTOPO30",
+                category="Terrain",
+                bands=["elevation"],
+                derived_bands=["slope"],
+                supported_derived_bands=["slope", "aspect"],
+                dataset_information={"description": "A DEM."},
+                dataset_spec={
+                    "image": "USGS/GTOPO30",
+                    "native_scale_m": 927.67,
+                    "use_utm_zone": False,
+                    "collection_date_policy": "nearest",
+                },
+                max_workers=4,
+                crs="EPSG:4326",
+            ),
+        ],
+        ids=["local", "earth_engine"],
+    )
+    def test_every_allowed_key_is_accepted_unchanged(self, entry):
+        """An entry with every key that its adapter allows registers as written."""
+        update_catalog({"datasets": {"my_dem": entry}})
+        assert load_catalogs()["datasets"]["my_dem"] == entry
+
+
+class TestDataType:
+    """``data_type`` is continuous, categorical, absent, or null (null counts as absent)."""
+
+    @pytest.mark.parametrize("data_type", ["Continuous", "numeric", "", 1, ["continuous"]])
+    @pytest.mark.parametrize("entry_factory", [_local_entry, _earth_engine_dem_entry])
+    def test_unknown_data_type_raises_and_lists_the_valid_values(self, entry_factory, data_type):
+        """A value other than continuous or categorical raises, also in another letter case."""
+        message = _catalog_error_of_dict(entry_factory(data_type=data_type))
+        assert message == (
+            f"datasets.my_dem: unknown data_type {data_type!r}. "
+            f"Valid values are: categorical, continuous."
+        )
+
+    @pytest.mark.parametrize("data_type", ["continuous", "categorical"])
+    def test_known_data_types_are_accepted(self, data_type):
+        """Both data types register for both built-in adapters."""
+        update_catalog(
+            {
+                "datasets": {
+                    "local_dataset": _local_entry(data_type=data_type),
+                    "ee_dataset": _earth_engine_dem_entry(data_type=data_type),
+                }
+            }
+        )
+        datasets = load_catalogs()["datasets"]
+        assert datasets["local_dataset"]["data_type"] == data_type
+        assert datasets["ee_dataset"]["data_type"] == data_type
+
+    def test_null_data_type_is_accepted_for_a_local_entry(self):
+        """``data_type: null`` counts as absent, and a local entry needs no data_type."""
+        update_catalog({"datasets": {"my_dem": _local_entry(data_type=None)}})
+        assert load_catalogs()["datasets"]["my_dem"] == _local_entry(data_type=None)
+
+    def test_null_data_type_raises_for_an_earth_engine_entry(self):
+        """An Earth Engine entry needs a data_type, and null does not count as one."""
+        message = _catalog_error_of_dict(_earth_engine_dem_entry(data_type=None))
+        assert message == (
+            "datasets.my_dem: missing required key 'data_type' for data_source 'earth_engine' "
+            "(null is not allowed). Valid values are: categorical, continuous."
+        )
+
+
+class TestPathValue:
+    """``path`` is a non-empty text or a ``pathlib.Path``, and envoi stores it as text."""
+
+    def test_pathlib_path_is_stored_as_text(self, tmp_path):
+        """A ``pathlib.Path`` registers, and the stored and returned entries have its text."""
+        raster_path = tmp_path / "my_dem.tif"
+        update_catalog({"datasets": {"my_dem": _local_entry(path=raster_path)}})
+
+        stored_path = load_catalogs()["datasets"]["my_dem"]["path"]
+        assert type(stored_path) is str
+        assert stored_path == str(raster_path)
+
+    def test_metadata_sidecar_records_a_pathlib_path_as_text(self, dem_tif, sample_df, tmp_path):
+        """A run of a dataset registered with a ``pathlib.Path`` records its text in the sidecar."""
+        update_catalog({"datasets": {"my_dem": _local_entry(path=Path(dem_tif), bands=1)}})
+        run_config = {
+            "batch_id": "path_run",
+            "datasets": ["my_dem"],
+            "settings": {"output_type": "tabular", "statistics": ["mean"], "window_size_m": 100},
+        }
+
+        outputs = extract(sample_df, run_config, output_dir=tmp_path, write_metadata=True)
+
+        sidecar = json.loads((tmp_path / "path_run_metadata.json").read_text(encoding="utf-8"))
+        assert sidecar["datasets"]["my_dem"]["path"] == str(dem_tif)
+        assert pd.read_csv(outputs["path_run"])["my_dem_mean_100m"].notna().all()
+
+    @pytest.mark.parametrize("path", ["", 3, b"data/dem.tif", ["data/dem.tif"]])
+    def test_invalid_path_raises(self, path):
+        """An empty text, a number, bytes, or a list is not a path."""
+        message = _catalog_error_of_dict(_local_entry(path=path))
+        assert message == (
+            f"datasets.my_dem: path must be a non-empty text or a pathlib.Path, got {path!r}."
+        )
+
+    @pytest.mark.parametrize("entry", [{"data_source": "local"}, _local_entry(path=None)])
+    def test_missing_or_null_path_raises(self, entry):
+        """An entry without a path, or with a null path, raises and says what path is."""
+        message = _catalog_error_of_dict(entry)
+        assert message.startswith("datasets.my_dem: missing required key 'path'.")
+
+
+class TestDerivedBandKeys:
+    """``derived_bands`` and ``supported_derived_bands`` name only bands the adapter computes."""
+
+    @pytest.mark.parametrize(
+        ("key", "value", "listed_bands"),
+        [
+            ("derived_bands", "slope", ["slope"]),
+            ("derived_bands", ["slope", "aspect"], ["slope", "aspect"]),
+            ("supported_derived_bands", ["slope", "aspect"], ["slope", "aspect"]),
+        ],
+    )
+    def test_derived_band_on_a_local_entry_raises(self, key, value, listed_bands):
+        """The local adapter computes no derived band, so each name raises."""
+        message = _catalog_error_of_dict(_local_entry(**{key: value}))
+        assert message == (
+            f"datasets.my_dem: {key} has {listed_bands}, which the adapter of data_source "
+            f"'local' cannot compute. Derived bands that this adapter computes: none."
+        )
+
+    def test_unknown_derived_band_on_an_earth_engine_entry_raises(self):
+        """A name that the Earth Engine adapter cannot compute raises and lists the ones it can."""
+        message = _catalog_error_of_dict(
+            _earth_engine_dem_entry(supported_derived_bands=["slope", "ndvi"])
+        )
+        assert message == (
+            "datasets.my_dem: supported_derived_bands has ['ndvi'], which the adapter of "
+            "data_source 'earth_engine' cannot compute. Derived bands that this adapter "
+            "computes: ['aspect', 'slope']."
+        )
+
+    @pytest.mark.parametrize("value", [None, [], ()])
+    def test_empty_derived_band_values_are_accepted_for_a_local_entry(self, value):
+        """Null or an empty list names no derived band, so a local entry accepts it."""
+        entry = _local_entry(derived_bands=value, supported_derived_bands=value)
+        update_catalog({"datasets": {"my_dem": entry}})
+        assert load_catalogs()["datasets"]["my_dem"]["derived_bands"] == value
+
+    @pytest.mark.parametrize("value", [3, {"slope": True}])
+    def test_derived_band_value_of_another_shape_raises(self, value):
+        """A value that is not a band name or a list of band names raises."""
+        message = _catalog_error_of_dict(_earth_engine_dem_entry(derived_bands=value))
+        assert message == (
+            f"datasets.my_dem: derived_bands must be a band name or a list of band names, "
+            f"got {value!r}."
+        )
+
+
+class TestEarthEngineDatasetSpec:
+    """``dataset_spec`` of an Earth Engine entry is a mapping with only the known options."""
+
+    def test_unknown_dataset_spec_key_raises_and_lists_the_allowed_keys(self):
+        """An unknown option raises with the dataset, the key, and the allowed keys."""
+        message = _catalog_error_of_dict(_earth_engine_dem_entry(dataset_spec={"native_scale": 30}))
+        assert message == (
+            f"datasets.my_dem: unknown dataset_spec key(s) ['native_scale']. "
+            f"Allowed keys: {_DATASET_SPEC_KEYS}."
+        )
+
+    @pytest.mark.parametrize(
+        ("key", "value"), [("bands", ["elevation"]), ("derived_bands", ["slope"])]
+    )
+    def test_band_keys_in_dataset_spec_raise_with_the_fix(self, key, value):
+        """``dataset_spec.bands`` and ``dataset_spec.derived_bands`` belong at the top level."""
+        message = _catalog_error_of_dict(_earth_engine_dem_entry(dataset_spec={key: value}))
+        assert message == (
+            f"datasets.my_dem: dataset_spec.{key} is not allowed. Move '{key}' to the top "
+            f"level of the catalog entry, next to 'path'."
+        )
+
+    @pytest.mark.parametrize("dataset_spec", [None, ["mosaic"], "mosaic"])
+    def test_dataset_spec_that_is_not_a_mapping_raises(self, dataset_spec):
+        """A null, list, or text ``dataset_spec`` raises and lists the allowed keys."""
+        message = _catalog_error_of_dict(_earth_engine_dem_entry(dataset_spec=dataset_spec))
+        assert message == (
+            f"datasets.my_dem: dataset_spec must be a mapping of options, got "
+            f"{dataset_spec!r}. Allowed keys: {_DATASET_SPEC_KEYS}. Remove 'dataset_spec' "
+            f"when the dataset needs no option."
+        )
+
+
+class TestCatalogFilesAndDictsAgree:
+    """A catalog file and a catalog dict give the same error for the same entry."""
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            pytest.param({"path": "data/dem.tif"}, id="missing_data_source"),
+            pytest.param({"data_source": "gdal", "path": "data/dem.tif"}, id="unknown_source"),
+            pytest.param({"data_source": "local"}, id="missing_path"),
+            pytest.param(_local_entry(path=""), id="empty_path"),
+            pytest.param(_local_entry(notes="survey"), id="unknown_key"),
+            pytest.param(_local_entry(data_type="numeric"), id="unknown_data_type"),
+            pytest.param(_local_entry(derived_bands=["slope"]), id="local_derived_band"),
+            pytest.param(_earth_engine_dem_entry(data_type=None), id="ee_null_data_type"),
+            pytest.param(
+                _earth_engine_dem_entry(dataset_spec={"bands": ["elevation"]}),
+                id="dataset_spec_bands",
+            ),
+            pytest.param(
+                _earth_engine_dem_entry(dataset_spec={"scale": 30}), id="dataset_spec_key"
+            ),
+            pytest.param(
+                _earth_engine_dem_entry(dataset_spec={"collection_date_policy": "closest"}),
+                id="date_policy",
+            ),
+            pytest.param(["not", "a", "mapping"], id="not_a_mapping"),
+        ],
+    )
+    def test_same_error_for_file_and_dict(self, tmp_path, entry):
+        """``load_catalog()`` and ``update_catalog()`` with a dict raise the same message."""
+        file_message = _catalog_error_of_file(tmp_path, entry)
+        dict_message = _catalog_error_of_dict(entry)
+
+        assert file_message == dict_message
+        assert file_message.startswith("datasets.my_dem: ")
+
+
+# ------------------------------------------------------------------
+# Copies — registered and returned entries are not shared.
+# ------------------------------------------------------------------
+
+
+class TestCatalogCopies:
+    """``update_catalog()`` stores copies, and ``load_catalogs()`` returns copies."""
+
+    def test_changes_to_the_registered_dict_and_to_returned_entries_have_no_effect(self):
+        """A later ``load_catalogs()`` is unchanged after both dicts change, also nested values."""
+        registered_entry = _local_entry(
+            bands=[1, 2], dataset_information={"description": "original"}
+        )
+        registered_catalog = {"datasets": {"my_dem": registered_entry}}
+        expected_entry = copy.deepcopy(registered_entry)
+        update_catalog(registered_catalog)
+
+        # Change the dict that the user registered, at the top level and nested.
+        registered_entry["path"] = "missing/other.tif"
+        registered_entry["bands"].append(3)
+        registered_entry["dataset_information"]["description"] = "changed"
+        registered_catalog["datasets"]["added_later"] = _local_entry()
+
+        # Change the entries that load_catalogs() and list_datasets() return.
+        returned_entry = load_catalogs()["datasets"]["my_dem"]
+        assert returned_entry == expected_entry
+        returned_entry["bands"].append(4)
+        returned_entry["dataset_information"]["description"] = "changed"
+        returned_entry["crs"] = "EPSG:4326"
+        full_record = next(record for record in list_datasets("full") if record["name"] == "my_dem")
+        full_record["dataset_information"]["description"] = "changed"
+
+        datasets = load_catalogs()["datasets"]
+        assert datasets["my_dem"] == expected_entry
+        assert "added_later" not in datasets
+
+    def test_dict_source_of_load_catalogs_is_not_changed(self, tmp_path):
+        """``load_catalogs()`` with a dict returns new entries and leaves the dict as it was."""
+        source_entry = _local_entry(path=tmp_path / "my_dem.tif", bands=[1])
+        source_catalog = {"datasets": {"my_dem": source_entry}}
+
+        returned_entry = load_catalogs(source_catalog)["datasets"]["my_dem"]
+
+        assert returned_entry is not source_entry
+        assert returned_entry["bands"] is not source_entry["bands"]
+        assert returned_entry["path"] == str(tmp_path / "my_dem.tif")
+        assert source_entry["path"] == tmp_path / "my_dem.tif"
+
+
+# ------------------------------------------------------------------
+# The bundled catalogs load with the strict rules.
+# ------------------------------------------------------------------
+
+
+class TestBundledCatalogs:
+    """The built-in catalog and ``examples/catalog.yml`` pass every catalog rule."""
+
+    def test_builtin_catalog_loads(self):
+        """Every built-in entry passes the generic and the Earth Engine rules."""
+        builtin_datasets = load_catalogs(BUILTIN_EE_CATALOG)["datasets"]
+
+        assert "dem_copernicus_glo30" in builtin_datasets
+        for dataset_name, dataset_entry in builtin_datasets.items():
+            assert set(dataset_entry) <= _GENERIC_KEYS | _EARTH_ENGINE_KEYS, dataset_name
+
+    def test_example_catalog_loads_and_registers(self, tmp_path, monkeypatch):
+        """``examples/catalog.yml`` loads and registers as written.
+
+        Its local files do not exist (the working directory is empty), so the
+        local entries are not inspected.
+        """
+        monkeypatch.chdir(tmp_path)
+        example_catalog_path = _EXAMPLES_DIR / "catalog.yml"
+        written_datasets = yaml.safe_load(example_catalog_path.read_text(encoding="utf-8"))[
+            "datasets"
+        ]
+
+        assert load_catalog(example_catalog_path)["datasets"] == written_datasets
+        update_catalog(example_catalog_path)
+        registered_datasets = load_catalogs()["datasets"]
+        assert {name: registered_datasets[name] for name in written_datasets} == written_datasets

@@ -68,7 +68,7 @@ def _patch_ee_session_pool(pool_size: int) -> None:
         # (not DEBUG) so the failure stays visible: the runtime keeps
         # working, but the user sees noisier output until we update the
         # patch. Matches the visibility level used elsewhere for "couldn't
-        # do auto-detect" cases (e.g. catalog._inspect_raster).
+        # do auto-detect" cases (e.g. LocalRasterAdapter.inspect_catalog_entry).
         logger.warning(
             "Could not patch EE session pool size (%s); urllib3 warnings may persist.", e
         )

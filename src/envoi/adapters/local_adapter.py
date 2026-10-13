@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import math
 import warnings
 from collections.abc import Sequence
@@ -46,6 +47,8 @@ except ImportError:
     # may not be available yet. Any other exception is a real bug and should
     # surface, so we deliberately do not catch a broader class here.
     _register = None
+
+logger = logging.getLogger(__name__)
 
 
 def _is_nodata(value, nodata) -> bool:
@@ -174,9 +177,10 @@ def _resolve_local_raster_settings(
       differs raises. When the file has no CRS, envoi uses the catalog
       ``crs``, and without one it raises.
 
-    The values that ``catalog._inspect_raster`` copies from the file into a
-    catalog entry never raise: a GeoTIFF has one nodata value for all bands,
-    and the CRS comparison uses the same ``to_epsg()`` rule as that function.
+    The values that ``LocalRasterAdapter.inspect_catalog_entry`` copies from
+    the file into a catalog entry never raise: a GeoTIFF has one nodata value
+    for all bands, and the CRS comparison uses the same ``to_epsg()`` rule as
+    that method.
 
     ``LocalRasterAdapter.check_dataset`` calls this for every local dataset
     of every run config before ``extract()`` builds the first adapter, and
@@ -319,9 +323,9 @@ def _resolve_local_raster_settings(
         return catalog_crs, nodata, nodata_source
 
     if catalog_crs is not None:
-        # Compare EPSG codes first, as catalog._inspect_raster writes the code
-        # of the file's CRS. A WKT text can differ in details from the file's
-        # own CRS although both describe the same CRS.
+        # Compare EPSG codes first, as LocalRasterAdapter.inspect_catalog_entry
+        # writes the code of the file's CRS. A WKT text can differ in details
+        # from the file's own CRS although both describe the same CRS.
         file_epsg = file_crs.to_epsg()
         catalog_epsg = catalog_crs.to_epsg()
         if file_epsg is not None and catalog_epsg is not None:
@@ -375,8 +379,85 @@ class LocalRasterAdapter(BaseAdapter):
     output_types = frozenset({"tabular", "raster"})
     supported_reducers = KNOWN_REDUCERS
     computable_derived_bands = frozenset()
+    # The catalog keys in addition to the generic keys: `crs` and `nodata`
+    # fill values that the file does not declare (_resolve_local_raster_settings).
+    # inspect_catalog_entry adds them and `resolution_m`, `type`, and
+    # `band_count`, which are for information only.
+    catalog_keys = frozenset({"crs", "nodata", "resolution_m", "type", "band_count"})
 
     spec: dict[str, Any]
+
+    # ------------------------------------------------------------------
+    # Catalog inspection
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def inspect_catalog_entry(cls, name: str, entry: dict) -> dict:
+        """Return a copy of a catalog entry with the metadata of its raster file.
+
+        Reads the file of ``entry["path"]`` and adds each of these keys that
+        the entry does not set: ``crs`` (``EPSG:<code>``, or the text form of
+        a CRS without an EPSG code), ``resolution_m`` (the pixel width in
+        metres, or None for a CRS without a length unit), ``type``
+        (``"raster"``), ``nodata`` (only when the file declares one), and
+        ``band_count``. Opens the file and closes it again.
+
+        A missing file gives an unchanged copy. A file that cannot be read
+        gives a logged warning, and the copy has the values read before the
+        failure, so the catalog still loads.
+
+        Args:
+            name: The name of the dataset, for the log messages.
+            entry: A copy of the catalog entry. Not changed.
+
+        Returns:
+            A new dict: ``entry`` with the values read from the file.
+        """
+        inspected_entry = dict(entry)
+        raster_path = Path(inspected_entry["path"])
+        if not raster_path.exists():
+            return inspected_entry
+
+        try:
+            with rasterio.open(raster_path) as src:
+                if "crs" not in inspected_entry:
+                    epsg = src.crs.to_epsg()
+                    if epsg:
+                        inspected_entry["crs"] = f"EPSG:{epsg}"
+                    else:
+                        inspected_entry["crs"] = str(src.crs)
+                    logger.debug("datasets.%s: auto-detected crs=%s", name, inspected_entry["crs"])
+
+                if "resolution_m" not in inspected_entry:
+                    # Pixel width in metres, also for a CRS in degrees or feet
+                    # (None for a CRS without a length unit).
+                    inspected_entry["resolution_m"] = pixel_size_m(src.crs, src.res[0])
+                    logger.debug(
+                        "datasets.%s: auto-detected resolution_m=%s",
+                        name,
+                        inspected_entry["resolution_m"],
+                    )
+
+                if "type" not in inspected_entry:
+                    inspected_entry["type"] = "raster"
+
+                if "nodata" not in inspected_entry and src.nodata is not None:
+                    inspected_entry["nodata"] = src.nodata
+
+                if "band_count" not in inspected_entry:
+                    # Store the number of bands as informational metadata only.
+                    # Which bands to actually read is decided by the adapter at runtime.
+                    inspected_entry["band_count"] = src.count
+
+        # Deliberately broad: auto-inspection is a convenience, so any failure
+        # (unreadable file, driver error) must degrade to a warning rather
+        # than stop the user's catalog from loading.
+        except Exception as error:
+            logger.warning(
+                "datasets.%s: could not read raster metadata from %s: %s", name, raster_path, error
+            )
+
+        return inspected_entry
 
     # ------------------------------------------------------------------
     # Pre-flight check

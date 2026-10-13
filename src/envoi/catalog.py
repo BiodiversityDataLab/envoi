@@ -1,8 +1,10 @@
 # src/envoi/catalog.py
 from __future__ import annotations
 
+import copy
 import importlib.resources as importlib_resources
 import logging
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -11,17 +13,29 @@ import yaml
 
 from ._filenames import describe_unsafe_path_component, is_safe_path_component
 
-REQUIRED_DATASET_KEYS = {"data_source", "path"}
-# Earth Engine datasets need a `data_type` so the right reducer set (continuous
-# vs categorical) gets picked. Local rasters can omit it — type is inferred at
-# read time from the raster file when needed.
-EE_REQUIRED_DATASET_KEYS = {"data_type"}
+# The top-level keys that every catalog entry can have, whatever its
+# data_source. Each adapter accepts more keys through its `catalog_keys`
+# declaration. Any other key is rejected: an ignored key, for example a typing
+# error in `data_type`, would give a silently different run.
+_GENERIC_CATALOG_KEYS = frozenset(
+    {
+        "data_source",
+        "path",
+        "data_type",
+        "display_name",
+        "category",
+        "bands",
+        "derived_bands",
+        "supported_derived_bands",
+        "dataset_information",
+    }
+)
 
-# The values of dataset_spec.collection_date_policy. The Earth Engine adapter
-# compares them without letter case. An unknown value would be read as
-# "contains" by one part of the date selection and as "nearest" by another,
-# so it is rejected when the catalog is loaded or registered.
-_COLLECTION_DATE_POLICIES = frozenset({"nearest", "contains", "mosaic"})
+# The values of `data_type`. It selects the continuous or the categorical
+# reducer list of the `statistics` setting. A null or absent data_type uses
+# the continuous list. Another value is rejected, because it would also use
+# the continuous list, without a message.
+_DATA_TYPES = frozenset({"continuous", "categorical"})
 
 # Module-level cache so each bundled YAML is only read once per process.
 _defaults_cache: dict[str, Any] | None = None
@@ -81,103 +95,173 @@ class CatalogError(ValueError):
     """Invalid or incomplete catalog.yaml."""
 
 
-def _require_keys(d: dict[str, Any], required: set, ctx: str) -> None:
-    missing = required - set(d.keys())
-    if missing:
-        raise CatalogError(f"{ctx}: missing required key(s): {sorted(missing)}")
-
-
-def _require_registered_data_source(name: str, data_source: Any) -> None:
-    """Raise ``CatalogError`` when no adapter is registered for ``data_source``.
+def _get_adapter_class(name: str, entry: Mapping) -> type:
+    """Return the adapter class that is registered for the ``data_source`` of ``entry``.
 
     Checking when a catalog is loaded or registered stops a typo before
     ``extract()`` builds an adapter for any dataset, or uses Earth Engine quota.
+
+    Raises:
+        CatalogError: If ``entry`` has no ``data_source``, or no adapter is
+            registered for it. The message lists the registered data sources.
     """
     # Imported here, not at module level: envoi.adapters imports this module
     # (the GEE adapter reads load_defaults()), so a module-level import would
     # be an import cycle. Validation runs only after both modules are loaded.
     from .adapters import _REG
 
+    if "data_source" not in entry:
+        raise CatalogError(
+            f"datasets.{name}: missing required key 'data_source'. "
+            f"Valid values are: {', '.join(sorted(_REG))}."
+        )
+    data_source = entry["data_source"]
     if not isinstance(data_source, str) or data_source not in _REG:
         raise CatalogError(
             f"datasets.{name}: unknown data_source {data_source!r}. "
             f"Valid values are: {', '.join(sorted(_REG))}."
         )
+    return _REG[data_source]
 
 
-def _require_known_date_policy(name: str, spec: dict[str, Any]) -> None:
-    """Raise ``CatalogError`` for an unknown ``dataset_spec.collection_date_policy``.
+def _derived_band_names(name: str, key: str, value: Any) -> list:
+    """Return the band names of a ``derived_bands`` or ``supported_derived_bands`` value.
 
-    The value is compared without letter case, as the Earth Engine adapter
-    reads it. An entry without ``dataset_spec`` or without the key uses
-    ``nearest`` and passes.
+    The value is one band name, a list of band names, or null (no bands).
+
+    Raises:
+        CatalogError: If the value has another shape.
     """
-    dataset_spec = spec.get("dataset_spec")
-    if not isinstance(dataset_spec, Mapping) or "collection_date_policy" not in dataset_spec:
-        return
-    policy = dataset_spec["collection_date_policy"]
-    if not isinstance(policy, str) or policy.lower() not in _COLLECTION_DATE_POLICIES:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    raise CatalogError(
+        f"datasets.{name}: {key} must be a band name or a list of band names, got {value!r}."
+    )
+
+
+def _validate_catalog_entry(name: str, entry: Any, *, inspect_entry: bool) -> dict[str, Any]:
+    """Check one catalog entry and return the copy of it that envoi stores.
+
+    The YAML path (``_validate_catalog``) and the dict path
+    (``_load_catalog_any``) both call this. It checks, in this order:
+
+    1. The generic rules: the entry is a mapping; ``data_source`` names a
+       registered adapter; every key is in ``_GENERIC_CATALOG_KEYS`` or in
+       the adapter's ``catalog_keys``; ``path`` is a non-empty ``str`` or an
+       ``os.PathLike``; ``data_type`` is absent, null, or in ``_DATA_TYPES``;
+       and ``derived_bands`` and ``supported_derived_bands`` name only the
+       adapter's ``computable_derived_bands``.
+    2. The adapter's own rules (``validate_catalog_entry``).
+    3. With ``inspect_entry`` (catalog files only), the adapter's
+       ``inspect_catalog_entry``, which can add values that it reads from the
+       data source, for example the CRS of a local raster.
+
+    Args:
+        name: The name of the dataset (its key under ``datasets``).
+        entry: The catalog entry, as the user wrote it. Not changed.
+        inspect_entry: Whether to run the adapter's ``inspect_catalog_entry``.
+
+    Returns:
+        A deep copy of ``entry``, with ``path`` as a ``str`` and the values
+        of the inspection. Later changes to ``entry`` do not reach it.
+
+    Raises:
+        CatalogError: If a rule is broken. The message names the dataset, the
+            key, and the allowed values or keys. A ``ValueError`` of an
+            adapter hook becomes a ``CatalogError`` with the same message
+            after ``datasets.<name>: ``.
+    """
+    if not isinstance(entry, Mapping):
+        raise CatalogError(f"datasets.{name}: must be a mapping")
+
+    # ---- data_source: the rules below use the declarations of its adapter ----
+    adapter_class = _get_adapter_class(name, entry)
+    data_source = entry["data_source"]
+
+    # ---- keys ----
+    allowed_keys = _GENERIC_CATALOG_KEYS | adapter_class.catalog_keys
+    unknown_keys = sorted((key for key in entry if key not in allowed_keys), key=str)
+    if unknown_keys:
         raise CatalogError(
-            f"datasets.{name}: unknown dataset_spec.collection_date_policy {policy!r}. "
-            f"Valid values are: {', '.join(sorted(_COLLECTION_DATE_POLICIES))}."
+            f"datasets.{name}: unknown key(s) {unknown_keys} for data_source "
+            f"{data_source!r}. Allowed keys: {sorted(allowed_keys)}. Put free text, for "
+            f"example notes about the dataset, under 'dataset_information'."
         )
 
+    # ---- path ----
+    if "path" not in entry or entry["path"] is None:
+        raise CatalogError(
+            f"datasets.{name}: missing required key 'path'. Set it to the location of the "
+            f"data, for example an Earth Engine asset ID ('COPERNICUS/S2_SR_HARMONIZED') or "
+            f"the path of a raster file ('data/dem.tif')."
+        )
+    path = entry["path"]
+    # A pathlib.Path is accepted, and stored as text, so that the metadata
+    # sidecar (JSON) can record it.
+    if isinstance(path, os.PathLike):
+        path = os.fspath(path)
+    if not isinstance(path, str) or not path:
+        raise CatalogError(
+            f"datasets.{name}: path must be a non-empty text or a pathlib.Path, "
+            f"got {entry['path']!r}."
+        )
 
-def _inspect_raster(name: str, spec: dict[str, Any]) -> None:
-    """Read CRS, resolution, type, and nodata from a local raster file
-    and fill in any missing spec fields automatically."""
-    if spec.get("data_source") != "local":
-        return
+    # ---- data_type: null counts as absent ----
+    data_type = entry.get("data_type")
+    if data_type is not None and (not isinstance(data_type, str) or data_type not in _DATA_TYPES):
+        raise CatalogError(
+            f"datasets.{name}: unknown data_type {data_type!r}. "
+            f"Valid values are: {', '.join(sorted(_DATA_TYPES))}."
+        )
 
-    p = Path(spec["path"])
-    if not p.exists():
-        return
+    # ---- derived bands: only the ones that the adapter can compute ----
+    computable_derived_bands = adapter_class.computable_derived_bands
+    for key in ("derived_bands", "supported_derived_bands"):
+        band_names = _derived_band_names(name, key, entry.get(key))
+        uncomputable_bands = [
+            band
+            for band in band_names
+            if not isinstance(band, str) or band not in computable_derived_bands
+        ]
+        if uncomputable_bands:
+            computable_label = (
+                str(sorted(computable_derived_bands)) if computable_derived_bands else "none"
+            )
+            raise CatalogError(
+                f"datasets.{name}: {key} has {uncomputable_bands}, which the adapter of "
+                f"data_source {data_source!r} cannot compute. Derived bands that this "
+                f"adapter computes: {computable_label}."
+            )
 
+    # The stored copy. A deep copy, so that a later change to the user's dict
+    # (or to its nested lists and dicts) does not change the stored entry.
+    stored_entry = copy.deepcopy(dict(entry))
+    stored_entry["path"] = path
+
+    # ---- the adapter's own rules, then the inspection (catalog files only) ----
     try:
-        import rasterio
+        adapter_class.validate_catalog_entry(name, stored_entry)
+        if inspect_entry:
+            stored_entry = adapter_class.inspect_catalog_entry(name, stored_entry)
+    except CatalogError:
+        raise
+    except ValueError as error:
+        raise CatalogError(f"datasets.{name}: {error}") from error
 
-        from .geo import pixel_size_m
-
-        with rasterio.open(p) as src:
-            if "crs" not in spec:
-                epsg = src.crs.to_epsg()
-                if epsg:
-                    spec["crs"] = f"EPSG:{epsg}"
-                else:
-                    spec["crs"] = str(src.crs)
-                logger.debug("datasets.%s: auto-detected crs=%s", name, spec["crs"])
-
-            if "resolution_m" not in spec:
-                # Pixel width in metres, also for a CRS in degrees or feet
-                # (None for a CRS without a length unit).
-                spec["resolution_m"] = pixel_size_m(src.crs, src.res[0])
-                logger.debug(
-                    "datasets.%s: auto-detected resolution_m=%s", name, spec["resolution_m"]
-                )
-
-            if "type" not in spec:
-                spec["type"] = "raster"
-
-            if "nodata" not in spec and src.nodata is not None:
-                spec["nodata"] = src.nodata
-
-            if "band_count" not in spec:
-                # Store the number of bands as informational metadata only.
-                # Which bands to actually read is decided by the adapter at runtime.
-                spec["band_count"] = src.count
-
-    # Deliberately broad: auto-inspection is a convenience, so any failure
-    # (missing rasterio, unreadable file, driver error) must degrade to a
-    # warning rather than stop the user's catalog from loading.
-    except Exception as e:
-        logger.warning("datasets.%s: could not read raster metadata from %s: %s", name, p, e)
+    return stored_entry
 
 
 def _validate_catalog(data: dict[str, Any], source_label: str) -> dict[str, Any]:
-    """Validate a parsed catalog dict and run auto-inspection on local rasters.
+    """Validate a parsed catalog file, and inspect each entry through its adapter.
 
-    Raises CatalogError if the structure is invalid.
-    Returns the (possibly mutated) data dict.
+    Raises CatalogError if the structure or an entry is invalid
+    (``_validate_catalog_entry``).
+    Returns a copy of ``data`` whose ``datasets`` are the checked and
+    inspected copies of the entries.
     """
     if not isinstance(data, dict):
         raise CatalogError(f"Top-level YAML must be a mapping (dict), got {type(data)}")
@@ -185,27 +269,11 @@ def _validate_catalog(data: dict[str, Any], source_label: str) -> dict[str, Any]
     if "datasets" not in data or not isinstance(data["datasets"], dict) or not data["datasets"]:
         raise CatalogError("Top-level key 'datasets' must be a non-empty mapping")
 
-    for name, spec in data["datasets"].items():
-        if not isinstance(spec, dict):
-            raise CatalogError(f"datasets.{name}: must be a mapping")
-        _require_keys(spec, REQUIRED_DATASET_KEYS, f"datasets.{name}")
-
-        if not isinstance(spec["data_source"], str) or not spec["data_source"]:
-            raise CatalogError(f"datasets.{name}.data_source must be a non-empty string")
-        _require_registered_data_source(name, spec["data_source"])
-        _require_known_date_policy(name, spec)
-        if not isinstance(spec["path"], str) or not spec["path"]:
-            raise CatalogError(f"datasets.{name}.path must be a non-empty string")
-
-        # Earth Engine entries must declare `data_type` up front. Local rasters
-        # are allowed to omit it because their type can be inferred from the
-        # raster file when needed.
-        if spec["data_source"] == "earth_engine":
-            _require_keys(spec, EE_REQUIRED_DATASET_KEYS, f"datasets.{name}")
-
-        _inspect_raster(name, spec)
-
-    return data
+    validated_datasets = {
+        name: _validate_catalog_entry(name, entry, inspect_entry=True)
+        for name, entry in data["datasets"].items()
+    }
+    return {**data, "datasets": validated_datasets}
 
 
 def load_catalog(path: str | Path) -> dict[str, Any]:
@@ -257,6 +325,10 @@ def _load_catalog_any(src: Any) -> dict[str, Any]:
     """
     Internal helper: accept a path, a dict-like catalog, or the BUILTIN_EE_CATALOG
     sentinel and return a normalized {'datasets': {...}} structure.
+
+    The entries in the result are checked copies (``_validate_catalog_entry``),
+    so a change to them does not change ``src``. A dict without a ``datasets``
+    mapping raises ``CatalogError``; ``{"datasets": {}}`` is accepted.
     """
     if src is None:
         return {"datasets": {}}
@@ -265,40 +337,21 @@ def _load_catalog_any(src: Any) -> dict[str, Any]:
     if src is BUILTIN_EE_CATALOG:
         return _validate_catalog(_read_builtin_yaml("ee_catalog.yml"), "builtin:ee_catalog.yml")
 
-    # If it's already a mapping, assume it's a parsed catalog dict.
+    # If it's already a mapping, assume it's a parsed catalog dict. Its
+    # entries are checked as the entries of a catalog file, but not inspected.
     if isinstance(src, Mapping):
-        d = dict(src)
-        if "datasets" not in d:
-            d["datasets"] = {}
-        for name, spec in d["datasets"].items():
-            if not isinstance(spec, dict):
-                raise CatalogError(f"datasets.{name}: must be a mapping")
-            if "data_source" not in spec or not spec.get("data_source"):
-                # Imported here for the reason given in
-                # _require_registered_data_source (an import cycle). The valid
-                # values are the data sources with a registered adapter.
-                from .adapters import _REG
-
-                raise CatalogError(
-                    f"datasets.{name}: missing required key 'data_source'.\n"
-                    f"Valid values are: {', '.join(sorted(_REG))}."
-                )
-            _require_registered_data_source(name, spec["data_source"])
-            _require_known_date_policy(name, spec)
-            if "path" not in spec or not spec.get("path"):
-                raise CatalogError(
-                    f"datasets.{name}: missing required key 'path'.\n"
-                    f"For GEE assets, this is the asset ID (e.g. 'COPERNICUS/S2_SR_HARMONIZED').\n"
-                    f"For local rasters, this is the file path (e.g. 'data/dem.tif')."
-                )
-            # Earth Engine entries must declare `data_type` so we know which
-            # reducer set (continuous / categorical) to apply.
-            if spec.get("data_source") == "earth_engine" and not spec.get("data_type"):
-                raise CatalogError(
-                    f"datasets.{name}: missing required key 'data_type' for earth_engine dataset.\n"
-                    f"Valid values are: continuous, categorical."
-                )
-        return d
+        datasets = src.get("datasets")
+        if not isinstance(datasets, Mapping):
+            raise CatalogError(
+                f"A catalog dict needs the top-level key 'datasets', a mapping of dataset "
+                f"names to catalog entries, got {datasets!r}. Example: "
+                f"{{'datasets': {{'my_dem': {{'data_source': ..., 'path': 'data/dem.tif'}}}}}}."
+            )
+        validated_datasets = {
+            name: _validate_catalog_entry(name, entry, inspect_entry=False)
+            for name, entry in datasets.items()
+        }
+        return {"datasets": validated_datasets}
 
     # Otherwise, treat it as a path and reuse the validated loader.
     return load_catalog(src)
@@ -308,7 +361,8 @@ def load_catalogs(*sources: Any) -> dict[str, Any]:
     """
     Merge one or more catalogs (paths, dicts, or lists of paths/dicts) into a
     single catalog. Later sources override earlier ones on a per-dataset basis.
-    Always returns: {'datasets': {...}}.
+    Always returns: {'datasets': {...}}. The entries are copies: a change to
+    them does not change a source or the datasets of ``update_catalog()``.
     """
     merged: dict[str, Any] = {"datasets": {}}
 
@@ -325,9 +379,10 @@ def load_catalogs(*sources: Any) -> dict[str, Any]:
             merged["datasets"][name] = spec
 
     # Apply user-registered datasets as the final layer so they override
-    # both built-in and caller-supplied catalogs.
+    # both built-in and caller-supplied catalogs. Deep copies, so that the
+    # caller can change the returned entries without an effect on the stored ones.
     if _user_catalog_datasets:
-        merged["datasets"].update(_user_catalog_datasets)
+        merged["datasets"].update(copy.deepcopy(_user_catalog_datasets))
 
     return merged
 
@@ -341,9 +396,10 @@ def update_catalog(source: str | Path | dict) -> None:
     to (or updates) the existing user catalog.
 
     A catalog file goes through ``load_catalog()``, which also adds the
-    metadata of local rasters to their entries. Entries of a dict are checked
-    for the same required keys, but are stored without reading the raster
-    files. In both cases, the local adapter reads the CRS, pixel size, nodata,
+    metadata of local rasters to their entries. Entries of a dict get the same
+    checks, but are stored without reading the raster files. envoi stores
+    copies of the entries, so a later change to ``source`` has no effect.
+    In both cases, the local adapter reads the CRS, pixel size, nodata,
     and band count from the file when an extraction opens it. The entry's
     ``crs`` and ``nodata`` only fill a CRS or nodata value that the file does
     not declare; ``extract()`` raises ``ValueError`` when they differ from the
@@ -354,17 +410,19 @@ def update_catalog(source: str | Path | dict) -> None:
                   {"datasets": {"my_dataset": {"data_source": ..., "path": ...}}}
 
     Raises:
-        CatalogError: if the source is invalid, an entry is missing a required
-            key or has an unknown ``data_source`` or
-            ``dataset_spec.collection_date_policy``, or a dataset name cannot
-            be used as a folder name.
+        CatalogError: if the source is invalid (also a dict without a
+            ``datasets`` mapping), an entry is missing a required key, has an
+            unknown key, or has an unknown value of ``data_source``,
+            ``data_type``, or ``dataset_spec.collection_date_policy``, or a
+            dataset name cannot be used as a folder name.
 
     Example:
         update_catalog("my_catalog.yml")
         update_catalog({"datasets": {"ndvi_local": {"data_source": "local", "path": "data/ndvi.tif"}}})
     """
     # No `global` declaration needed: the module-level dict is mutated in
-    # place (see the .update() below), never rebound.
+    # place (see the .update() below), never rebound. The entries of `cat` are
+    # copies (_validate_catalog_entry), so the user's dict is not stored.
     cat = _load_catalog_any(source)
     new_datasets = cat.get("datasets", {})
 

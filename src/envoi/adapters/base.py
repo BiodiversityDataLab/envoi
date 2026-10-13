@@ -25,9 +25,10 @@ class BaseAdapter:
     ``export_tiles`` when it declares ``"raster"``, with the same parameter
     names, kinds, and defaults (``tests/test_adapters.py`` checks this).
     It sets the capability declarations below as class attributes, and
-    ``envoi.adapters.register`` checks them. It can override the class method
-    ``check_dataset``, the pre-flight check of one dataset, with the same
-    parameters.
+    ``envoi.adapters.register`` checks them. It can override the class
+    methods ``check_dataset`` (the pre-flight check of one dataset),
+    ``validate_catalog_entry``, and ``inspect_catalog_entry`` (the catalog
+    hooks), with the same parameters.
     ``docs/architecture.md`` ("Adapter interface") describes each method.
     """
 
@@ -48,8 +49,71 @@ class BaseAdapter:
     # example "slope". Empty when the adapter computes none.
     computable_derived_bands: ClassVar[frozenset[str]] = frozenset()
     # The top-level catalog keys that the adapter accepts in addition to the
-    # generic keys that every catalog entry can have.
+    # generic keys that every catalog entry can have (envoi.catalog lists
+    # them), including the keys that inspect_catalog_entry adds. envoi.catalog
+    # rejects every other key.
     catalog_keys: ClassVar[frozenset[str]] = frozenset()
+
+    # ---- catalog hooks ------------------------------------------------------
+    @classmethod
+    def validate_catalog_entry(cls, name: str, entry: dict) -> None:
+        """Check the rules of this adapter for one catalog entry.
+
+        ``envoi.catalog`` calls this for each entry of this adapter's
+        ``data_source`` when a catalog is loaded or registered, after the
+        generic checks: ``data_source`` names this adapter, ``path`` is a
+        non-empty text, ``data_type`` is absent, null, or a known value, the
+        derived bands are in ``computable_derived_bands``, and every key is a
+        generic key or in ``catalog_keys``. The default checks nothing.
+
+        An override must not import an optional SDK, must not send a network
+        request, and must not change ``entry``.
+
+        Args:
+            name: The name of the dataset (its key under ``datasets``).
+            entry: A copy of the catalog entry, with ``path`` as a ``str``.
+
+        Raises:
+            CatalogError: If the entry breaks a rule of the adapter. The
+                message starts with ``datasets.<name>: ``, names the key, and
+                lists the allowed values or keys. ``envoi.catalog`` raises it
+                unchanged.
+            ValueError: If the entry breaks a rule of the adapter.
+                ``envoi.catalog`` raises a ``CatalogError`` with the same
+                message, after ``datasets.<name>: ``.
+        """
+        return
+
+    @classmethod
+    def inspect_catalog_entry(cls, name: str, entry: dict) -> dict:
+        """Return a copy of a catalog entry with values read from its data source.
+
+        ``envoi.catalog`` calls this for each entry of this adapter's
+        ``data_source`` in a catalog file (the built-in catalog,
+        ``load_catalog()``, and ``update_catalog()`` with a path), after
+        ``validate_catalog_entry``, and stores the returned dict. It does not
+        call it for the entries of a catalog dict. The default returns an
+        unchanged copy.
+
+        An override returns a new dict and never changes ``entry``. It adds
+        only keys that are in ``catalog_keys``, and does not replace a value
+        that the entry sets. It must not import an optional SDK and must not
+        send a network request. When it cannot read the data source, it
+        should log a warning and return the entry without the missing values,
+        so that the catalog still loads.
+
+        Args:
+            name: The name of the dataset (its key under ``datasets``).
+            entry: A copy of the catalog entry that passed
+                ``validate_catalog_entry``.
+
+        Returns:
+            A new dict: ``entry`` with the values that the adapter read.
+
+        Raises:
+            CatalogError, ValueError: As for ``validate_catalog_entry``.
+        """
+        return dict(entry)
 
     # ---- pre-flight check ---------------------------------------------------
     @classmethod

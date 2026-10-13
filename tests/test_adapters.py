@@ -28,8 +28,11 @@ _LIFECYCLE_METHODS = frozenset({"close", "__enter__", "__exit__"})
 _CAPABILITY_ATTRIBUTES = frozenset(
     {"output_types", "supported_reducers", "computable_derived_bands", "catalog_keys"}
 )
-# The class-method hooks that extract() calls before it builds any adapter.
-_CLASS_METHOD_HOOKS = frozenset({"check_dataset"})
+# The class-method hooks: the pre-flight check that extract() calls before it
+# builds any adapter, and the catalog hooks that envoi.catalog calls.
+_CLASS_METHOD_HOOKS = frozenset(
+    {"check_dataset", "validate_catalog_entry", "inspect_catalog_entry"}
+)
 
 
 def _public_methods(cls: type) -> set[str]:
@@ -102,6 +105,17 @@ class TestBaseAdapterInterface:
         assert BaseAdapter.check_dataset(spec, context="Output 'x': dataset 'y'") is None
         assert spec == {"data_source": "any", "path": "not/a/file"}
 
+    def test_default_catalog_hooks_accept_and_copy_the_entry(self):
+        """The default catalog hooks check nothing and return an equal new dict."""
+        entry = {"data_source": "any", "path": "not/a/file", "bands": [1]}
+
+        assert BaseAdapter.validate_catalog_entry("y", entry) is None
+        inspected_entry = BaseAdapter.inspect_catalog_entry("y", entry)
+
+        assert inspected_entry == entry
+        assert inspected_entry is not entry
+        assert entry == {"data_source": "any", "path": "not/a/file", "bands": [1]}
+
     def test_parity_check_covers_inherited_and_overridden_check_dataset(self):
         """The Earth Engine adapter inherits ``check_dataset`` and the local adapter overrides it.
 
@@ -136,16 +150,25 @@ class TestBaseAdapterInterface:
 
 class TestBuiltInCapabilityDeclarations:
     @pytest.mark.parametrize(
-        ("data_source", "expected_derived_bands"),
-        [("earth_engine", {"slope", "aspect"}), ("local", set())],
+        ("data_source", "expected_derived_bands", "expected_catalog_keys"),
+        [
+            ("earth_engine", {"slope", "aspect"}, {"dataset_spec", "max_workers", "crs"}),
+            ("local", set(), {"crs", "nodata", "resolution_m", "type", "band_count"}),
+        ],
     )
-    def test_built_in_adapter_declarations(self, data_source, expected_derived_bands):
-        """Both built-in adapters support both output types and all known reducers."""
+    def test_built_in_adapter_declarations(
+        self, data_source, expected_derived_bands, expected_catalog_keys
+    ):
+        """Both built-in adapters support both output types and all known reducers.
+
+        Each one accepts the catalog keys that it reads, and the local adapter
+        also the keys that its inspection adds.
+        """
         adapter_class = _REG[data_source]
         assert adapter_class.output_types == {"tabular", "raster"}
         assert adapter_class.supported_reducers == KNOWN_REDUCERS
         assert adapter_class.computable_derived_bands == expected_derived_bands
-        assert adapter_class.catalog_keys == frozenset()
+        assert adapter_class.catalog_keys == expected_catalog_keys
 
 
 # Stand-in classes for the test of the class-method check: a base class with
