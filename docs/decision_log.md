@@ -277,3 +277,15 @@ This decision adds a warning to the per-point image selection of the 2026-10-12 
 - **Rejected:**
   - Warn for every point that used a fallback image: the warning would come in most Sentinel-2 runs, and users would learn to ignore it.
   - A QC column with the gap: it changes the output contract of the QC table, and the QC date columns already give the image dates.
+
+## 2026-10-13 — Day rule for the nearest policy
+
+This decision extends the "Day rule" of the 2026-10-12 entry to the `nearest` policy (follow-up FU28, branch `pipeline-bugs`). The user asked for it on 2026-10-13.
+
+- **Decision:** the batch-selected image of `nearest` and its `date_clamped` and `date_source` also use whole UTC days (`_find_nearest_timestamp`).
+  - The nearest image is the one with the fewest whole days between its start day and the sample day. Of two equally near images, the earlier one, as in the per-point fallback.
+  - A date is clamped only when its day is before the start day of the first image or after the start day of the last image.
+- **Reason:** with exact times, a date on the start day of the first image was clamped when that image started later in the day, and was then also left out of the far-image warning. An image that started at 23:00 on the day before the sample date also won over an image of the sample day at 10:00. Sample dates have no time of day, so both results depended on a time that the date does not have. The per-point fallback already counted whole days, so the two selections now follow one rule.
+- **Consequence:** collections whose images start at 00:00 (all built-in date-based datasets) select the same images as before. Collections with images later in the day can select another image when two images are within one day of the date.
+- **Rejected:** keep exact times for `nearest` and change only `date_clamped`: the selection and the flag would then follow different rules.
+

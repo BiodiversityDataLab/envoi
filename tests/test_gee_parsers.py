@@ -17,7 +17,11 @@ import math
 import pandas as pd
 import pytest
 
-from envoi.adapters.earth_engine._image import _is_mosaic_date_policy, _resolve_date_filter_range
+from envoi.adapters.earth_engine._image import (
+    _find_nearest_timestamp,
+    _is_mosaic_date_policy,
+    _resolve_date_filter_range,
+)
 from envoi.adapters.earth_engine._reducers import (
     _circular_aspect_statistics,
     _dedupe_categorical_for_ee,
@@ -488,6 +492,46 @@ class TestIsMosaicDatePolicy:
 # Three 8-day intervals, the shape of the built-in "contains" collections.
 _EIGHT_DAY_STARTS = pd.DatetimeIndex(["2021-01-01", "2021-01-09", "2021-01-17"])
 _EIGHT_DAY_ENDS = pd.DatetimeIndex(["2021-01-09", "2021-01-17", "2021-01-25"])
+
+
+class TestFindNearestTimestamp:
+    """The nearest start and the clamp flag follow whole UTC days (the day rule)."""
+
+    # Two images start later in their day, and one starts at 23:00.
+    _STARTS = pd.DatetimeIndex(
+        ["2021-06-01 10:00", "2021-06-05 23:00", "2021-06-06 10:00", "2021-06-10 10:00"]
+    )
+
+    @pytest.mark.parametrize(
+        ("sample_date", "expected_start", "expected_clamped"),
+        [
+            # On the start day of the first or last image: not clamped, although
+            # the image starts later in that day.
+            ("2021-06-01", "2021-06-01 10:00", False),
+            ("2021-06-10", "2021-06-10 10:00", False),
+            # Before the first or after the last start day: clamped.
+            ("2021-05-31", "2021-06-01 10:00", True),
+            ("2021-06-11", "2021-06-10 10:00", True),
+            # An image on the sample day wins over a closer time on the day before.
+            ("2021-06-06", "2021-06-06 10:00", False),
+            # Equally many days to two images: the earlier image.
+            ("2021-06-03", "2021-06-01 10:00", False),
+            ("2021-06-08", "2021-06-06 10:00", False),
+        ],
+    )
+    def test_whole_days(self, sample_date, expected_start, expected_clamped):
+        """Gaps, ties, and clamping count whole days between the start day and the sample day."""
+        nearest, was_clamped = _find_nearest_timestamp(self._STARTS, pd.Timestamp(sample_date))
+
+        assert nearest == pd.Timestamp(expected_start)
+        assert was_clamped is expected_clamped
+
+    def test_batch_range_is_the_day_of_the_nearest_start(self):
+        """The nearest policy filters the whole start day of the selected image."""
+        assert _resolve_date_filter_range(pd.Timestamp("2021-06-06"), "nearest", self._STARTS) == (
+            "2021-06-06",
+            "2021-06-07",
+        )
 
 
 class TestResolveDateFilterRangeContains:

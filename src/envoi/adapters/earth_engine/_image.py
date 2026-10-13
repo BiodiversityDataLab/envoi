@@ -272,9 +272,9 @@ def _get_collection_time_bounds(
     # so they stay aligned element-by-element — required for
     # `time_ends[idx]` lookups to map back to the correct start.
     # Two images can have the same start and different ends. A duplicate
-    # start makes the index non-unique, and the nearest-image lookup
-    # (`get_indexer`) then raises. Keep the latest end of each start, so
-    # the interval covers every image with that start.
+    # start would make the index non-unique and the interval lookups by
+    # position ambiguous. Keep the latest end of each start, so the
+    # interval covers every image with that start.
     bounds_df = pd.DataFrame({"start": clean_starts, "end": [int(end) for _, end in paired_times]})
     bounds_df = bounds_df.groupby("start", as_index=False, sort=True)["end"].max()
     start_index = pd.DatetimeIndex(pd.to_datetime(bounds_df["start"], unit="ms", origin="unix"))
@@ -286,16 +286,24 @@ def _find_nearest_timestamp(
     time_starts: pd.DatetimeIndex,
     target: pd.Timestamp,
 ) -> tuple[pd.Timestamp, bool]:
-    """Return the timestamp closest to *target*, clamping to range.
+    """Return the image start nearest to *target* in whole UTC days, and whether it was clamped.
+
+    Dates compare as whole days (the day rule): the nearest start is the one
+    with the fewest days between its start day and the day of *target*, and
+    of two equally near starts the earlier one. The date is clamped only when
+    its day is before the start day of the first image or after the start day
+    of the last image. A sample date has day precision, so an image that
+    starts later on the sample day is on that day, not after it.
 
     Returns (nearest_timestamp, was_clamped).
     """
-    if target <= time_starts.min():
-        return time_starts.min(), target < time_starts.min()
-    if target >= time_starts.max():
-        return time_starts.max(), target > time_starts.max()
-    idx = time_starts.get_indexer([target], method="nearest")[0]
-    return time_starts[idx], False
+    start_days = time_starts.normalize()
+    target_day = target.normalize()
+    was_clamped = bool(target_day < start_days.min() or target_day > start_days.max())
+    day_gaps = abs((start_days - target_day).days)
+    # Of the starts with the smallest gap, take the earliest.
+    nearest = time_starts[day_gaps == day_gaps.min()].min()
+    return nearest, was_clamped
 
 
 def _is_mosaic_date_policy(dataset_spec: dict) -> bool:
