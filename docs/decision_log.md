@@ -259,3 +259,21 @@ The specification of this work is in a task folder that is not committed, so eac
   - The batch-selected image of `nearest` is still the image whose start time is nearest to the sample date (00:00 UTC of its day). Its fast-path range is the whole start day of that image.
 - **Reason:** sample dates are days without a time of day (envoi reduces each date value to one day). Images start at any time of the day, for example a Sentinel-2 image at 10:30. A comparison of times would treat an image that starts at 10:00 on the sample day as an image after the sample date, so `contains` selected the image before it or marked the date as clamped. In the fallback, whole days make the images of the day before and the day after the sample date equally near, whatever their time of day, and the earlier start then wins.
 - **Rejected:** compare the times as they are: the result depends on the time of day of the image, which the sample date does not have.
+
+## 2026-10-13 — Warning for far fallback images
+
+This decision adds a warning to the per-point image selection of the 2026-10-12 entry ("Image selection per point", branch `pipeline-bugs`). The user approved it on 2026-10-13.
+
+### Warning for far fallback images
+
+- **Decision:** `extract()` gives one warning for each dataset and window (tabular and raster) when at least one point used a fallback image that is more than 32 days from its sample date.
+  - A fallback image is an image that the per-point fallback of the 2026-10-12 decision selected, because the date range that envoi selected for the batch had no own image of the point. The Earth Engine server gives this as a flag (`fallback`) in the `image_dates` value of the point's request, from the condition of the fast path. The flag adds no request, and the adapter does not guess it from the dates.
+  - The gap is the number of whole UTC days between the sample day and the image (the day rule of 2026-10-12). With `nearest`, it is the days to the image's start day. With `contains`, it is 0 when the image contains the sample day, and otherwise the days to the nearest day that the image contains: its start day for a later image, and its last day for an earlier image (an end at 00:00 does not contain the day that starts then).
+  - Only points with a sample date that is not clamped count. A clamped date is outside the dates of the batch's images, and `date_clamped` already reports it.
+  - The Earth Engine adapter keeps the gap in the point's meta dict under the internal key `fallback_image_gap_days`. No output writes it: the QC table and the sidecar summaries read only the keys that they name.
+  - The warning gives the dataset, the window ("point values" for point-only statistics), the number of these points, the largest gap in days, the IDs of up to 10 of them, and where the image dates are (the QC columns `<dataset>_image_time_start_<N>m` and `<dataset>_image_time_end_<N>m`, or the sidecar `date_info` in raster runs). The sidecar records it in `warnings` under `far_image_<dataset>_<N>m` (`far_image_<dataset>_point` for point-only statistics).
+  - The limit of 32 days is the first search window of the fallback.
+- **Reason:** a fallback image can be weeks or months from the sample date, for example when a point's own images are rare or have a long gap. Its statistics are then plausible but can describe another season. The QC date columns show the image dates, but nothing told the user to look at them. The fallback is normal for collections whose images have different dates at different places, and the image is then often near the date: in the live Sentinel-2 checks of 2026-10-12 (Uppsala and Göteborg), the fallback image was one day from the date. A limit of 32 days keeps such runs without a warning.
+- **Rejected:**
+  - Warn for every point that used a fallback image: the warning would come in most Sentinel-2 runs, and users would learn to ignore it.
+  - A QC column with the gap: it changes the output contract of the QC table, and the QC date columns already give the image dates.

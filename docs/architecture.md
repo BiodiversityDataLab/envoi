@@ -204,7 +204,8 @@ Update this document when you add a module or change the adapter interface.
 
   `extract.py`, not the adapters, applies the rules for a batch: `_raise_if_every_point_failed` raises `RuntimeError`
   (chained to the exception of the first failed point) when every point failed, and `_warn_about_failed_points` emits one warning
-  and returns it for the sidecar's `warnings`. `qc.py` adds the `<dataset>_error_<N>m` QC column, `_write_tile_manifest`
+  and returns it for the sidecar's `warnings`. `_warn_about_far_images` does the same for points whose own fallback image
+  (see `image_dates` below) is more than 32 days from their sample date. `qc.py` adds the `<dataset>_error_<N>m` QC column, `_write_tile_manifest`
   adds the manifest's `error` column, and both modes add `n_errors` and `ids_errors` to the sidecar's quality summaries.
 - Each adapter module registers itself at the end with `register("<data_source>", AdapterClass)`.
   `update_catalog()` and catalog loading raise `CatalogError` for a `data_source` without a registered adapter, and for an unknown `dataset_spec.collection_date_policy`.
@@ -262,8 +263,9 @@ For each point: _build_image(dataset_spec, date, geometry, ...)
                              fast path nor the fallback selects an own image (for example a
                              wrong use_utm_zone), the image stays null, and the point is a
                              failed point
-        image_dates       -> {start, end} of the selected image (before the masked image), or
-                             null for a point without images. A branch of the statistics
+        image_dates       -> {start, end, fallback} of the selected image (before the masked
+                             image), or null for a point without images; fallback is true when
+                             the fast path had no own image. A branch of the statistics
                              request; one small getInfo() per tile in raster runs
     _apply_derived_bands                  <- slope, aspect (KNOWN_DERIVED_BANDS)
     select(bands + derived bands)         <- derived bands only when no bands are set;
@@ -279,6 +281,7 @@ the circular aspect statistics (only when the derived `aspect` band is reduced w
 and the point value (only for the `point` statistic).
 For collections with per-point date selection, the same request also returns `image_dates`, the start and end of the selected image.
 `_resolve_date_info` takes `image_time_start` and `image_time_end` from it, and `date_clamped` and `date_source` from the timestamp index.
+For a point that used its own fallback image, has a sample date, and is not clamped, it also adds the internal meta key `fallback_image_gap_days` (whole days between the sample day and the image, by the day rule). `extract.py` uses it for the far-image warning; no output writes it.
 In raster runs, `_export_single` requests `image_dates` once per tile, in its worker thread, before the download. A failed request makes a failed tile.
 The circular aspect image is built for each point from the same image as the main image (`_build_image` with the same date and point), and it is never cached in `_static_image`.
 

@@ -22,6 +22,7 @@ import hashlib
 import importlib
 import json
 import math
+import warnings
 from types import SimpleNamespace
 
 import ee
@@ -42,6 +43,10 @@ from envoi.adapters.earth_engine.adapter import GeeRasterAdapter
 from envoi.catalog import BUILTIN_EE_CATALOG, load_catalogs, load_defaults
 from envoi.extract import extract
 from envoi.metadata import summarize_date_info
+
+# The package exports the function extract() under the module's name, so get
+# the module itself from the import system, for its private helpers.
+_extract_module = importlib.import_module("envoi.extract")
 
 
 @pytest.fixture(autouse=True)
@@ -2338,7 +2343,7 @@ class TestEmptyDateSelection:
         monkeypatch.setattr(_image, "_build_fallback_image", symbolic_fallback)
 
     @pytest.mark.parametrize(
-        ("dataset_spec", "time_starts", "time_ends", "selection"),
+        ("dataset_spec", "time_starts", "time_ends", "fast_path", "fallback"),
         [
             # The interval that contains 2021-06-15, in the point's UTM zone.
             # The range ends at the end of the centre day, not at the interval
@@ -2347,31 +2352,24 @@ class TestEmptyDateSelection:
                 {"collection_date_policy": "contains", "use_utm_zone": True},
                 pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
                 pd.DatetimeIndex(["2022-01-01", "2023-01-01"]),
-                (
-                    "(if size of embeddings at point where UTM_ZONE == 26N from 2021-01-01 to "
-                    "2021-06-16 limited to 1 > 0 then first of embeddings at point where "
-                    "UTM_ZONE == 26N from 2021-01-01 to 2021-06-16 else fallback(embeddings at "
-                    "point where UTM_ZONE == 26N, 2021-06-15, contains))"
-                ),
+                "embeddings at point where UTM_ZONE == 26N from 2021-01-01 to 2021-06-16",
+                "fallback(embeddings at point where UTM_ZONE == 26N, 2021-06-15, contains)",
             ),
             # The nearest start. Without an own image on that day: the fallback.
             (
                 {"collection_date_policy": "nearest"},
                 pd.DatetimeIndex(["2021-01-01", "2022-01-01"]),
                 None,
-                (
-                    "(if size of embeddings at point from 2021-01-01 to 2021-01-02 limited to "
-                    "1 > 0 then first of embeddings at point from 2021-01-01 to 2021-01-02 else "
-                    "fallback(embeddings at point, 2021-06-15, nearest))"
-                ),
+                "embeddings at point from 2021-01-01 to 2021-01-02",
+                "fallback(embeddings at point, 2021-06-15, nearest)",
             ),
             # No timestamp index: one day before and after the sample date, no
             # fallback, and no date request.
-            ({}, None, None, "first of embeddings at point from 2021-06-14 to 2021-06-16"),
+            ({}, None, None, "embeddings at point from 2021-06-14 to 2021-06-16", None),
         ],
     )
     def test_point_without_images_gets_a_masked_image(
-        self, dataset_spec, time_starts, time_ends, selection
+        self, dataset_spec, time_starts, time_ends, fast_path, fallback
     ):
         """The check looks for one image at the point; the image is the selected one."""
         image, image_dates = _image._build_image(
@@ -2383,6 +2381,14 @@ class TestEmptyDateSelection:
             lat=0.0,
             lon=-30.0,
         )
+
+        # The fast path: the first own image in the batch-selected range. When
+        # the range has no own image: the per-point fallback.
+        fast_path_has_image = f"size of {fast_path} limited to 1 > 0"
+        if fallback is None:
+            selection = f"first of {fast_path}"
+        else:
+            selection = f"(if {fast_path_has_image} then first of {fast_path} else {fallback})"
 
         # The condition looks for an image at the point before the UTM-zone
         # and date filters. When the point has images, but no own image is
@@ -2396,13 +2402,16 @@ class TestEmptyDateSelection:
             f"where A01 in system:band_names) masked to 0).select(['A00', 'A01'])"
         )
         # The date request reads the selected image, before the masked image,
-        # with the same condition: null for a point without images.
+        # with the same condition: null for a point without images. Its
+        # fallback flag uses the condition of the fast path: True only when
+        # the fast-path range has no own image, so the fallback selected it.
         if time_starts is None:
             assert image_dates is None
         else:
             assert image_dates == (
                 f"if {point_has_images} then {{start: {selection}.system:time_start, "
-                f"end: {selection}.system:time_end}} else null"
+                f"end: {selection}.system:time_end, "
+                f"fallback: if {fast_path_has_image} then False else True}} else null"
             )
 
     @pytest.mark.parametrize(
@@ -2705,9 +2714,16 @@ def _select_point_image(
     )
 
 
-def _image_dates_of(image: _SimulatedImage) -> dict:
-    """Return the ``image_dates`` result that Earth Engine gives for ``image``."""
-    return {"start": image.get("system:time_start"), "end": image.get("system:time_end")}
+def _image_dates_of(image: _SimulatedImage, *, fallback: bool) -> dict:
+    """Return the ``image_dates`` result that Earth Engine gives for ``image``.
+
+    ``fallback`` is True when the per-point fallback selected the image.
+    """
+    return {
+        "start": image.get("system:time_start"),
+        "end": image.get("system:time_end"),
+        "fallback": fallback,
+    }
 
 
 # Uppsala and Göteborg in June 2021 (live 2026-10-12): Sentinel-2 images on
@@ -2737,13 +2753,18 @@ class TestPerPointFallbackNearest:
         }
 
         # The batch-selected day is 2021-06-16 (Göteborg). Uppsala's images
-        # on 06-15 and 06-17 are one day away: the earlier one wins.
+        # on 06-15 and 06-17 are one day away: the earlier one wins. Only
+        # Uppsala's image comes from the fallback.
         assert {point: _read_server_value(image) for point, (image, _) in results.items()} == {
             "U": "U 2021-06-15",
             "G": "G 2021-06-16",
         }
-        assert _read_server_value(results["U"][1]) == _image_dates_of(_UPPSALA_IMAGES[1])
-        assert _read_server_value(results["G"][1]) == _image_dates_of(_GOTEBORG_IMAGES[1])
+        assert _read_server_value(results["U"][1]) == _image_dates_of(
+            _UPPSALA_IMAGES[1], fallback=True
+        )
+        assert _read_server_value(results["G"][1]) == _image_dates_of(
+            _GOTEBORG_IMAGES[1], fallback=False
+        )
 
     def test_point_alone_gets_the_same_image(self, simulated_server):
         """A point alone selects the same image as in the batch with the other point."""
@@ -2781,6 +2802,7 @@ class TestPerPointFallbackNearest:
         assert _read_server_value(image_dates) == {
             "start": _epoch_ms("2021-06-15 09:00"),
             "end": None,
+            "fallback": True,
         }
 
     def test_gap_counts_whole_days(self, simulated_server):
@@ -2889,7 +2911,7 @@ class TestPerPointFallbackContains:
         b_image, _ = _select_point_image(images, "B", "2021-06-20", "contains", batch_points="AB")
 
         assert _read_server_value(a_image) == "A 06-01"
-        assert _read_server_value(a_image_dates) == _image_dates_of(a_images[0])
+        assert _read_server_value(a_image_dates) == _image_dates_of(a_images[0], fallback=True)
         assert _read_server_value(b_image) == "B 06-15"
 
     @pytest.mark.parametrize(
@@ -2969,7 +2991,7 @@ class TestPerPointFallbackContains:
         u_image, _ = _select_point_image(images, "U", None, "contains", batch_points="UG")
 
         assert _read_server_value(g_image) == "G long"
-        assert _read_server_value(g_image_dates) == _image_dates_of(g_images[0])
+        assert _read_server_value(g_image_dates) == _image_dates_of(g_images[0], fallback=True)
         assert _read_server_value(u_image) == "U 2021-06-20"
 
 
@@ -3277,6 +3299,331 @@ class TestImageDatesOfTiles:
             "2021-06-15",
             "2021-06-17",
         ]
+
+
+# ------------------------------------------------------------------
+# Warning for points that used a fallback image far from their sample date
+# ------------------------------------------------------------------
+
+
+class TestCountGapDays:
+    """``_count_gap_days`` counts whole UTC days between a sample date and an image (day rule)."""
+
+    @pytest.mark.parametrize(
+        ("image_start", "image_end", "expected_gap_days"),
+        [
+            ("2021-07-26 10:30", None, 40),
+            # Whole days: 23:00 on 2021-05-07 is 39 days and 1 hour before
+            # the sample day, but 40 days by start day. The end does not count.
+            ("2021-05-07 23:00", "2021-06-30", 40),
+            ("2021-06-16 23:59", None, 0),
+        ],
+    )
+    def test_nearest_counts_the_days_to_the_start_day(
+        self, image_start, image_end, expected_gap_days
+    ):
+        """``nearest``: the whole days between the sample day and the image's start day."""
+        gap_days = _image._count_gap_days(
+            "2021-06-16",
+            _epoch_ms(image_start),
+            _epoch_ms(image_end) if image_end is not None else None,
+            "nearest",
+        )
+
+        assert gap_days == expected_gap_days
+
+    @pytest.mark.parametrize(
+        ("image_start", "image_end", "expected_gap_days"),
+        [
+            # The image contains the sample day.
+            ("2021-06-01", "2021-07-01", 0),
+            # An image without an end contains its start day, also when it
+            # starts later on that day.
+            ("2021-06-20 10:00", None, 0),
+            # An image after the sample day: the days to its start day.
+            ("2021-07-30 10:00", "2021-08-30", 40),
+            # An image before the sample day: the days from its last day. An
+            # end at 00:00 does not contain the day that starts then, so the
+            # last day is 2021-05-11, not the day of the end (2021-05-12).
+            ("2021-05-01", "2021-05-12", 40),
+            # An end later on its day contains that day.
+            ("2021-05-01", "2021-05-11 06:00", 40),
+            # An image without an end, or with an end on its start day,
+            # contains only its start day.
+            ("2021-05-11 10:00", None, 40),
+            ("2021-05-11 10:00", "2021-05-11 10:01", 40),
+            # An image that ends at the start of the sample day does not contain it.
+            ("2021-06-10", "2021-06-20", 1),
+        ],
+    )
+    def test_contains_counts_the_days_to_the_nearest_day_of_the_image(
+        self, image_start, image_end, expected_gap_days
+    ):
+        """``contains``: 0 when the image contains the sample day, else the days to its nearest day."""
+        gap_days = _image._count_gap_days(
+            "2021-06-20",
+            _epoch_ms(image_start),
+            _epoch_ms(image_end) if image_end is not None else None,
+            "contains",
+        )
+
+        assert gap_days == expected_gap_days
+
+
+def _fallback_image_times(start_text: str, end_text: str | None = None) -> dict:
+    """Return the ``image_dates`` result of a point whose image the per-point fallback selected."""
+    return {**_image_times(start_text, end_text), "fallback": True}
+
+
+class TestFallbackImageGapInDateInfo:
+    """``_resolve_date_info`` adds the internal gap only for the fallback image of a dated point."""
+
+    @pytest.mark.parametrize(
+        ("sample_date", "image_times", "expected_gap_days"),
+        [
+            ("2021-06-16", _fallback_image_times("2021-07-26 10:30"), 40),
+            ("2021-06-16", _fallback_image_times("2021-06-06 10:30"), 10),
+            # The fast path selected the image: no gap.
+            ("2021-06-16", {**_image_times("2021-07-26 10:30"), "fallback": False}, None),
+            # A clamped date (before the first start of the batch index): no gap.
+            ("2020-03-01", _fallback_image_times("2021-06-13"), None),
+            # No sample date: no gap.
+            (None, _fallback_image_times("2021-03-01"), None),
+        ],
+    )
+    def test_nearest(self, sample_date, image_times, expected_gap_days):
+        """The gap of a ``nearest`` collection counts the days to the image's start day."""
+        adapter = _nearest_index_adapter()
+
+        date_info = adapter._resolve_date_info(sample_date, image_times)
+
+        assert date_info.get("fallback_image_gap_days") == expected_gap_days
+        assert ("fallback_image_gap_days" in date_info) == (expected_gap_days is not None)
+        assert date_info["image_time_start"] == pd.to_datetime(
+            image_times["start"], unit="ms"
+        ).strftime("%Y-%m-%d")
+
+    def test_contains_uses_the_last_day_of_an_earlier_image(self):
+        """The gap of a ``contains`` collection counts from the last day of an image before the date."""
+        adapter = _contains_adapter(_EIGHT_DAY_STARTS, _EIGHT_DAY_ENDS)
+
+        # 2021-01-20 is in the last interval of the index, so it is not
+        # clamped. The image's last day is 2020-12-09: 42 days before the
+        # sample day (its start day is 50 days before it).
+        date_info = adapter._resolve_date_info(
+            "2021-01-20", _fallback_image_times("2020-12-01", "2020-12-10")
+        )
+
+        assert date_info["date_clamped"] is False
+        assert date_info["fallback_image_gap_days"] == 42
+
+
+# Four points of one batch. Each point's request returns the image times in
+# _FAR_IMAGE_TIMES_BY_LATITUDE, and the adapter turns them into the point's
+# date fields. Only p_far used a fallback image more than 32 days from its
+# sample date and is not clamped.
+_FAR_IMAGE_POINTS = pd.DataFrame(
+    {
+        "occurrenceID": ["p_far", "p_near", "p_clamped", "p_fast"],
+        "decimalLatitude": [59.85, 59.86, 59.87, 59.88],
+        "decimalLongitude": [17.63, 17.64, 17.65, 17.66],
+        "eventDate": ["2021-06-16", "2021-06-16", "2020-03-01", "2021-06-16"],
+    }
+)
+_FAR_IMAGE_TIMES_BY_LATITUDE = {
+    # A fallback image 40 days after the sample date.
+    59.85: _fallback_image_times("2021-07-26 10:30"),
+    # A fallback image 10 days before the sample date.
+    59.86: _fallback_image_times("2021-06-06 10:30"),
+    # A clamped date (before the first image of the batch), and a fallback
+    # image 306 days later.
+    59.87: _fallback_image_times("2021-01-01 10:30"),
+    # The fast path: the image of the batch-selected range, 40 days away.
+    59.88: {**_image_times("2021-07-26 10:30"), "fallback": False},
+}
+
+
+def _stub_far_image_requests(adapter: GeeRasterAdapter) -> None:
+    """Replace the per-point statistics request and tile export of ``adapter`` with stubs.
+
+    The batch index starts on 2021-01-01 and ends on 2021-12-01. Each point
+    gets the image times of ``_FAR_IMAGE_TIMES_BY_LATITUDE``, and
+    ``_resolve_date_info`` turns them into its date fields, as for a real
+    request.
+    """
+    adapter._collection_time_starts = pd.DatetimeIndex(["2021-01-01 10:30", "2021-12-01 10:30"])
+
+    def request(lat, lon, window_m, *args, date=None, **kwargs):
+        meta = {
+            "in_extent": True,
+            "n_pixels": 400,
+            "had_nodata": False,
+            "coverage_pct": 100.0,
+            "window_m": window_m,
+            **adapter._resolve_date_info(date, _FAR_IMAGE_TIMES_BY_LATITUDE[lat]),
+        }
+        return {"B1_mean": 1.0, "B2_mean": 2.0}, meta
+
+    def export(lat, lon, window_m, output_path, date=None, resample_m=None):
+        return output_path, adapter._resolve_date_info(date, _FAR_IMAGE_TIMES_BY_LATITUDE[lat])
+
+    adapter._fetch_stats_single = request
+    adapter._export_single = export
+
+
+def _far_image_warnings(recorded_warnings) -> list:
+    """Return the recorded warnings about images far from the sample date."""
+    return [
+        recorded
+        for recorded in recorded_warnings
+        if "more than 32 days from their sample date" in str(recorded.message)
+    ]
+
+
+class TestFarImageWarningThroughExtract:
+    """``extract()`` warns once per dataset and window about fallback images far from the date."""
+
+    def test_tabular_run_warns_only_for_the_far_fallback_image(self, stub_gee_dataset, tmp_path):
+        """Only p_far gives a warning; the sidecar records it and has no internal key."""
+        _stub_far_image_requests(stub_gee_dataset)
+
+        with pytest.warns(UserWarning, match="more than 32 days") as recorded_warnings:
+            extract(_FAR_IMAGE_POINTS, _stub_gee_config("gee_far", "tabular"), output_dir=tmp_path)
+
+        [far_image_warning] = _far_image_warnings(recorded_warnings)
+        # The warning points at the caller of extract().
+        assert far_image_warning.filename == __file__
+        message = str(far_image_warning.message)
+        assert message.startswith(
+            "Dataset 'stub_gee', window 200 m: 1 of 4 points used an image more than 32 days "
+            "from their sample date (largest gap: 40 days; IDs: 'p_far')."
+        )
+        assert message.endswith(
+            "The QC columns 'stub_gee_image_time_start_200m' and "
+            "'stub_gee_image_time_end_200m' show the dates of each point's image."
+        )
+        sidecar_text = (tmp_path / "gee_far_metadata.json").read_text()
+        sidecar = json.loads(sidecar_text)
+        assert {
+            key: value for key, value in sidecar["warnings"].items() if key.startswith("far_image")
+        } == {"far_image_stub_gee_200m": message}
+        assert "fallback_image_gap_days" not in sidecar_text
+        qc_table = pd.read_csv(tmp_path / "gee_far_qc.csv")
+        assert not [column for column in qc_table.columns if "gap" in column]
+        assert qc_table["stub_gee_image_time_start_200m"].tolist() == [
+            "2021-07-26",
+            "2021-06-06",
+            "2021-01-01",
+            "2021-07-26",
+        ]
+        assert qc_table["stub_gee_date_clamped_200m"].tolist() == [False, False, True, False]
+
+    def test_tabular_run_without_metadata_says_that_the_qc_table_is_not_written(
+        self, stub_gee_dataset, tmp_path
+    ):
+        """With ``write_metadata=False``, the warning says that the QC table is not written."""
+        _stub_far_image_requests(stub_gee_dataset)
+
+        with pytest.warns(UserWarning, match="more than 32 days") as recorded_warnings:
+            extract(
+                _FAR_IMAGE_POINTS,
+                _stub_gee_config("gee_far", "tabular"),
+                output_dir=tmp_path,
+                write_metadata=False,
+            )
+
+        [far_image_warning] = _far_image_warnings(recorded_warnings)
+        assert str(far_image_warning.message).endswith(
+            "is not written because write_metadata is False."
+        )
+
+    def test_raster_run_warns_only_for_the_far_fallback_image(self, stub_gee_dataset, tmp_path):
+        """A raster run gives the same warning; the sidecar and the manifest have no internal key."""
+        _stub_far_image_requests(stub_gee_dataset)
+
+        with pytest.warns(UserWarning, match="more than 32 days") as recorded_warnings:
+            extract(
+                _FAR_IMAGE_POINTS, _stub_gee_config("gee_far_tiles", "raster"), output_dir=tmp_path
+            )
+
+        [far_image_warning] = _far_image_warnings(recorded_warnings)
+        assert far_image_warning.filename == __file__
+        message = str(far_image_warning.message)
+        assert message.startswith(
+            "Dataset 'stub_gee', window 200 m: 1 of 4 points used an image more than 32 days "
+            "from their sample date (largest gap: 40 days; IDs: 'p_far')."
+        )
+        assert "The sidecar 'date_info' lists the dates of the images" in message
+        batch_dir = tmp_path / "gee_far_tiles"
+        sidecar_text = (batch_dir / "gee_far_tiles_metadata.json").read_text()
+        sidecar = json.loads(sidecar_text)
+        assert {
+            key: value for key, value in sidecar["warnings"].items() if key.startswith("far_image")
+        } == {"far_image_stub_gee_200m": message}
+        assert "fallback_image_gap_days" not in sidecar_text
+        manifest = pd.read_csv(batch_dir / "stub_gee" / "tiles_manifest.csv")
+        assert list(manifest.columns) == ["occurrenceID", "tile_filename", "exported"]
+
+    def test_run_without_dates_gives_no_warning(self, stub_gee_dataset, tmp_path):
+        """Without a sample date, a fallback image far from the latest start gives no warning."""
+        _stub_far_image_requests(stub_gee_dataset)
+
+        with warnings.catch_warnings(record=True) as recorded_warnings:
+            warnings.simplefilter("always")
+            extract(
+                _FAR_IMAGE_POINTS.drop(columns="eventDate"),
+                _stub_gee_config("gee_no_dates", "tabular"),
+                output_dir=tmp_path,
+            )
+
+        assert _far_image_warnings(recorded_warnings) == []
+        sidecar = json.loads((tmp_path / "gee_no_dates_metadata.json").read_text())
+        assert not [key for key in sidecar.get("warnings", {}) if key.startswith("far_image")]
+        assert sidecar["datasets"]["stub_gee"]["date_info"]["n_most_recent_no_date"] == 4
+
+
+class TestFarImageWarningText:
+    """The warning counts the points with a gap above 32 days and lists up to 10 IDs."""
+
+    def test_threshold_is_the_first_fallback_window(self):
+        """The warning threshold equals the first search window of the fallback (32 days)."""
+        assert _extract_module._FAR_IMAGE_GAP_DAYS == _image._FALLBACK_WINDOWS_DAYS[0] == 32
+
+    @pytest.mark.parametrize(("gap_days", "expected_warning"), [(32, False), (33, True)])
+    def test_warning_starts_above_32_days(self, gap_days, expected_warning):
+        """A gap of 32 days gives no warning; a gap of 33 days gives one."""
+        with warnings.catch_warnings(record=True) as recorded_warnings:
+            warnings.simplefilter("always")
+            message = _extract_module._warn_about_far_images(
+                [{"fallback_image_gap_days": gap_days}, {}],
+                ["a", "b"],
+                dataset="d",
+                batch_label="window 200 m",
+                date_location="Dates are in the QC table.",
+            )
+
+        assert (message is not None) == expected_warning
+        assert len(_far_image_warnings(recorded_warnings)) == int(expected_warning)
+
+    def test_message_lists_ten_ids_and_the_number_of_points(self):
+        """Twelve far points: the count, the largest gap, ten IDs, and the number not listed."""
+        meta_list = [{"fallback_image_gap_days": 33 + index} for index in range(12)]
+        meta_list.append({"fallback_image_gap_days": 5})
+
+        with pytest.warns(UserWarning, match="more than 32 days"):
+            message = _extract_module._warn_about_far_images(
+                meta_list,
+                [f"p{index}" for index in range(13)],
+                dataset="d",
+                batch_label="point values",
+                date_location="Dates are in the QC table.",
+            )
+
+        ids_text = ", ".join(f"'p{index}'" for index in range(10))
+        assert message.startswith(
+            f"Dataset 'd', point values: 12 of 13 points used an image more than 32 days from "
+            f"their sample date (largest gap: 44 days; IDs: {ids_text}, ... and 2 more)."
+        )
 
 
 # ------------------------------------------------------------------

@@ -38,6 +38,7 @@ from ...qc import format_point_error
 from ..base import BaseAdapter
 from ._image import (
     _build_image,
+    _count_gap_days,
     _ensure_gee_init,
     _find_nearest_timestamp,
     _get_collection_time_bounds,
@@ -579,9 +580,11 @@ class GeeRasterAdapter(BaseAdapter):
             date: The point's sample date, or None in a run without dates.
             image_times: The ``image_dates`` value of ``_build_image`` that
                 Earth Engine returned for the point: ``{"start": ..., "end":
-                ...}`` in milliseconds since 1970, with ``"end"`` None when the
-                image has no end. None when the collection has no image at the
-                point (the masked image).
+                ..., "fallback": ...}``, the times in milliseconds since 1970,
+                with ``"end"`` None when the image has no end, and
+                ``"fallback"`` True when the per-point fallback selected the
+                image. None when the collection has no image at the point (the
+                masked image).
 
         Returns:
             The four date keys, without ``image_time_end`` when the image has
@@ -589,6 +592,12 @@ class GeeRasterAdapter(BaseAdapter):
             mosaic collections, and collections without an image at the
             batch's points), and when ``image_times`` is None: a point without
             an image has no date fields, and ``date_info`` does not count it.
+
+            One internal key is added when the per-point fallback selected the
+            image, the point has a sample date, and the date is not clamped:
+            ``fallback_image_gap_days``, the whole days between the sample
+            date and the image (see ``_count_gap_days``). ``extract()`` warns
+            when it is large. It stays in memory: no output writes it.
         """
         if self._collection_time_starts is None or image_times is None:
             return {}
@@ -606,6 +615,17 @@ class GeeRasterAdapter(BaseAdapter):
         if image_times.get("end") is not None:
             date_info["image_time_end"] = pd.to_datetime(image_times["end"], unit="ms").strftime(
                 "%Y-%m-%d"
+            )
+
+        # The gap between the sample date and an image that the per-point
+        # fallback selected, for the warning about images far from the date.
+        # Only for a point with a sample date that is not clamped: without a
+        # date there is no gap, and a clamped date is outside the dates of
+        # the batch's images, which date_clamped already reports.
+        if image_times.get("fallback") and date is not None and not date_clamped:
+            policy = str(self._dataset_spec.get("collection_date_policy", "nearest")).lower()
+            date_info["fallback_image_gap_days"] = _count_gap_days(
+                date, image_times["start"], image_times.get("end"), policy
             )
         return date_info
 
@@ -748,8 +768,9 @@ class GeeRasterAdapter(BaseAdapter):
 
         A fourth branch, **image_dates**, is no reduction: for collections
         with per-point date selection, it returns the start and end of the
-        image that the date selection chose, for the date fields of the meta
-        dict (see ``_resolve_date_info``).
+        image that the date selection chose, and whether the per-point
+        fallback chose it, for the date fields of the meta dict (see
+        ``_resolve_date_info``).
 
         GEE evaluates the branches in parallel server-side, so callers pay
         one round-trip for all of them. Returns a single

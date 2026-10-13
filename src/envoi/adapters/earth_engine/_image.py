@@ -527,6 +527,56 @@ def _build_fallback_image(own_images, centre_day: pd.Timestamp, policy: str):
     return selected_image
 
 
+def _count_gap_days(
+    sample_date: str | pd.Timestamp, image_start_ms: int, image_end_ms: int | None, policy: str
+) -> int:
+    """Return the number of whole days between a sample date and an image (the day rule).
+
+    Dates compare as whole days in UTC. No request: the times are numbers
+    that Earth Engine already returned.
+
+    Args:
+        sample_date: The point's sample date (text ``YYYY-MM-DD`` or a
+            timestamp). Only its day counts.
+        image_start_ms: ``system:time_start`` of the image, in milliseconds
+            since 1970.
+        image_end_ms: ``system:time_end`` of the image in milliseconds, or
+            None when the image has no end.
+        policy: The ``collection_date_policy``, "nearest" or "contains".
+
+    Returns:
+        For "nearest": the number of days between the sample day and the
+        image's start day. For "contains": 0 when the image contains the
+        sample day; otherwise the number of days from the sample day to the
+        nearest day that the image contains: its start day for an image after
+        the sample day, and its last day for an image before it. An image
+        without an end, or with an end on its start day, contains only its
+        start day.
+    """
+    one_day = pd.Timedelta(days=1)
+    sample_day = pd.Timestamp(sample_date).normalize()
+    start_day = pd.to_datetime(image_start_ms, unit="ms").normalize()
+    if policy != "contains":
+        return abs((start_day - sample_day).days)
+
+    # Day rule: the image ends at least at the end of its start day.
+    end = start_day + one_day
+    if image_end_ms is not None:
+        end = max(end, pd.to_datetime(image_end_ms, unit="ms"))
+
+    if start_day > sample_day:
+        return (start_day - sample_day).days
+    if end > sample_day:
+        # The image starts on or before the sample day and ends after the
+        # start of it: it contains the sample day.
+        return 0
+    # The image ends at or before the start of the sample day. Its last day is
+    # the last day that starts before its end: an end at 00:00 does not
+    # contain the day that starts at that time.
+    last_day = end.ceil("D") - one_day
+    return (sample_day - last_day).days
+
+
 # ---------------------------------------------------------------------------
 # Derived bands  (slope, aspect, …)
 # ---------------------------------------------------------------------------
@@ -650,13 +700,15 @@ def _build_image(
     -------
     (image, image_dates)
         ``image`` is the ee.Image to sample. ``image_dates`` is a server-side
-        value for the point's request: ``{"start": ..., "end": ...}``, the
-        ``system:time_start`` and ``system:time_end`` (milliseconds, ``None``
-        when the image has no end) of the image that the date selection chose,
-        or null when the collection has no image at the point (the masked
-        image). ``image_dates`` is ``None`` when there is no per-point date
-        selection (an image asset, a mosaic, no point geometry, or no batch
-        index). Building both sends no request.
+        value for the point's request: ``{"start": ..., "end": ...,
+        "fallback": ...}``, the ``system:time_start`` and ``system:time_end``
+        (milliseconds, ``None`` when the image has no end) of the image that
+        the date selection chose, and ``fallback``, True when the per-point
+        fallback chose it (the fast-path range had no own image of the point)
+        and False for the fast path. It is null when the collection has no
+        image at the point (the masked image). ``image_dates`` is ``None``
+        when there is no per-point date selection (an image asset, a mosaic,
+        no point geometry, or no batch index). Building both sends no request.
     """
     image = None
     image_dates = None
@@ -735,10 +787,9 @@ def _build_image(
             # If that it needs, so a point with an image in the fast-path
             # range does not pay for the fallback.
             if use_point_fallback:
+                fast_path_has_image = dated_collection.limit(1).size().gt(0)
                 fallback_image = _build_fallback_image(image_collection, centre_day, date_policy)
-                image = ee.Image(
-                    ee.Algorithms.If(dated_collection.limit(1).size().gt(0), image, fallback_image)
-                )
+                image = ee.Image(ee.Algorithms.If(fast_path_has_image, image, fallback_image))
 
             # When the collection has no image at the point on any date (for
             # example an ocean point of a tiled land product), .first() gives
@@ -783,6 +834,10 @@ def _build_image(
                 # used (the fallback image can differ from the batch-selected
                 # image). The masked image has no dates of its own: its point
                 # has no image, so the value is null, with the same condition.
+                # "fallback" tells whether the per-point fallback selected the
+                # image (the fast-path range had no own image of the point).
+                # The server decides it with the condition of the If above, so
+                # the adapter does not have to guess it from the dates.
                 if use_point_fallback:
                     image_dates = ee.Algorithms.If(
                         point_has_images,
@@ -790,6 +845,7 @@ def _build_image(
                             {
                                 "start": image.get("system:time_start"),
                                 "end": image.get("system:time_end"),
+                                "fallback": ee.Algorithms.If(fast_path_has_image, False, True),
                             }
                         ),
                         None,
