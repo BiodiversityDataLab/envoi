@@ -19,10 +19,19 @@ def summarize_tile_export(exported_paths: list, n_points: int) -> dict:
 def summarize_date_info(meta_list: list[dict]) -> dict | None:
     """Summarise per-point date decisions for inclusion in group metadata.
 
-    Returns None when the meta dicts contain no date info (e.g. local rasters
-    or IMAGE assets where date selection does not apply).
+    Failed points and failed tiles (meta dicts with ``error``) are not
+    counted: no data of theirs is in the outputs. Returns None when no other
+    meta dict contains date info (e.g. local rasters or IMAGE assets where
+    date selection does not apply).
     """
-    if not meta_list or "image_time_start" not in meta_list[0]:
+    # Leave out every meta dict with an error: no data of it is in the
+    # outputs. The adapters give a failed point or tile no date keys (the
+    # Earth Engine adapter reads the dates of a tile's image in the tile's own
+    # request), so this filter is a safeguard.
+    meta_list = [point_meta for point_meta in meta_list or [] if "error" not in point_meta]
+    # Check every point, not only the first: the summary must not disappear
+    # because the first point has no date keys.
+    if not meta_list or not any("image_time_start" in m for m in meta_list):
         return None
     sources = [m.get("date_source", "") for m in meta_list]
 
@@ -41,6 +50,7 @@ def summarize_date_info(meta_list: list[dict]) -> dict | None:
 
     return {
         "n_nearest_to_sample": sum(1 for s in sources if s == "nearest_to_sample"),
+        "n_contains_sample_date": sum(1 for s in sources if s == "contains_sample_date"),
         "n_clamped_to_nearest": sum(1 for s in sources if s == "clamped_to_nearest"),
         "n_most_recent_no_date": sum(1 for s in sources if s == "most_recent_no_date"),
         "image_date_ranges_used": ranges_used,
@@ -51,7 +61,6 @@ def write_metadata_sidecar(
     out_dir: str | Path,
     group_name: str,
     *,
-    output_type: str,
     n_points: int,
     datasets: dict,
     config: dict,

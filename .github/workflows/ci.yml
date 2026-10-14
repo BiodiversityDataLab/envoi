@@ -26,11 +26,11 @@ jobs:
       - name: Tests
         run: pytest -q
 
-  # The web app runs each extraction in a worker process, and process start,
-  # pipes, and process stop differ between operating systems. The build job
-  # above covers Linux. This job runs the web-app worker and job tests on
-  # Windows and macOS.
-  webapp-portability:
+  # The offline test suite on Windows and macOS. envoi supports both, and file
+  # names, paths, raster I/O, and the web app's worker processes (process start,
+  # pipes, and stop) differ there. One Python version is enough: the build job
+  # above covers the Python versions on Linux.
+  portability:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -45,14 +45,28 @@ jobs:
         run: |
           python -m pip install -U pip
           pip install -e ".[dev,webapp]"
-      - name: Web-app worker and job tests
-        run: >-
-          pytest
-          tests/test_webapp_job_protocol.py
-          tests/test_webapp_worker.py
-          tests/test_webapp_jobs.py
-          tests/test_webapp_settings.py
-          tests/test_webapp_apptest.py
+      - name: Tests
+        run: pytest -m "not gee" -q
+
+  # The offline test suite at the oldest versions that pyproject.toml allows,
+  # on the oldest supported Python. The pins come from pyproject.toml itself
+  # (each '>=' becomes '=='), so this job follows the declared minimums.
+  minimum-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Pin the minimum versions
+        run: |
+          python -m pip install -U pip tomli
+          python .github/scripts/minimum_constraints.py > minimum-constraints.txt
+          cat minimum-constraints.txt
+      - name: Install
+        run: pip install -e ".[dev,webapp]" -c minimum-constraints.txt
+      - name: Tests
+        run: pytest -m "not gee" -q
 
   package:
     runs-on: ubuntu-latest

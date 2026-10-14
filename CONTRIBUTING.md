@@ -148,7 +148,8 @@ Built-in Earth Engine datasets live in [src/envoi/configs/ee_catalog.yml](src/en
 These GitHub Actions workflows check your changes automatically:
 
 - **`ci.yml`** runs on every push and pull request. It installs envoi with the `dev` and `webapp` extras across Python 3.10–3.13, runs `ruff check src tests deploy` and `black --check src tests deploy`, then `pytest -q`. The live `gee`-marked tests are skipped in CI (no service account is provisioned), so they should pass deterministically based on the non-GEE suite.
-  Its `webapp-portability` job runs the web-app tests (`tests/test_webapp_job_protocol.py`, `test_webapp_worker.py`, `test_webapp_jobs.py`, `test_webapp_settings.py`, and `test_webapp_apptest.py`) on Windows and macOS with Python 3.12. The web app starts a worker process for each extraction, and process start, pipes, and process stop differ between operating systems.
+  The `portability` job runs `pytest -m "not gee"` on Windows and macOS with Python 3.12. It includes the web-app worker tests: the web app starts a worker process for each extraction, and process start, pipes, and process stop differ between operating systems.
+  The `minimum-versions` job runs the same tests on Python 3.10 with every dependency at the minimum version that `pyproject.toml` allows (`.github/scripts/minimum_constraints.py` turns each `>=` into `==`). When you raise a minimum in `pyproject.toml`, this job tests the new minimum.
 - **`webapp-image.yml`** builds and checks the container image of the hosted web app on pull requests that change it. See [Web-app container image](#web-app-container-image).
 
 If CI fails on your PR, the formatter/lint output is the first thing to check — running `pre-commit run --all-files` locally reproduces those steps.
@@ -212,20 +213,25 @@ The image installs exactly the versions in `deploy/serve/requirements.txt` (`pip
 
 ## Releasing
 
-Releases publish to PyPI **and** are archived on Zenodo, which mints a DOI for each one. A release also publishes the container image of the hosted web app (step 5). The order of steps 3 and 4 matters: `release.yml` fires on a *tag push*, but Zenodo only reacts to a *published GitHub Release*. Pushing a tag alone gets the version onto PyPI with no DOI.
+Releases publish to PyPI **and** are archived on Zenodo, which mints a DOI for each one. A release also publishes the container image of the hosted web app (step 6). The order of steps 4 and 5 matters: `release.yml` fires on a *tag push*, but Zenodo only reacts to a *published GitHub Release*. Pushing a tag alone gets the version onto PyPI with no DOI.
 
-1. **Bump the version in three places, in a single PR:**
+1. **Regenerate the walkthrough outputs with a live run.**
+   Start Jupyter in the `examples/` folder, open `walkthrough.ipynb`, and run all cells from top to bottom with Earth Engine credentials.
+   The notebook needs `jupyter` and `matplotlib`, and it writes its outputs to `examples/walkthrough_output/`.
+   Check that every cell runs without an error and that the outputs agree with the documentation, for example the `date_info` section of `walkthrough_output/ndvi_metadata.json`.
+   Git ignores `examples/walkthrough_output/`, so this step changes no file in the repository.
+2. **Bump the version in three places, in a single PR:**
    - `src/envoi/_version.py` — `__version__`
    - `CITATION.cff` — both `version` and `date-released` (CI fails if the version doesn't match `_version.py`)
    - `CHANGELOG.md` — a new section for the release
-2. **Merge to `main`** once CI is green.
-3. **Push the tag:** `git tag vX.Y.Z && git push origin vX.Y.Z`. This triggers `release.yml`, which builds the distribution and publishes it to PyPI via Trusted Publishing.
-4. **Publish a GitHub Release** for that tag (Releases → Draft a new release → pick the existing tag → Publish). Zenodo archives the repository at that tag and mints a version DOI for it, plus updating the permanent concept DOI that always points at the latest version.
-5. **Publish and deploy the web-app image.** The tag push in step 3 also starts `webapp-image.yml`. When its checks pass, it publishes `ghcr.io/biodiversitydatalab/envoi-webapp:<version>-<short commit SHA>` (see [The image workflow](#the-image-workflow)). Check that the workflow passed. Then a maintainer with access to the envoi project on SciLifeLab Serve changes the app to the new image tag. To roll back, select an earlier tag on Serve.
+3. **Merge to `main`** once CI is green.
+4. **Push the tag:** `git tag vX.Y.Z && git push origin vX.Y.Z`. This triggers `release.yml`, which builds the distribution and publishes it to PyPI via Trusted Publishing.
+5. **Publish a GitHub Release** for that tag (Releases → Draft a new release → pick the existing tag → Publish). Zenodo archives the repository at that tag and mints a version DOI for it, plus updating the permanent concept DOI that always points at the latest version.
+6. **Publish and deploy the web-app image.** The tag push in step 4 also starts `webapp-image.yml`. When its checks pass, it publishes `ghcr.io/biodiversitydatalab/envoi-webapp:<version>-<short commit SHA>` (see [The image workflow](#the-image-workflow)). Check that the workflow passed. Then a maintainer with access to the envoi project on SciLifeLab Serve changes the app to the new image tag. To roll back, select an earlier tag on Serve.
 
    No image is published and no app is deployed on Serve yet. These first steps need a maintainer:
-   - **First publication.** A maintainer approves the first publication: a `v*` tag, or a manual run of `webapp-image.yml` with `publish` set to true. After it, the maintainer makes sure that the `envoi-webapp` package on GitHub is public, because Serve needs an image in a public registry.
-   - **First deployment on Serve.** Before it, the Serve team must confirm the open hosting questions, for example outbound access to `*.googleapis.com` and the size of the container disk. Then a maintainer creates the app on Serve with the image tag, port 8501, and the permission "Link", so that only people with the link can open it. The maintainer tests the app through the link, and then changes the permission to "Public".
+   - **First publication.** A maintainer approves the first publication: a manual run of `webapp-image.yml` with `publish` set to true (Actions → "webapp image" → "Run workflow"). Do not push a `v*` tag only for the image: `release.yml` would also publish envoi to PyPI. After the publication, the maintainer makes sure that the `envoi-webapp` package on GitHub is public, because Serve needs an image in a public registry.
+   - **First deployment on Serve.** The Serve team answered the hosting questions on 2026-10-14: outbound access to Google APIs works, `/tmp` has about 5 GB of temporary disk that a restart clears, the app runs as one pod that restarts in announced maintenance windows (https://serve.scilifelab.se/maintenance/), uploads through Serve are limited to 100 MB, and credentials must never reach the app logs. A maintainer creates the app on Serve with the image tag, port 8501, no mount path (the results are temporary and must not survive a restart), and the permission "Link", so that only people with the link can open it. The maintainer tests the app through the link, checks the Serve app logs for key material, and then changes the permission to "Public".
 
 The release title should match the tag — it becomes the title of the Zenodo archive record.
 

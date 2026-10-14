@@ -8,6 +8,7 @@ adapter relies on (drop NaN/inf, return NaN on empty input, etc.).
 from __future__ import annotations
 
 import math
+import statistics
 
 import pytest
 
@@ -61,15 +62,30 @@ class TestBasicReducers:
     def test_sum(self):
         assert r_sum([1.0, 2.0, 3.0]) == 6.0
 
-    def test_std_is_sample_std(self):
-        # ddof=1 — sample std, not population. NumPy defaults to ddof=0,
-        # so this is the explicit contract that envoi reducers expose.
-        # Pinning the value here catches any accidental flip to ddof=0.
-        assert r_std([1.0, 2.0, 3.0]) == pytest.approx(1.0)
+    def test_std_is_population_std(self):
+        """std divides by n (population statistic), as Earth Engine's stdDev does."""
+        # Squared deviations from the mean 2: 1, 0, 1. Their sum 2, divided by
+        # n = 3, is the variance 2/3. The sample statistic (n - 1) would give 1.
+        assert r_std([1.0, 2.0, 3.0]) == pytest.approx(math.sqrt(2 / 3))
+        assert r_std([1.0, 2.0, 3.0]) == pytest.approx(statistics.pstdev([1.0, 2.0, 3.0]))
 
-    def test_var_is_sample_var(self):
-        # ddof=1 sample variance, same reasoning as r_std above.
-        assert r_var([1.0, 2.0, 3.0]) == pytest.approx(1.0)
+    def test_var_is_population_var(self):
+        """var divides by n (population statistic), as Earth Engine's variance does."""
+        assert r_var([1.0, 2.0, 3.0]) == pytest.approx(2 / 3)
+        assert r_var([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]) == pytest.approx(
+            statistics.pvariance([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0])
+        )
+
+    def test_std_population_example(self):
+        """The textbook population example (mean 5) has standard deviation exactly 2."""
+        # Squared deviations: 9, 1, 1, 1, 0, 0, 4, 16. Sum 32, divided by n = 8, is 4.
+        assert r_std([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]) == pytest.approx(2.0)
+
+    @pytest.mark.parametrize("reducer_callable", [r_std, r_var])
+    def test_one_value_gives_zero(self, reducer_callable):
+        """A window with one valid pixel has std 0 and var 0, not NaN."""
+        assert reducer_callable([42.0]) == 0.0
+        assert reducer_callable([42.0, float("nan")]) == 0.0
 
     def test_count_returns_int(self):
         # r_count is the only reducer that returns int (not float). Downstream

@@ -218,11 +218,15 @@ The local web app runs only on your own computer. It has no limits, except one r
 
 **Reducer columns** look like: `dem_copernicus_glo30_mean_200m`, `dem_copernicus_glo30_std_200m`.
 
-**QC columns** look like: `dem_copernicus_glo30_in_extent_200m`, `dem_copernicus_glo30_n_pixels_200m`, `dem_copernicus_glo30_had_nodata_200m`, `dem_copernicus_glo30_coverage_pct_200m`.
+**QC columns** look like: `dem_copernicus_glo30_in_extent_200m`, `dem_copernicus_glo30_n_pixels_200m`, `dem_copernicus_glo30_had_nodata_200m`, `dem_copernicus_glo30_coverage_pct_200m`. When the data request or read of a point failed, the QC table also has `dem_copernicus_glo30_error_200m` (`..._error_point` for point-only statistics), with the error for that point and an empty value for the other points. This column exists only when at least one point of that dataset and window failed.
+
+For a window without valid pixels, both kinds of dataset give an empty `sum`, but they differ in two ways. Earth Engine datasets set `in_extent` to `False` and give `count` as `0`. Local datasets set `in_extent` to `True` when the window overlaps the raster (with `n_pixels` `0`), and give an empty `count`. [Known limitations](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md#known-limitations) lists other differences between the two kinds of dataset, and other limits of the outputs.
 
 **Available reducers:**
 
 - Core stats: `mean`, `median`, `min`, `max`, `sum`, `std`, `var`, `count`, `mode`
+  - `std` and `var` are population statistics: they divide by the number of pixels n, not n − 1. Earth Engine and local rasters use the same formula. Their values can still differ a little at the edge of the window, because Earth Engine gives a weight to pixels that are only partly inside the window, and the local adapter does not.
+  - For the Earth Engine derived band `aspect`, `mean`, `std`, and `var` are circular statistics in degrees (the mean of 350° and 10° is 0°, not 180°). Flat pixels (slope 0) are not used. See [Circular aspect statistics](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md#circular-aspect-statistics).
 - Quantiles: `q05`, `q10`, `q25`, `q50`, `q75`, `q90`, `q95`
 - Categorical: `class_count`, `class_fraction` (expanded per-class downstream)
 - Special: `point` — samples the exact pixel at each coordinate (no window)
@@ -271,11 +275,19 @@ extract(sample_points, {
 })
 ```
 
-Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`.
+Tiles land at `outputs/<batch_id>/<dataset>/<id>-<dataset>.tif`. When the ID is portable, for example `site_01`, the file name uses the ID as written. envoi changes an ID that is not portable, for example an ID with a character other than A–Z, a–z, 0–9, `.`, `_`, and `-` (such as `/`, `:`, or a space), or a very long ID. It replaces each other character with `_` and adds a short hash suffix: `urn:catalog:1` gives `urn_catalog_1-341248ef-<dataset>.tif`. An ID that differs from another ID only in letter case also gets a hash suffix, because Windows and macOS treat such file names as one file: `Site1` and `site1` give `Site1-d235a19f-<dataset>.tif` and `site1-8e62d73f-<dataset>.tif`. Each dataset folder also has a `tiles_manifest.csv`, which maps each input row and its ID to its tile file (`exported` is `False` when no tile was written). Use the manifest to find the tile of an ID.
 
-**Without `resample_m`,** tiles are written in the source raster's native CRS at native resolution. The tile boundary snaps to the source pixel grid, so the actual extent is `window_size_m` rounded to whole pixels — any pixel touched by the requested window is included, and tile dimensions can vary slightly across points (especially for global datasets where pixel size depends on latitude).
+For a point without data, the two kinds of dataset differ. Earth Engine datasets write a tile in which every pixel is masked (`exported` is `True`, and the sidecar counts the tile in `n_exported`). Local datasets write no tile for a point outside the raster (`exported` is `False`, and the sidecar counts the point in `n_failed`).
 
-**With `resample_m`,** every tile is reprojected to the point's UTM zone at exactly `resample_m` meters per pixel, on a grid snapped to that resolution. All tiles end up the same size (`round(window_size_m / resample_m)` pixels per side) and are spatially aligned across data sources — useful when feeding tiles to a CNN that expects a fixed input size or when comparing GEE and local rasters pixel-for-pixel.
+**With `resample_m`,** every tile is reprojected to the point's UTM zone at exactly `resample_m` meters per pixel. Earth Engine and local datasets use the same rule for the size and position of a tile:
+
+- A tile has n × n pixels. n is `window_size_m / resample_m` rounded to the nearest whole number, with ties rounded up (2.5 gives 3), and at least 1. For example, a 200 m window gives 7 × 7 pixels at `resample_m: 30` and 20 × 20 pixels at `resample_m: 10`. When `window_size_m` is at least half of `resample_m`, the side of a tile (n × `resample_m`) differs from `window_size_m` by at most half a pixel. A smaller window gives a tile of 1 × 1 pixel, which is larger than the window.
+- The tile corners lie on multiples of `resample_m` in the UTM zone.
+- When n is odd, the pixel that contains the point is the centre pixel of the tile. When n is even, the centre of the tile is the grid line nearest to the point.
+
+All tiles end up the same size and are spatially aligned across data sources — useful when feeding tiles to a CNN that expects a fixed input size or when comparing GEE and local rasters pixel-for-pixel.
+
+**Without `resample_m`,** Earth Engine tiles follow the same rule in the point's UTM zone, with the dataset's native pixel size in place of `resample_m`. Local tiles are written in the source raster's native CRS at native resolution. The tile boundary snaps to the source pixel grid, so the actual extent is `window_size_m` rounded to whole pixels — any pixel touched by the requested window is included, and tile dimensions can vary slightly across points (especially for global datasets where pixel size depends on latitude).
 
 ---
 
@@ -329,9 +341,12 @@ The machine-readable source, including descriptions, citations, and URLs for eve
 ### Notes
 
 - **Input CRS.** Coordinates in the input DataFrame are assumed to be in **WGS84 (EPSG:4326)**. If yours are in a different CRS, pass `input_crs="EPSG:XXXX"` to `extract()` and envoi reprojects them to WGS84 before extraction.
-- **Window units.** `window_size_m` is in meters. Each window is projected into the point's local UTM zone so distances are correct globally.
+- **Coordinates must be numbers.** Every row needs a finite number in the latitude and longitude columns. Text that holds a number, such as `"59.85"`, is accepted. If a value is missing, is other text, or is infinite, `extract()` stops before any extraction with an error that lists the IDs of those rows. Correct or remove those rows first.
+- **Other input columns.** Columns that are not your ID, coordinate, or date columns appear in the statistics table. A column named `id`, `lat`, `lon`, `date`, `lat_original`, or `lon_original` keeps its name there, but envoi does not use it. For example, a `date` column is not the sample date unless you pass `date_column="date"`.
+- **Window units.** `window_size_m` is in meters. Each window is projected into the point's local UTM zone so distances are correct globally. For statistics, a window smaller than one pixel of the dataset is widened to two pixels, so that it contains at least one pixel. The column names and the metadata keep the window you requested.
 - **Data source CRS and resolution.** Both are detected automatically from each dataset — no manual configuration needed.
 - **QC, not failure.** Low pixel coverage is flagged in QC columns rather than raising. Filter on `<dataset>_coverage_pct_<window>m` to drop unreliable rows downstream.
+  A point whose data request or read fails (for example a temporary Earth Engine error) does not stop the run either: its statistics are empty (raster runs: no tile), and the error goes into the QC column `<dataset>_error_<window>m` (raster runs: the `error` column of the tile manifest) and the metadata sidecar, with one warning. When every point of a dataset and window fails, the run stops with a `RuntimeError` that shows the first error. See [Failed points](https://github.com/BiodiversityDataLab/envoi/blob/main/docs/advanced_usage.md#failed-points).
 
 ---
 

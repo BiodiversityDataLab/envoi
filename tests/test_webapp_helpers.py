@@ -63,6 +63,18 @@ def test_validate_points_dataframe_rejects_missing_gbif_columns():
         validate_points_dataframe(pd.DataFrame({"x": [1], "y": [2]}))
 
 
+@pytest.mark.parametrize("infinite_value", [float("inf"), float("-inf"), "inf"])
+def test_validate_points_dataframe_rejects_infinite_coordinates(infinite_value):
+    """An infinite coordinate, also as the text "inf", is rejected at upload."""
+    df = _points_df()
+    df["decimalLongitude"] = [18.1, infinite_value]
+
+    with pytest.raises(
+        ValueError, match="Column 'decimalLongitude' contains infinite coordinate values"
+    ):
+        validate_points_dataframe(df)
+
+
 def test_validate_points_dataframe_rejects_duplicate_occurrence_ids():
     """Raster output names one tile per occurrenceID, so duplicates lose data.
 

@@ -8,8 +8,13 @@ through the full extract() pipeline.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
+import rasterio
+import yaml
+from rasterio.transform import from_origin
 
+from envoi import adapters as adapter_registry
 from envoi import list_datasets, reset_catalog, update_catalog
 from envoi.catalog import (
     BUILTIN_EE_CATALOG,
@@ -46,6 +51,16 @@ class TestCatalogDictValidation:
     def test_missing_data_source_raises(self):
         # Every dataset spec needs data_source; the error must name the field.
         with pytest.raises(CatalogError, match="data_source"):
+            _load_catalog_any({"datasets": {"x": {"path": "data/file.tif"}}})
+
+    def test_missing_data_source_lists_the_registered_data_sources(self, monkeypatch):
+        """The message lists the data sources of the adapter registry, not a fixed list."""
+        monkeypatch.setitem(adapter_registry._REG, "test_source", object)
+
+        with pytest.raises(
+            CatalogError,
+            match="Valid values are: earth_engine, local, test_source.",
+        ):
             _load_catalog_any({"datasets": {"x": {"path": "data/file.tif"}}})
 
     def test_missing_path_raises(self):
@@ -195,6 +210,101 @@ class TestUpdateAndResetCatalog:
         update_catalog(yml_path)
         merged = load_catalogs()
         assert "yml_local" in merged["datasets"]
+
+
+# ------------------------------------------------------------------
+# Unknown data_source — rejected when a catalog is registered or loaded.
+# ------------------------------------------------------------------
+
+
+class TestUnknownDataSource:
+    """A ``data_source`` without a registered adapter fails before ``extract()`` runs."""
+
+    def test_update_catalog_dict_raises_and_registers_nothing(self):
+        """A dict entry with an unknown ``data_source`` raises and is not registered."""
+        dataset_entry = {"data_source": "gee", "path": "USGS/GTOPO30", "data_type": "continuous"}
+
+        expected_message = "datasets.x: unknown data_source 'gee'"
+        with pytest.raises(CatalogError, match=expected_message) as error_info:
+            update_catalog({"datasets": {"x": dataset_entry}})
+
+        assert "earth_engine, local" in str(error_info.value)
+        assert "x" not in load_catalogs()["datasets"]
+
+    def test_load_catalog_file_raises(self, tmp_path):
+        """A YAML entry with an unknown ``data_source`` raises ``CatalogError``."""
+        catalog_path = tmp_path / "catalog.yml"
+        catalog_path.write_text(
+            yaml.safe_dump({"datasets": {"my_dem": {"data_source": "gdal", "path": "dem.tif"}}}),
+            encoding="utf-8",
+        )
+
+        expected_message = "datasets.my_dem: unknown data_source 'gdal'"
+        with pytest.raises(CatalogError, match=expected_message) as error_info:
+            load_catalog(catalog_path)
+
+        assert "earth_engine, local" in str(error_info.value)
+
+
+# ------------------------------------------------------------------
+# Unknown collection_date_policy — rejected when a catalog is registered or loaded.
+# ------------------------------------------------------------------
+
+
+def _earth_engine_entry(collection_date_policy) -> dict:
+    """Return an Earth Engine catalog entry with ``dataset_spec.collection_date_policy``."""
+    return {
+        "data_source": "earth_engine",
+        "path": "ECMWF/ERA5_LAND/MONTHLY_AGGR",
+        "data_type": "continuous",
+        "dataset_spec": {"collection_date_policy": collection_date_policy},
+    }
+
+
+class TestUnknownCollectionDatePolicy:
+    """A ``collection_date_policy`` other than nearest, contains, or mosaic fails at registration."""
+
+    @pytest.mark.parametrize("policy", ["nearst", "interval", "", None, 1])
+    def test_update_catalog_dict_raises_and_registers_nothing(self, policy):
+        """A dict entry with an unknown policy raises, names the value, and is not registered."""
+        with pytest.raises(CatalogError) as error_info:
+            update_catalog({"datasets": {"era5": _earth_engine_entry(policy)}})
+
+        message = str(error_info.value)
+        assert message.startswith(
+            f"datasets.era5: unknown dataset_spec.collection_date_policy {policy!r}."
+        )
+        assert message.endswith("Valid values are: contains, mosaic, nearest.")
+        assert "era5" not in load_catalogs()["datasets"]
+
+    def test_load_catalog_file_raises(self, tmp_path):
+        """A YAML entry with an unknown policy raises ``CatalogError``."""
+        catalog_path = tmp_path / "catalog.yml"
+        catalog_path.write_text(
+            yaml.safe_dump({"datasets": {"era5": _earth_engine_entry("closest")}}),
+            encoding="utf-8",
+        )
+
+        expected_message = "datasets.era5: unknown dataset_spec.collection_date_policy 'closest'"
+        with pytest.raises(CatalogError, match=expected_message):
+            load_catalog(catalog_path)
+
+    @pytest.mark.parametrize("policy", ["nearest", "contains", "mosaic", "Contains", "MOSAIC"])
+    def test_known_policies_are_accepted_in_any_letter_case(self, policy):
+        """The three policies register, also in another letter case, as the adapter reads them."""
+        update_catalog({"datasets": {"era5": _earth_engine_entry(policy)}})
+
+        registered_spec = load_catalogs()["datasets"]["era5"]["dataset_spec"]
+        assert registered_spec["collection_date_policy"] == policy
+
+    def test_builtin_catalog_loads_with_the_check(self):
+        """The built-in catalog loads, and each of its entries uses a known policy."""
+        builtin_datasets = load_catalogs(BUILTIN_EE_CATALOG)["datasets"]
+
+        for dataset_name, dataset_entry in builtin_datasets.items():
+            dataset_spec = dataset_entry.get("dataset_spec") or {}
+            policy = dataset_spec.get("collection_date_policy", "nearest")
+            assert policy in {"nearest", "contains", "mosaic"}, dataset_name
 
 
 # ------------------------------------------------------------------
@@ -349,3 +459,77 @@ class TestListDatasets:
         # caller can fix the typo without reading the source.
         with pytest.raises(ValueError, match="verbosity must be one of"):
             list_datasets("verbose")
+
+
+# ------------------------------------------------------------------
+# Local raster inspection — resolution_m in metres
+# ------------------------------------------------------------------
+
+
+def _write_one_band_raster(path, crs: str, pixel_width: float) -> None:
+    """Write a 10 × 10 float32 raster with square pixels of ``pixel_width`` CRS units."""
+    random_generator = np.random.default_rng(seed=21)
+    pixel_values = random_generator.uniform(0.0, 100.0, (10, 10)).astype(np.float32)
+    # Origins inside the valid range of each CRS; the values do not matter.
+    origin_x, origin_y = (18.0, 63.0) if crs == "EPSG:4326" else (500_000.0, 1_000_000.0)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=10,
+        width=10,
+        count=1,
+        dtype="float32",
+        crs=crs,
+        transform=from_origin(origin_x, origin_y, pixel_width, pixel_width),
+    ) as dst:
+        dst.write(pixel_values, 1)
+
+
+def _load_local_catalog_file(tmp_path, dataset_spec: dict) -> dict:
+    """Write a catalog YAML with one local dataset, load it, and return the dataset's entry.
+
+    A catalog file runs the local raster inspection (``load_catalog``).
+    """
+    catalog_path = tmp_path / "catalog.yml"
+    catalog_path.write_text(
+        yaml.safe_dump({"datasets": {"inspected": dataset_spec}}), encoding="utf-8"
+    )
+    return load_catalog(catalog_path)["datasets"]["inspected"]
+
+
+class TestLocalRasterResolution:
+    """``resolution_m`` that local raster inspection fills in is in metres for every CRS."""
+
+    @pytest.mark.parametrize(
+        ("crs", "pixel_width", "expected_resolution_m"),
+        [
+            # Geographic: 0.001° × 111 319.49 m per degree (one degree at the equator).
+            ("EPSG:4326", 0.001, 111.31949),
+            # Projected in metres: unchanged.
+            ("EPSG:32634", 30.0, 30.0),
+            # Projected in US survey feet: 1 ft = 1200 / 3937 m (about 0.3048 m).
+            ("EPSG:2263", 100.0, 100.0 * 1200 / 3937),
+        ],
+    )
+    def test_resolution_m_is_in_metres(self, tmp_path, crs, pixel_width, expected_resolution_m):
+        """The auto-detected ``resolution_m`` is the pixel width converted to metres."""
+        raster_path = tmp_path / "raster.tif"
+        _write_one_band_raster(raster_path, crs, pixel_width)
+
+        dataset_entry = _load_local_catalog_file(
+            tmp_path, {"data_source": "local", "path": str(raster_path)}
+        )
+
+        assert dataset_entry["resolution_m"] == pytest.approx(expected_resolution_m)
+
+    def test_resolution_m_from_the_catalog_is_kept(self, tmp_path):
+        """A ``resolution_m`` set in the catalog entry is not replaced."""
+        raster_path = tmp_path / "raster.tif"
+        _write_one_band_raster(raster_path, "EPSG:4326", 0.001)
+
+        dataset_entry = _load_local_catalog_file(
+            tmp_path, {"data_source": "local", "path": str(raster_path), "resolution_m": 100}
+        )
+
+        assert dataset_entry["resolution_m"] == 100
