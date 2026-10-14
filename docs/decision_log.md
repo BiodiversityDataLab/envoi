@@ -402,3 +402,26 @@ This decision extends the "Day rule" of the 2026-10-12 entry to the `nearest` po
 - **Consequence:** collections whose images start at 00:00 (all built-in date-based datasets) select the same images as before. Collections with images later in the day can select another image when two images are within one day of the date.
 - **Rejected:** keep exact times for `nearest` and change only `date_clamped`: the selection and the flag would then follow different rules.
 
+
+## 2026-10-14 — Hosted capacity on Serve's default resources
+
+This entry changes two values of "Hosted limits and retention" (2026-10-08). The user asked for more concurrent users than two, on Serve's default 2 vCPU and 4 GB, and approved these changes on 2026-10-14 after load tests of the container image.
+
+- **Decision:**
+  - 3 concurrent jobs on the server by default (was 2). `ENVOI_WEBAPP_MAX_JOBS` still overrides it.
+  - Workspace limit 500 MB for each job (was 1 GB). The disk budget stays 4 GB, so three running jobs reserve 1.5 GB and leave 2.5 GB for finished results.
+  - The web app reads the dataset catalog once per server process (`_dataset_catalog()` in `app.py`), not on every page run.
+- **Reason (measurements in local Docker with 2 vCPU and 4 GB):**
+  - An extraction worker uses about 0.35 CPU cores and 0.2 GB, for tabular and raster jobs (elevation data). Four jobs ran 10 % slower than one. Six jobs used 1.9 of 2 cores and ran twice as long.
+  - The Streamlit server is one Python process and uses at most about 1.1 cores for page runs. Three workers (about 1 core) and the page fit in 2 vCPU.
+  - A download holds the whole archive in the memory of the Streamlit process, and a repeated click holds it twice for a moment. With three jobs and 1 GB archives, three downloads, one repeated click, the workers, and the memory that large uploads leave could need about 5.9 GB. With 500 MB archives, about 3.9 GB.
+  - Parsing the bundled catalog took about 120 of 140 ms of each page run. With 30 sessions that each rerun the page every 3 s, the median page response fell from 3.6 s to 0.17 s with the catalog cached. The web app never registers datasets with `update_catalog()`, so the catalog cannot change while the server process runs.
+- **Rejected:**
+  - 4 or more concurrent jobs on 2 vCPU: the workers and the page runs compete for the CPU, and with 1 GB workspaces the disk budget admits at most 4 running jobs.
+  - 3 concurrent jobs with 1 GB workspaces: the memory worst case is larger than 4 GB, and running out of memory restarts the app, which ends all jobs and deletes all results.
+  - Read only the required columns of the uploaded CSV, to reduce the memory of large uploads: the other input columns appear in the statistics table, so this changes the output contract.
+  - A waiting queue instead of the "try again in a few minutes" message: a larger change. It can come later.
+- **Consequences:**
+  - Raster rows of data products with many bands reach the workspace limit at half the size before. Such a job stops without results.
+  - With more resources from Serve (for example 4 vCPU and 8 GB), `ENVOI_WEBAPP_MAX_JOBS` can be raised to about 6. More than 4 running jobs also needs a larger disk budget or a smaller workspace limit.
+  - The memory and CPU of data products with many bands, and a large download through Serve's proxy, are not measured yet.

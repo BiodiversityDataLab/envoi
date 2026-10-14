@@ -83,9 +83,9 @@ class TestLoadSettings:
             raster_tile_budget=1_000,
             max_tabular_window_m=10_000,
             max_raster_window_m=2_000,
-            max_concurrent_jobs=2,
+            max_concurrent_jobs=3,
             max_run_time_s=3_600,
-            max_workspace_bytes=1 * _GB,
+            max_workspace_bytes=500 * _MB,
             disk_budget_bytes=4 * _GB,
             abandon_timeout_s=600,
             retention_after_download_s=600,
@@ -126,7 +126,7 @@ class TestLoadSettings:
         with pytest.raises(ValueError, match="ENVOI_WEBAPP_WORKSPACE must be an absolute"):
             load_settings({"ENVOI_WEBAPP_WORKSPACE": "relative/folder"})
 
-    @pytest.mark.parametrize(("value", "expected_jobs"), [("1", 1), (" 3 ", 3), ("", 2)])
+    @pytest.mark.parametrize(("value", "expected_jobs"), [("1", 1), (" 4 ", 4), ("", 3)])
     def test_max_jobs(self, value, expected_jobs):
         """ENVOI_WEBAPP_MAX_JOBS sets the concurrent-job limit of hosted mode."""
         settings = load_settings({"ENVOI_WEBAPP_MODE": "hosted", "ENVOI_WEBAPP_MAX_JOBS": value})

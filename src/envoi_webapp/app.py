@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 import secrets
 import shutil
@@ -289,7 +290,16 @@ def _inject_css(st) -> None:
     )
 
 
+# The page needs the catalog on every run, and parsing the bundled catalog
+# took about 120 of 140 ms of each page run. The web app never registers
+# datasets with update_catalog(), so the catalog cannot change while the
+# server process runs. Tests reset the cache with _dataset_catalog.cache_clear().
+@functools.cache
 def _dataset_catalog() -> dict[str, dict[str, Any]]:
+    """Return the full catalog entries by dataset name, read once per process.
+
+    All sessions share the returned dicts. Callers must not change them.
+    """
     entries = list_datasets("full")
     return {entry["name"]: entry for entry in entries}
 

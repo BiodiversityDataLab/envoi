@@ -50,7 +50,7 @@ MAX_JOBS_VARIABLE = "ENVOI_WEBAPP_MAX_JOBS"
 
 LOCAL_MODE = "local"
 HOSTED_MODE = "hosted"
-_DEFAULT_MAX_CONCURRENT_JOBS = 2
+_DEFAULT_MAX_CONCURRENT_JOBS = 3
 
 
 @dataclass(frozen=True)
@@ -81,7 +81,7 @@ class HostedLimits:
     # Job checks, applied by the job manager.
     max_concurrent_jobs: int = _DEFAULT_MAX_CONCURRENT_JOBS
     max_run_time_s: float = 60 * 60
-    max_workspace_bytes: int = 1 * _BYTES_PER_GB
+    max_workspace_bytes: int = 500 * _BYTES_PER_MB
     # Admit a new job only if (the sizes of the finished workspaces) + (running
     # jobs + 1) x max_workspace_bytes <= disk_budget_bytes.
     disk_budget_bytes: int = 4 * _BYTES_PER_GB
@@ -134,7 +134,7 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> WebappSettings:
       manager creates its workspace root in this folder (see
       :class:`WebappSettings`).
     * ``ENVOI_WEBAPP_MAX_JOBS``: the maximum number of jobs that run at the same
-      time in hosted mode, a positive integer. The default is 2. Local mode
+      time in hosted mode, a positive integer. The default is 3. Local mode
       does not read it, because no server-wide limit applies there.
 
     Args:

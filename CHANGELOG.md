@@ -52,6 +52,7 @@
 - Web app: a service-account key without `token_uri` is now rejected when you start an extraction, with a message that names the missing field. Keys that Google issues contain this field, so use the unchanged key file from the Google Cloud Console.
 - The `webapp` extra now needs Streamlit 1.52 or later. Run `pip install --upgrade "envoi-geospatial[webapp]"` to update an existing installation.
 - Web app: **Cancel** in the local web app leaves the files that the extraction wrote before the cancel in the output directory. They can be incomplete, so check or delete them before you use them.
+- Web app: the page reads the dataset catalog once when the server shows the page for the first time, not again on every click. Each update of the page is about 0.1 s faster.
 
 ### Fixed
 - Per-class columns of categorical datasets with named bands, such as `lulc_naturallands_2020_classification_class_10_count_200m`, are now `0` (count) or `0.0` (fraction) for points whose window did not contain that class, as other class columns already were. Before, these cells were empty, so an absent class looked like missing data. This affected Earth Engine runs that extract more than one band of a categorical dataset; single-band runs and local rasters were already correct.

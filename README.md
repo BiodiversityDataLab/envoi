@@ -171,8 +171,8 @@ The hosted web app runs on a server that many users share. It handles your key a
 | Tabular rows                 | Windows up to 10,000 m. Points × window sizes up to 20,000 over all tabular rows (**Point** counts as one window size). |
 | Raster rows                  | Windows up to 2,000 m. Points × window sizes up to 1,000 tiles over all raster rows.                          |
 | Run time                     | 60 minutes per extraction                                                                                     |
-| Size of the results          | 1 GB per extraction                                                                                           |
-| Extractions at the same time | One per page and one per key. The server also runs only a few extractions at the same time (2 by default).   |
+| Size of the results          | 500 MB per extraction                                                                                         |
+| Extractions at the same time | One per page and one per key. The server also runs only a few extractions at the same time (3 by default).   |
 
 The web app checks the file, the rows, and the windows before an extraction starts, and tells you what to change. It stops an extraction that runs longer than the run time, or whose results grow larger than the size limit, and you then get no results. Raster rows of data products with many bands give large results. When the server is busy, the web app asks you to try again in a few minutes.
 
