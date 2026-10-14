@@ -1391,7 +1391,10 @@ def _hosted_notice(limits: HostedLimits) -> str:
             "closed or the computer sleeps, the extraction stops after "
             f"{format_minutes(limits.abandon_timeout_s)}."
         ),
-        "**A server restart** stops running extractions and deletes all results.",
+        (
+            "**A server restart**, for example during planned maintenance, stops running "
+            "extractions and deletes all results."
+        ),
         (
             "**Downloads** go to the download folder of your browser. Most browsers can be "
             "set to ask where to save each download."

@@ -156,7 +156,7 @@ The hosted web app runs on a server that many users share. It handles your key a
 
 - **Your key** stays in the server's memory for your browser session only. The web app never writes it to disk. Each extraction runs in its own process on the server, and that process uses only your key.
 - **Your points and the results** stay on the server's disk only while they are needed. The server deletes the results 10 minutes after your first click on **Download results**, or at the latest 30 minutes after the extraction ends. A new extraction or **Clear results** deletes them earlier. A failed, cancelled, or stopped extraction gives no results, and the server deletes its files when it ends. Like your key, the uploaded points file stays in the server's memory for your browser session, and the results contain the IDs and coordinates of your points.
-- **A server restart** stops running extractions and deletes all results.
+- **A server restart** stops running extractions and deletes all results. The public instance on SciLifeLab Serve restarts during planned maintenance, which Serve announces at https://serve.scilifelab.se/maintenance/.
 
 **Keep the page open and visible while an extraction runs.** The page asks the server for the status every 2 seconds. When no page asks for 10 minutes, for example because you closed the tab or your computer went to sleep, the server stops the extraction. A page reload loses the link to a running extraction. If you then start an extraction with the same key, the web app offers **Cancel the earlier job**.
 
