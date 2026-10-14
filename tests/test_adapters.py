@@ -3,7 +3,8 @@
 ``BaseAdapter`` declares the members that ``extract()`` calls, the
 capability declarations, and the class-method hooks, and every registered
 adapter keeps the same signatures. The adapter registry rejects an unknown
-``data_source`` with a ``ValueError``. No test builds an adapter, so none
+``data_source`` with a ``ValueError``. The Earth Engine adapter handles
+each reducer that it declares. No test builds an adapter, so none
 needs Earth Engine or a raster file. ``tests/test_provider_contract.py``
 tests ``register()``.
 """
@@ -18,6 +19,8 @@ import pytest
 
 from envoi.adapters import _REG, get_adapter
 from envoi.adapters.base import BaseAdapter
+from envoi.adapters.earth_engine import GeeRasterAdapter
+from envoi.adapters.earth_engine._reducers import _EE_REDUCER_MAP
 from envoi.reducers import KNOWN_REDUCERS
 
 # The members that extract() uses: the three adapter calls, and the
@@ -150,25 +153,85 @@ class TestBaseAdapterInterface:
 
 class TestBuiltInCapabilityDeclarations:
     @pytest.mark.parametrize(
-        ("data_source", "expected_derived_bands", "expected_catalog_keys"),
+        (
+            "data_source",
+            "expected_output_types",
+            "expected_reducers",
+            "expected_derived_bands",
+            "expected_catalog_keys",
+        ),
         [
-            ("earth_engine", {"slope", "aspect"}, {"dataset_spec", "max_workers", "crs"}),
-            ("local", set(), {"crs", "nodata", "resolution_m", "type", "band_count"}),
+            (
+                "earth_engine",
+                {"tabular", "raster"},
+                KNOWN_REDUCERS,
+                {"slope", "aspect"},
+                {"dataset_spec", "max_workers", "crs"},
+            ),
+            (
+                "local",
+                {"tabular", "raster"},
+                KNOWN_REDUCERS,
+                set(),
+                {"crs", "nodata", "resolution_m", "type", "band_count"},
+            ),
         ],
     )
     def test_built_in_adapter_declarations(
-        self, data_source, expected_derived_bands, expected_catalog_keys
+        self,
+        data_source,
+        expected_output_types,
+        expected_reducers,
+        expected_derived_bands,
+        expected_catalog_keys,
     ):
-        """Both built-in adapters support both output types and all known reducers.
+        """Each adapter has the expected values of its four capability declarations.
 
-        Each one accepts the catalog keys that it reads, and the local adapter
-        also the keys that its inspection adds.
+        Both built-in adapters support both output types and all known
+        reducers. Each one accepts the catalog keys that it reads, and the
+        local adapter also the keys that its inspection adds.
         """
         adapter_class = _REG[data_source]
-        assert adapter_class.output_types == {"tabular", "raster"}
-        assert adapter_class.supported_reducers == KNOWN_REDUCERS
+        assert adapter_class.output_types == expected_output_types
+        assert adapter_class.supported_reducers == expected_reducers
         assert adapter_class.computable_derived_bands == expected_derived_bands
         assert adapter_class.catalog_keys == expected_catalog_keys
+
+
+# The reducers that the Earth Engine adapter handles without an entry in
+# _EE_REDUCER_MAP: class_fraction, which it computes from the class_count
+# histogram, and point, which samples the pixel at the point.
+_EE_REDUCERS_OUTSIDE_THE_MAP = frozenset({"class_fraction", "point"})
+
+
+def _is_ee_percentile_reducer(reducer_name: str) -> bool:
+    """Return whether ``_get_ee_reducer`` reads ``reducer_name`` as a percentile.
+
+    The rule of ``_get_ee_reducer``: ``q`` or ``p``, then digits with a value
+    from 1 to 100. The test does not call ``_get_ee_reducer``, because its
+    ``ee.Reducer`` calls need an initialized Earth Engine.
+    """
+    if reducer_name[:1] not in ("q", "p") or not reducer_name[1:].isdigit():
+        return False
+    return 0 < int(reducer_name[1:]) <= 100
+
+
+class TestEarthEngineReducerHandling:
+    def test_every_supported_reducer_is_handled_by_the_adapter(self):
+        """The Earth Engine adapter handles each reducer of its ``supported_reducers``.
+
+        Its declaration is ``KNOWN_REDUCERS``, which grows with the local
+        reducer registry. A reducer that only the local registry has would
+        pass the pre-flight check and fail in ``fetch_stats_batch``.
+        """
+        unhandled_reducers = sorted(
+            reducer_name
+            for reducer_name in GeeRasterAdapter.supported_reducers
+            if reducer_name not in _EE_REDUCER_MAP
+            and reducer_name not in _EE_REDUCERS_OUTSIDE_THE_MAP
+            and not _is_ee_percentile_reducer(reducer_name)
+        )
+        assert unhandled_reducers == []
 
 
 # Stand-in classes for the test of the class-method check: a base class with

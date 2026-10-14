@@ -291,7 +291,7 @@ This decision extends the "Day rule" of the 2026-10-12 entry to the `nearest` po
 
 ## 2026-10-13 — Provider contract
 
-These decisions came from the multi-provider findings of the combined review (F4–F9, F11–F13, F16, and the provider parts of F10 and F14), on the branch `provider-contract`. The user approved the specification and the plan on 2026-10-13.
+These decisions came from the multi-provider findings (F4–F9, F11–F13, F16, and the provider parts of F10 and F14) of the review `docs/temp/combined-review.md` on the branch `hosting-streamlit` (not on `main`). The work is on the branch `provider-contract`. The user approved the specification and the plan on 2026-10-13.
 The specification of this work is in a task folder that is not committed, so each decision is stated in full here.
 Terms: a data provider is a source of environmental data with its own access method, for example Earth Engine. In code, it is one `data_source` value with one registered adapter class.
 The generic modules are `extract.py`, `_config_parsing.py`, `catalog.py`, `_input_validation.py`, `_output_assembly.py`, `qc.py`, `metadata.py`, `reducers.py`, `geo.py`, and `_filenames.py`.
@@ -373,6 +373,17 @@ The generic modules are `extract.py`, `_config_parsing.py`, `catalog.py`, `_inpu
 - **Reason:** both adapters computed the summary in the same way, so it is shared behavior. A new adapter then cannot compute it in a different way.
 - **Rejected:** keep a copy of the summary in each adapter (the old behavior): each new adapter would need a third copy of the same rule.
 
+### One adapter for each run config and dataset
+
+- **Decision:** `extract()` builds one adapter for each (run config, dataset) pair, and uses it for every window size of that pair.
+  - `close()` runs once, after the last window, also when a window raises.
+  - An adapter must not cache a value that depends on the window size.
+  - `extract()` makes a deep copy of the dataset metadata of each `build_dataset_meta` call, before it adds keys to it and merges the windows.
+- **Reason:** before, the setup ran again for each window size: the Earth Engine asset lookup, the native-scale request, the request for the image dates of a collection, and the opening of a local raster file. A check of every instance cache of both adapters found none that depends on the window size. The copy protects the sidecar from an adapter that returns the same dict for each window: without it, the summary of an earlier window was lost, or the dict contained itself.
+- **Rejected:**
+  - One adapter for each (dataset, window size) pair (the old behavior): it repeats the setup.
+  - One adapter for each dataset across run configs: the band overrides, and so the merged spec, can differ between run configs.
+
 ### Derived bands in band lists
 
 - **Decision:** a per-call band list is split on the union of `computable_derived_bands` of all registered adapters (`all_computable_derived_bands()`). Then a derived band that the dataset's adapter does not compute raises `ValueError`. The message names the batch, the dataset, its `data_source`, and the derived bands that its adapter computes.
@@ -396,6 +407,7 @@ The generic modules are `extract.py`, `_config_parsing.py`, `catalog.py`, `_inpu
 
 - **Decision:** the `check_dataset` of a provider that needs an optional SDK or credentials checks that the SDK can be imported and that the credentials exist. It sends no network request. The adapter reads the credentials on first use. Credentials never go into the catalog, the run config, or the sidecar.
 - **Reason:** this keeps the rule "validate before any quota is used" for queued providers. So the deferred execution context (F10) does not block a provider such as Copernicus CDS.
+- **Consequence:** the Earth Engine adapter has no credentials check in `check_dataset` yet. The check needs the credential search of `auth.py`, which PR #75 changes. It is a follow-up after PR #75 merges.
 - **Rejected:** check the credentials only on first use: a missing credential would then stop the run after other datasets used time and quota.
 
 ### Built-in catalog of other providers

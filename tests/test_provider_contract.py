@@ -8,12 +8,14 @@ runs with the adapter declarations and ``check_dataset`` before it builds any
 adapter, the catalog checks with the adapter's ``catalog_keys`` and
 catalog hooks, the checks of the adapter results with variants of the
 fake adapter that break the result contract, and the lifetime of the adapter:
-one instance for each run config and dataset, used for every window size. No
-test uses the network or a raster file.
+one instance for each run config and dataset, used for every window size. A
+search of the source of the generic modules finds no comparison with the name
+of a built-in data source. No test uses the network or a raster file.
 """
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 from collections.abc import Sequence
@@ -24,6 +26,7 @@ import pandas as pd
 import pytest
 import yaml
 
+import envoi
 from envoi import adapters, update_catalog
 from envoi._filenames import build_tile_filenames
 from envoi.adapters import register
@@ -252,12 +255,12 @@ def _fake_tabular_config(
     }
 
 
-def _fake_raster_config(batch_id: str) -> dict[str, Any]:
-    """Return a raster run config of ``fake_climate`` with a 100 m window."""
+def _fake_raster_config(batch_id: str, window_size_m: int | list[int] = 100) -> dict[str, Any]:
+    """Return a raster run config of ``fake_climate``, with a 100 m window by default."""
     return {
         "batch_id": batch_id,
         "datasets": ["fake_climate"],
-        "settings": {"output_type": "raster", "window_size_m": 100},
+        "settings": {"output_type": "raster", "window_size_m": window_size_m},
     }
 
 
@@ -962,6 +965,35 @@ class SecondWindowFailsAdapter(WindowRecordingAdapter):
         return results
 
 
+class CachedDatasetMetaAdapter(FakeRasterAdapter):
+    """Returns the same dataset metadata dict from each ``build_dataset_meta`` call.
+
+    The first call builds the dict and keeps it. Each later call sets the
+    ``quality`` of the kept dict, when given, and returns the kept dict again.
+    """
+
+    def __init__(self, spec: dict[str, Any]) -> None:
+        super().__init__(spec)
+        self.kept_dataset_meta: dict | None = None
+
+    def build_dataset_meta(
+        self,
+        spec: dict,
+        meta_list: list | None = None,
+        quality: dict | None = None,
+        lats: Sequence[float] | None = None,
+        lons: Sequence[float] | None = None,
+    ) -> dict:
+        """Return the kept dict, with the ``quality`` of this call when given."""
+        if self.kept_dataset_meta is None:
+            self.kept_dataset_meta = super().build_dataset_meta(
+                spec, meta_list=meta_list, quality=quality, lats=lats, lons=lons
+            )
+        elif quality:
+            self.kept_dataset_meta["quality"] = dict(quality)
+        return self.kept_dataset_meta
+
+
 class TestAdapterLifetime:
     """``extract()`` builds one adapter for each (run config, dataset) pair.
 
@@ -1071,3 +1103,169 @@ class TestAdapterLifetime:
 
         assert WindowRecordingAdapter.events == ["build", "fetch 100 m", "fetch 200 m", "close"]
         assert not any(tmp_path.iterdir())
+
+    def test_same_dataset_meta_dict_for_each_tabular_window(
+        self, isolated_registry, three_points, tmp_path
+    ):
+        """The sidecar has the quality summary of each window when the adapter returns one dict.
+
+        ``extract()`` copies the dataset metadata of each window. Without the
+        copy, the second window replaced the summary of the first one.
+        """
+        _register_fake_variant(CachedDatasetMetaAdapter)
+        run_config = _fake_tabular_config("kept_meta", ["fake_climate"], window_size_m=[100, 200])
+
+        extract(three_points, run_config, output_dir=tmp_path)
+
+        sidecar = _read_sidecar(tmp_path / "kept_meta_metadata.json")
+        quality = sidecar["datasets"]["fake_climate"]["quality"]
+        assert list(quality) == ["100m", "200m"]
+        assert [quality[window_key]["n_full"] for window_key in quality] == [3, 3]
+
+    def test_same_dataset_meta_dict_for_each_raster_window(
+        self, isolated_registry, three_points, tmp_path
+    ):
+        """The sidecar has the tile summary of each window when the adapter returns one dict.
+
+        ``extract()`` copies the dataset metadata of each window. Without the
+        copy, the dict contained itself, and the write of the sidecar failed.
+        """
+        _register_fake_variant(CachedDatasetMetaAdapter)
+
+        extract(three_points, _fake_raster_config("kept_tiles", [100, 200]), output_dir=tmp_path)
+
+        sidecar = _read_sidecar(tmp_path / "kept_tiles" / "kept_tiles_metadata.json")
+        # Points A and B get a tile, point C does not (see FakeRasterAdapter).
+        tile_summary = {
+            "n_exported": 2,
+            "n_failed": 1,
+            "total": 3,
+            "n_errors": 0,
+            "ids_errors": [],
+        }
+        assert sidecar["datasets"]["fake_climate"]["quality"] == {
+            "100m": {"tiles": tile_summary},
+            "200m": {"tiles": tile_summary},
+        }
+
+
+# The generic modules: the modules that do not change for a new provider.
+_GENERIC_MODULES = (
+    "extract",
+    "_config_parsing",
+    "catalog",
+    "_input_validation",
+    "_output_assembly",
+    "qc",
+    "metadata",
+    "reducers",
+    "geo",
+    "_filenames",
+)
+# The data_source values of the built-in adapters.
+_BUILT_IN_DATA_SOURCES = frozenset({"earth_engine", "local"})
+
+
+def _comparisons_with_built_in_names(source: str) -> list[str]:
+    """Return each comparison in ``source`` with ``"earth_engine"`` or ``"local"`` as an operand.
+
+    An operand counts when it is the text constant, or a tuple, list, or set
+    that contains it (the right side of an ``in`` test). Docstrings and
+    messages can contain the names.
+    """
+    comparisons = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Compare):
+            continue
+        for operand in (node.left, *node.comparators):
+            if isinstance(operand, (ast.Tuple, ast.List, ast.Set)):
+                values = operand.elts
+            else:
+                values = [operand]
+            if any(
+                isinstance(value, ast.Constant) and value.value in _BUILT_IN_DATA_SOURCES
+                for value in values
+            ):
+                comparisons.append(f"line {node.lineno}: {ast.unparse(node)}")
+                break
+    return comparisons
+
+
+def _imports_of_the_earth_engine_package(source: str) -> list[str]:
+    """Return each import in ``source`` of ``envoi.adapters.earth_engine`` or its modules.
+
+    ``source`` is the source of a module of the ``envoi`` package, so a
+    relative import (``from .adapters.earth_engine import ...``) starts in
+    ``envoi``.
+    """
+    imports = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            package_parts = ("envoi" if node.level else "", node.module or "")
+            module_name = ".".join(part for part in package_parts if part)
+            imported_names = [module_name] + [f"{module_name}.{alias.name}" for alias in node.names]
+        elif isinstance(node, ast.Import):
+            imported_names = [alias.name for alias in node.names]
+        else:
+            continue
+        if any(
+            name == "envoi.adapters.earth_engine" or name.startswith("envoi.adapters.earth_engine.")
+            for name in imported_names
+        ):
+            imports.append(f"line {node.lineno}: {ast.unparse(node)}")
+    return imports
+
+
+def _generic_module_source(module_name: str) -> str:
+    """Return the source of the generic module ``envoi.<module_name>``."""
+    return (Path(envoi.__file__).parent / f"{module_name}.py").read_text(encoding="utf-8")
+
+
+class TestGenericModules:
+    """The generic modules name no built-in provider in their code.
+
+    A new provider then needs no change to a generic module.
+    """
+
+    @pytest.mark.parametrize("module_name", _GENERIC_MODULES)
+    def test_no_comparison_with_a_built_in_data_source(self, module_name):
+        """The module compares no value with ``"earth_engine"`` or ``"local"``."""
+        source = _generic_module_source(module_name)
+        assert _comparisons_with_built_in_names(source) == []
+
+    def test_config_parsing_does_not_import_the_earth_engine_package(self):
+        """``_config_parsing.py`` imports nothing from ``envoi.adapters.earth_engine``."""
+        source = _generic_module_source("_config_parsing")
+        assert _imports_of_the_earth_engine_package(source) == []
+
+    @pytest.mark.parametrize(
+        ("source", "expected_count"),
+        [
+            ('if data_source == "local":\n    pass\n', 1),
+            ('found = "earth_engine" != data_source\n', 1),
+            ('found = data_source in ("earth_engine", "gcs")\n', 1),
+            ('found = data_source not in {"local"}\n', 1),
+            ('"""Datasets of data_source local or earth_engine."""\n', 0),
+            ('raise ValueError("only for earth_engine datasets")\n', 0),
+            ('found = data_source == "local_copy"\n', 0),
+        ],
+    )
+    def test_comparison_search_finds_comparisons_only(self, source, expected_count):
+        """The search finds comparisons with the names, and ignores text that contains them."""
+        assert len(_comparisons_with_built_in_names(source)) == expected_count
+
+    @pytest.mark.parametrize(
+        ("source", "expected_count"),
+        [
+            ("from .adapters.earth_engine import KNOWN_DERIVED_BANDS\n", 1),
+            ("from .adapters.earth_engine._image import KNOWN_DERIVED_BANDS\n", 1),
+            ("from .adapters import earth_engine\n", 1),
+            ("import envoi.adapters.earth_engine\n", 1),
+            ("from envoi.adapters.earth_engine import GeeRasterAdapter\n", 1),
+            ("from .adapters import get_adapter\n", 0),
+            ("from .adapters.base import BaseAdapter\n", 0),
+        ],
+    )
+    def test_import_search_finds_the_earth_engine_package(self, source, expected_count):
+        """The search finds absolute and relative imports of the Earth Engine package only."""
+        assert len(_imports_of_the_earth_engine_package(source)) == expected_count

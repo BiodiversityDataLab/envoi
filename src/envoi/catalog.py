@@ -1,4 +1,23 @@
 # src/envoi/catalog.py
+"""Dataset catalogs: loading, checks of the entries, and the user catalog.
+
+Reads the bundled ``defaults.yml`` (``load_defaults``) and loads catalogs:
+the built-in ``ee_catalog.yml``, catalog files (``load_catalog``), and
+catalog dicts. ``load_catalogs`` merges them, with the datasets of
+``update_catalog()`` last. ``update_catalog()`` keeps these datasets for the
+Python session, and ``reset_catalog()`` clears them. ``list_datasets()``
+shows the merged catalog.
+
+One validator, ``_validate_catalog_entry``, checks each entry of a catalog
+file and of a catalog dict, and returns a copy of the entry. envoi stores and
+returns only copies, so a change to a returned entry or to the user's dict
+does not change the catalog.
+
+The rules of a data provider are in the class-method hooks of its adapter
+(``validate_catalog_entry``, ``inspect_catalog_entry``), not in this module.
+This module compares no ``data_source`` with the name of a built-in adapter.
+"""
+
 from __future__ import annotations
 
 import copy

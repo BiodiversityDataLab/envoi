@@ -1,6 +1,7 @@
 # src/envoi/extract.py
 from __future__ import annotations
 
+import copy
 import warnings
 from pathlib import Path
 from typing import Any
@@ -756,6 +757,11 @@ def _process_dataset_tabular(
         quality={quality_key: coverage_summary},
     )
     _check_adapter_result(adapter, "build_dataset_meta", dataset_meta, dataset=dataset)
+    # A deep copy: one adapter serves every window size, and extract() adds
+    # keys to this dict and merges the later windows into it. A dict that the
+    # adapter keeps and returns again would otherwise lose the summary of an
+    # earlier window, or contain itself.
+    dataset_meta = copy.deepcopy(dataset_meta)
 
     # Warn once when some points failed. The QC error column, built by
     # attach_quality_control above, has the error text of each failed point.
@@ -895,6 +901,9 @@ def _process_dataset_raster(
         lons=lons,
     )
     _check_adapter_result(adapter, "build_dataset_meta", dataset_meta, dataset=dataset)
+    # A deep copy, as in _process_dataset_tabular: this helper and extract()
+    # add keys to the dict, and extract() merges the later windows into it.
+    dataset_meta = copy.deepcopy(dataset_meta)
 
     # The tile summary, the same for every adapter: the numbers of exported
     # and not exported tiles, and the failed tiles with their IDs (the

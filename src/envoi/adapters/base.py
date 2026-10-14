@@ -6,6 +6,13 @@ from typing import ClassVar
 
 from ..progress import ProgressStepCallback
 
+# The keys that every meta dict of fetch_stats_batch has, in the order of
+# their QC columns. extract() checks them (see "Result contract" below).
+# qc.py defines the tuple, because it builds the QC columns from these keys.
+# This module imports it as a part of the adapter contract: extract.py and
+# adapter authors import it from here, so the import is used outside this file.
+from ..qc import REQUIRED_POINT_META_KEYS  # noqa: F401
+
 # The mark that a per-call band list puts in the merged config of its dataset
 # (``_normalize_dataset_entry`` in ``_config_parsing.py`` adds it to the band
 # overrides). With the mark, an adapter names every statistic key after its
@@ -15,10 +22,6 @@ from ..progress import ProgressStepCallback
 # selected.
 _BAND_NAMING_KEY = "band_naming"
 _PER_BAND_NAMING = "per_band"
-
-# The keys that every meta dict of fetch_stats_batch has, in the order of
-# their QC columns. extract() checks them (see "Result contract" below).
-REQUIRED_POINT_META_KEYS = ("in_extent", "n_pixels", "had_nodata", "coverage_pct")
 
 
 class BaseAdapter:
@@ -34,6 +37,12 @@ class BaseAdapter:
     ``validate_catalog_entry``, and ``inspect_catalog_entry`` (the catalog
     hooks), with the same parameters.
     ``docs/architecture.md`` ("Adapter interface") describes each method.
+
+    Lifetime. ``extract()`` builds one instance with ``AdapterClass(spec)``
+    for each run config and dataset, and uses it for every window size of
+    that pair. ``close()`` runs once, after the last window. So an adapter
+    must not cache a value that depends on the window size. ``extract()``
+    copies the dict that ``build_dataset_meta`` returns before it changes it.
 
     Result contract. ``extract()`` checks each result directly after the
     call, and raises ``RuntimeError`` (a bug in the adapter) when it breaks
@@ -56,9 +65,9 @@ class BaseAdapter:
     more bands or a per-call band list (``{band}`` is the band name, or
     ``b<n>`` for band ``n`` of a local raster), and ``class_<value>_count``
     and ``class_<value>_fraction``, with an optional ``{band}_`` prefix, for
-    the reducers ``class_count`` and ``class_fraction`` (``<value>`` is a
-    whole number). A point without a key gets null in that column, or 0 in a
-    class column (a failed point gets null).
+    the reducers ``class_count`` and ``class_fraction`` (``<value>`` is an
+    integer, which can be negative). A point without a key gets null in that
+    column, or 0 in a class column (a failed point gets null).
 
     Failed point (its data request or read raised an exception that the
     adapter caught): the stats dict is empty, the required meta keys have the
@@ -295,5 +304,6 @@ class BaseAdapter:
         tabular mode ``extract()`` passes the coverage summary of the batch as
         ``quality``. In raster mode it passes no ``quality``, and adds the
         tile summary ``quality["tiles"]`` to the returned dict itself.
+        Return a new dict for each call.
         """
         raise NotImplementedError

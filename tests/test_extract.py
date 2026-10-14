@@ -2263,16 +2263,12 @@ class TestRunConfigKeys:
                 {"multi_band_local": [1, 2]},
                 (
                     "got dict: {'multi_band_local': [1, 2]}. Write it as a list: datasets: "
-                    "[{multi_band_local: [1, 2]}] (YAML) or [{'multi_band_local': [1, 2]}] "
-                    "(Python)."
+                    "[{'multi_band_local': [1, 2]}]."
                 ),
             ),
             (
                 "dem_local",
-                (
-                    "got str: 'dem_local'. Write it as a list: datasets: [dem_local] (YAML) or "
-                    "['dem_local'] (Python)."
-                ),
+                "got str: 'dem_local'. Write it as a list: datasets: ['dem_local'].",
             ),
         ],
         ids=["mapping", "text"],
@@ -2599,7 +2595,12 @@ class TestTypedStatistics:
 
     def test_missing_categorical_list_raises_for_categorical_dataset(self, sample_df, tmp_path):
         """Categorical dataset in run with no 'categorical' key in stats raises ValueError."""
-        with pytest.raises(ValueError, match="categorical"):
+        expected_message = (
+            "Output 'typed_stats': dataset 'dem_local_categorical' has data_type='categorical' "
+            "but the 'categorical' statistics list is missing or empty. Add a 'categorical' key "
+            "to the 'statistics' dict in the run config."
+        )
+        with pytest.raises(ValueError, match=f"^{re.escape(expected_message)}$"):
             _run_typed_stats(
                 sample_df,
                 ["dem_local_categorical"],

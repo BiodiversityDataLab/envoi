@@ -24,6 +24,12 @@ import pandas as pd
 # and the adapters).
 logger = logging.getLogger(__name__)
 
+# The keys that every meta dict of fetch_stats_batch has, in the order of
+# their QC columns. compute_qc_flags reads them, and extract() checks them
+# (the "Result contract" of BaseAdapter in adapters/base.py, which imports
+# this name).
+REQUIRED_POINT_META_KEYS = ("in_extent", "n_pixels", "had_nodata", "coverage_pct")
+
 # Date fields written into adapter meta dicts (GEE ImageCollections only).
 # Used exclusively by extract_date_columns below.
 _DATE_META_KEYS = (
@@ -120,12 +126,13 @@ def summarize_point_errors(meta_list: list[dict], ids: Sequence) -> dict:
 def compute_qc_flags(meta_list: list[dict], min_coverage_pct: float) -> pd.DataFrame:
     """Build core QC flags from adapter metadata dicts.
 
-    Extracts in_extent, n_pixels, had_nodata, and coverage_pct from each
-    meta dict, warns when any point falls below min_coverage_pct, and
-    returns a DataFrame with one row per input point.
+    Extracts the keys of ``REQUIRED_POINT_META_KEYS`` (in_extent, n_pixels,
+    had_nodata, and coverage_pct) from each meta dict, warns when any point
+    falls below min_coverage_pct, and returns a DataFrame with one row per
+    input point.
     """
     if not meta_list:
-        return pd.DataFrame(columns=["in_extent", "n_pixels", "had_nodata", "coverage_pct"])
+        return pd.DataFrame(columns=list(REQUIRED_POINT_META_KEYS))
     df = pd.DataFrame(meta_list)
     below_threshold_mask = df["coverage_pct"] < min_coverage_pct
     if below_threshold_mask.any():
@@ -138,7 +145,7 @@ def compute_qc_flags(meta_list: list[dict], min_coverage_pct: float) -> pd.DataF
             f"(<{min_coverage_pct}%).",
             stacklevel=2,
         )
-    return df[["in_extent", "n_pixels", "had_nodata", "coverage_pct"]]
+    return df[list(REQUIRED_POINT_META_KEYS)]
 
 
 def extract_date_columns(meta_list: list[dict]) -> pd.DataFrame:

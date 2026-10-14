@@ -112,15 +112,15 @@ Interface and registration:
   Each one is a `frozenset` of `str`. In a dataclass adapter, set them without a type annotation, so that they do not become fields.
   The generic modules read the declarations. They never compare `data_source` with the name of a built-in adapter.
 - Register the adapter at the end of its module with `_register("<data_source>", AdapterClass)`, and import the module in `adapters/__init__.py`.
-  `register()` raises `ValueError` for a name that does not match `^[a-z][a-z0-9_]*$`, a class that is not a `BaseAdapter`,
-  a name that another class has, and a declaration that is not valid.
+  `register()` raises `ValueError` for a name that does not match `^[a-z][a-z0-9_]*$`, a class that is not a subclass of `BaseAdapter`,
+  a name under which a different class is registered (a class of a reloaded module replaces the registered class), and a declaration that is not valid.
   Catalog validation in `catalog.py` accepts only a `data_source` that has a registered adapter.
 - Put the rules of a provider in the class-method hooks of its adapter, not in a generic module:
   `validate_catalog_entry` and `inspect_catalog_entry` for catalog entries, and `check_dataset` for the pre-flight check before any adapter is built.
   A hook never sends a network request and never changes its input. A catalog hook never imports an optional SDK.
 - Error types of the hooks: `check_dataset` raises `ValueError` for a configuration that is not valid, and `FileNotFoundError` or another `OSError` for a missing resource.
   A catalog hook raises `CatalogError`, or a `ValueError`, which `catalog.py` raises as a `CatalogError` that names the dataset.
-- If only one source supports a feature, declare it only in that adapter. The generic checks then reject it for the other sources with a clear `ValueError`.
+- If only one provider supports a feature, declare it only in its adapter. The generic checks then reject it for the other providers with a clear `ValueError`.
   Example: only `GeeRasterAdapter.computable_derived_bands` has `slope` and `aspect`, so `_config_parsing.py` rejects them for local datasets.
 
 Optional SDKs and credentials:
@@ -128,6 +128,8 @@ Optional SDKs and credentials:
   (`earthengine-api` and `rasterio` are required dependencies, so the built-in adapters import them at module level.)
 - In `check_dataset`, check that the SDK can be imported and that the required credentials exist, without a network request.
   Say in the message what to install or what to set.
+  The error type for a missing SDK or missing credentials in `check_dataset` is not decided yet.
+  The specification of the first provider that needs an SDK or credentials decides it, and updates "Error contract".
 - Read the credentials on first use. Never put credentials in the catalog, the run config, or the metadata sidecar.
 
 Setup, caching, and cleanup:
@@ -138,7 +140,7 @@ Setup, caching, and cleanup:
   Without the filter, large collections exceed Earth Engine's compute limits.
 - Cache values that are expensive to fetch and used across points. A cache lives as long as the adapter instance.
   `extract()` builds one instance for each (run config, dataset) pair, and uses it for every window size.
-  So a cache must not depend on the window size.
+  So a cache must not depend on the window size. `build_dataset_meta` returns a new dict for each call.
 - If setup opens a resource and then fails, release it before re-raising.
   The orchestrator's `with` block cannot do this, because `__exit__` never runs when the constructor fails.
 - If the adapter holds a resource, override `close()`, and make it safe to call more than once.
@@ -394,7 +396,7 @@ batch_id = run_settings.batch_id
 
 ### Module docstrings
 
-Start each module with a docstring. **[Proposed]** `metadata.py`, `catalog.py`, and `reducers.py` do not have one yet.
+Start each module with a docstring. **[Proposed]** `metadata.py` and `reducers.py` do not have one yet.
 Add one when you make a substantial change to such a module. The model is `_input_validation.py`.
 It states the module's responsibility, its main functions, and its boundaries (for example "no GEE calls").
 

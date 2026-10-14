@@ -634,7 +634,8 @@ def _validate_datasets_is_list(raw_datasets: Any, batch_id: str) -> None:
     Without this check, a mapping such as ``{"dem": ["slope"]}`` would give its
     keys and silently drop the band lists, and a text value such as ``"dem"``
     would give its letters as dataset names. For a mapping or a text value,
-    the message shows the same entries as a list.
+    the message shows the same entries as a Python list, which is also valid
+    YAML (flow style).
 
     Args:
         raw_datasets: The non-empty ``datasets`` value from the run config.
@@ -659,17 +660,7 @@ def _validate_datasets_is_list(raw_datasets: Any, batch_id: str) -> None:
         list_form = [raw_datasets]
     else:
         raise ValueError(message)
-    # A Python value without a YAML form (for example a Path) cannot be
-    # written as YAML. The message then shows the Python form only.
-    try:
-        yaml_text = yaml.safe_dump(list_form, default_flow_style=True, width=10**6).strip()
-    except yaml.YAMLError:
-        yaml_text = None
-    if yaml_text is None:
-        raise ValueError(f"{message} Write it as a list: {list_form!r}.")
-    raise ValueError(
-        f"{message} Write it as a list: datasets: {yaml_text} (YAML) or {list_form!r} (Python)."
-    )
+    raise ValueError(f"{message} Write it as a list: datasets: {list_form!r}.")
 
 
 def _validate_unique_dataset_names(
@@ -830,19 +821,18 @@ def _resolve_stats_for_dataset(
 ) -> list[str]:
     """Return the reducer list to use for one dataset based on its data_type.
 
-    Falls back to 'continuous' when data_type is None or unrecognised, since
-    most ecological rasters are continuous and users often omit data_type for
-    local datasets. Raises ValueError when the resolved list would be empty
-    so the user gets a clear message rather than a run with no output columns.
+    Falls back to 'continuous' when data_type is None, since most ecological
+    rasters are continuous and users often omit data_type for local datasets.
+    Raises ValueError when the resolved list would be empty so the user gets a
+    clear message rather than a run with no output columns.
     """
     resolved_type = data_type if data_type in _DATA_TYPES else "continuous"
     reducers = stats.get(resolved_type)
     if not reducers:
         raise ValueError(
-            f"Dataset '{dataset_name}' has data_type='{data_type}' but the "
-            f"'{resolved_type}' statistics list is missing or empty. "
-            f"Add a '{resolved_type}' key to the 'statistics' dict in the run config "
-            f"for output '{batch_id}'."
+            f"Output '{batch_id}': dataset '{dataset_name}' has data_type='{data_type}' but "
+            f"the '{resolved_type}' statistics list is missing or empty. "
+            f"Add a '{resolved_type}' key to the 'statistics' dict in the run config."
         )
     return reducers
 

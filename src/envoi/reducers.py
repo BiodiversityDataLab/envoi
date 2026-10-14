@@ -183,6 +183,10 @@ def make_quantile(quantile: float) -> Callable[[Iterable], float]:
 
 # Add new reducers here, then they are available in configs
 # via their dictionary key, e.g. "mean", "std", "q10", "sum", ...
+# A new reducer must also be handled by every adapter whose
+# ``supported_reducers`` includes it (both built-in adapters declare all of
+# KNOWN_REDUCERS below), or be removed from that declaration.
+# tests/test_adapters.py checks this for the Earth Engine adapter.
 _REGISTRY: dict[str, Callable] = {
     # core stats
     "mean": r_mean,
