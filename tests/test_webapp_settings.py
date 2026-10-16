@@ -86,7 +86,7 @@ class TestLoadSettings:
             max_concurrent_jobs=3,
             max_run_time_s=3_600,
             max_workspace_bytes=500 * _MB,
-            disk_budget_bytes=4 * _GB,
+            disk_budget_bytes=2 * _GB,
             abandon_timeout_s=600,
             retention_after_download_s=600,
             max_retention_s=1_800,

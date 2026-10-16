@@ -83,8 +83,11 @@ class HostedLimits:
     max_run_time_s: float = 60 * 60
     max_workspace_bytes: int = 500 * _BYTES_PER_MB
     # Admit a new job only if (the sizes of the finished workspaces) + (running
-    # jobs + 1) x max_workspace_bytes <= disk_budget_bytes.
-    disk_budget_bytes: int = 4 * _BYTES_PER_GB
+    # jobs + 1) x max_workspace_bytes <= disk_budget_bytes. A download click
+    # reads the whole archive into the server's memory, so this budget also
+    # limits the memory of downloads at the same time: at most 2 GB of results
+    # exist at one time.
+    disk_budget_bytes: int = 2 * _BYTES_PER_GB
     # The job manager stops a running job when no session asked for its status
     # for this time.
     abandon_timeout_s: float = 10 * 60

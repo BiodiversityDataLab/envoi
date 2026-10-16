@@ -402,26 +402,32 @@ This decision extends the "Day rule" of the 2026-10-12 entry to the `nearest` po
 - **Consequence:** collections whose images start at 00:00 (all built-in date-based datasets) select the same images as before. Collections with images later in the day can select another image when two images are within one day of the date.
 - **Rejected:** keep exact times for `nearest` and change only `date_clamped`: the selection and the flag would then follow different rules.
 
-
 ## 2026-10-14 — Hosted capacity on Serve's default resources
 
-This entry changes two values of "Hosted limits and retention" (2026-10-08). The user asked for more concurrent users than two, on Serve's default 2 vCPU and 4 GB, and approved these changes on 2026-10-14 after load tests of the container image.
+This entry changes three values of "Hosted limits and retention" (2026-10-08). The user asked for more concurrent users than two, on Serve's default 2 vCPU and 4 GB. The user approved these changes on 2026-10-14 and 2026-10-16, after load tests of the container image and code review 3 of the hosting work.
 
 - **Decision:**
   - 3 concurrent jobs on the server by default (was 2). `ENVOI_WEBAPP_MAX_JOBS` still overrides it.
-  - Workspace limit 500 MB for each job (was 1 GB). The disk budget stays 4 GB, so three running jobs reserve 1.5 GB and leave 2.5 GB for finished results.
-  - The web app reads the dataset catalog once per server process (`_dataset_catalog()` in `app.py`), not on every page run.
-- **Reason (measurements in local Docker with 2 vCPU and 4 GB):**
-  - An extraction worker uses about 0.35 CPU cores and 0.2 GB, for tabular and raster jobs (elevation data). Four jobs ran 10 % slower than one. Six jobs used 1.9 of 2 cores and ran twice as long.
-  - The Streamlit server is one Python process and uses at most about 1.1 cores for page runs. Three workers (about 1 core) and the page fit in 2 vCPU.
-  - A download holds the whole archive in the memory of the Streamlit process, and a repeated click holds it twice for a moment. With three jobs and 1 GB archives, three downloads, one repeated click, the workers, and the memory that large uploads leave could need about 5.9 GB. With 500 MB archives, about 3.9 GB.
-  - Parsing the bundled catalog took about 120 of 140 ms of each page run. With 30 sessions that each rerun the page every 3 s, the median page response fell from 3.6 s to 0.17 s with the catalog cached. The web app never registers datasets with `update_catalog()`, so the catalog cannot change while the server process runs.
+  - Workspace limit 500 MB for each job (was 1 GB).
+  - Disk budget 2 GB for all workspaces (was 4 GB). Three running jobs reserve 1.5 GB and leave 0.5 GB for finished results.
+  - The web app reads the dataset catalog once per server process (`dataset_catalog()` in `envoi_webapp/helpers.py`), not on every page run.
+- **Reason (measurements in local Docker with 2 vCPU and 4 GB, recorded in the hosting plan):**
+  - An extraction worker uses about 0.35 CPU cores and 0.2-0.27 GB, for tabular and raster jobs, and also for satellite embeddings (64 bands). With elevation data, four jobs ran 10 % slower than one, and six jobs used 1.9 of 2 cores and ran twice as long.
+  - The Streamlit server is one Python process. Its page runs use at most about 1.1 cores, when many sessions are active. Three workers (about 1 core) and a moderately busy page fill the 2 vCPU.
+  - A download click reads the whole archive into the memory of the Streamlit process, and Streamlit frees it only after two later script runs anywhere in the app. Every result on disk can therefore be in memory at the same time. So the disk budget, not the workspace limit, bounds the memory of downloads.
+    - With 2 GB, the worst case is about 3.8 GB: 0.2 GB for the server, 2 GB of downloads, 0.5 GB for a repeated click, and about 1.1 GB that large uploads leave. Running jobs reserve part of the budget, so the worst case is lower while jobs run.
+    - With 4 GB, the worst case was about 5.7 GB. Running out of memory restarts the app, which ends all jobs and deletes all results.
+  - With 500 MB workspaces, three running jobs fit in the 2 GB budget with room for finished results. One satellite-embedding tile of 2,000 m is 3.7 MB, so about 140 such tiles fit in one job.
+  - Parsing the bundled catalog took about 33 ms of a hosted page run of 52 ms. With the cache, a hosted page run takes 19 ms. With 30 sessions that each rerun the page every 3 s, the median page response fell from 3.6 s to 0.17 s.
+  - The web app never registers datasets with `update_catalog()`, so the catalog cannot change while the server process runs. The cache is in `helpers.py`, because local mode runs `app.py` again as the page script on each rerun (see "One job manager per process, outside the Streamlit cache").
 - **Rejected:**
-  - 4 or more concurrent jobs on 2 vCPU: the workers and the page runs compete for the CPU, and with 1 GB workspaces the disk budget admits at most 4 running jobs.
-  - 3 concurrent jobs with 1 GB workspaces: the memory worst case is larger than 4 GB, and running out of memory restarts the app, which ends all jobs and deletes all results.
+  - 4 or more concurrent jobs on 2 vCPU: the workers and the page runs compete for the CPU.
+  - Keep the 4 GB disk budget and test several large downloads on Serve first: an out-of-memory restart affects all users, and the smaller budget costs little in normal use.
   - Read only the required columns of the uploaded CSV, to reduce the memory of large uploads: the other input columns appear in the statistics table, so this changes the output contract.
   - A waiting queue instead of the "try again in a few minutes" message: a larger change. It can come later.
 - **Consequences:**
-  - Raster rows of data products with many bands reach the workspace limit at half the size before. Such a job stops without results.
-  - With more resources from Serve (for example 4 vCPU and 8 GB), `ENVOI_WEBAPP_MAX_JOBS` can be raised to about 6. More than 4 running jobs also needs a larger disk budget or a smaller workspace limit.
-  - The memory and CPU of data products with many bands, and a large download through Serve's proxy, are not measured yet.
+  - A new job gets the "not enough free disk space" message when the running jobs and the finished results of other sessions leave less than 500 MB of the budget. This happens only with large results, and finished results wait at most 30 minutes.
+  - Raster rows of data products with many bands reach the workspace limit at half the size before. The limit stopped a satellite-embedding job of 160 tiles at 502 MiB, after about 7.5 minutes, with the message that names the limit.
+  - With more resources from Serve (for example 4 vCPU and 8 GB), `ENVOI_WEBAPP_MAX_JOBS` can be raised to about 6. That also needs a larger disk budget (a constant in `settings.py`), because 6 running jobs reserve 3 GB.
+  - A running local web app shows a changed `ee_catalog.yml` only after a restart.
+  - Not measured yet: a large download through Serve's proxy.

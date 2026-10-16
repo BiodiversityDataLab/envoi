@@ -30,6 +30,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # fails at the first page view (the smoke check found this on 2026-10-09).
 # The other system libraries of the pinned wheels (libc, libgcc, libstdc++,
 # zlib) are in the base image.
+# The package has no version pin on purpose: Debian replaces it with security
+# updates, and the mirror removes old versions, so a pin would break the build.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends libexpat1 \
     && rm -rf /var/lib/apt/lists/*

@@ -182,33 +182,6 @@ def test_dataset_catalog_url_targets_formatted_catalog_on_main():
     )
 
 
-def test_dataset_catalog_reads_the_catalog_once_per_process(monkeypatch):
-    """Page runs after the first one reuse the catalog instead of reading it again."""
-    calls = []
-
-    def fake_list_datasets(verbosity):
-        calls.append(verbosity)
-        return [{"name": "dem_copernicus_glo30", "display_name": "Copernicus DEM GLO-30"}]
-
-    monkeypatch.setattr(app, "list_datasets", fake_list_datasets)
-    app._dataset_catalog.cache_clear()
-    try:
-        first = app._dataset_catalog()
-        second = app._dataset_catalog()
-    finally:
-        # Later tests read the real catalog.
-        app._dataset_catalog.cache_clear()
-
-    assert calls == ["full"]
-    assert second is first
-    assert first == {
-        "dem_copernicus_glo30": {
-            "name": "dem_copernicus_glo30",
-            "display_name": "Copernicus DEM GLO-30",
-        }
-    }
-
-
 def test_dataset_display_name_uses_catalog_label_and_falls_back_to_key():
     catalog = {
         "dem_copernicus_glo30": {"display_name": "Copernicus DEM GLO-30"},
@@ -1109,12 +1082,19 @@ def test_warning_count_text_calls_records_warnings(warning_count, expected):
 def test_hosted_notice_states_the_limits_it_is_given():
     """The notice takes its numbers from the limits, so it always matches them."""
     notice = _hosted_notice(
-        HostedLimits(max_input_rows=500, max_concurrent_jobs=3, retention_after_download_s=300)
+        HostedLimits(
+            max_input_rows=500,
+            max_concurrent_jobs=5,
+            max_workspace_bytes=200 * 1024 * 1024,
+            retention_after_download_s=300,
+        )
     )
 
     assert "and 500 rows" in notice
-    assert "at most 3 at a time on the server" in notice
+    assert "at most 5 at a time on the server" in notice
+    assert "200 MB of results" in notice
     assert "deleted 5 minutes after the first download" in notice
+    assert "planned maintenance" in notice
     assert "data products with many bands" in notice
     assert "points file stays in the server's memory for this browser session" in notice
     assert "the results contain the IDs and coordinates of your points" in notice

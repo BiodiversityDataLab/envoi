@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import pandas as pd
 from pyproj import CRS
 from pyproj.exceptions import CRSError
 
+from envoi import list_datasets
 from envoi._input_validation import _validate_sample_ids
 from envoi.reducers import CATEGORICAL_ONLY_REDUCERS, CONTINUOUS_ONLY_REDUCERS
 
@@ -164,6 +166,23 @@ def parse_window_sizes(value: str) -> tuple[int, ...]:
         window_sizes.append(window_size)
 
     return tuple(window_sizes)
+
+
+# The page needs the catalog on every run, and parsing the bundled catalog took
+# about 33 ms of each page run (a hosted page run took 52 ms without the cache).
+# The web app never registers datasets with update_catalog(), so the catalog
+# cannot change while the server process runs. The cache is in this module, not
+# in app.py: local mode runs app.py again as the page script on each rerun,
+# which would start with an empty cache each time. Tests reset it with
+# dataset_catalog.cache_clear().
+@functools.cache
+def dataset_catalog() -> dict[str, dict[str, Any]]:
+    """Return the full catalog entries by dataset name, read once per process.
+
+    All sessions share the returned dicts. Callers must not change them.
+    """
+    entries = list_datasets("full")
+    return {entry["name"]: entry for entry in entries}
 
 
 def default_statistics_for_dataset(dataset_entry: dict) -> tuple[str, ...]:

@@ -6,11 +6,13 @@ import json
 import pandas as pd
 import pytest
 
+from envoi_webapp import helpers
 from envoi_webapp.helpers import (
     RASTER_OUTPUT,
     TABULAR_OUTPUT,
     DatasetSelection,
     build_run_config,
+    dataset_catalog,
     normalize_crs,
     parse_window_sizes,
     permissible_statistics_for_dataset,
@@ -382,3 +384,30 @@ def test_redact_credential_secrets_removes_the_encoded_email_and_certificate_url
     safe_message = redact_credential_secrets(message, payload)
 
     assert safe_message == "certificate [redacted], account [redacted]"
+
+
+def test_dataset_catalog_reads_the_catalog_once_per_process(monkeypatch):
+    """Calls after the first one reuse the catalog instead of reading it again."""
+    calls = []
+
+    def fake_list_datasets(verbosity):
+        calls.append(verbosity)
+        return [{"name": "dem_copernicus_glo30", "display_name": "Copernicus DEM GLO-30"}]
+
+    monkeypatch.setattr(helpers, "list_datasets", fake_list_datasets)
+    dataset_catalog.cache_clear()
+    try:
+        first = dataset_catalog()
+        second = dataset_catalog()
+    finally:
+        # Later tests read the real catalog.
+        dataset_catalog.cache_clear()
+
+    assert calls == ["full"]
+    assert second is first
+    assert first == {
+        "dem_copernicus_glo30": {
+            "name": "dem_copernicus_glo30",
+            "display_name": "Copernicus DEM GLO-30",
+        }
+    }

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import os
 import secrets
 import shutil
@@ -18,7 +17,7 @@ if __package__ in {None, ""}:
 
 import pandas as pd
 
-from envoi import list_datasets, list_reducers
+from envoi import list_reducers
 from envoi.catalog_docs import CATEGORY_ORDER as DATASET_TYPE_ORDER
 from envoi.catalog_docs import UNCATEGORISED_LABEL
 
@@ -29,6 +28,7 @@ try:
         CsvValidationResult,
         DatasetSelection,
         build_run_config,
+        dataset_catalog,
         normalize_crs,
         parse_window_sizes,
         permissible_statistics_for_dataset,
@@ -56,6 +56,7 @@ except ImportError:
         CsvValidationResult,
         DatasetSelection,
         build_run_config,
+        dataset_catalog,
         normalize_crs,
         parse_window_sizes,
         permissible_statistics_for_dataset,
@@ -288,20 +289,6 @@ def _inject_css(st) -> None:
         """,
         unsafe_allow_html=True,
     )
-
-
-# The page needs the catalog on every run, and parsing the bundled catalog
-# took about 120 of 140 ms of each page run. The web app never registers
-# datasets with update_catalog(), so the catalog cannot change while the
-# server process runs. Tests reset the cache with _dataset_catalog.cache_clear().
-@functools.cache
-def _dataset_catalog() -> dict[str, dict[str, Any]]:
-    """Return the full catalog entries by dataset name, read once per process.
-
-    All sessions share the returned dicts. Callers must not change them.
-    """
-    entries = list_datasets("full")
-    return {entry["name"]: entry for entry in entries}
 
 
 def _dataset_display_name(dataset_name: str, catalog: dict[str, dict[str, Any]]) -> str:
@@ -1801,7 +1788,7 @@ def render_app() -> None:
     if SESSION_TOKEN_KEY not in st.session_state:
         st.session_state[SESSION_TOKEN_KEY] = secrets.token_urlsafe(16)
 
-    catalog = _dataset_catalog()
+    catalog = dataset_catalog()
 
     st.subheader("1. Upload location data")
     st.write(

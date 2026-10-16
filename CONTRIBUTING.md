@@ -128,6 +128,8 @@ Built-in Earth Engine datasets live in [src/envoi/configs/ee_catalog.yml](src/en
 6. Regenerate the dataset reference: `python scripts/generate_dataset_docs.py`, and commit the updated `docs/datasets.md`. A test fails if the two drift apart; check with `pytest tests/test_catalog_docs.py`.
 7. Add a smoke test in `tests/test_gee_features.py` marked `@pytest.mark.gee`.
 
+A running web app reads the catalog once, so restart `envoi-webapp` to see a new or changed entry in its dataset menu.
+
 ---
 
 ## Submitting a pull request

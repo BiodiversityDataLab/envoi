@@ -17,7 +17,8 @@ import ee
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from envoi_webapp import app
+from envoi_webapp import app, helpers
+from envoi_webapp import jobs as jobs_module
 from envoi_webapp.app import (
     JOB_ID_KEY,
     JOB_LOST_MESSAGE,
@@ -103,6 +104,14 @@ class _FakeJobManager:
 
     def mark_downloaded(self, job_id: str) -> None:
         raise AssertionError("AppTest never clicks the download button.")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_dataset_catalog():
+    """Clear the web app's catalog cache around each test, so no test sees a stale catalog."""
+    helpers.dataset_catalog.cache_clear()
+    yield
+    helpers.dataset_catalog.cache_clear()
 
 
 @pytest.fixture
@@ -194,6 +203,33 @@ class TestModes:
         assert not any(
             "How this service handles your data" in text for text in _texts(app_test.info)
         )
+
+    def test_local_page_script_reads_the_catalog_once(self, monkeypatch, tmp_path):
+        """Local mode runs app.py again on each rerun, and the page still reads the catalog once."""
+
+        def refuse_initialize(*args, **kwargs):
+            raise AssertionError("The Streamlit server process must not call ee.Initialize().")
+
+        monkeypatch.setattr(ee, "Initialize", refuse_initialize)
+        monkeypatch.setenv(MODE_VARIABLE, "local")
+        monkeypatch.setenv(WORKSPACE_VARIABLE, str(tmp_path))
+        # app.py is the page script here, as envoi-webapp starts it, so each run
+        # imports get_job_manager from the jobs module again.
+        monkeypatch.setattr(jobs_module, "get_job_manager", lambda: _FakeJobManager())
+        calls = []
+        read_catalog = helpers.list_datasets
+
+        def counting_list_datasets(verbosity):
+            calls.append(verbosity)
+            return read_catalog(verbosity)
+
+        monkeypatch.setattr(helpers, "list_datasets", counting_list_datasets)
+
+        app_test = AppTest.from_file(app.__file__, default_timeout=60).run()
+        app_test.run()
+
+        assert not app_test.exception
+        assert calls == ["full"]
 
     @hosted_only
     def test_hosted_mode_hides_the_output_folder_and_shows_the_notice(self, run_app):
