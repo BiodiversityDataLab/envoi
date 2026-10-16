@@ -21,14 +21,15 @@ jobs:
           pip install -e ".[dev,webapp]"
       - name: Lint
         run: |
-          ruff check src tests
-          black --check src tests
+          ruff check src tests deploy
+          black --check src tests deploy
       - name: Tests
         run: pytest -q
 
   # The offline test suite on Windows and macOS. envoi supports both, and file
-  # names, paths, and raster I/O can differ there. One Python version is enough:
-  # the build job above covers the Python versions on Linux.
+  # names, paths, raster I/O, and the web app's worker processes (process start,
+  # pipes, and stop) differ there. One Python version is enough: the build job
+  # above covers the Python versions on Linux.
   portability:
     runs-on: ${{ matrix.os }}
     strategy:

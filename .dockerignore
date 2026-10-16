@@ -1,0 +1,45 @@
+# Build context of deploy/serve/Dockerfile, which is the repository root.
+# The Dockerfile copies only pyproject.toml, README.md, LICENSE, src/, and named
+# files in deploy/serve/. This file keeps credentials, local data, outputs,
+# and tools out of the build context as a second barrier.
+# Do not exclude a path that the Dockerfile copies.
+
+# Credentials and other secrets
+**/credentials
+**/.env
+**/.env.*
+**/*.pem
+**/*.p12
+**/.streamlit/secrets.toml
+# A JSON file can be a service-account key. The image needs no JSON file: the
+# package data in pyproject.toml has none.
+**/*.json
+
+# Version control, environments, and agent files
+.git
+.github
+.venv
+**/venv
+.agents
+.claude
+.codex
+
+# Tests, test data, example data, outputs, and notes
+tests
+data
+outputs
+examples/walkthrough_input
+examples/walkthrough_output
+docs/temp
+
+# Build output and caches
+build
+dist
+**/*.egg-info
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/.ipynb_checkpoints
+.cache

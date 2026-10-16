@@ -64,7 +64,8 @@ dev = [
     "twine>=4.0.0",
 ]
 webapp = [
-    "streamlit>=1.36",
+    # 1.52 is the first release in which st.download_button accepts a callable as data.
+    "streamlit>=1.52",
 ]
 
 [project.scripts]
