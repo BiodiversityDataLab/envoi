@@ -10,6 +10,7 @@ from envoi_webapp import app
 from envoi_webapp.app import (
     ALL_DATASET_TYPES,
     DATASET_CATALOG_URL,
+    ENVOI_README_URL,
     POINTS_CACHE_KEY,
     RESULTS_DELETED_MESSAGE,
     _apply_pending_dataset_remove,
@@ -22,7 +23,8 @@ from envoi_webapp.app import (
     _dataset_type,
     _escape_applescript_string,
     _escape_powershell_string,
-    _hosted_notice,
+    _hosted_help,
+    _hosted_retention_note,
     _job_progress,
     _load_uploaded_points,
     _ordered_dataset_types,
@@ -264,6 +266,15 @@ def test_validate_form_collects_errors_in_step_and_field_order():
         "Step 3 — Enter an output directory.",
         "Step 4 — Add at least one data product.",
     ]
+
+
+def test_validate_form_names_the_hosted_data_product_step_3():
+    """Hosted mode has no output-folder step, so its data-product messages name step 3."""
+    validation = _validate_hosted_form([], HostedLimits())
+
+    messages = [issue.message for issue in validation.issues]
+    assert "Step 3 — Add at least one data product." in messages
+    assert not any(message.startswith("Step 4") for message in messages)
 
 
 def test_validate_form_names_new_row_without_output_type_or_product():
@@ -936,14 +947,14 @@ class TestHostedFormValidation:
 
         assert [issue.message for issue in validation.issues] == [
             "Step 2 — Upload an Earth Engine service-account JSON key.",
-            "Step 4 — Data product “Elevation”: enter at least one sampling-window size.",
+            "Step 3 — Data product “Elevation”: enter at least one sampling-window size.",
         ]
 
     def test_hosted_form_has_no_output_folder_issue(self):
-        """Hosted mode passes no output folder, so step 3 has nothing to check."""
+        """Hosted mode passes no output folder, so no output-folder issue appears."""
         validation = _validate_hosted_form([_raster_row("100")], HostedLimits())
 
-        assert not any(issue.message.startswith("Step 3") for issue in validation.issues)
+        assert not any("output directory" in issue.message for issue in validation.issues)
 
 
 class _FakeUpload:
@@ -1079,25 +1090,46 @@ def test_warning_count_text_calls_records_warnings(warning_count, expected):
     assert _warning_count_text(warning_count) == expected
 
 
-def test_hosted_notice_states_the_limits_it_is_given():
-    """The notice takes its numbers from the limits, so it always matches them."""
-    notice = _hosted_notice(
+def test_hosted_help_states_the_limits_it_is_given():
+    """The "?" help texts take their numbers from the limits, so they always match them."""
+    help_texts = _hosted_help(
         HostedLimits(
+            max_upload_bytes=20 * 1024 * 1024,
             max_input_rows=500,
+            max_dataset_rows=4,
+            tabular_request_budget=900,
+            raster_tile_budget=70,
+            max_run_time_s=1_200,
             max_concurrent_jobs=5,
             max_workspace_bytes=200 * 1024 * 1024,
-            retention_after_download_s=300,
+            abandon_timeout_s=900,
         )
     )
 
-    assert "and 500 rows" in notice
-    assert "at most 5 at a time on the server" in notice
-    assert "200 MB of results" in notice
-    assert "deleted 5 minutes after the first download" in notice
-    assert "planned maintenance" in notice
-    assert "data products with many bands" in notice
-    assert "points file stays in the server's memory for this browser session" in notice
-    assert "the results contain the IDs and coordinates of your points" in notice
+    assert help_texts.upload == "CSV file: at most 20 MB and 500 rows."
+    assert "At most 4 data products per extraction." in help_texts.data_products
+    assert "Tabular data products: at most 900 points × window sizes" in help_texts.data_products
+    assert "For example, 450 points with two window sizes." in help_texts.data_products
+    assert "Raster data products: at most 70 tiles" in help_texts.data_products
+    assert "70 points with one window size, or 35 points with two" in help_texts.data_products
+    assert "at most 20 minutes and 200 MB of results" in help_texts.run
+    assert "data products with many bands" in help_texts.run
+    assert "the extraction stops after 15 minutes" in help_texts.run
+    assert "at a time on the server" not in help_texts.run
+    assert "points file stays in the server's memory for this browser session" in help_texts.run
+    assert "The results contain the IDs and coordinates of your points" in help_texts.run
+    assert ENVOI_README_URL in help_texts.run
+
+
+def test_hosted_retention_note_states_the_retention_it_is_given():
+    """The note on how long the results stay takes its times from the limits."""
+    note = _hosted_retention_note(
+        HostedLimits(retention_after_download_s=300, max_retention_s=1_200)
+    )
+
+    assert "for 5 minutes after the first download" in note
+    assert "at the latest 20 minutes after the extraction ends" in note
+    assert "the server deletes them" in note
 
 
 class _DownloadRecorder:
