@@ -156,20 +156,19 @@ The hosted web app runs on a server that many users share. It handles your key a
 
 - **Your key** stays in the server's memory for your browser session only. The web app never writes it to disk. Each extraction runs in its own process on the server, and that process uses only your key.
 - **Your points and the results** stay on the server's disk only while they are needed. The server deletes the results 10 minutes after your first click on **Download results**, or at the latest 30 minutes after the extraction ends. A new extraction or **Clear results** deletes them earlier. A failed, cancelled, or stopped extraction gives no results, and the server deletes its files when it ends. Like your key, the uploaded points file stays in the server's memory for your browser session, and the results contain the IDs and coordinates of your points.
-- **A server restart** stops running extractions and deletes all results. The public instance on SciLifeLab Serve restarts during planned maintenance, which Serve announces at https://serve.scilifelab.se/maintenance/.
 
 **Keep the page open and visible while an extraction runs.** The page asks the server for the status every 2 seconds. When no page asks for 10 minutes, for example because you closed the tab or your computer went to sleep, the server stops the extraction. A page reload loses the link to a running extraction. If you then start an extraction with the same key, the web app offers **Cancel the earlier job**.
 
 **Download.** When the extraction is complete, click **Download results**. You get one ZIP file, for example `envoi-results-20261008T141500Z.zip`, with all output files and the run log. You can download it again until the server deletes it. Your browser saves the file in its download folder. Most browsers can be set to ask where to save each download.
 
-**Limits.** The hosted web app has these limits. They are starting values and can change, and the web app always shows the limits that apply.
+**Limits.** The hosted web app has these limits. They are starting values and can change. The web app shows the limits of each step under the **?** next to it.
 
 | What                         | Limit                                                                                                         |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | CSV file                     | 50 MB, and 10,000 data rows                                                                                   |
 | Data-product rows            | 10 per extraction                                                                                             |
-| Tabular rows                 | Windows up to 10,000 m. Points × window sizes up to 20,000 over all tabular rows (**Point** counts as one window size). |
-| Raster rows                  | Windows up to 2,000 m. Points × window sizes up to 1,000 tiles over all raster rows.                          |
+| Tabular data products        | Windows up to 10,000 m. Points × window sizes, added up over all tabular data products, up to 20,000 (**Point** counts as one window size). For example, 10,000 points with two window sizes. |
+| Raster data products         | Windows up to 2,000 m. Points × window sizes, added up over all raster data products, up to 1,000 tiles. For example, 1,000 points with one window size, or 500 points with two. |
 | Run time                     | 60 minutes per extraction                                                                                     |
 | Size of the results          | 500 MB per extraction                                                                                         |
 | Extractions at the same time | One per page and one per key. The server also runs only a few extractions at the same time (3 by default).   |

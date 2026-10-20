@@ -323,19 +323,19 @@ def check_hosted_limits(
     tabular_requests = point_count * tabular_window_count
     if tabular_requests > limits.tabular_request_budget:
         messages.append(
-            f"The {TABULAR_OUTPUT} rows need {point_count:,} points x "
+            f"The {TABULAR_OUTPUT} data products need {point_count:,} points x "
             f"{_count_window_sizes(tabular_window_count)} = {tabular_requests:,} requests. "
             f"The limit is {limits.tabular_request_budget:,}. Use fewer points, or fewer "
-            f"window sizes in the {TABULAR_OUTPUT} rows (the point value counts as one "
+            f"window sizes in the {TABULAR_OUTPUT} data products (Point counts as one "
             "window size)."
         )
     raster_tiles = point_count * raster_window_count
     if raster_tiles > limits.raster_tile_budget:
         messages.append(
-            f"The {RASTER_OUTPUT} rows need {point_count:,} points x "
+            f"The {RASTER_OUTPUT} data products need {point_count:,} points x "
             f"{_count_window_sizes(raster_window_count)} = {raster_tiles:,} tiles. "
             f"The limit is {limits.raster_tile_budget:,}. Use fewer points, or fewer "
-            f"window sizes in the {RASTER_OUTPUT} rows."
+            f"window sizes in the {RASTER_OUTPUT} data products."
         )
     return messages
 

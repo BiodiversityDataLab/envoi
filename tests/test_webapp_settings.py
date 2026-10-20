@@ -287,7 +287,8 @@ class TestCheckHostedLimits:
         messages = check_hosted_limits(_points(10_000), [_tabular(0, 100, 200)], _LIMITS)
 
         assert len(messages) == 1
-        assert "10,000 points x 3 window sizes = 30,000 requests" in messages[0]
+        assert "The tabular data products need 10,000 points x 3 window sizes" in messages[0]
+        assert "= 30,000 requests" in messages[0]
         assert "The limit is 20,000" in messages[0]
 
     def test_tabular_request_budget_one_step_above(self):
@@ -308,6 +309,7 @@ class TestCheckHostedLimits:
 
         assert len(messages) == 1
         assert "1,001 points x 1 window size = 1,001 tiles. The limit is 1,000." in messages[0]
+        assert "fewer window sizes in the raster data products" in messages[0]
 
     @pytest.mark.parametrize(
         ("selection", "limit_text"),

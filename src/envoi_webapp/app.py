@@ -93,9 +93,14 @@ THEME_PRIMARY_COLOR = STAT_TAG_BACKGROUND
 DATASET_CATALOG_URL = "https://github.com/BiodiversityDataLab/envoi/blob/main/docs/datasets.md"
 VALIDATION_ERROR_COLOR = "#d32f2f"
 ALL_DATASET_TYPES = "__all_dataset_types__"
-# Installation of envoi for the local web app and the Python package. The
-# hosted notice points users with larger runs here.
-LOCAL_INSTALL_URL = "https://github.com/BiodiversityDataLab/envoi#browser-based-user-interface"
+# The README, which explains envoi and how to install the local web app and the
+# Python package. The "?" help of the hosted run step links to it (for larger runs).
+ENVOI_README_URL = "https://github.com/BiodiversityDataLab/envoi#envoi"
+# The source code, the local web app, and the Python package, which the hosted
+# abstract links to.
+ENVOI_GITHUB_URL = "https://github.com/BiodiversityDataLab/envoi"
+ENVOI_LOCAL_APP_URL = "https://github.com/BiodiversityDataLab/envoi#local-web-app"
+ENVOI_PYPI_URL = "https://pypi.org/project/envoi-geospatial/"
 
 # Session-state keys of the extraction job of one browser session. The session
 # keeps only the job ID and a random session token. The job manager keeps the
@@ -193,6 +198,9 @@ def _inject_css(st) -> None:
           top: 0;
           width: var(--envoi-right-panel-width);
           z-index: 0;
+        }}
+        div[data-testid="stTooltipContent"] {{
+          max-width: min(48rem, calc(100vw - 2rem));
         }}
         @media (max-width: 900px) {{
           .block-container {{
@@ -1035,22 +1043,33 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]]) -> None:
         st.rerun()
 
 
+def _step_numbers(is_hosted: bool) -> tuple[int, int]:
+    """Return the numbers of the data-product step and the run step.
+
+    Hosted mode has no output-folder step (step 3 of local mode), so its later
+    steps have lower numbers.
+    """
+    return (3, 4) if is_hosted else (4, 5)
+
+
 def _validate_dataset_rows(
     rows: list[dict],
     catalog: dict[str, dict[str, Any]],
     widget_version: int,
+    step: int = 4,
 ) -> tuple[list[_ValidationIssue], list[DatasetSelection]]:
     """Validate visible data-product fields in their left-to-right order.
 
     Each row is checked with its own output type. A row without an output type
     or without a data product gets an issue for each missing choice, and its
-    other fields are not checked.
+    other fields are not checked. ``step`` is the number of the data-product
+    step on the page (see ``_step_numbers()``), which the messages name.
     """
 
     issues: list[_ValidationIssue] = []
     selections: list[DatasetSelection] = []
     if not rows:
-        return [_ValidationIssue("Step 4 — Add at least one data product.", ())], selections
+        return [_ValidationIssue(f"Step {step} — Add at least one data product.", ())], selections
 
     for index, row in enumerate(rows):
         row_widget_key = f"{widget_version}_{index}"
@@ -1060,14 +1079,14 @@ def _validate_dataset_rows(
         if output_type not in {TABULAR_OUTPUT, RASTER_OUTPUT}:
             issues.append(
                 _ValidationIssue(
-                    f"Step 4 — {label}: choose an output type (Tabular or Raster).",
+                    f"Step {step} — {label}: choose an output type (Tabular or Raster).",
                     (f"output_type_select_{row_widget_key}",),
                 )
             )
         if not dataset:
             issues.append(
                 _ValidationIssue(
-                    f"Step 4 — {label}: choose a data product.",
+                    f"Step {step} — {label}: choose a data product.",
                     (f"dataset_select_{row_widget_key}",),
                 )
             )
@@ -1082,7 +1101,7 @@ def _validate_dataset_rows(
             if not sample_point and not sample_window:
                 issues.append(
                     _ValidationIssue(
-                        f"Step 4 — {label}: choose Point, Window, or both.",
+                        f"Step {step} — {label}: choose Point, Window, or both.",
                         (
                             f"point_checkbox_{row_widget_key}",
                             f"window_checkbox_{row_widget_key}",
@@ -1096,7 +1115,7 @@ def _validate_dataset_rows(
             if sample_window and not statistics:
                 issues.append(
                     _ValidationIssue(
-                        f"Step 4 — {label}: choose at least one spatial statistic.",
+                        f"Step {step} — {label}: choose at least one spatial statistic.",
                         (f"stats_select_{row_widget_key}_{dataset}",),
                     )
                 )
@@ -1113,7 +1132,7 @@ def _validate_dataset_rows(
                         detail = f"enter valid sampling-window sizes. {detail}"
                     issues.append(
                         _ValidationIssue(
-                            f"Step 4 — {label}: {detail}",
+                            f"Step {step} — {label}: {detail}",
                             (f"windows_input_{row_widget_key}",),
                         )
                     )
@@ -1137,7 +1156,7 @@ def _validate_dataset_rows(
                     detail = f"enter valid sampling-window sizes. {detail}"
                 issues.append(
                     _ValidationIssue(
-                        f"Step 4 — {label}: {detail}",
+                        f"Step {step} — {label}: {detail}",
                         (f"windows_input_{row_widget_key}",),
                     )
                 )
@@ -1172,11 +1191,11 @@ def _validate_form(
     Args:
         points_df: The parsed points, or None when the upload is missing or bad.
         points_error: The message for a bad upload, or None.
-        input_crs: The CRS text of step 1.
+        input_crs: The CRS text of the upload step.
         credentials_bytes: The uploaded key, or None.
-        output_dir: The output folder text of step 3. None in hosted mode, which
-            has no output-folder field.
-        dataset_rows: The data-product rows of step 4.
+        output_dir: The output folder text of the output step. None in hosted mode,
+            which has no output-folder field.
+        dataset_rows: The data-product rows of the data-product step.
         catalog: The dataset catalog.
         widget_version: The widget version of the data-product rows.
         limits: The hosted limits, or None in local mode. The limit checks run
@@ -1238,8 +1257,12 @@ def _validate_form(
             )
         )
 
-    # Step 4: data-product rows, each with its own output type.
-    dataset_issues, selections = _validate_dataset_rows(dataset_rows, catalog, widget_version)
+    # The data-product step: rows, each with its own output type. Hosted mode
+    # (with limits) has no output-folder step, so this step has a lower number.
+    data_product_step, _ = _step_numbers(limits is not None)
+    dataset_issues, selections = _validate_dataset_rows(
+        dataset_rows, catalog, widget_version, step=data_product_step
+    )
     issues.extend(dataset_issues)
 
     # Hosted limits. check_hosted_limits() numbers the rows by their position
@@ -1364,59 +1387,62 @@ def _warning_count_text(warning_count: int) -> str:
     return f"{warning_count:,} {noun} in the run log."
 
 
-def _hosted_notice(limits: HostedLimits) -> str:
-    """Return the hosted-mode notice about the key, the data, the limits, and downloads (R19).
+# The hosted page shows how it handles the key and the data in highlighted
+# notes next to the steps they concern, and each limit as the "?" help of the
+# heading of the step that it applies to (R19).
+HOSTED_KEY_NOTE = (
+    "**Your key stays private.** The server keeps it in memory for this browser session "
+    "only, and never saves it to disk or writes it to a log."
+)
 
-    The numbers come from ``limits``, so the notice always states the limits
-    that the web app applies.
+# A short abstract of the hosted web app for people who open it for the first
+# time, with links to the source code and the Python package.
+HOSTED_INTRO = (
+    "*envoi* web app adds environmental data from Google Earth Engine to your sample "
+    "points, such as species occurrence records, without installing anything. Upload a "
+    "CSV file with your points and your own Earth Engine service-account key, then choose "
+    "data products, for example elevation, climate, or land cover. For each point, you "
+    "get values or summary statistics within a window around it, or raster tiles. You "
+    "download them with quality checks and metadata in one ZIP file.\n\n"
+    "*envoi* is an open-source Python package, and the web app runs a simplified version "
+    "of it. For more flexibility and larger downloads, you can "
+    f"[run the app locally]({ENVOI_LOCAL_APP_URL}) or [use envoi in Python]({ENVOI_PYPI_URL}). "
+    f"Source code and documentation: [GitHub]({ENVOI_GITHUB_URL})."
+)
+
+
+@dataclass(frozen=True)
+class _HostedHelp:
+    """The "?" help texts of the hosted page, for the steps that have limits."""
+
+    upload: str
+    data_products: str
+    run: str
+
+
+def _hosted_help(limits: HostedLimits) -> _HostedHelp:
+    """Return the "?" help texts that state the hosted limits of each step.
+
+    The numbers come from ``limits``, so the page always states the limits that
+    the web app applies.
     """
-    data_handling = [
-        (
-            "**Your key** stays in the server's memory for this browser session only. "
-            "It is never written to disk."
-        ),
-        (
-            "**Your points and the results** stay on the server's disk only while they are "
-            f"needed. The results are deleted {format_minutes(limits.retention_after_download_s)} "
-            "after the first download, or at the latest "
-            f"{format_minutes(limits.max_retention_s)} after the extraction ends. Like your "
-            "key, the uploaded points file stays in the server's memory for this browser "
-            "session, and the results contain the IDs and coordinates of your points."
-        ),
-        (
-            "**Keep this page open and visible** while an extraction runs. If the page is "
-            "closed or the computer sleeps, the extraction stops after "
-            f"{format_minutes(limits.abandon_timeout_s)}."
-        ),
-        (
-            "**A server restart**, for example during planned maintenance, stops running "
-            "extractions and deletes all results."
-        ),
-        (
-            "**Downloads** go to the download folder of your browser. Most browsers can be "
-            "set to ask where to save each download."
-        ),
-        (
-            "**For larger runs**, or to write the results straight into a folder, "
-            f"[install envoi]({LOCAL_INSTALL_URL}) and use the local web app or the Python "
-            "package."
-        ),
-    ]
-    service_limits = [
-        (
-            f"CSV file: at most {format_bytes(limits.max_upload_bytes)} and "
-            f"{limits.max_input_rows:,} rows."
-        ),
+    data_product_limits = [
         f"At most {limits.max_dataset_rows} data products per extraction.",
         (
-            f"Tabular rows: at most {limits.tabular_request_budget:,} points × window sizes "
-            "(the point value counts as one window size), and windows of at most "
-            f"{limits.max_tabular_window_m:,} m."
+            f"Tabular data products: at most {limits.tabular_request_budget:,} points × "
+            "window sizes, added up over all tabular data products (**Point** counts as one "
+            f"window size). For example, {limits.tabular_request_budget // 2:,} points with "
+            f"two window sizes. Windows of at most {limits.max_tabular_window_m:,} m."
         ),
         (
-            f"Raster rows: at most {limits.raster_tile_budget:,} points × window sizes, and "
-            f"windows of at most {limits.max_raster_window_m:,} m."
+            f"Raster data products: at most {limits.raster_tile_budget:,} tiles, that is "
+            "points × window sizes, added up over all raster data products. For example, "
+            f"{limits.raster_tile_budget:,} points with one window size, or "
+            f"{limits.raster_tile_budget // 2:,} points with two. Windows of at most "
+            f"{limits.max_raster_window_m:,} m."
         ),
+    ]
+    run_limits = [
         (
             f"Each extraction: at most {format_minutes(limits.max_run_time_s)} and "
             f"{format_bytes(limits.max_workspace_bytes)} of results. Raster tiles of data "
@@ -1424,20 +1450,37 @@ def _hosted_notice(limits: HostedLimits) -> str:
             "fewer points or smaller windows for them."
         ),
         (
-            "One extraction at a time per page and per key, and at most "
-            f"{limits.max_concurrent_jobs} at a time on the server."
+            "Keep this page open and visible while an extraction runs. If the page is closed "
+            "or the computer sleeps, the extraction stops after "
+            f"{format_minutes(limits.abandon_timeout_s)}."
+        ),
+        (
+            "Your uploaded points file stays in the server's memory for this browser "
+            "session only. The results contain the IDs and coordinates of your points."
+        ),
+        (
+            "For larger runs, or to write the results straight into a folder, "
+            f"[install envoi]({ENVOI_README_URL}) and use the local web app or the Python "
+            "package."
         ),
     ]
-    return "\n".join(
-        [
-            "**How this service handles your data**",
-            "",
-            *(f"- {line}" for line in data_handling),
-            "",
-            "**Limits of this service**",
-            "",
-            *(f"- {line}" for line in service_limits),
-        ]
+    return _HostedHelp(
+        upload=(
+            f"CSV file: at most {format_bytes(limits.max_upload_bytes)} and "
+            f"{limits.max_input_rows:,} rows."
+        ),
+        data_products="\n".join(f"- {line}" for line in data_product_limits),
+        run="\n".join(f"- {line}" for line in run_limits),
+    )
+
+
+def _hosted_retention_note(limits: HostedLimits) -> str:
+    """Return the hosted-mode note on how long the results stay on the server."""
+    return (
+        "**The results stay on the server** for "
+        f"{format_minutes(limits.retention_after_download_s)} after the first download, or "
+        f"at the latest {format_minutes(limits.max_retention_s)} after the extraction ends. "
+        "After that, the server deletes them."
     )
 
 
@@ -1698,7 +1741,7 @@ def _render_run_section(
     credentials_bytes: bytes | None,
     output_dir: str | None,
 ) -> None:
-    """Render the run button, the form errors, and the job of this session (section 5).
+    """Render the run button, the form errors, and the job of this session (the last section).
 
     The run button is disabled while the session's job runs. A configuration
     error of the job manager replaces the whole section, so that no job starts.
@@ -1789,8 +1832,13 @@ def render_app() -> None:
         st.session_state[SESSION_TOKEN_KEY] = secrets.token_urlsafe(16)
 
     catalog = dataset_catalog()
+    hosted_help = _hosted_help(settings.limits) if settings.is_hosted else None
+    data_product_step, run_step = _step_numbers(settings.is_hosted)
 
-    st.subheader("1. Upload location data")
+    if settings.is_hosted:
+        st.markdown(HOSTED_INTRO)
+
+    st.subheader("1. Upload location data", help=hosted_help.upload if hosted_help else None)
     st.write(
         "Upload a CSV file with occurrence records or sampling locations. It should contain the following columns, "
         "in Darwin Core format: occurrenceID (a unique identifier for the occurrence or location), decimalLatitude, and decimalLongitude."
@@ -1831,16 +1879,24 @@ def render_app() -> None:
             st.error(str(exc))
 
     st.subheader("2. Add Earth Engine credentials")
+    # In hosted mode, the highlighted note below says where the key stays.
+    key_storage_text = (
+        ""
+        if settings.is_hosted
+        else "The web app keeps the key in memory for this browser session only and "
+        "never writes it to disk. "
+    )
     st.markdown(
-        """
-        Upload your Google Earth Engine service account JSON key. The web app keeps
-        the key in memory for this browser session only and never writes it to disk.
-        Each extraction runs in a separate process that uses only your key. If you do
-        not have a service account yet, follow the
-        <a href="https://developers.google.com/earth-engine/guides/service_account" target="_blank">Earth Engine service account setup guide</a>.
-        """,
+        "Upload your Google Earth Engine service account JSON key. "
+        f"{key_storage_text}"
+        "Each extraction runs in a separate process that uses only your key. If you do "
+        "not have a service account yet, follow the "
+        '<a href="https://developers.google.com/earth-engine/guides/service_account" '
+        'target="_blank">Earth Engine service account setup guide</a>.',
         unsafe_allow_html=True,
     )
+    if settings.is_hosted:
+        st.info(HOSTED_KEY_NOTE, icon=":material/lock:")
     credentials_file = st.file_uploader(
         "Earth Engine service account JSON",
         type=["json"],
@@ -1852,10 +1908,7 @@ def render_app() -> None:
     # Hosted mode has no output-folder field: the user downloads the results,
     # and no widget accepts a server path.
     output_dir: str | None = None
-    if settings.is_hosted:
-        st.subheader("3. Results and your data")
-        st.info(_hosted_notice(settings.limits))
-    else:
+    if not settings.is_hosted:
         st.subheader("3. Choose output settings")
         if "output_dir" not in st.session_state:
             st.session_state.output_dir = str(Path("~/envoi_outputs").expanduser())
@@ -1873,7 +1926,10 @@ def render_app() -> None:
                     st.session_state._pending_output_dir = selected_dir
                     st.rerun()
 
-    st.subheader("4. Select data products")
+    st.subheader(
+        f"{data_product_step}. Select data products",
+        help=hosted_help.data_products if hosted_help else None,
+    )
     st.markdown(
         f"""
         Add one entry per Earth Engine data product that should be downloaded. If a data product contains multiple bands, all of them will be processed and downloaded. For information about available data products, see the
@@ -1883,12 +1939,15 @@ def render_app() -> None:
     )
     _render_dataset_rows(st, catalog)
 
-    st.subheader("5. Run extraction")
+    st.subheader(f"{run_step}. Run extraction", help=hosted_help.run if hosted_help else None)
     if settings.is_hosted:
         st.write(
-            "The final outputs, data quality checks, metadata, and a run log are packed into "
-            "one ZIP file. A download button appears here when the extraction is complete."
+            "When the extraction is complete, a **Download results** button appears here. "
+            "It gives you one ZIP file with the extracted data, the data quality checks, the "
+            "metadata, and a run log. Your browser saves it in its download folder, or asks "
+            "where to save it if it is set to do so."
         )
+        st.info(_hosted_retention_note(settings.limits), icon=":material/auto_delete:")
     else:
         st.write(
             "The final outputs, data quality checks, metadata, and a run log are written to "

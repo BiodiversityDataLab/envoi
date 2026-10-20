@@ -20,10 +20,15 @@ from streamlit.testing.v1 import AppTest
 from envoi_webapp import app, helpers
 from envoi_webapp import jobs as jobs_module
 from envoi_webapp.app import (
+    ENVOI_GITHUB_URL,
+    ENVOI_LOCAL_APP_URL,
+    ENVOI_PYPI_URL,
+    ENVOI_README_URL,
+    HOSTED_INTRO,
+    HOSTED_KEY_NOTE,
     JOB_ID_KEY,
     JOB_LOST_MESSAGE,
     JOB_OUTPUT_DIR_KEY,
-    LOCAL_INSTALL_URL,
     RESULTS_DELETED_MESSAGE,
 )
 from envoi_webapp.job_protocol import JobSnapshot, JobState
@@ -143,6 +148,15 @@ def _texts(elements) -> list[str]:
     return [element.value for element in elements]
 
 
+def _step_help(app_test: AppTest) -> dict[str, str]:
+    """Return the "?" help text of each numbered step heading, by heading text."""
+    return {
+        heading.value: heading.proto.help
+        for heading in app_test.subheader
+        if heading.value[:1].isdigit()
+    }
+
+
 def _button(app_test: AppTest, label: str):
     return next(button for button in app_test.button if button.label == label)
 
@@ -200,9 +214,17 @@ class TestModes:
         assert not app_test.exception
         assert [text_input.label for text_input in app_test.text_input] == ["Output directory"]
         assert any(button.label == "Browse..." for button in app_test.button)
-        assert not any(
-            "How this service handles your data" in text for text in _texts(app_test.info)
-        )
+        assert list(_step_help(app_test)) == [
+            "1. Upload location data",
+            "2. Add Earth Engine credentials",
+            "3. Choose output settings",
+            "4. Select data products",
+            "5. Run extraction",
+        ]
+        assert not any(_step_help(app_test).values())
+        assert HOSTED_KEY_NOTE not in _texts(app_test.info)
+        assert "keeps the key in memory" in " ".join(_texts(app_test.markdown))
+        assert HOSTED_INTRO not in _texts(app_test.markdown)
 
     def test_local_page_script_reads_the_catalog_once(self, monkeypatch, tmp_path):
         """Local mode runs app.py again on each rerun, and the page still reads the catalog once."""
@@ -232,24 +254,40 @@ class TestModes:
         assert calls == ["full"]
 
     @hosted_only
-    def test_hosted_mode_hides_the_output_folder_and_shows_the_notice(self, run_app):
-        """Hosted mode has no widget for a server path, and its notice states the data rules."""
+    def test_hosted_mode_shows_the_notes_and_the_limits_at_their_steps(self, run_app):
+        """Hosted mode has no output-folder step; each step states its own limits and data rules."""
         app_test = run_app("hosted", _FakeJobManager())
 
         assert not app_test.exception
         assert not any(text_input.label == "Output directory" for text_input in app_test.text_input)
         assert not any(button.label == "Browse..." for button in app_test.button)
-        notice = next(
-            text for text in _texts(app_test.info) if "How this service handles your data" in text
-        )
-        assert "never written to disk" in notice
-        assert "deleted 10 minutes after the first download" in notice
-        assert "at the latest 30 minutes after the extraction ends" in notice
-        assert "the extraction stops after 10 minutes" in notice
-        assert "A server restart" in notice
-        assert "at most 50 MB and 10,000 rows" in notice
-        assert LOCAL_INSTALL_URL in notice
-        assert "ask where to save each download" in notice
+        step_help = _step_help(app_test)
+        assert list(step_help) == [
+            "1. Upload location data",
+            "2. Add Earth Engine credentials",
+            "3. Select data products",
+            "4. Run extraction",
+        ]
+        assert "at most 50 MB and 10,000 rows" in step_help["1. Upload location data"]
+        assert step_help["2. Add Earth Engine credentials"] == ""
+        assert "10 data products per extraction" in step_help["3. Select data products"]
+        assert "the extraction stops after 10 minutes" in step_help["4. Run extraction"]
+        assert "IDs and coordinates of your points" in step_help["4. Run extraction"]
+        assert ENVOI_README_URL in step_help["4. Run extraction"]
+        assert HOSTED_INTRO in _texts(app_test.markdown)
+        assert f"[GitHub]({ENVOI_GITHUB_URL})" in HOSTED_INTRO
+        assert f"[run the app locally]({ENVOI_LOCAL_APP_URL})" in HOSTED_INTRO
+        assert f"[use envoi in Python]({ENVOI_PYPI_URL})" in HOSTED_INTRO
+        notes = _texts(app_test.info)
+        assert HOSTED_KEY_NOTE in notes
+        retention_note = next(text for text in notes if "The results stay on the server" in text)
+        assert "for 10 minutes after the first download" in retention_note
+        assert "at the latest 30 minutes after the extraction ends" in retention_note
+        page_text = " ".join(_texts(app_test.markdown))
+        assert "a **Download results** button appears here" in page_text
+        assert "asks where to save it" in page_text
+        assert "keeps the key in memory" not in page_text
+        assert "restart" not in page_text + " ".join(notes)
 
     @needs_upload_driver
     def test_invalid_mode_shows_a_configuration_error_and_no_form(self, run_app):

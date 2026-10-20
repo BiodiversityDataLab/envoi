@@ -12,7 +12,7 @@ Checks (they need no network access):
 
 1. The page script ``app.py`` in this folder runs once in hosted mode, with
    Streamlit's ``AppTest``. The page must show no exception and no error, must
-   show the hosted section 3, and must not call ``ee.Initialize()`` in the
+   show the hosted run step, and must not call ``ee.Initialize()`` in the
    server process.
 2. The real ``JobManager`` starts a real worker process for a job with a
    generated service-account key without ``token_uri``. The job must end as
@@ -62,8 +62,8 @@ APP_TIMEOUT_S = 60
 JOB_TIMEOUT_S = 120
 JOB_POLL_INTERVAL_S = 0.5
 
-# Section 3 has this title only in hosted mode.
-HOSTED_SECTION_TITLE = "3. Results and your data"
+# Hosted mode has no output-folder step, so only there the run step is step 4.
+HOSTED_RUN_STEP_TITLE = "4. Run extraction"
 LOCAL_OUTPUT_FIELD_LABEL = "Output directory"
 # Part of the error of init_gee() for a key that is not valid. It tells the
 # key error apart from a worker that crashed before it read the key.
@@ -85,8 +85,8 @@ def check_app_script() -> list[str]:
         f"The page shows an exception: {exception.value}" for exception in app_test.exception
     ]
     problems.extend(f"The page shows an error: {error.value}" for error in app_test.error)
-    if HOSTED_SECTION_TITLE not in [subheader.value for subheader in app_test.subheader]:
-        problems.append(f"The page has no section {HOSTED_SECTION_TITLE!r}, so it is not hosted.")
+    if HOSTED_RUN_STEP_TITLE not in [subheader.value for subheader in app_test.subheader]:
+        problems.append(f"The page has no step {HOSTED_RUN_STEP_TITLE!r}, so it is not hosted.")
     if any(text_input.label == LOCAL_OUTPUT_FIELD_LABEL for text_input in app_test.text_input):
         problems.append("The page shows the output-folder field, which hosted mode must hide.")
     return problems
