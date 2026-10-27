@@ -101,6 +101,7 @@ ENVOI_README_URL = "https://github.com/BiodiversityDataLab/envoi#envoi"
 ENVOI_GITHUB_URL = "https://github.com/BiodiversityDataLab/envoi"
 ENVOI_LOCAL_APP_URL = "https://github.com/BiodiversityDataLab/envoi#local-web-app"
 ENVOI_PYPI_URL = "https://pypi.org/project/envoi-geospatial/"
+EE_SERVICE_ACCOUNT_GUIDE_URL = "https://developers.google.com/earth-engine/guides/service_account"
 
 # Session-state keys of the extraction job of one browser session. The session
 # keeps only the job ID and a random session token. The job manager keeps the
@@ -1386,6 +1387,24 @@ def _warning_count_text(warning_count: int) -> str:
     return f"{warning_count:,} {noun} in the run log."
 
 
+# The steps to get a service-account key, in a popover of the credentials step.
+# They give only the parts of the Earth Engine guide that envoi needs. The
+# service account uses Earth Engine in its own project, so it needs the two roles.
+SERVICE_ACCOUNT_KEY_STEPS = (
+    "**Get a JSON key for a service account**\n\n"
+    "You need a Google Cloud project that is "
+    "[registered for Earth Engine](https://console.cloud.google.com/earth-engine).\n\n"
+    "1. Open the [Service Accounts page](https://console.cloud.google.com/iam-admin/serviceaccounts) "
+    "in the Google Cloud Console, and select your project.\n"
+    "2. If the project has no service account yet, click **Create service account**. Give "
+    "the account the roles **Earth Engine Resource Viewer** and **Service Usage Consumer**.\n"
+    "3. Click the menu of the account (⋮), then **Manage keys** > **Add key** > "
+    "**Create new key** > **JSON** > **Create**.\n"
+    "4. Your browser downloads the JSON key file. Upload this file below.\n\n"
+    "Keep the key file private. Anyone who has it can use your Earth Engine access.\n\n"
+    f"All details: [Earth Engine service account guide]({EE_SERVICE_ACCOUNT_GUIDE_URL})."
+)
+
 # The hosted page shows how it handles the key and the data in highlighted
 # notes next to the steps they concern, and each limit as the "?" help at the
 # end of the description of the step that it applies to (R19).
@@ -1891,12 +1910,10 @@ def render_app() -> None:
     st.markdown(
         "Upload your Google Earth Engine service account JSON key. "
         f"{key_storage_text}"
-        "Each extraction runs in a separate process that uses only your key. If you do "
-        "not have a service account yet, follow the "
-        '<a href="https://developers.google.com/earth-engine/guides/service_account" '
-        'target="_blank">Earth Engine service account setup guide</a>.',
-        unsafe_allow_html=True,
+        "Each extraction runs in a separate process that uses only your key."
     )
+    with st.popover("How do I get a key?", type="tertiary", icon=":material/key:"):
+        st.markdown(SERVICE_ACCOUNT_KEY_STEPS)
     if settings.is_hosted:
         st.info(HOSTED_KEY_NOTE, icon=":material/lock:")
     credentials_file = st.file_uploader(

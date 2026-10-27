@@ -30,6 +30,7 @@ from envoi_webapp.app import (
     JOB_LOST_MESSAGE,
     JOB_OUTPUT_DIR_KEY,
     RESULTS_DELETED_MESSAGE,
+    SERVICE_ACCOUNT_KEY_STEPS,
 )
 from envoi_webapp.job_protocol import JobSnapshot, JobState
 from envoi_webapp.jobs import JobRejected, key_hash
@@ -164,6 +165,16 @@ def _step_help(app_test: AppTest) -> dict[str, str]:
     return step_help
 
 
+def _popover_texts(app_test: AppTest, label: str) -> list[str]:
+    """Return the Markdown texts in the popover with this label."""
+    popover = next(
+        block
+        for block in app_test.main.children.values()
+        if block.type == "popover" and block.proto.popover.label == label
+    )
+    return _texts(popover.markdown)
+
+
 def _button(app_test: AppTest, label: str):
     return next(button for button in app_test.button if button.label == label)
 
@@ -231,6 +242,7 @@ class TestModes:
         assert not any(_step_help(app_test).values())
         assert HOSTED_KEY_NOTE not in _texts(app_test.info)
         assert "keeps the key in memory" in " ".join(_texts(app_test.markdown))
+        assert _popover_texts(app_test, "How do I get a key?") == [SERVICE_ACCOUNT_KEY_STEPS]
         assert HOSTED_INTRO not in _texts(app_test.markdown)
 
     def test_local_page_script_reads_the_catalog_once(self, monkeypatch, tmp_path):
@@ -285,6 +297,7 @@ class TestModes:
         assert f"[GitHub]({ENVOI_GITHUB_URL})" in HOSTED_INTRO
         assert f"[run the app locally]({ENVOI_LOCAL_APP_URL})" in HOSTED_INTRO
         assert f"[use envoi in Python]({ENVOI_PYPI_URL})" in HOSTED_INTRO
+        assert _popover_texts(app_test, "How do I get a key?") == [SERVICE_ACCOUNT_KEY_STEPS]
         notes = _texts(app_test.info)
         assert HOSTED_KEY_NOTE in notes
         retention_note = next(text for text in notes if "The results stay on the server" in text)
