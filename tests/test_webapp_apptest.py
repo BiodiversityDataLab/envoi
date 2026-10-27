@@ -149,12 +149,19 @@ def _texts(elements) -> list[str]:
 
 
 def _step_help(app_test: AppTest) -> dict[str, str]:
-    """Return the "?" help text of each numbered step heading, by heading text."""
-    return {
-        heading.value: heading.proto.help
-        for heading in app_test.subheader
-        if heading.value[:1].isdigit()
-    }
+    """Return the "?" help text of each numbered step, by heading text.
+
+    The help is on the step's description text, below the heading.
+    """
+    step_help: dict[str, str] = {}
+    heading = None
+    for element in app_test.main.children.values():
+        if element.type == "subheader" and element.value[:1].isdigit():
+            heading = element.value
+            step_help[heading] = ""
+        elif heading is not None and element.type == "markdown":
+            step_help[heading] += element.proto.help
+    return step_help
 
 
 def _button(app_test: AppTest, label: str):

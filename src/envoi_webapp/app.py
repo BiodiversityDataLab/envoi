@@ -419,8 +419,7 @@ def _render_header(st) -> None:
               <div class="envoi-kicker">Biodiversity Data Lab</div>
               <h1>envoi: Geospatial data extraction</h1>
               <p>
-                A tool for downloading environmental data from Google Earth Engine
-                for sampling points or occurrence records.
+                A tool for downloading environmental data for sampling points or occurrence records.
               </p>
             </div>
             """,
@@ -907,7 +906,7 @@ def _render_dataset_rows(st, catalog: dict[str, dict[str, Any]]) -> None:
                     if current_output_type in output_type_options
                     else None
                 ),
-                placeholder="Choose output type",
+                placeholder="Choose type",
                 format_func=str.title,
                 key=f"output_type_select_{row_widget_key}",
             )
@@ -1388,8 +1387,8 @@ def _warning_count_text(warning_count: int) -> str:
 
 
 # The hosted page shows how it handles the key and the data in highlighted
-# notes next to the steps they concern, and each limit as the "?" help of the
-# heading of the step that it applies to (R19).
+# notes next to the steps they concern, and each limit as the "?" help at the
+# end of the description of the step that it applies to (R19).
 HOSTED_KEY_NOTE = (
     "**Your key stays private.** The server keeps it in memory for this browser session "
     "only, and never saves it to disk or writes it to a log."
@@ -1398,11 +1397,11 @@ HOSTED_KEY_NOTE = (
 # A short abstract of the hosted web app for people who open it for the first
 # time, with links to the source code and the Python package.
 HOSTED_INTRO = (
-    "*envoi* web app adds environmental data from Google Earth Engine to your sample "
+    "*envoi* adds environmental data from Google Earth Engine to your sample "
     "points, such as species occurrence records, without installing anything. Upload a "
-    "CSV file with your points and your own Earth Engine service-account key, then choose "
-    "data products, for example elevation, climate, or land cover. For each point, you "
-    "get values or summary statistics within a window around it, or raster tiles. You "
+    "CSV file with your points and an Earth Engine service-account key, then choose "
+    "data products, like elevation, climate, or land cover. You can get point-wise "
+    "values or summary statistics within a window around it, or image raster tiles. You "
     "download them with quality checks and metadata in one ZIP file.\n\n"
     "*envoi* is an open-source Python package, and the web app runs a simplified version "
     "of it. For more flexibility and larger downloads, you can "
@@ -1838,11 +1837,14 @@ def render_app() -> None:
     if settings.is_hosted:
         st.markdown(HOSTED_INTRO)
 
-    st.subheader("1. Upload location data", help=hosted_help.upload if hosted_help else None)
-    st.write(
+    # The "?" help goes at the end of each step description. Streamlit puts it
+    # inline only in Markdown without HTML.
+    st.subheader("1. Upload location data")
+    st.markdown(
         "Upload a CSV file with occurrence records or sampling locations. It should contain the following columns, "
         "in Darwin Core format: occurrenceID (a unique identifier for the occurrence or location), decimalLatitude, and decimalLongitude."
-        " Optionally, eventDate can be included to obtain date-specific information if available."
+        " Optionally, eventDate can be included to obtain date-specific information if available.",
+        help=hosted_help.upload if hosted_help else None,
     )
     uploaded_csv = st.file_uploader(
         "Location CSV",
@@ -1926,26 +1928,24 @@ def render_app() -> None:
                     st.session_state._pending_output_dir = selected_dir
                     st.rerun()
 
-    st.subheader(
-        f"{data_product_step}. Select data products",
-        help=hosted_help.data_products if hosted_help else None,
-    )
+    st.subheader(f"{data_product_step}. Select data products")
     st.markdown(
         f"""
         Add one entry per Earth Engine data product that should be downloaded. If a data product contains multiple bands, all of them will be processed and downloaded. For information about available data products, see the
-        <a href="{DATASET_CATALOG_URL}" target="_blank">envoi catalog</a>.
+        [envoi catalog]({DATASET_CATALOG_URL}).
         """,
-        unsafe_allow_html=True,
+        help=hosted_help.data_products if hosted_help else None,
     )
     _render_dataset_rows(st, catalog)
 
-    st.subheader(f"{run_step}. Run extraction", help=hosted_help.run if hosted_help else None)
+    st.subheader(f"{run_step}. Run extraction")
     if settings.is_hosted:
-        st.write(
+        st.markdown(
             "When the extraction is complete, a **Download results** button appears here. "
             "It gives you one ZIP file with the extracted data, the data quality checks, the "
             "metadata, and a run log. Your browser saves it in its download folder, or asks "
-            "where to save it if it is set to do so."
+            "where to save it if it is set to do so.",
+            help=hosted_help.run if hosted_help else None,
         )
         st.info(_hosted_retention_note(settings.limits), icon=":material/auto_delete:")
     else:
