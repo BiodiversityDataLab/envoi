@@ -56,7 +56,14 @@ Requires Python 3.10 or newer.
 
 Datasets that come from Google Earth Engine (most of the built-in catalog — `dem_copernicus_glo30`, `ndvi_landsat_annual`, etc.) need a service account key from Google. If you only plan to use your own local rasters you can skip this section.
 
-**Step 1 — get the key file.** In the [Google Cloud Console](https://console.cloud.google.com/iam-admin/serviceaccounts), create a service account that has Earth Engine access and download its JSON key. You'll end up with a file like `my-project-1234-abcdef.json`. See the [official guide](https://developers.google.com/earth-engine/guides/service_account) for the full walkthrough.
+**Step 1 — get the key file.** You need a Google Cloud project that is [registered for Earth Engine](https://console.cloud.google.com/earth-engine). Then:
+
+1. Open the [Service Accounts page](https://console.cloud.google.com/iam-admin/serviceaccounts) in the Google Cloud Console, and select your project.
+2. If the project has no service account yet, click **Create service account**. Give the account the roles **Earth Engine Resource Viewer** and **Service Usage Consumer**.
+3. Click the menu of the account (⋮), then **Manage keys** > **Add key** > **Create new key** > **JSON** > **Create**.
+4. Your browser downloads the JSON key file, a file like `my-project-1234-abcdef.json`.
+
+Keep the key file private. Anyone who has it can use your Earth Engine access. See the [official guide](https://developers.google.com/earth-engine/guides/service_account) for all details.
 
 **Step 2 — put the file somewhere envoi can find it.** Pick whichever of these is easiest:
 
@@ -134,7 +141,7 @@ envoi also includes a web app for users who prefer to work in a browser instead 
 You need:
 
 - a CSV file with your points, with the same GBIF / Darwin Core columns as the Python API: `occurrenceID`, `decimalLatitude`, `decimalLongitude`, and optionally `eventDate`,
-- a Google Earth Engine service account JSON key. Step 1 of [Earth Engine setup](#earth-engine-setup) tells you how to get one. You upload the key file in the web app, so you do not need to save it in a special folder.
+- a Google Earth Engine service account JSON key. Step 1 of [Earth Engine setup](#earth-engine-setup) tells you how to get one, and the web app shows the same steps under **How do I get a key?**. You upload the key file in the web app, so you do not need to save it in a special folder.
 
 The page has five steps:
 

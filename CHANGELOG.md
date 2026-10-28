@@ -25,6 +25,7 @@
 - Web app: the progress and the results stay on the page when you change other settings, until you click **Clear results** or start a new extraction.
 - Web app: each extraction writes a run log (`envoi-run-log-<UTC start time>.txt`) next to the outputs. It lists the warnings and errors that envoi reported, for example points for which Earth Engine returned an error. The page shows the number of warnings, and the last lines of the run log when an extraction fails.
 - Web app: each data-product row has its own **Output type** (tabular or raster), so one run can mix tabular statistics and raster tiles.
+- Web app: the credentials step has a **How do I get a key?** popup with the steps to create an Earth Engine service account and its JSON key.
 - A container image definition for the hosted web app on SciLifeLab Serve (`deploy/serve/`), and a GitHub workflow that builds, checks, and publishes the image as `ghcr.io/biodiversitydatalab/envoi-webapp`.
 
 ### Changed
@@ -102,6 +103,7 @@
 ### Documentation
 - New section "Known limitations" in `docs/advanced_usage.md`: how `n_pixels` and `coverage_pct` differ between adapters, `in_extent` for windows without valid pixels, class columns after failed points, tiles from earlier runs, local paths in the metadata sidecar, and `date_info` in runs with several windows.
 - The README explains when a tile name gets a hash suffix, and that `tiles_manifest.csv` maps each ID to its tile.
+- The README gives the steps to create an Earth Engine service account with the roles that envoi needs, and its JSON key, in "Earth Engine setup".
 
 ## [0.2.2] — 2026-08-28
 
